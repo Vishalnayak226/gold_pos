@@ -1,0 +1,5 @@
+{
+  "name": "blackbox-analyzer",
+  "private": true,
+  "type": "module"
+}

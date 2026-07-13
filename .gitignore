@@ -1,0 +1,17 @@
+node_modules/
+.env
+*.log
+backend/logs/
+backend/backups/
+backend/data/
+dist/
+gold_pos_release.zip
+backups/
+licensing_server/data/
+graphify-out/
+
+# Private keys and offline developer-only material must never be committed
+developer_doomsday_keys/*.pem
+developer_blackbox_keys/*.pem
+licensing_server/keys/*private*.pem
+docs/credentials.md

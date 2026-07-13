@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gold Business POS</title>
+    <link rel="stylesheet" href="css/app.css">
+    <script>
+        // Custom UI Alert Override
+        window.alert = function(message) {
+            if (document.getElementById('custom-alert-box')) return;
+            
+            const isSuccess = message.toLowerCase().includes('success');
+            const icon = isSuccess ? '✓' : '!';
+            const iconBg = isSuccess ? '#dcfce7' : '#f1f5f9';
+            const iconColor = isSuccess ? '#166534' : '#334155';
+
+            const overlay = document.createElement('div');
+            overlay.id = 'custom-alert-box';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(15,23,42,0.8);display:flex;align-items:center;justify-content:center;z-index:999999;backdrop-filter:blur(2px);';
+            overlay.innerHTML = `
+                <div style="background:#ffffff; border-radius:8px; padding:25px; width:90%; max-width:400px; box-shadow:0 10px 25px rgba(0,0,0,0.2); text-align:center; border:1px solid #cbd5e1; font-family:'Outfit',sans-serif;">
+                    <div style="width:40px; height:40px; border-radius:50%; background:${iconBg}; color:${iconColor}; display:flex; align-items:center; justify-content:center; margin:0 auto 15px; font-weight:bold; font-size:20px;">${icon}</div>
+                    <p style="color:#1e293b; font-size:14px; line-height:1.5; margin-bottom:20px; font-weight:500;">${message}</p>
+                    <button style="background:#0f172a; color:#fff; border:none; padding:10px 25px; border-radius:6px; cursor:pointer; font-weight:600; width:100%; font-family:'Outfit',sans-serif;" onclick="document.getElementById('custom-alert-box').remove()">OK</button>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+        };
+    </script>
+</head>
+<body>
+    <!-- Admin Login Screen -->
+    <div id="admin-login-view" style="width:100vw; height:100vh; background:#0f172a; display:flex; align-items:center; justify-content:center; font-family:'Outfit',sans-serif;">
+        <div style="background:#1e293b; padding:40px; border-radius:12px; width:100%; max-width:350px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,0.5); border:1px solid #334155;">
+            <h1 style="color:#f8fafc; font-size:24px; margin-bottom:5px;">Admin Terminal</h1>
+            <p style="color:#94a3b8; font-size:14px; margin-bottom:25px;">Enter Cashier PIN to unlock</p>
+            <input type="password" id="admin-pin-input" style="width:100%; box-sizing:border-box; padding:15px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#f8fafc; font-size:20px; text-align:center; margin-bottom:20px; letter-spacing:8px;" placeholder="****" maxlength="4">
+            <button id="admin-login-btn" style="width:100%; padding:15px; background:#3b82f6; color:#fff; border:none; border-radius:8px; font-size:16px; font-weight:bold; cursor:pointer;">UNLOCK</button>
+        </div>
+    </div>
+
+    <!-- Main PDF-Style Fixed App Viewport -->
+    <div id="app-viewport" style="display:none;">
+        <!-- Sidebar Navigation (Gentle, Low-Saturation) -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <h2>GOLD POS</h2>
+                <span class="system-status badge active" id="system-status-indicator">SYSTEM HEALTHY</span>
+            </div>
+            <nav class="sidebar-nav">
+                <button class="nav-btn active" data-target="dashboard-tab">Dashboard</button>
+                <button class="nav-btn" data-target="sales-tab">Billing Desk</button>
+                <button class="nav-btn" data-target="advances-tab">Customer Advances</button>
+                <button class="nav-btn" data-target="settings-tab">Settings</button>
+                <button class="nav-btn" data-target="diagnostics-tab">Diagnostics</button>
+                <a href="/customer.html" target="_blank" style="text-decoration:none; text-align:left; color:#cbd5e1; display:block; padding:15px 20px; font-weight:bold; font-size:13px; border-top:1px solid #334155; margin-top:10px;">⧉ Open Customer Login</a>
+            </nav>
+            <div class="sidebar-footer">
+                <div id="update-available-banner" style="display:none; background:rgba(59,130,246,0.15); border:1px solid #3b82f6; color:#bfdbfe; font-size:11px; padding:8px 10px; border-radius:6px; margin-bottom:12px; line-height:1.4;"></div>
+                <button id="admin-logout-btn" style="width:100%; margin-bottom:15px; padding:10px; background:#ef4444; color:#fff; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer;">LOGOUT</button>
+                <p id="license-footer">SaaS Core v1.0.0</p>
+                <p id="license-status">Status: Active</p>
+            </div>
+        </aside>
+
+        <!-- Main Content Area (Tabs Grid Layout) -->
+        <main id="main-content">
+            <!-- Active Gold Price Header Widget -->
+            <header id="top-bar">
+                <div class="gold-rate-widget">
+                    <span class="widget-label">LIVE GOLD RATE (22K):</span>
+                    <span class="widget-value" id="current-gold-rate-22k">₹0.00 / g</span>
+                    <span class="widget-type-badge" id="rate-type-badge">Auto</span>
+                </div>
+                <div class="user-profile-widget">
+                    <span id="store-profile-name">Admin Cashier Desk</span>
+                </div>
+            </header>
+
+            <!-- Tab Panels Area (contained panels with scroll limits) -->
+            <div id="tab-container">
+                <!-- Dashboard Tab -->
+                <section id="dashboard-tab" class="tab-panel active">
+                    <div class="panel-header">
+                        <h1>Business Performance Dashboard</h1>
+                    </div>
+                    <div class="panel-body">
+                        <p>Loading dashboard...</p>
+                    </div>
+                </section>
+
+                <!-- Sales Desk Tab -->
+                <section id="sales-tab" class="tab-panel">
+                    <div class="panel-header">
+                        <h1>Sales Billing Desk</h1>
+                    </div>
+                    <div class="panel-body">
+                        <p>Loading POS Billing...</p>
+                    </div>
+                </section>
+
+                <!-- Customer Advances Tab -->
+                <section id="advances-tab" class="tab-panel">
+                    <div class="panel-header">
+                        <h1>Advances Manager & Reports</h1>
+                    </div>
+                    <div class="panel-body">
+                        <p>Loading advances...</p>
+                    </div>
+                </section>
+
+                <!-- Settings Tab -->
+                <section id="settings-tab" class="tab-panel">
+                    <div class="panel-header">
+                        <h1>System Configurations</h1>
+                    </div>
+                    <div class="panel-body">
+                        <p>Loading settings...</p>
+                    </div>
+                </section>
+
+                <!-- Diagnostics Tab -->
+                <section id="diagnostics-tab" class="tab-panel">
+                    <div class="panel-header">
+                        <h1>System Diagnostics</h1>
+                    </div>
+                    <div class="panel-body">
+                        <div>
+                            <p style="font-size:13px; color:#64748b; margin-bottom:15px;">Developer Telemetry and Log Exports.</p>
+                            <div id="debug-drawer" style="background:#f8fafc; border:1px solid #cbd5e1; padding:15px; font-family:monospace; border-radius:4px;">
+                                <div class="debug-actions" style="margin-bottom:15px; display:flex; gap:10px;">
+                                    <button id="pull-technical-logs" style="padding:8px 12px; background:#e2e8f0; border:1px solid #94a3b8; cursor:pointer; border-radius:4px;">Pull Level 1 Logs</button>
+                                    <button id="pull-emergency-logs" style="padding:8px 12px; background:#fecaca; border:1px solid #f87171; color:#991b1b; cursor:pointer; border-radius:4px; font-weight:bold;">Request Level 2 Export</button>
+                                    <button id="pull-blackbox-export" style="padding:8px 12px; background:#1e293b; border:1px solid #334155; color:#38bdf8; cursor:pointer; border-radius:4px; font-weight:bold;">Export Black-Box Log</button>
+                                </div>
+                                <pre id="log-output" style="background:#0f172a; color:#38bdf8; padding:15px; max-height:150px; overflow-y:auto; font-size:12px; border-radius:4px; margin:0;">System initialized. Awaiting queries...</pre>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+    <!-- Core App ESM Loader -->
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>

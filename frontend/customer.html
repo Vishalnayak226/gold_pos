@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Customer Advance Portal</title>
+    <link rel="stylesheet" href="css/app.css">
+    <!-- Razorpay Checkout SDK -->
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+    <script>
+        // Custom UI Alert Override
+        window.alert = function(message) {
+            if (document.getElementById('custom-alert-box')) return;
+            
+            const isSuccess = message.toLowerCase().includes('success');
+            const icon = isSuccess ? '✓' : '!';
+            const iconBg = isSuccess ? '#dcfce7' : '#f1f5f9';
+            const iconColor = isSuccess ? '#166534' : '#334155';
+
+            const overlay = document.createElement('div');
+            overlay.id = 'custom-alert-box';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(15,23,42,0.8);display:flex;align-items:center;justify-content:center;z-index:999999;backdrop-filter:blur(2px);';
+            overlay.innerHTML = `
+                <div style="background:#ffffff; border-radius:8px; padding:25px; width:90%; max-width:400px; box-shadow:0 10px 25px rgba(0,0,0,0.2); text-align:center; border:1px solid #cbd5e1; font-family:'Outfit',sans-serif;">
+                    <div style="width:40px; height:40px; border-radius:50%; background:${iconBg}; color:${iconColor}; display:flex; align-items:center; justify-content:center; margin:0 auto 15px; font-weight:bold; font-size:20px;">${icon}</div>
+                    <p style="color:#1e293b; font-size:14px; line-height:1.5; margin-bottom:20px; font-weight:500;">${message}</p>
+                    <button style="background:#0f172a; color:#fff; border:none; padding:10px 25px; border-radius:6px; cursor:pointer; font-weight:600; width:100%; font-family:'Outfit',sans-serif;" onclick="document.getElementById('custom-alert-box').remove()">OK</button>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+        };
+    </script>
+    <style>
+        /* Specific Customer mobile-first adjustments */
+        body {
+            overflow: hidden; /* Lock body scrolling completely */
+            height: 100vh;
+            margin: 0;
+            background-color: #f1f5f9;
+        }
+        #customer-container {
+            max-width: 480px;
+            margin: 0 auto;
+            padding: 20px 20px 0 20px;
+            background-color: var(--color-bg-panel);
+            height: 100vh;
+            box-sizing: border-box;
+            border-left: 1px solid var(--color-border);
+            border-right: 1px solid var(--color-border);
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.02);
+        }
+        .header-banner {
+            text-align: center;
+            padding: 20px 0;
+            border-bottom: 1px dashed var(--color-border-dark);
+            margin-bottom: 25px;
+        }
+        .header-banner h1 {
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            color: var(--color-text-main);
+        }
+        .login-card, .portal-card {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            flex-grow: 1;
+        }
+        .balance-card {
+            background-color: var(--color-accent-light);
+            border: 1px solid var(--color-border-dark);
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .balance-card h3 {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--color-text-muted);
+            margin-bottom: 5px;
+        }
+        .balance-amount {
+            font-family: var(--font-mono);
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--color-text-main);
+        }
+        .payment-box {
+            border: 1px solid var(--color-border);
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            background-color: #fafafa;
+        }
+        .qr-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 15px 0;
+            gap: 8px;
+        }
+        #qr-canvas {
+            border: 1px solid var(--color-border-dark);
+            padding: 10px;
+            background-color: white;
+            border-radius: 4px;
+        }
+        .table-wrapper {
+            margin-top: 20px;
+            max-height: 250px;
+            overflow-y: auto;
+            border: 1px solid var(--color-border);
+            border-radius: 6px;
+        }
+        .table-wrapper::-webkit-scrollbar {
+            width: 4px;
+        }
+        .table-wrapper::-webkit-scrollbar-thumb {
+            background-color: var(--color-border-dark);
+        }
+    </style>
+</head>
+<body>
+    <div id="customer-container">
+        <div class="header-banner">
+            <h1>GOLD SAVINGS PORTAL</h1>
+            <p class="text-muted-small">Manage Monthly Gold Advances</p>
+        </div>
+
+        <!-- Phone Verification / Login Screen -->
+        <div id="login-view" class="login-card">
+            <div class="form-group">
+                <label for="login-phone">Verify Mobile Number</label>
+                <input type="tel" id="login-phone" class="form-control" placeholder="Enter 10-Digit Mobile" maxlength="10">
+                <span class="input-error-msg" id="login-phone-error"></span>
+            </div>
+            <button id="login-submit-btn" class="btn btn-primary btn-block">LOGIN</button>
+            <p class="text-muted-small" style="text-align: center; margin-top: 10px;">Verify balance, review deposit history, or make monthly payments.</p>
+        </div>
+
+        <!-- Onboarding Screen -->
+        <div id="onboarding-view" class="portal-card" style="display: none; align-items: center; justify-content: center;">
+            <div style="background: var(--color-bg-panel); border: 1px solid var(--color-border); padding: 25px; border-radius: 8px; width: 100%; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
+                <h2 style="font-size: 18px; text-align: center; margin-bottom: 5px;">Complete Your Profile</h2>
+                <p class="text-muted-small" style="text-align: center; margin-bottom: 20px;">Help us serve you better.</p>
+                
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <label>First Name <span style="color:red;">*</span></label>
+                    <input type="text" id="ob-fname" class="form-control" placeholder="Required">
+                </div>
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <label>Last Name</label>
+                    <input type="text" id="ob-lname" class="form-control" placeholder="Optional">
+                </div>
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <label>Date of Birth</label>
+                    <input type="date" id="ob-dob" class="form-control">
+                </div>
+                <div class="form-group" style="margin-bottom: 20px;">
+                    <label>Anniversary Date</label>
+                    <input type="date" id="ob-doa" class="form-control">
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button id="ob-skip-btn" class="btn btn-secondary" style="flex:1;">Skip Optional</button>
+                    <button id="ob-save-btn" class="btn btn-primary" style="flex:1;">Save Profile</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Logged-in Customer Dashboard Screen -->
+        <div id="portal-view" style="display: none; flex: 1; min-height: 0; flex-direction: column;">
+            <div style="flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 20px;">
+                <!-- TAB: PROFILE -->
+                <div id="tab-profile" style="display: block;">
+                    <div class="balance-card" style="margin-bottom: 20px;">
+                        <h2 style="font-size: 18px; margin-bottom: 15px; color: var(--color-text-main);">Welcome, <span id="greet-name"></span>!</h2>
+                        <h3>Total Advance Credit Balance</h3>
+                        <div class="balance-amount" id="customer-balance-val">₹0.00</div>
+                        <p class="text-muted-small" id="customer-profile-info">Phone: -</p>
+                    </div>
+                    
+                    <div class="portal-card" style="background: linear-gradient(135deg, #fef3c7, #fde68a); border: 1px solid #fcd34d; padding: 20px; border-radius: 12px; margin-bottom: 20px; color: #92400e;">
+                        <h3 style="font-size: 16px; margin-bottom: 10px; font-weight: 600;">Money Worth in Gold</h3>
+                        <p style="font-size: 13px; margin-bottom: 15px;">We track the 22K market price on the exact day of your deposits.</p>
+                        
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 14px;">
+                            <span>Total Grams Locked:</span>
+                            <strong id="gold-grams-locked">0.000 g</strong>
+                        </div>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; font-size: 14px;">
+                            <span>Current Day Worth:</span>
+                            <strong id="gold-current-worth">₹0.00</strong>
+                        </div>
+                        <div style="text-align: center; font-size: 15px; font-weight: 700; background: #fffbeb; padding: 10px; border-radius: 8px;">
+                            Appreciation: <span id="gold-appreciation" style="color: #166534;">+₹0.00</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: HISTORY -->
+                <div id="tab-history" style="display: none;">
+                    <div class="form-section">
+                        <h3>Payment History</h3>
+                        <div class="table-wrapper">
+                            <table class="invoice-table" style="margin: 0;">
+                                <thead>
+                                    <tr>
+                                        <th>Date</th>
+                                        <th>Ref ID</th>
+                                        <th>Type</th>
+                                        <th class="text-right">Amount</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="customer-ledger-rows">
+                                    <!-- Rows injected dynamically -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: DEPOSIT -->
+                <div id="tab-deposit" style="display: none;">
+                    <div class="form-section">
+                        <h3>Submit Advance Payment</h3>
+                        <div class="form-group">
+                            <label for="pay-amount">Deposit Amount (₹)</label>
+                            <input type="number" id="pay-amount" class="form-control" placeholder="Enter Deposit Amount (e.g. 5000)" min="100">
+                        </div>
+                        <div class="form-group" id="name-group">
+                            <label for="pay-name">Your Full Name (Mandatory for first deposit)</label>
+                            <input type="text" id="pay-name" class="form-control" placeholder="Enter Customer Name">
+                        </div>
+                        <div class="form-group">
+                            <label for="pay-method">Payment Method</label>
+                            <select id="pay-method" class="form-control">
+                                <option value="RAZORPAY" selected>Online Payment (Razorpay - Card/UPI/Netbanking)</option>
+                                <option value="UPI">Manual UPI (Scan QR Code & Submit Reference)</option>
+                            </select>
+                        </div>
+
+                        <!-- UPI QR Code simulated container (hidden by default) -->
+                        <div id="upi-payment-box" class="payment-box" style="display: none;">
+                            <p class="text-muted-small" style="text-align: center;">Scan QR Code using your UPI App to make payment</p>
+                            <div class="qr-wrapper">
+                                <canvas id="qr-canvas" width="180" height="180"></canvas>
+                                <span id="upi-string-display" style="font-family: var(--font-mono); font-size: 10px; color: var(--color-text-muted);"></span>
+                            </div>
+                        </div>
+
+                        <!-- Transaction reference input (hidden by default, only for manual UPI verification) -->
+                        <div class="form-group" id="ref-group" style="margin-top: 15px; display: none;">
+                            <label for="pay-ref">Transaction Reference ID (e.g. UPI Ref / Card Auth)</label>
+                            <input type="text" id="pay-ref" class="form-control" placeholder="Enter 12-Digit Reference Number">
+                        </div>
+
+                        <button id="pay-submit-btn" class="btn btn-primary btn-block">PAY & SUBMIT DEPOSIT</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bottom Tab Navigation -->
+            <div style="background: #0f172a; display: flex; justify-content: space-around; padding: 15px 0; border-top-left-radius: 12px; border-top-right-radius: 12px; z-index: 10; margin-top: auto; flex-shrink: 0; margin-left: -20px; margin-right: -20px;">
+                <button onclick="window.switchTab('profile')" id="nav-profile" style="background: none; border: none; color: #fff; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                    <span style="font-size: 20px;">👤</span> Profile
+                </button>
+                <button onclick="window.switchTab('deposit')" id="nav-deposit" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                    <span style="font-size: 20px;">💰</span> Deposit
+                </button>
+                <button onclick="window.switchTab('history')" id="nav-history" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                    <span style="font-size: 20px;">📜</span> Payment History
+                </button>
+                <button id="logout-btn" style="background: none; border: none; color: #ef4444; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                    <span style="font-size: 20px;">🚪</span> Logout
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { drawQR } from './js/qrGenerator.js';
+
+        let customerPhone = '';
+        let customerName = 'Regular Customer';
+        let balance = 0;
+        let merchantSettings = { companyName: 'Universal Gold POS', upiId: '' };
+
+        (async function loadMerchantSettings() {
+            try {
+                const res = await fetch('/api/settings/public');
+                if (res.ok) {
+                    merchantSettings = await res.json();
+                }
+            } catch (err) {
+                console.error('Failed to load merchant settings for UPI QR:', err);
+            }
+        })();
+
+        window.switchTab = function(tabName) {
+            document.getElementById('tab-profile').style.display = 'none';
+            document.getElementById('tab-deposit').style.display = 'none';
+            document.getElementById('tab-history').style.display = 'none';
+            
+            document.getElementById('nav-profile').style.color = '#64748b';
+            document.getElementById('nav-deposit').style.color = '#64748b';
+            document.getElementById('nav-history').style.color = '#64748b';
+            
+            document.getElementById('tab-' + tabName).style.display = 'block';
+            document.getElementById('nav-' + tabName).style.color = '#fff';
+        };
+
+        document.getElementById('login-submit-btn').addEventListener('click', async () => {
+            const phoneInput = document.getElementById('login-phone');
+            const errorEl = document.getElementById('login-phone-error');
+            const phone = phoneInput.value.replace(/\D/g, '');
+
+            if (phone.length !== 10) {
+                errorEl.textContent = 'Please enter a valid 10-digit phone number.';
+                return;
+            }
+
+            errorEl.textContent = '';
+            customerPhone = phone;
+
+            await loadCustomerData();
+        });
+
+        async function loadCustomerData() {
+            try {
+                // Fetch Live Gold Price for Appreciation Calculator
+                let currentLiveRate22K = 7000;
+                try {
+                    const priceRes = await fetch('/api/gold-price');
+                    if (priceRes.ok) {
+                        const priceData = await priceRes.json();
+                        currentLiveRate22K = priceData.rates.price22K;
+                    }
+                } catch(e) {}
+
+                const res = await fetch(`/api/advances/lookup?phone=${customerPhone}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    balance = data.balance;
+                    
+                    // Display profile info
+                    document.getElementById('customer-balance-val').textContent = `₹${balance.toLocaleString('en-IN')}`;
+                    document.getElementById('customer-profile-info').textContent = `Phone: ${customerPhone.replace(/(\d{5})(\d{5})/, '$1-$2')}`;
+                    
+                    // Populate ledger table rows & Calculate Gold Appreciation
+                    let totalGramsLocked = 0;
+                    let totalCashDeposited = 0;
+
+                    const tbody = document.getElementById('customer-ledger-rows');
+                    tbody.innerHTML = '';
+                    if (data.history.length === 0) {
+                        tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--color-text-light);">No deposit history found.</td></tr>`;
+                    } else {
+                        // Sort history descending by timestamp
+                        data.history.sort((a,b) => b.timestamp - a.timestamp);
+                        data.history.forEach(item => {
+                            const date = new Date(item.timestamp).toLocaleDateString();
+                            const row = document.createElement('tr');
+                            const typeColor = item.type === 'deposit' ? 'color: var(--color-success); font-weight: 600;' : 'color: var(--color-danger);';
+                            
+                            // Math for Appreciation
+                            if (item.type === 'deposit') {
+                                const lockedRate = item.lockedGoldRate22K || currentLiveRate22K; // fallback to today if old data
+                                totalGramsLocked += (item.amount / lockedRate);
+                                totalCashDeposited += item.amount;
+                            } else if (item.type === 'deduction') {
+                                const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
+                                totalGramsLocked -= (item.amount / lockedRate);
+                                totalCashDeposited -= item.amount;
+                            }
+
+                            row.innerHTML = `
+                                <td>${date}</td>
+                                <td>${item.id}</td>
+                                <td style="${typeColor}">${item.type.toUpperCase()}</td>
+                                <td class="text-right" style="${typeColor}">₹${item.amount.toLocaleString('en-IN')}</td>
+                            `;
+                            tbody.appendChild(row);
+                        });
+                    }
+
+                    // Render Gold Math
+                    const currentWorth = totalGramsLocked * currentLiveRate22K;
+                    const profit = currentWorth - totalCashDeposited;
+                    
+                    document.getElementById('gold-grams-locked').textContent = totalGramsLocked.toFixed(3) + ' g';
+                    document.getElementById('gold-current-worth').textContent = '₹' + currentWorth.toLocaleString('en-IN', {maximumFractionDigits:0});
+                    
+                    const appreciationEl = document.getElementById('gold-appreciation');
+                    if (profit >= 0) {
+                        appreciationEl.textContent = '+₹' + profit.toLocaleString('en-IN', {maximumFractionDigits:0});
+                        appreciationEl.style.color = '#166534';
+                    } else {
+                        appreciationEl.textContent = '-₹' + Math.abs(profit).toLocaleString('en-IN', {maximumFractionDigits:0});
+                        appreciationEl.style.color = '#b91c1c';
+                    }
+
+                    // Check if onboarding is needed
+                    if (data.history.length === 0 || !data.history[0].customerName || data.history[0].customerName === 'Regular Customer') {
+                        document.getElementById('login-view').style.display = 'none';
+                        document.getElementById('onboarding-view').style.display = 'flex';
+                    } else {
+                        customerName = data.history[0].customerName;
+                        document.getElementById('pay-name').value = customerName;
+                        document.getElementById('name-group').style.display = 'none';
+                        
+                        document.getElementById('greet-name').textContent = customerName;
+                        document.getElementById('login-view').style.display = 'none';
+                        document.getElementById('portal-view').style.display = 'flex';
+                        updateQR();
+                    }
+                }
+            } catch (err) {
+                alert('Connection error. Server diagnostics console updated.');
+            }
+        }
+
+        // Handle logout
+        document.getElementById('logout-btn').addEventListener('click', () => {
+            customerPhone = '';
+            document.getElementById('login-phone').value = '';
+            document.getElementById('portal-view').style.display = 'none';
+            document.getElementById('login-view').style.display = 'flex';
+        });
+
+        // Toggle payment fields
+        document.getElementById('pay-method').addEventListener('change', (e) => {
+            const upiBox = document.getElementById('upi-payment-box');
+            const refGroup = document.getElementById('ref-group');
+            if (e.target.value === 'UPI') {
+                upiBox.style.display = 'block';
+                refGroup.style.display = 'block';
+                updateQR();
+            } else {
+                upiBox.style.display = 'none';
+                refGroup.style.display = 'none';
+            }
+        });
+
+        // Recalculate QR on amount change
+        document.getElementById('pay-amount').addEventListener('input', () => {
+            if (document.getElementById('pay-method').value === 'UPI') {
+                updateQR();
+            }
+        });
+
+        function updateQR() {
+            const amountInput = document.getElementById('pay-amount');
+            const amount = parseFloat(amountInput.value) || 1000; // default to 1000 for QR preview if empty
+            const displayEl = document.getElementById('upi-string-display');
+            const canvas = document.getElementById('qr-canvas');
+
+            if (!merchantSettings.upiId) {
+                if (displayEl) {
+                    displayEl.textContent = 'UPI QR not available — store has not configured a UPI ID yet. Please use Online Payment instead.';
+                }
+                if (canvas) {
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                }
+                return;
+            }
+
+            // Build a real, scannable Standard India UPI deep link
+            const merchantName = encodeURIComponent(merchantSettings.companyName || 'Gold POS');
+            const upiLink = `upi://pay?pa=${encodeURIComponent(merchantSettings.upiId)}&pn=${merchantName}&am=${amount}.00&cu=INR`;
+
+            if (displayEl) {
+                displayEl.textContent = `UPI: ${merchantSettings.upiId} | ₹${amount}`;
+            }
+
+            // Draw the real QR code (rendered server-side, see js/qrGenerator.js)
+            if (canvas) {
+                drawQR(canvas, upiLink);
+            }
+        }
+
+        function proceedToPortal() {
+            document.getElementById('onboarding-view').style.display = 'none';
+            document.getElementById('portal-view').style.display = 'flex';
+            document.getElementById('greet-name').textContent = customerName;
+            document.getElementById('pay-name').value = customerName;
+            document.getElementById('name-group').style.display = 'none';
+            updateQR();
+        }
+
+        document.getElementById('ob-save-btn').addEventListener('click', () => {
+            const fname = document.getElementById('ob-fname').value.trim();
+            const lname = document.getElementById('ob-lname').value.trim();
+            if (!fname) {
+                alert('First Name is mandatory to save your profile.');
+                return;
+            }
+            customerName = fname + (lname ? ' ' + lname : '');
+            proceedToPortal();
+        });
+
+        document.getElementById('ob-skip-btn').addEventListener('click', () => {
+            const fname = document.getElementById('ob-fname').value.trim();
+            if (!fname) {
+                alert('First Name is mandatory even if you skip optional fields.');
+                return;
+            }
+            customerName = fname;
+            proceedToPortal();
+        });
+
+        // Submit Advance Payment Deposit
+        document.getElementById('pay-submit-btn').addEventListener('click', async () => {
+            const amountInput = document.getElementById('pay-amount');
+            const nameInput = document.getElementById('pay-name');
+            const methodSelect = document.getElementById('pay-method');
+            const refInput = document.getElementById('pay-ref');
+
+            const amount = parseFloat(amountInput.value) || 0;
+            const name = nameInput.value.trim() || customerName;
+            const method = methodSelect.value;
+            const refId = refInput.value.trim();
+
+            if (amount <= 100) {
+                alert('Minimum deposit amount is ₹100.');
+                return;
+            }
+
+            if (method === 'RAZORPAY') {
+                // Razorpay Payment Flow
+                try {
+                    // 1. Create order on backend
+                    const orderRes = await fetch('/api/payment/order', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ amount })
+                    });
+
+                    if (!orderRes.ok) {
+                        const err = await orderRes.json();
+                        alert('Order initiation failed: ' + err.error);
+                        return;
+                    }
+
+                    const orderData = await orderRes.json();
+                    
+                    // MOCK FRONTEND BYPASS FOR DUMMY KEYS
+                    if (orderData.keyId === 'rzp_test_xxxxxx') {
+                        const verifyRes = await fetch('/api/payment/verify', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                customerPhone, customerName: name,
+                                razorpay_order_id: orderData.order.id,
+                                razorpay_payment_id: 'pay_mock_' + Math.random().toString(36).substring(2, 9),
+                                razorpay_signature: 'mock_signature',
+                                amount
+                            })
+                        });
+                        if (verifyRes.ok) {
+                            alert('TEST MODE: Razorpay mock payment verified successfully!');
+                            amountInput.value = '';
+                            await loadCustomerData();
+                        } else {
+                            const err = await verifyRes.json();
+                            alert('Mock Verification failed: ' + err.error);
+                        }
+                        return;
+                    }
+
+                    // 2. Open Razorpay Popup
+                    const options = {
+                        "key": orderData.keyId,
+                        "amount": orderData.order.amount,
+                        "currency": "INR",
+                        "name": "Universal Gold POS",
+                        "description": "Monthly Gold Advance Deposit",
+                        "order_id": orderData.order.id,
+                        "handler": async function (response) {
+                            // 3. Verify on backend
+                            try {
+                                const verifyRes = await fetch('/api/payment/verify', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        customerPhone,
+                                        customerName: name,
+                                        razorpay_order_id: response.razorpay_order_id,
+                                        razorpay_payment_id: response.razorpay_payment_id,
+                                        razorpay_signature: response.razorpay_signature,
+                                        amount
+                                    })
+                                });
+
+                                if (verifyRes.ok) {
+                                    alert('Razorpay payment verified and registered successfully!');
+                                    amountInput.value = '';
+                                    await loadCustomerData();
+                                } else {
+                                    const err = await verifyRes.json();
+                                    alert('Payment verification failed: ' + err.error);
+                                }
+                            } catch (e) {
+                                alert('Error verifying payment.');
+                            }
+                        },
+                        "prefill": {
+                            "name": name,
+                            "contact": customerPhone
+                        },
+                        "theme": {
+                            "color": "#0f172a"
+                        }
+                    };
+
+                    const rzp = new window.Razorpay(options);
+                    rzp.on('payment.failed', function (response){
+                        alert("Payment failed: " + response.error.description);
+                    });
+                    rzp.open();
+
+                } catch (err) {
+                    alert('Failed to connect to checkout servers: ' + err.message);
+                }
+            } else {
+                // Manual UPI Verification Flow
+                if (!refId) {
+                    alert('Please enter the transaction reference number.');
+                    return;
+                }
+
+                const payload = {
+                    customerPhone,
+                    customerName: name,
+                    amount,
+                    paymentMethod: method,
+                    referenceId: refId
+                };
+
+                try {
+                    const res = await fetch('/api/advances', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (res.ok) {
+                        alert('Advance payment submitted successfully for verification!');
+                        amountInput.value = '';
+                        refInput.value = '';
+                        await loadCustomerData();
+                    } else {
+                        const err = await res.json();
+                        alert('Failed to submit payment: ' + err.error);
+                    }
+                } catch (err) {
+                    alert('Connection failure to POS servers.');
+                }
+            }
+        });
+    </script>
+</body>
+</html>

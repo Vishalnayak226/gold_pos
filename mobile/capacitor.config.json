@@ -1,0 +1,12 @@
+{
+  "appId": "com.goldpos.customerportal",
+  "appName": "Gold POS Customer Portal",
+  "webDir": "www",
+  "server": {
+    "url": "https://REPLACE-WITH-TENANT-DOMAIN.example.com/customer.html",
+    "cleartext": false
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
