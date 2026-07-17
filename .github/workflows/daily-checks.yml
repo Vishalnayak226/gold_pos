@@ -1,0 +1,51 @@
+name: Daily Bug & Security Detection
+
+# Detection only — this workflow never deploys or auto-patches anything.
+# It runs the integration test suite plus a dependency vulnerability audit
+# once a day and on every push, and fails loudly (visible here in the
+# Actions tab, and to anyone with notifications on for this repo) if either
+# finds something. Turning a finding into a shipped patch is still a human
+# decision: fix it, review it, then publish it through the licensing
+# server's release registry (see docs/ai_handover.md §7) — security-channel
+# releases auto-apply to tenants after that; nothing here does.
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # 03:00 UTC daily
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  integration-tests:
+    name: Integration test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+      - name: Run integration test suite
+        working-directory: backend
+        run: node test_suite.js
+
+  dependency-audit:
+    name: Dependency vulnerability audit
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [backend, licensing_server]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install ${{ matrix.module }} dependencies
+        working-directory: ${{ matrix.module }}
+        run: npm install --no-audit --no-fund
+      - name: Audit ${{ matrix.module }} (high+ severity fails the build)
+        working-directory: ${{ matrix.module }}
+        run: npm audit --audit-level=high

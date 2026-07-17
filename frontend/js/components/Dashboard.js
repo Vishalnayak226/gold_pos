@@ -3,6 +3,21 @@ import { logTelemetry, adminFetch } from '../app.js';
 const PURITY_LABELS = { '24K': '24K Gold', '22K': '22K Gold', '18K': '18K Gold' };
 const PURITY_SWATCH_CLASS = { '24K': 'swatch-24k', '22K': 'swatch-22k', '18K': 'swatch-18k' };
 
+/**
+ * Escapes HTML-significant characters. Sales/advances records can contain
+ * customer-supplied strings (customerName, phone, purity, paymentMethod)
+ * submitted through public, unauthenticated endpoints (POST /api/advances,
+ * POST /api/payment/verify) with no server-side content restriction — every
+ * such field must be escaped before going into innerHTML here, since this
+ * renders inside the authenticated admin session (bearer token in
+ * sessionStorage would otherwise be exfiltratable via a stored-XSS payload).
+ */
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+}
+
 export class Dashboard {
     constructor() {
         this.loaded = false;
@@ -212,8 +227,8 @@ export class Dashboard {
         list.innerHTML = recent.map(s => `
             <div class="recent-list-item">
                 <div>
-                    <strong>${s.id || 'N/A'}</strong>
-                    <div class="text-muted-small">${s.customerName || 'Cash Sale'} · ${s.purity || ''} · ${(parseFloat(s.weightGrams) || 0).toFixed(3)}g</div>
+                    <strong>${escapeHtml(s.id || 'N/A')}</strong>
+                    <div class="text-muted-small">${escapeHtml(s.customerName || 'Cash Sale')} · ${escapeHtml(s.purity || '')} · ${(parseFloat(s.weightGrams) || 0).toFixed(3)}g</div>
                 </div>
                 <div class="text-right">
                     <strong>₹${(parseFloat(s.totalAmount) || 0).toLocaleString('en-IN')}</strong>
@@ -240,8 +255,8 @@ export class Dashboard {
         list.innerHTML = recentDeposits.map(a => `
             <div class="recent-list-item">
                 <div>
-                    <strong>${a.customerName || 'Regular Customer'}</strong>
-                    <div class="text-muted-small">${a.customerPhone || ''} · ${a.paymentMethod || 'UPI'}</div>
+                    <strong>${escapeHtml(a.customerName || 'Regular Customer')}</strong>
+                    <div class="text-muted-small">${escapeHtml(a.customerPhone || '')} · ${escapeHtml(a.paymentMethod || 'UPI')}</div>
                 </div>
                 <div class="text-right">
                     <strong>₹${(parseFloat(a.amount) || 0).toLocaleString('en-IN')}</strong>

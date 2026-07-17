@@ -46,12 +46,14 @@ if (!fs.existsSync(dbFile)) {
     ], null, 2));
 }
 
-// Platform-wide config (currently just the latest published client version —
-// POS clients poll GET /api/version and show a non-blocking "update
-// available" banner if their own package.json version is older).
+// Platform-wide config: latest published client version (legacy field, kept
+// for backward compat with GET /api/version) plus a full release registry —
+// POS clients poll GET /api/releases/latest and cryptographically verify the
+// signature (via release_public.pem) before ever trusting/applying a release.
+// See backend/updateEngine.js and docs/ai_handover.md §7.
 const configFile = path.join(DATA_DIR, 'config.json');
 if (!fs.existsSync(configFile)) {
-    fs.writeFileSync(configFile, JSON.stringify({ latestVersion: "1.0.0" }, null, 2));
+    fs.writeFileSync(configFile, JSON.stringify({ latestVersion: "1.0.0", releases: [] }, null, 2));
 }
 
 // Automatically generate RSA key pairs for signing license tokens if missing
@@ -70,6 +72,45 @@ if (!fs.existsSync(privateKeyPath)) {
 }
 
 const privateKey = fs.readFileSync(privateKeyPath, 'utf8');
+
+// Dedicated release-signing RSA keypair — deliberately separate from the
+// license-signing key above (same compartmentalization pattern as
+// backend/cryptoHelper.js's developer key vs backend/blackBoxLogger.js's
+// black-box key: compromising one key must never unlock the other). This is
+// the key that makes auto-applying a "security" release safe: a POS client
+// verifies every release manifest against release_public.pem before it will
+// ever download or apply it, so a compromised/spoofed licensing server alone
+// cannot get malicious code auto-applied to a tenant.
+const releasePrivateKeyPath = path.join(KEYS_DIR, 'release_private.pem');
+const releasePublicKeyPath = path.join(KEYS_DIR, 'release_public.pem');
+
+if (!fs.existsSync(releasePrivateKeyPath)) {
+    console.log('[Licensing Server] Generating release-signing RSA-4096 key pair...');
+    const { publicKey: relPub, privateKey: relPriv } = crypto.generateKeyPairSync('rsa', {
+        modulusLength: 4096,
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
+    });
+    fs.writeFileSync(releasePrivateKeyPath, relPriv);
+    fs.writeFileSync(releasePublicKeyPath, relPub);
+    console.log(`[Licensing Server] IMPORTANT: copy ${releasePublicKeyPath} to every POS client's backend/keys/release_public.pem so it can verify releases.`);
+}
+
+const releasePrivateKey = fs.readFileSync(releasePrivateKeyPath, 'utf8');
+
+const VALID_CHANNELS = ['security', 'feature', 'patch'];
+
+/** Compares two "x.y.z" strings — true if `a` is newer than `b`. */
+function isNewerVersion(a, b) {
+    const pa = String(a).split('.').map(n => parseInt(n) || 0);
+    const pb = String(b).split('.').map(n => parseInt(n) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const va = pa[i] || 0, vb = pb[i] || 0;
+        if (va > vb) return true;
+        if (va < vb) return false;
+    }
+    return false;
+}
 
 const app = express();
 app.use(cors());
@@ -178,6 +219,38 @@ app.get('/api/version', (req, res) => {
     }
 });
 
+/**
+ * GET /api/releases/latest?channel=security|feature|patch
+ * Public — returns the newest published release (optionally filtered to one
+ * channel) plus its RSA signature, so a POS client's updateEngine.js can
+ * verify authenticity before ever downloading or applying it. Omit
+ * `channel` to consider all channels (used for the "update available"
+ * banner, which surfaces feature/patch releases too — those are never
+ * auto-applied, only security-channel releases are).
+ */
+app.get('/api/releases/latest', (req, res) => {
+    try {
+        const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        const releases = Array.isArray(config.releases) ? config.releases : [];
+        const { channel } = req.query;
+
+        const candidates = channel ? releases.filter(r => r.channel === channel) : releases;
+        if (candidates.length === 0) {
+            return res.status(404).json({ error: 'No matching release published' });
+        }
+
+        // Pick the highest-semver candidate. Return the exact signed payload
+        // string alongside its signature — the client verifies the raw
+        // string (never a re-serialized object, which could reorder keys
+        // and break the signature) and only JSON.parses it after that
+        // verification succeeds.
+        const latest = candidates.reduce((best, r) => (isNewerVersion(r.version, best.version) ? r : best), candidates[0]);
+        res.json({ payload: latest.payload, signature: latest.signature });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to read release registry' });
+    }
+});
+
 /* ==========================================================================
    API Routes: Management & Control Panel
    ========================================================================== */
@@ -238,20 +311,66 @@ app.post('/api/admin/keys', authenticateAdmin, async (req, res) => {
 });
 
 /**
- * POST /api/admin/version
- * Updates the platform-wide "latest published version" flag POS clients
- * check on boot.
+ * POST /api/admin/releases
+ * Publishes a new release into the registry: builds the manifest, signs it
+ * with the dedicated release-signing key, and appends it. Also advances the
+ * legacy `latestVersion` flag if this is the newest version seen (that flag
+ * is now derived, not directly editable — see history: the old
+ * POST /api/admin/version endpoint overwrote the whole config file
+ * including this releases array, which would have silently wiped the
+ * registry the moment anyone called it after this feature shipped).
  */
-app.post('/api/admin/version', authenticateAdmin, (req, res) => {
+app.post('/api/admin/releases', authenticateAdmin, (req, res) => {
     try {
-        const { latestVersion } = req.body;
-        if (!latestVersion) {
-            return res.status(400).json({ error: 'latestVersion is required' });
+        const { version, channel, changelog, downloadUrl, sha256 } = req.body;
+        if (!version || !channel || !downloadUrl || !sha256) {
+            return res.status(400).json({ error: 'version, channel, downloadUrl, and sha256 are all required' });
         }
-        fs.writeFileSync(configFile, JSON.stringify({ latestVersion }, null, 2));
-        res.json({ success: true, latestVersion });
+        if (!VALID_CHANNELS.includes(channel)) {
+            return res.status(400).json({ error: `channel must be one of: ${VALID_CHANNELS.join(', ')}` });
+        }
+
+        const manifest = {
+            version,
+            channel,
+            changelog: changelog || '',
+            downloadUrl,
+            sha256,
+            publishedAt: Date.now()
+        };
+        const payloadStr = JSON.stringify(manifest);
+
+        const signer = crypto.createSign('sha256');
+        signer.update(payloadStr);
+        const signature = signer.sign(releasePrivateKey, 'base64');
+
+        const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        if (!Array.isArray(config.releases)) config.releases = [];
+        config.releases.push({ payload: payloadStr, signature, ...manifest });
+        if (isNewerVersion(version, config.latestVersion || '0.0.0')) {
+            config.latestVersion = version;
+        }
+        fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
+
+        res.json({ success: true, release: manifest });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to update platform version' });
+        console.error('Publish release error:', err);
+        res.status(500).json({ error: 'Failed to publish release' });
+    }
+});
+
+/**
+ * GET /api/releases
+ * Admin-only — lists every published release (newest first) for the
+ * dashboard.
+ */
+app.get('/api/releases', authenticateAdmin, (req, res) => {
+    try {
+        const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        const releases = Array.isArray(config.releases) ? config.releases : [];
+        res.json([...releases].sort((a, b) => b.publishedAt - a.publishedAt));
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to read release registry' });
     }
 });
 
@@ -363,9 +482,30 @@ app.get('/', (req, res) => {
 
             <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
                 <strong style="font-size:13px;">Latest Published Version:</strong>
-                <input type="text" id="latest-version-input" placeholder="1.0.0" style="width:100px;">
-                <button onclick="updateVersion()">Update</button>
-                <span id="version-status" style="font-size:12px; color:#64748b;"></span>
+                <input type="text" id="latest-version-input" placeholder="1.0.0" style="width:100px;" readonly>
+                <span style="font-size:12px; color:#64748b;">(derived from the newest published release below)</span>
+            </div>
+
+            <div style="border-top:1px dashed #cbd5e1; margin-top:15px; padding-top:15px;">
+                <h2 style="font-size:15px; margin-bottom:10px;">Publish Release</h2>
+                <div class="form-grid" style="grid-template-columns: repeat(3,1fr) 2fr 1.5fr; align-items:start;">
+                    <input type="text" id="rel-version" placeholder="Version (1.1.0)">
+                    <select id="rel-channel">
+                        <option value="security">security (auto-applies)</option>
+                        <option value="feature">feature (manual)</option>
+                        <option value="patch">patch (manual)</option>
+                    </select>
+                    <input type="text" id="rel-sha256" placeholder="SHA-256 of release zip">
+                    <input type="text" id="rel-url" placeholder="Download URL (https://...)">
+                    <button onclick="publishRelease()">PUBLISH</button>
+                </div>
+                <textarea id="rel-changelog" placeholder="Changelog for this release..." style="width:100%; box-sizing:border-box; margin-top:10px; padding:8px; font-family:inherit; font-size:13px;" rows="2"></textarea>
+                <span id="release-status" style="font-size:12px; color:#64748b;"></span>
+
+                <table style="margin-top:15px;">
+                    <thead><tr><th>Version</th><th>Channel</th><th>Published</th><th>Changelog</th></tr></thead>
+                    <tbody id="releases-tbody"></tbody>
+                </table>
             </div>
 
             <table>
@@ -454,6 +594,59 @@ app.get('/', (req, res) => {
                         document.getElementById('latest-version-input').value = verData.latestVersion;
                     }
                 } catch (e) { /* non-fatal */ }
+
+                loadReleases();
+            }
+
+            async function loadReleases() {
+                const res = await fetch('/api/releases', { headers: { 'Authorization': 'Bearer ' + adminToken } });
+                if (!res.ok) return;
+                const releases = await res.json();
+                const tbody = document.getElementById('releases-tbody');
+                tbody.innerHTML = releases.map(r => \`
+                    <tr>
+                        <td><strong>\${r.version}</strong></td>
+                        <td>\${r.channel}</td>
+                        <td>\${new Date(r.publishedAt).toLocaleString()}</td>
+                        <td>\${(r.changelog || '').replace(/</g,'&lt;')}</td>
+                    </tr>
+                \`).join('') || '<tr><td colspan="4" style="color:#94a3b8;">No releases published yet.</td></tr>';
+            }
+
+            async function publishRelease() {
+                const version = document.getElementById('rel-version').value.trim();
+                const channel = document.getElementById('rel-channel').value;
+                const sha256 = document.getElementById('rel-sha256').value.trim();
+                const downloadUrl = document.getElementById('rel-url').value.trim();
+                const changelog = document.getElementById('rel-changelog').value.trim();
+                const statusEl = document.getElementById('release-status');
+
+                if (!version || !sha256 || !downloadUrl) {
+                    statusEl.textContent = 'Version, SHA-256, and download URL are required.';
+                    return;
+                }
+                if (channel === 'security') {
+                    const confirmed = confirm('This release is on the SECURITY channel — every tenant will auto-apply it (after backup + signature verification) on their next daily check, with no manual approval step. Continue?');
+                    if (!confirmed) return;
+                }
+
+                const res = await fetch('/api/admin/releases', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
+                    body: JSON.stringify({ version, channel, changelog, downloadUrl, sha256 })
+                });
+
+                if (res.ok) {
+                    statusEl.textContent = 'Published.';
+                    document.getElementById('rel-version').value = '';
+                    document.getElementById('rel-sha256').value = '';
+                    document.getElementById('rel-url').value = '';
+                    document.getElementById('rel-changelog').value = '';
+                    loadKeys();
+                } else {
+                    const data = await res.json().catch(() => ({}));
+                    statusEl.textContent = 'Failed: ' + (data.error || res.status);
+                }
             }
 
             async function upsertKey() {
@@ -491,20 +684,6 @@ app.get('/', (req, res) => {
                 }
             }
 
-            async function updateVersion() {
-                const latestVersion = document.getElementById('latest-version-input').value.trim();
-                if (!latestVersion) return;
-                const statusEl = document.getElementById('version-status');
-                const res = await fetch('/api/admin/version', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Bearer ' + adminToken
-                    },
-                    body: JSON.stringify({ latestVersion })
-                });
-                statusEl.textContent = res.ok ? 'Saved.' : 'Failed to save.';
-            }
 
             async function deleteKey(key) {
                 if(!confirm('Are you sure you want to revoke this license?')) return;

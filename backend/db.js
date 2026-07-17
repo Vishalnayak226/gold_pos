@@ -77,27 +77,64 @@ export function readJSON(filepath, defaultData = []) {
 }
 
 /**
+ * Blocking synchronous sleep (no async/await). Kept synchronous deliberately:
+ * every route handler in server.js does its read-modify-write JSON cycle
+ * without ever yielding to the event loop, which is what makes concurrent
+ * HTTP requests safe from interleaved lost updates (Node's run-to-completion
+ * semantics serialize them). An async retry here would reintroduce exactly
+ * that race.
+ */
+function sleepSync(ms) {
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch (_) {
+        // Extremely defensive fallback; Atomics.wait is available in every
+        // Node >=18 target this project supports.
+    }
+}
+
+/**
  * Writes data atomicly to JSON file.
  * Prevents file corruption by writing to a temporary file first, then renaming.
- * @param {string} filepath 
- * @param {*} data 
+ * Retries the rename a few times on transient Windows file-lock contention
+ * (EPERM/EBUSY/EACCES) — observed under concurrent load when another handle
+ * (a concurrent backup copy, antivirus, search indexer) is briefly open on
+ * the destination file. Without this, a transient failure here was silently
+ * swallowed by every call site (none check the return value), which under
+ * real load produced a duplicate invoice number when a settings.json write
+ * silently failed to persist the incremented invoice sequence.
+ * @param {string} filepath
+ * @param {*} data
  * @returns {boolean}
  */
 export function writeJSON(filepath, data) {
     const tempFile = filepath + '.tmp';
-    try {
-        fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
-        fs.renameSync(tempFile, filepath);
-        return true;
-    } catch (err) {
-        logError(`Error writing JSON database atomic chunk at ${filepath}: ${err.message}`, err.stack);
+    const MAX_ATTEMPTS = 5;
+    const RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+    let lastErr;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-            if (fs.existsSync(tempFile)) {
-                fs.unlinkSync(tempFile);
+            fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf8');
+            fs.renameSync(tempFile, filepath);
+            return true;
+        } catch (err) {
+            lastErr = err;
+            if (attempt < MAX_ATTEMPTS && RETRYABLE_CODES.has(err.code)) {
+                sleepSync(15 * attempt);
+                continue;
             }
-        } catch (_) {}
-        return false;
+            break;
+        }
     }
+
+    logError(`Error writing JSON database atomic chunk at ${filepath}: ${lastErr.message}`, lastErr.stack);
+    try {
+        if (fs.existsSync(tempFile)) {
+            fs.unlinkSync(tempFile);
+        }
+    } catch (_) {}
+    return false;
 }
 
 /**

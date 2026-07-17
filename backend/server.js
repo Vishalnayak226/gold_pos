@@ -11,13 +11,27 @@ import https from 'https';
 import crypto from 'crypto';
 import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseChecker.js';
 import { initBackupScheduler, createBackup } from './backupEngine.js';
-import { requireAdminSession, verifyAdminPin, createAdminSession, destroyAdminSession } from './adminAuth.js';
+import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
+import { requireAdminSession, verifyAdminPin, createAdminSession, destroyAdminSession, loginRateLimiter, recordLoginResult } from './adminAuth.js';
 import { initReportScheduler, sendSummaryReport } from './emailReporter.js';
 import { logBlackBoxEvent, exportBlackBoxEnvelope } from './blackBoxLogger.js';
+import { loadExtensions, fireHook } from './extensions/index.js';
 import QRCode from 'qrcode';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Sanity ceiling for a single advance deposit/redemption amount (10 crore
+// INR) — not a business rule, just a guard against fat-finger/malicious
+// extreme values (e.g. 1e308) that would otherwise sit permanently in the
+// ledger and distort balance arithmetic.
+const MAX_SANE_AMOUNT = 100000000;
+
+// Trust the loopback reverse proxy (Nginx, see deploy/nginx.conf.template) so
+// req.ip resolves the real client IP from X-Forwarded-For instead of always
+// reading 127.0.0.1 — required for the admin-login rate limiter (adminAuth.js)
+// to key lockouts per real caller instead of globally locking every user.
+app.set('trust proxy', 'loopback');
 
 // Enable CORS and body parsers
 app.use(cors());
@@ -60,12 +74,14 @@ app.use(express.static(path.join(__dirname, '../frontend')));
  * Verifies the admin PIN server-side and issues a bearer session token.
  * Replaces the old client-only PIN check.
  */
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', loginRateLimiter, (req, res) => {
     const { pin } = req.body;
     if (!verifyAdminPin(pin)) {
+        recordLoginResult(req, false);
         logTelemetry('ADMIN_LOGIN_FAILED', 0);
         return res.status(401).json({ error: 'Incorrect PIN' });
     }
+    recordLoginResult(req, true);
     const token = createAdminSession();
     logTelemetry('ADMIN_LOGIN_SUCCESS', 0);
     res.json({ success: true, token });
@@ -187,7 +203,10 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
             newSettings.overrideGoldPrice.price18K = parseFloat(newSettings.overrideGoldPrice.price18K) || 0.0;
         }
 
-        writeJSON(settingsFile, newSettings);
+        if (!writeJSON(settingsFile, newSettings)) {
+            return res.status(500).json({ error: 'Failed to persist settings. Please retry.' });
+        }
+        fireHook('onSettingsUpdated', newSettings);
         res.json({ success: true, settings: newSettings });
     } catch (err) {
         logError('Error updating settings: ' + err.message, err.stack);
@@ -229,6 +248,38 @@ app.get('/api/sales', requireAdminSession, (req, res) => {
  */
 app.post('/api/sales', requireAdminSession, (req, res) => {
     try {
+        // Validate the core billing fields before consuming a real,
+        // sequential, legally-relevant invoice number on garbage/empty data.
+        const VALID_PURITIES = ['24K', '22K', '18K'];
+        const { purity, weightGrams, goldPricePerGram, metalValue, totalAmount, customerName, customerPhone, appliedAdvance } = req.body;
+
+        if (!VALID_PURITIES.includes(purity)) {
+            return res.status(400).json({ error: 'A valid purity (24K, 22K, or 18K) is required.' });
+        }
+        const numWeight = Number(weightGrams);
+        const numRate = Number(goldPricePerGram);
+        const numMetalValue = Number(metalValue);
+        const numTotal = Number(totalAmount);
+        const numAppliedAdvance = appliedAdvance === undefined ? 0 : Number(appliedAdvance);
+        if (!Number.isFinite(numWeight) || numWeight <= 0) {
+            return res.status(400).json({ error: 'A valid positive gold weight is required.' });
+        }
+        if (!Number.isFinite(numRate) || numRate < 0 || !Number.isFinite(numMetalValue) || numMetalValue < 0) {
+            return res.status(400).json({ error: 'A valid non-negative gold rate and metal value are required.' });
+        }
+        if (!Number.isFinite(numTotal) || numTotal < 0) {
+            return res.status(400).json({ error: 'A valid non-negative total amount is required.' });
+        }
+        if (!Number.isFinite(numAppliedAdvance) || numAppliedAdvance < 0) {
+            return res.status(400).json({ error: 'Applied advance must be a valid non-negative amount.' });
+        }
+        if (customerPhone && !/^\d{10}$/.test(customerPhone)) {
+            return res.status(400).json({ error: 'Customer phone must be exactly 10 digits if provided.' });
+        }
+        if (customerName && String(customerName).length > 200) {
+            return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
+        }
+
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const settings = readJSON(settingsFile, {});
 
@@ -236,17 +287,29 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         const prefix = settings.invoicePrefix || 'GOLD';
         const startSeq = settings.invoiceSeqStart || 1;
         const currentYearShort = new Date().getFullYear().toString().slice(-2);
-        
-        const invoiceId = `${prefix}-${startSeq.toString().padStart(6, '0')}-${currentYearShort}`;
-        
-        // Increment and save start sequence
-        settings.invoiceSeqStart = startSeq + 1;
-        writeJSON(settingsFile, settings);
 
-        // 2. Prepare Sale Record
+        const invoiceId = `${prefix}-${startSeq.toString().padStart(6, '0')}-${currentYearShort}`;
+
+        // Increment and save start sequence. If this write doesn't actually
+        // persist (e.g. transient Windows file-lock contention exhausting
+        // writeJSON's retries), the next request would silently recompute
+        // and hand out this same invoiceId again — bail out loudly instead
+        // of reporting a false success on a since-duplicated invoice number.
+        settings.invoiceSeqStart = startSeq + 1;
+        if (!writeJSON(settingsFile, settings)) {
+            return res.status(500).json({ error: 'Failed to persist invoice sequence. Sale was not saved — please retry.' });
+        }
+
+        // 2. Prepare Sale Record (numeric fields normalized to clean numbers
+        // regardless of what was submitted, now that they've passed validation)
         const sale = {
             id: invoiceId,
-            ...req.body
+            ...req.body,
+            weightGrams: numWeight,
+            goldPricePerGram: numRate,
+            metalValue: numMetalValue,
+            totalAmount: numTotal,
+            appliedAdvance: numAppliedAdvance
         };
 
         // 3. Save to partitioned annual file (e.g. sales_2026.json)
@@ -254,13 +317,22 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         const salesFile = path.join(DATA_DIR, `sales_${year}.json`);
         const sales = readJSON(salesFile, []);
         sales.push(sale);
-        writeJSON(salesFile, sales);
+        if (!writeJSON(salesFile, sales)) {
+            // The invoice sequence above already advanced, so this invoiceId
+            // is now permanently consumed as a gap rather than reused — an
+            // acceptable, auditable outcome versus silently reporting a sale
+            // as saved when it was not actually written to disk.
+            return res.status(500).json({ error: 'Failed to persist sale record. Please retry — invoice number ' + invoiceId + ' will be skipped.' });
+        }
 
-        // 4. Handle Customer Advance Redemption
+        // 4. Handle Customer Advance Redemption. Best-effort: the sale itself
+        // is already durably saved at this point, so a failure here (logged
+        // by writeJSON internally) shouldn't un-report the successful sale —
+        // it would only leave the redemption ledger entry to be reconciled.
         if (sale.appliedAdvance > 0 && sale.customerPhone) {
             const advancesFile = path.join(DATA_DIR, 'advances.json');
             const advances = readJSON(advancesFile, []);
-            
+
             advances.push({
                 id: 'RED-' + Math.random().toString(36).substring(2, 9).toUpperCase(),
                 customerPhone: sale.customerPhone,
@@ -270,10 +342,13 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
                 invoiceId: invoiceId,
                 timestamp: Date.now()
             });
-            writeJSON(advancesFile, advances);
+            if (!writeJSON(advancesFile, advances)) {
+                logError(`Sale ${invoiceId} saved but its advance redemption entry failed to persist — reconcile customer ${sale.customerPhone}'s advance ledger manually.`);
+            }
         }
 
         logTelemetry('SAVE_SALE', 0, `Invoice: ${invoiceId}, Total: ${sale.totalAmount}`);
+        fireHook('onSaleSaved', sale);
         res.json({ success: true, invoiceId, sale });
     } catch (err) {
         logError('Error saving sale transaction: ' + err.message, err.stack);
@@ -309,7 +384,7 @@ app.get('/api/advances', requireAdminSession, (req, res) => {
 app.get('/api/advances/lookup', (req, res) => {
     try {
         const { phone } = req.query;
-        if (!phone || phone.length !== 10) {
+        if (!phone || !/^\d{10}$/.test(phone)) {
             return res.status(400).json({ error: 'Valid 10-digit phone number required' });
         }
 
@@ -341,24 +416,28 @@ app.get('/api/advances/lookup', (req, res) => {
 app.post('/api/advances', (req, res) => {
     try {
         const { customerPhone, customerName, amount, paymentMethod, referenceId } = req.body;
-        if (!customerPhone || customerPhone.length !== 10) {
+        if (!customerPhone || !/^\d{10}$/.test(customerPhone)) {
             return res.status(400).json({ error: 'Valid 10-digit customer phone number required' });
         }
-        if (!amount || parseFloat(amount) <= 0) {
+        const numAmount = parseFloat(amount);
+        if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
             return res.status(400).json({ error: 'Valid deposit amount required' });
+        }
+        if (customerName && String(customerName).length > 200) {
+            return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
         }
 
         const advancesFile = path.join(DATA_DIR, 'advances.json');
         const advances = readJSON(advancesFile, []);
 
         const depositId = 'ADV-' + Math.random().toString(36).substring(2, 9).toUpperCase();
-        
+
         const deposit = {
             id: depositId,
             customerPhone,
             customerName: customerName || 'Regular Customer',
             type: 'deposit',
-            amount: parseFloat(amount),
+            amount: numAmount,
             paymentMethod: paymentMethod || 'UPI',
             referenceId: referenceId || '',
             lockedGoldRate22K: getActiveGoldRates().price22K,
@@ -366,9 +445,12 @@ app.post('/api/advances', (req, res) => {
         };
 
         advances.push(deposit);
-        writeJSON(advancesFile, advances);
+        if (!writeJSON(advancesFile, advances)) {
+            return res.status(500).json({ error: 'Failed to persist advance deposit. Please retry.' });
+        }
 
         logTelemetry('SAVE_ADVANCE_DEPOSIT', 0, `Cust: ${customerPhone}, Amount: ${amount}, Ref: ${referenceId}`);
+        fireHook('onAdvanceDeposit', deposit);
         res.json({ success: true, id: depositId, deposit });
     } catch (err) {
         logError('Error saving advance deposit transaction: ' + err.message, err.stack);
@@ -486,6 +568,16 @@ app.post('/api/payment/verify', (req, res) => {
         if (!customerPhone || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amount) {
             return res.status(400).json({ error: 'Missing payment details for verification' });
         }
+        if (!/^\d{10}$/.test(customerPhone)) {
+            return res.status(400).json({ error: 'Valid 10-digit customer phone number required' });
+        }
+        const numAmount = parseFloat(amount);
+        if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
+            return res.status(400).json({ error: 'Valid payment amount required' });
+        }
+        if (customerName && String(customerName).length > 200) {
+            return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
+        }
 
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const settings = readJSON(settingsFile, {});
@@ -519,7 +611,7 @@ app.post('/api/payment/verify', (req, res) => {
             customerPhone,
             customerName: customerName || 'Regular Customer',
             type: 'deposit',
-            amount: parseFloat(amount),
+            amount: numAmount,
             paymentMethod: 'Razorpay',
             referenceId: razorpay_payment_id,
             lockedGoldRate22K: getActiveGoldRates().price22K,
@@ -527,9 +619,16 @@ app.post('/api/payment/verify', (req, res) => {
         };
 
         advances.push(deposit);
-        writeJSON(advancesFile, advances);
+        if (!writeJSON(advancesFile, advances)) {
+            // The customer's money has already moved via Razorpay at this point
+            // (signature verified above) — this is now an urgent reconciliation
+            // case, not a simple retry, so log it loudly and say so plainly.
+            logError(`CRITICAL: Razorpay payment ${razorpay_payment_id} verified but the advance deposit failed to persist — customer ${customerPhone} paid but has no ledger credit. Manual reconciliation required.`);
+            return res.status(500).json({ error: 'Payment verified but could not be recorded. Please contact support with your payment ID: ' + razorpay_payment_id });
+        }
 
         logTelemetry('PAYMENT_VERIFIED_SUCCESS', 0, `Invoice: ${depositId}, PayId: ${razorpay_payment_id}`);
+        fireHook('onAdvanceDeposit', deposit);
         res.json({
             success: true,
             id: depositId,
@@ -650,6 +749,47 @@ app.post('/api/license/activate', async (req, res) => {
 });
 
 /* ==========================================================================
+   API Routes: Tiered Auto-Update Engine
+   ========================================================================== */
+
+/**
+ * POST /api/admin/update/check
+ * Manually triggers the same check the daily 2:00 AM scheduler runs:
+ * verified `security`-channel releases auto-apply, anything else newer is
+ * just recorded as pending for manual review.
+ */
+app.post('/api/admin/update/check', requireAdminSession, async (req, res) => {
+    try {
+        await checkForUpdates();
+        const license = readJSON(path.join(DATA_DIR, 'license.json'), {});
+        res.json({ success: true, pendingRelease: license.pendingRelease || null, lastAppliedRelease: license.lastAppliedRelease || null });
+    } catch (err) {
+        logError('Manual update check failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Update check failed: ' + err.message });
+    }
+});
+
+/**
+ * POST /api/admin/update/apply
+ * Manually applies whatever release is currently pending (feature/patch
+ * channel — security releases already auto-applied and never sit pending).
+ * This is the human-approval gate for non-urgent releases.
+ */
+app.post('/api/admin/update/apply', requireAdminSession, async (req, res) => {
+    try {
+        const result = await applyPendingUpdate();
+        if (result.success) {
+            res.json(result);
+        } else {
+            res.status(400).json(result);
+        }
+    } catch (err) {
+        logError('Manual update apply failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Update apply failed: ' + err.message });
+    }
+});
+
+/* ==========================================================================
    API Routes: Diagnostics & Telemetry
    ========================================================================= */
 
@@ -764,16 +904,21 @@ app.get('/api/diagnostics/blackbox-export', requireAdminSession, (req, res) => {
    Server Bootstrap & Scheduler Init
    ========================================================================== */
 
-// Initialize pricing, backup, and report-email schedulers
+// Initialize pricing, backup, report-email, and update-check schedulers
 initPriceScheduler();
 initBackupScheduler();
 initReportScheduler();
+initUpdateScheduler();
 
 // Trigger initial SaaS license sync & database backup on startup
 syncLicenseStatus().catch(err => {
     console.warn('[Server] Initial license sync failed, operating under local grace checks.');
 });
 createBackup();
+
+// Load any tenant-specific extensions (backend/extensions/*.extension.js —
+// see backend/extensions/README.md) and notify them the server has booted.
+loadExtensions().then(() => fireHook('onServerBoot', {}));
 
 // Start Server listening
 app.listen(PORT, '127.0.0.1', () => {

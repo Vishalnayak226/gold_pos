@@ -31,7 +31,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Run SaaS licensing gate check
     checkLicenseStatus();
+
+    // Load a tenant-specific frontend extension, if one has been dropped in.
+    // See frontend/js/extensions/ and backend/extensions/README.md for the
+    // full contract. Absent by default — a missing file is expected and
+    // silently skipped, not an error.
+    loadFrontendExtension();
 });
+
+async function loadFrontendExtension() {
+    try {
+        const mod = await import('./extensions/index.js');
+        const init = mod.default;
+        if (typeof init === 'function') {
+            init({
+                billingDesk: window.billingDesk,
+                dashboard: window.dashboard,
+                advancesManager: window.advancesManager,
+                settingsManager: window.settingsManager,
+                adminFetch,
+                logTelemetry
+            });
+        }
+    } catch (err) {
+        // No extension present, or it failed to load — never blocks core boot.
+    }
+}
 
 /**
  * Wraps fetch() with the admin bearer session token. Use for any endpoint

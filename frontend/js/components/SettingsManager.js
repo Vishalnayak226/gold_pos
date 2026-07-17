@@ -1,5 +1,11 @@
 import { adminFetch, logTelemetry } from '../app.js';
 
+function escapeHtmlAttr(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+}
+
 const SECTIONS = [
     { id: 'profile', label: 'Store Profile' },
     { id: 'pricing', label: 'Gold Pricing & Overrides' },
@@ -478,6 +484,13 @@ export class SettingsManager {
                 <input type="text" id="set-license-key" class="form-control">
             </div>
             <button type="button" id="resync-license-btn" class="btn btn-primary">Activate / Re-sync License</button>
+
+            <h3 class="settings-section-title" style="margin-top:30px;">Platform Updates</h3>
+            <div id="update-status-block" class="text-muted-small">Loading update status...</div>
+            <div style="display:flex; gap:10px; margin-top:12px;">
+                <button type="button" id="check-updates-btn" class="btn btn-secondary">Check for Updates Now</button>
+                <button type="button" id="apply-update-btn" class="btn btn-primary" style="display:none;">Apply Update Now</button>
+            </div>
         `;
     }
 
@@ -503,11 +516,56 @@ export class SettingsManager {
                         </table>
                     `;
                 }
+                this.renderUpdateStatusBlock(license);
             } catch (err) {
                 const block = document.getElementById('license-status-block');
                 if (block) block.textContent = 'Failed to load license status.';
             }
         })();
+
+        document.getElementById('check-updates-btn').addEventListener('click', async (e) => {
+            const btn = e.target;
+            btn.disabled = true;
+            btn.textContent = 'Checking...';
+            try {
+                const res = await adminFetch('/api/admin/update/check', { method: 'POST' });
+                const data = await res.json();
+                if (res.ok) {
+                    this.renderUpdateStatusBlock({ pendingRelease: data.pendingRelease, lastAppliedRelease: data.lastAppliedRelease });
+                } else {
+                    alert('Update check failed: ' + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Could not reach the server to check for updates.');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Check for Updates Now';
+            }
+        });
+
+        document.getElementById('apply-update-btn').addEventListener('click', async (e) => {
+            const btn = e.target;
+            const pending = this._pendingRelease;
+            if (!pending) return;
+            if (!confirm(`Apply v${pending.version} (${pending.channel}) now? A full backup and code snapshot are taken first, and this will restart the server.`)) return;
+            btn.disabled = true;
+            btn.textContent = 'Applying...';
+            try {
+                const res = await adminFetch('/api/admin/update/apply', { method: 'POST' });
+                const data = await res.json();
+                if (res.ok) {
+                    alert(`Update v${data.version} applied. If the server does not restart automatically (no PM2 in this environment), restart it manually now.`);
+                    this.renderSection();
+                } else {
+                    alert('Apply failed: ' + (data.error || 'Unknown error') + (data.rolledBack ? ' (automatically rolled back — nothing was left half-applied)' : ''));
+                }
+            } catch (err) {
+                alert('Could not reach the server to apply the update — it may already be restarting.');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Apply Update Now';
+            }
+        });
 
         document.getElementById('resync-license-btn').addEventListener('click', async (e) => {
             const btn = e.target;
@@ -538,6 +596,36 @@ export class SettingsManager {
                 btn.textContent = 'Activate / Re-sync License';
             }
         });
+    }
+
+    /**
+     * Renders the pending/last-applied release status and shows the "Apply
+     * Update Now" button only when a human-approved (feature/patch)
+     * release is actually waiting — security releases auto-apply and never
+     * sit pending, so there's nothing to manually approve for those.
+     */
+    renderUpdateStatusBlock(license) {
+        const block = document.getElementById('update-status-block');
+        const applyBtn = document.getElementById('apply-update-btn');
+        if (!block) return;
+
+        this._pendingRelease = license.pendingRelease || null;
+
+        const lines = [];
+        if (license.pendingRelease) {
+            const p = license.pendingRelease;
+            lines.push(`<strong style="color:var(--color-warning);">Update available: v${escapeHtmlAttr(p.version)} (${escapeHtmlAttr(p.channel)})</strong>`);
+            if (p.changelog) lines.push(`<div style="margin-top:4px;">${escapeHtmlAttr(p.changelog)}</div>`);
+            if (applyBtn) applyBtn.style.display = 'inline-block';
+        } else {
+            lines.push('Up to date — no pending update.');
+            if (applyBtn) applyBtn.style.display = 'none';
+        }
+        if (license.lastAppliedRelease) {
+            const a = license.lastAppliedRelease;
+            lines.push(`<div style="margin-top:8px; color:var(--color-text-muted); font-size:12px;">Last applied: v${escapeHtmlAttr(a.version)} (${escapeHtmlAttr(a.channel)}) on ${new Date(a.appliedAt).toLocaleString()}${a.auto ? ' — auto-applied' : ' — manually approved'}</div>`);
+        }
+        block.innerHTML = lines.join('');
     }
 
     // ---------------------------------------------------------------- Shared

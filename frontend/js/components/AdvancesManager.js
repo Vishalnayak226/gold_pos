@@ -1,6 +1,21 @@
 import { adminFetch, logTelemetry } from '../app.js';
 
 /**
+ * Escapes HTML-significant characters. Advance records can contain
+ * customer-supplied strings (customerName, phone, paymentMethod, referenceId)
+ * submitted through public, unauthenticated endpoints (POST /api/advances,
+ * POST /api/payment/verify) with no server-side content restriction — every
+ * such field must be escaped before going into innerHTML here, since this
+ * renders inside the authenticated admin session (bearer token in
+ * sessionStorage would otherwise be exfiltratable via a stored-XSS payload).
+ */
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+}
+
+/**
  * Advances report/browse module — the missing counterpart to the redemption
  * flow already built into BillingDesk. Lists every customer with an advance
  * balance, supports search, a full per-customer ledger drill-down, and a
@@ -130,12 +145,12 @@ export class AdvancesManager {
         }
 
         tbody.innerHTML = customers.map(c => `
-            <tr class="advances-row" data-phone="${c.phone}">
-                <td>${c.phone}</td>
-                <td>${c.name || 'Regular Customer'}</td>
+            <tr class="advances-row" data-phone="${escapeHtml(c.phone)}">
+                <td>${escapeHtml(c.phone)}</td>
+                <td>${escapeHtml(c.name || 'Regular Customer')}</td>
                 <td class="text-right">₹${Math.max(0, c.balance).toLocaleString('en-IN')}</td>
                 <td>${new Date(c.lastActivity).toLocaleDateString()}</td>
-                <td class="text-right"><button type="button" class="btn btn-secondary btn-sm expand-btn" data-phone="${c.phone}">${this.expandedPhone === c.phone ? 'Hide' : 'View'}</button></td>
+                <td class="text-right"><button type="button" class="btn btn-secondary btn-sm expand-btn" data-phone="${escapeHtml(c.phone)}">${this.expandedPhone === c.phone ? 'Hide' : 'View'}</button></td>
             </tr>
             ${this.expandedPhone === c.phone ? this.renderDetailRow(c) : ''}
         `).join('');
@@ -159,7 +174,7 @@ export class AdvancesManager {
                             <div class="recent-list-item">
                                 <div>
                                     <strong>${e.type === 'deposit' ? 'Deposit' : 'Redeemed at Billing'}</strong>
-                                    <div class="text-muted-small">${e.paymentMethod || (e.invoiceId ? 'Invoice ' + e.invoiceId : '')}${e.referenceId ? ' · Ref: ' + e.referenceId : ''}</div>
+                                    <div class="text-muted-small">${escapeHtml(e.paymentMethod || (e.invoiceId ? 'Invoice ' + e.invoiceId : ''))}${e.referenceId ? ' · Ref: ' + escapeHtml(e.referenceId) : ''}</div>
                                 </div>
                                 <div class="text-right">
                                     <strong class="${e.type === 'deposit' ? 'ledger-amount-positive' : 'ledger-amount-negative'}">${e.type === 'deposit' ? '+' : '-'}₹${(parseFloat(e.amount) || 0).toLocaleString('en-IN')}</strong>

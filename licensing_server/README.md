@@ -6,6 +6,56 @@ A portable, serverless-ready microservice designed for issuing, suspending, and 
 1. **RSA-2048 Cryptographic Handshakes:** Signs verification responses with an RSA Private Key. POS client instances verify this signature using the matching Public Key, preventing DNS overrides or spoofed server hacks.
 2. **Database Agnostic Adapter:** Easily swaps out local JSON file storage for Cloudflare KV, MongoDB, Postgres, or Redis.
 3. **PDF-Ledger Style Admin Control:** Password-protected dashboard to manage keys, set custom expirations, and revoke clients in real-time.
+4. **Signed Release Registry (added 2026-07-17):** Publish new POS platform releases here; every tenant's `backend/updateEngine.js` polls and cryptographically verifies them before ever applying anything. See "Release Registry & Tiered Updates" below.
+5. **Liveness Probe:** `GET /api/health` (public) returns `{status, version, env}` — used by CI post-deploy smoke tests and uptime monitoring (see `deploy/README.md` §8).
+
+---
+
+## Release Registry & Tiered Updates
+
+This server is also the authority POS clients trust for platform updates —
+full mechanism in `docs/ai_handover.md` §7, summarized here for anyone
+working directly in this codebase.
+
+**How it works:** on first boot this server generates a dedicated
+**release-signing RSA-4096 keypair** (`keys/release_private.pem` /
+`release_public.pem`) — deliberately separate from the license-signing key
+above, so compromising one can never unlock the other. `keys/release_public.pem`
+must be copied to every POS client at `backend/keys/release_public.pem`
+before that client can verify (and therefore ever apply) a release.
+
+**Publishing a release** (admin dashboard "Publish Release" form, or
+directly):
+```bash
+curl -X POST http://localhost:6060/api/admin/releases \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -d '{
+    "version": "1.1.1",
+    "channel": "security",
+    "changelog": "Fixes X",
+    "downloadUrl": "https://your-host/release-1.1.1.zip",
+    "sha256": "<sha256 of that zip>"
+  }'
+```
+`channel` must be `security`, `feature`, or `patch` — see `CHANGELOG.md`
+"Release channels" for what each one means to a tenant. The server signs
+`{version, channel, changelog, downloadUrl, sha256, publishedAt}` and stores
+it in `data/config.json`'s `releases` array (an append-only registry — there
+is no edit/delete endpoint by design, so a tenant can never be shown a
+retroactively-altered release history).
+
+**Reading the registry:**
+- `GET /api/releases/latest?channel=security` — public, returns the newest
+  release on that channel (or all channels if `channel` is omitted) as
+  `{payload, signature}`. This is exactly what `backend/updateEngine.js`
+  polls daily. Returns `404` if nothing has been published on that channel.
+- `GET /api/releases` — admin-only, lists every published release for the
+  dashboard.
+- `GET /api/version` — legacy/simple endpoint, returns just
+  `{latestVersion}` (derived automatically from the highest version in the
+  registry) for anything that only needs a version number, not the full
+  signed payload.
 
 ---
 

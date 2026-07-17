@@ -175,6 +175,16 @@ export async function syncLicenseStatus(forceKey = null) {
  * Express middleware to restrict operations if license gate is closed.
  */
 export function checkLicenseGate(req, res, next) {
+    // Only gate API operations. Static frontend assets (index.html,
+    // customer.html, js/, css/) must always be servable — otherwise the
+    // browser can never load the JS that fetches /api/license/status and
+    // renders the license-lock overlay + activation form in the first
+    // place, bricking the entire app (including the customer portal) behind
+    // a raw 402 JSON response with no in-app recovery path.
+    if (!req.path.startsWith('/api/')) {
+        return next();
+    }
+
     // Exempt licensing/admin-login endpoints themselves so users can still
     // authenticate and activate a new key while the gate is closed
     if (req.path.startsWith('/api/license') || req.path === '/api/settings' || req.path.startsWith('/api/admin')) {

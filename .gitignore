@@ -4,6 +4,8 @@ node_modules/
 backend/logs/
 backend/backups/
 backend/data/
+backend/_rollback/
+backend/_staging/
 dist/
 gold_pos_release.zip
 backups/

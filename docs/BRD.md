@@ -5,8 +5,8 @@
 ---
 
 ## 1. Document Control
-*   **Version:** 1.0.0
-*   **Status:** Final / Approved
+*   **Version:** 1.1.0 (see `CHANGELOG.md` for the platform's own release history — this document tracks *requirements*, which change less often than shipped versions)
+*   **Status:** Final / Approved — revised 2026-07-17 to add §3.5 (Update & Extensibility Management) and update §4.2
 *   **Author:** Antigravity AI Coding Assistant
 *   **Target Audience:** Platform Owners, Developers, Retail Operators
 
@@ -51,6 +51,12 @@ The Gold Business POS is a lightweight, responsive SaaS system designed for prec
 *   **Level 1 (Technical Monitoring):** Plaintext technical metrics (latency, memory footprint, CPU, error logs) with zero customer data.
 *   **Level 2 (Database Export):** Asymmetric envelope packaging data under RSA-4096 + AES-256-GCM, decryptable only offline by the developer.
 
+### 3.5 Update & Extensibility Management (added 2026-07-17)
+*   **Tiered Release Channels:** Every platform release is published as `security`, `feature`, or `patch`. Security releases auto-apply to every tenant without waiting on manual action; feature/patch releases require the tenant's admin to explicitly approve them. This balances "urgent fixes reach every store fast" against "the platform owner/tenant stays in control of when non-urgent change happens."
+*   **Cryptographic Trust:** No release is downloaded or applied unless its signature verifies against a dedicated release-signing key, independent of the licensing key. A compromised or spoofed update source cannot get code onto a tenant's till.
+*   **Zero Data-Loss Guarantee:** An applied update can only ever replace application code. Sales records, customer advance ledgers, settings, backups, and license state are structurally unreachable by the update mechanism — not a configuration choice, a hard boundary in the code path itself.
+*   **Third-Party Extensibility (Shopify-Partner model):** A tenant may commission their own developer to customize their instance — custom workflows, integrations, or UI additions — through a defined extension surface, without that developer ever needing access to the core platform's source, licensing, or cryptographic material. An update never overwrites a tenant's extension code.
+
 ---
 
 ## 4. Non-Functional Requirements
@@ -61,6 +67,9 @@ The Gold Business POS is a lightweight, responsive SaaS system designed for prec
 *   **Aesthetic Guidelines:** Low-saturation, high-contrast slate grids (similar to a paper ledger). No vibrant dopamine-inducing palettes.
 
 ### 4.2 Security & Data Integrity
-*   **Atomic Database Writes:** JSON files must write to a `.tmp` file first and then rename to prevent corruption.
+*   **Atomic Database Writes:** JSON files must write to a `.tmp` file first and then rename to prevent corruption; transient write failures (e.g. OS-level file-lock contention) must retry rather than silently report success on data that was never actually persisted.
 *   **Asymmetric Licensing Sync:** Central server signs activation states using RSA-2048 private keys. Clients verify signatures using public keys.
-*   **Rolling Backups:** Retain the last 7 daily snapshots of JSON databases.
+*   **Rolling Backups:** Retain the last 7 daily snapshots of JSON databases; a fresh backup is also taken immediately before any code update is applied.
+*   **Session & Brute-Force Protection:** Admin authentication is server-verified with a bearer session token, and login attempts are rate-limited after repeated failures.
+*   **Output Sanitization:** Any customer-supplied data reaching an admin-facing screen must be rendered as text, never as raw HTML — no field a customer controls may execute code in an operator's browser.
+*   **Signed Update Provenance:** Code updates are only trusted after RSA signature and checksum verification against a key independent of the licensing key (§3.5).
