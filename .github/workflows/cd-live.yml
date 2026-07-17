@@ -1,0 +1,92 @@
+name: Deploy — Live
+
+# Final stage of the dev/sandbox/live pipeline (deploy/README.md §8).
+# Promote via a PR from staging -> main once a change has been through
+# Development and manual UAT on Sandbox. The deploy job requires manual
+# approval (GitHub Environment protection on "production") before it runs —
+# nothing reaches Live without a human clicking Approve in the Actions tab.
+#
+# "Live" here is the platform owner's own pilot/production instance and the
+# proven main-branch state — it does NOT auto-push to paying tenants. Tenant
+# updates stay the manual per-tenant process in deploy/README.md §1-7 (or the
+# existing signed security-channel auto-update, backend/updateEngine.js).
+#
+# One-time setup required before this can run (see deploy/README.md §8.2-8.4):
+#   - Repo secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY
+#   - Repo/environment variable: PIPELINE_DOMAIN (e.g. yourpos.com)
+#   - A "production" GitHub Environment with required reviewers configured
+#     (Settings -> Environments -> production -> Required reviewers)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    name: Test gate
+    runs-on: ubuntu-latest
+    outputs:
+      licensing_changed: ${{ steps.filter.outputs.licensing_server }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            licensing_server:
+              - 'licensing_server/**'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+      - name: Run integration test suite
+        working-directory: backend
+        run: node test_suite.js
+      - name: Install licensing_server dependencies
+        working-directory: licensing_server
+        run: npm install --no-audit --no-fund
+      - name: Audit backend (high+ severity fails the build)
+        working-directory: backend
+        run: npm audit --audit-level=high
+      - name: Audit licensing_server (high+ severity fails the build)
+        working-directory: licensing_server
+        run: npm audit --audit-level=high
+
+  deploy:
+    name: Deploy to Live (requires manual approval)
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy backend
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            /opt/gold-pos/live-backend/deploy/remote-deploy.sh \
+              /opt/gold-pos/live-backend main backend \
+              deploy/ecosystem.live.config.cjs
+
+      - name: Deploy production licensing server (only if it changed)
+        if: needs.test.outputs.licensing_changed == 'true'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            /opt/gold-pos/live-licensing/deploy/remote-deploy.sh \
+              /opt/gold-pos/live-licensing main licensing_server \
+              deploy/ecosystem.licensing-live.config.cjs
+
+      - name: Smoke test
+        run: |
+          sleep 3
+          curl -fsS "https://app.${{ vars.PIPELINE_DOMAIN }}/api/health"

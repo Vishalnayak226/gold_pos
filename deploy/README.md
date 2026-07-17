@@ -94,3 +94,95 @@ Per `docs/PROJECT_PLAN.md` §5.1, releases are **manual and version-flagged**:
 no auto-updater ships in this phase. Phase 15 adds a non-blocking
 "update available" banner the platform owner can use to know when a tenant
 should be manually upgraded; it never pushes code by itself.
+
+## 8. Multi-environment pipeline (Dev / Sandbox / Live) — Phase 19
+
+Sections 1-7 above are the **per-tenant** runbook — one server per paying
+customer, updated manually on their own schedule. This section is a
+**separate, additional** thing: the platform owner's own internal
+Development → Sandbox/Test → Live pipeline, used to vet a change before it
+is ever rolled out to a real tenant using the runbook above. "Live" here
+means the platform owner's own pilot/production instance and the
+proven `main` branch state — not a new mechanism that auto-pushes to every
+tenant.
+
+All three environments (plus a shared non-production licensing server) run
+on **one VPS**, as separate PM2 processes on separate ports, so pipeline
+testing never touches a paying tenant's server or the real licensing data.
+
+### 8.1 Layout
+
+| Env | Branch | PM2 app name | Port | Licensing server it uses | Subdomain |
+|---|---|---|---|---|---|
+| Development | `develop` | `gold-pos-dev` | 5001 | non-prod (6061) | `dev.<domain>` |
+| Sandbox/Test | `staging` | `gold-pos-sandbox` | 5002 | non-prod (6061) | `sandbox.<domain>` |
+| Live | `main` | `gold-pos-live` | 5000 | production (6060) | `app.<domain>` |
+| Licensing (non-prod) | `develop` | `licensing-nonprod` | 6061 | — | `license-dev.<domain>` |
+| Licensing (production) | `main` | `licensing-live` | 6060 | — | `license.<domain>` |
+
+Recommend a **2GB RAM** droplet/instance (not the 1GB box §1 suggests for a
+single tenant) — 5 Node processes plus Nginx is more headroom than a 1GB box
+comfortably gives.
+
+### 8.2 One-time provisioning
+
+1. Do §1 once (Node, PM2, Nginx, Certbot) on the pipeline VPS.
+2. DNS: 5 A records (table above) → the VPS IP.
+3. Create a low-privilege `deploy` Linux user for CI to SSH in as (not
+   root), scoped to `/opt/gold-pos/`. Generate an SSH keypair for it — the
+   private key becomes the `VPS_SSH_KEY` GitHub Actions secret (§8.4).
+4. For each of the 5 rows in the table, as the `deploy` user:
+   ```bash
+   git clone -b <branch> <this repo> /opt/gold-pos/<name>
+   cd /opt/gold-pos/<name>/<backend-or-licensing_server>
+   npm ci --omit=dev
+   cp .env.example .env
+   # edit .env: set PORT and (for backend rows) LICENSING_SERVER_URL per
+   # the table above, plus ENV_NAME=<dev|sandbox|live|nonprod> so GET
+   # /api/health reports which instance you hit
+   ```
+5. `pm2 start deploy/ecosystem.<name>.config.cjs` for each (see the 5
+   `deploy/ecosystem.*.config.cjs` files — each just sets a unique PM2 app
+   name so all 5 processes coexist on one PM2 daemon without colliding).
+   `pm2 save`, `pm2 startup` once.
+6. 5 Nginx vhosts from `deploy/nginx.conf.template` (§4), one per row,
+   `certbot --nginx -d <subdomain>` for each.
+
+### 8.3 Deploying a build
+
+`deploy/remote-deploy.sh <checkout-path> <branch> <module-dir> <ecosystem-file>`
+does the actual work (`git fetch && git reset --hard`, `npm ci`,
+`pm2 startOrRestart`, `pm2 save`) — run it by hand on the server, or let
+CI run it over SSH (§8.4). Example, deploying Dev by hand:
+
+```bash
+deploy/remote-deploy.sh /opt/gold-pos/dev-backend develop backend deploy/ecosystem.dev.config.cjs
+```
+
+**Rollback:** re-run the same command against a specific commit —
+`git checkout <previous-sha>` at the checkout path, then re-run
+`remote-deploy.sh` (or just `pm2 restart <app-name>` after the checkout, no
+need to redo `npm ci` if dependencies didn't change).
+
+### 8.4 CI/CD (GitHub Actions)
+
+Three workflows, one per stage, each gated on `node backend/test_suite.js`
++ `npm audit --audit-level=high` (same test gate `.github/workflows/daily-checks.yml`
+already runs) passing before deploying:
+
+- `cd-dev.yml` — push to `develop` → deploy to `dev-backend` (+
+  `nonprod-licensing` if `licensing_server/` changed) → smoke-test
+  `GET https://dev.<domain>/api/health`.
+- `cd-sandbox.yml` — push to `staging` → same, targeting `sandbox-backend`.
+  This is where the platform owner does manual UAT before promoting further.
+- `cd-live.yml` — push to `main` → deploy job declares
+  `environment: production`, which GitHub blocks on a **manual approval**
+  (Settings → Environments → `production` → required reviewers) → deploys
+  to `live-backend` + `live-licensing` → smoke test.
+
+Repo secrets needed: `VPS_HOST`, `VPS_USER` (the `deploy` user from §8.2),
+`VPS_SSH_KEY`.
+
+**Day-to-day promotion:** `feature branch → PR into develop` (auto-deploys
+Dev) → `PR develop → staging` (auto-deploys Sandbox, do UAT here) →
+`PR staging → main` (blocks on manual Approve, then deploys Live).

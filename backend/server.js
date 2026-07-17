@@ -57,6 +57,22 @@ app.use((req, res, next) => {
     next();
 });
 
+/**
+ * GET /api/health
+ * Public, unauthenticated liveness check — used by CI post-deploy smoke
+ * tests and uptime monitoring to confirm this specific environment's
+ * process is up and serving the expected commit, independent of license
+ * state (exempted in checkLicenseGate).
+ */
+app.get('/api/health', (req, res) => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'));
+    res.json({
+        status: 'ok',
+        version: pkg.version,
+        env: process.env.ENV_NAME || process.env.NODE_ENV || 'unknown'
+    });
+});
+
 // Protect all POS cashier routes with licensing gate
 app.use(checkLicenseGate);
 

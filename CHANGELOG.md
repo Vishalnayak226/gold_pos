@@ -30,6 +30,17 @@ working version. See `backend/updateEngine.js`.
 
 ## [Unreleased]
 
+### Added
+- **Dev/Sandbox/Live deployment pipeline** — `GET /api/health` on `backend`
+  and `licensing_server`; per-environment PM2 configs
+  (`deploy/ecosystem.{dev,sandbox,live,licensing-nonprod,licensing-live}.config.cjs`);
+  a shared `deploy/remote-deploy.sh`; three GitHub Actions workflows
+  (`cd-dev.yml`, `cd-sandbox.yml`, `cd-live.yml`) with a manual-approval gate
+  before Live. This is the platform owner's own internal promotion pipeline,
+  separate from the existing per-tenant manual update process. See
+  `deploy/README.md` §8. Not yet exercised end-to-end — no VPS/domain
+  provisioned yet.
+
 ## [1.1.0] — 2026-07-17
 
 ### Added

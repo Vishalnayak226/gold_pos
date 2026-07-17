@@ -116,6 +116,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/**
+ * GET /api/health
+ * Public liveness check — used by CI post-deploy smoke tests and uptime
+ * monitoring to confirm this specific environment's process is up.
+ */
+app.get('/api/health', (req, res) => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    res.json({
+        status: 'ok',
+        version: pkg.version,
+        env: process.env.ENV_NAME || process.env.NODE_ENV || 'unknown'
+    });
+});
+
 /* ==========================================================================
    PORTABLE DATABASE ADAPTER (Easily replace JSON with CF KV / Mongo / Postgres)
    ========================================================================== */

@@ -1,0 +1,85 @@
+name: Deploy — Sandbox/Test
+
+# Second stage of the dev/sandbox/live pipeline (deploy/README.md §8).
+# Promote via a PR from develop -> staging once a change looks good on
+# Development; this is the environment the platform owner should do manual
+# UAT against (sandbox.<domain>) before promoting further to Live.
+#
+# One-time setup required before this can run (see deploy/README.md §8.2-8.4):
+#   - Repo secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY
+#   - Repo/environment variable: PIPELINE_DOMAIN (e.g. yourpos.com)
+#   - A "sandbox" GitHub Environment (no protection rules needed)
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    name: Test gate
+    runs-on: ubuntu-latest
+    outputs:
+      licensing_changed: ${{ steps.filter.outputs.licensing_server }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            licensing_server:
+              - 'licensing_server/**'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install --no-audit --no-fund
+      - name: Run integration test suite
+        working-directory: backend
+        run: node test_suite.js
+      - name: Install licensing_server dependencies
+        working-directory: licensing_server
+        run: npm install --no-audit --no-fund
+      - name: Audit backend (high+ severity fails the build)
+        working-directory: backend
+        run: npm audit --audit-level=high
+      - name: Audit licensing_server (high+ severity fails the build)
+        working-directory: licensing_server
+        run: npm audit --audit-level=high
+
+  deploy:
+    name: Deploy to Sandbox
+    needs: test
+    runs-on: ubuntu-latest
+    environment: sandbox
+    steps:
+      - name: Deploy backend
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            /opt/gold-pos/sandbox-backend/deploy/remote-deploy.sh \
+              /opt/gold-pos/sandbox-backend staging backend \
+              deploy/ecosystem.sandbox.config.cjs
+
+      - name: Deploy non-prod licensing server (only if it changed)
+        if: needs.test.outputs.licensing_changed == 'true'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            /opt/gold-pos/nonprod-licensing/deploy/remote-deploy.sh \
+              /opt/gold-pos/nonprod-licensing develop licensing_server \
+              deploy/ecosystem.licensing-nonprod.config.cjs
+
+      - name: Smoke test
+        run: |
+          sleep 3
+          curl -fsS "https://sandbox.${{ vars.PIPELINE_DOMAIN }}/api/health"

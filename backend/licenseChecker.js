@@ -191,6 +191,12 @@ export function checkLicenseGate(req, res, next) {
         return next();
     }
 
+    // Exempt the health check — deploy smoke tests and uptime monitoring need
+    // to confirm the process itself is up independent of license state.
+    if (req.path === '/api/health') {
+        return next();
+    }
+
     if (!isLicenseValid()) {
         logTelemetry('LICENSE_GATE_BLOCKED', 0, `Blocked API request to: ${req.path}`);
         return res.status(402).json({

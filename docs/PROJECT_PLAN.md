@@ -140,6 +140,25 @@ Reflects focused AI-assisted build+review sessions, not a traditional team estim
 *   Pricing decision (monthly vs. yearly amount) to seed the licensing schema (Phase 15).
 *   Play Store developer account plus app name/icon/branding assets (Phase 17).
 
+### 5.14 Phase 19: Dev/Sandbox/Live Pipeline
+A platform-owner-internal Development → Sandbox/Test → Live promotion
+pipeline, separate from (and upstream of) the per-tenant manual update
+process in §5.1/`deploy/README.md` §1-7. All three environments plus a
+shared non-production `licensing_server` run on one VPS as isolated PM2
+processes (`deploy/ecosystem.*.config.cjs`); `GET /api/health` on both
+`backend/` and `licensing_server/` gives each a liveness/version probe.
+Three GitHub Actions workflows (`cd-dev.yml`, `cd-sandbox.yml`,
+`cd-live.yml`) gate on the existing `test_suite.js` + `npm audit` checks,
+deploy over SSH via a shared `deploy/remote-deploy.sh` script, and smoke-test
+`/api/health` post-deploy. Live deploys require manual approval via a GitHub
+Environment protection rule — nothing reaches the platform owner's own
+production/pilot instance unattended. See `deploy/README.md` §8 for the full
+layout, provisioning runbook, and promotion flow.
+
+**Inputs needed from platform owner for this phase:** a domain name and one
+VPS (2GB RAM recommended) to provision the pipeline on, plus the repo
+secrets/variables listed in `deploy/README.md` §8.4 once that server exists.
+
 ---
 
 ## 6. Completion Checklist
@@ -225,6 +244,14 @@ Living tracker — update as each item lands. Verified against source as of 2026
 - [x] Daily detection-only CI (`.github/workflows/daily-checks.yml`) — integration tests + dependency audit, never deploys anything itself.
 - [x] Semver adopted properly; `CHANGELOG.md` added as the source of truth for what shipped in each version.
 
+### Done — Phase 19: Dev/Sandbox/Live Pipeline, 2026-07-17
+- [x] `GET /api/health` (public, license-gate-exempt) on both `backend/server.js` and `licensing_server/server.js` — reports `{status, version, env}` for post-deploy smoke tests and monitoring.
+- [x] `deploy/ecosystem.base.cjs` factory + 5 per-environment PM2 configs (`ecosystem.dev/sandbox/live/licensing-nonprod/licensing-live.config.cjs`), each a distinct PM2 app name so all 5 processes coexist on one VPS. Existing single-tenant `deploy/ecosystem.config.cjs` left untouched.
+- [x] `deploy/remote-deploy.sh` — shared, parameterized deploy script (`git reset --hard` + `npm ci` + `pm2 startOrRestart` + `pm2 save`) used identically by hand or from CI.
+- [x] `deploy/README.md` §8 — full layout table, provisioning runbook, and day-to-day promotion flow for the pipeline.
+- [x] Three GitHub Actions workflows (`cd-dev.yml`, `cd-sandbox.yml`, `cd-live.yml`) — test gate (existing `test_suite.js` + `npm audit` pattern) → SSH deploy → `/api/health` smoke test. `cd-live.yml` requires a GitHub Environment manual-approval gate before touching the platform owner's own Live instance.
+- [ ] **Not yet exercised end-to-end** — no VPS/domain provisioned yet, so the workflows have not actually run against a live server. See Blocked list below.
+
 ### Blocked on Inputs From Platform Owner
 Step-by-step "how do I actually get this" instructions for every item below are in **`docs/GO_LIVE_CHECKLIST.md`** (2026-07-13) — each requires the platform owner's own identity/account/payment details and cannot be completed by an AI agent.
 - [ ] VPS/cloud account for pilot deployment (Phase 14's runbook and PM2 config are verified-working; nothing to deploy *to* yet)
@@ -232,3 +259,4 @@ Step-by-step "how do I actually get this" instructions for every item below are 
 - [ ] Real or sandbox Razorpay credentials
 - [ ] Pricing decision (monthly/yearly amount) — Phase 15's schema is ready to store it, needs the actual number(s)
 - [ ] Play Store developer account + branding assets (icon, screenshots, privacy policy URL) — Phase 17's scaffold is ready, needs these plus a machine with Android Studio to build
+- [ ] Domain name + a 2GB VPS for the Phase 19 dev/sandbox/live pipeline, plus the GitHub repo secrets (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`) and variable (`PIPELINE_DOMAIN`) once that server exists — see `deploy/README.md` §8.2-8.4

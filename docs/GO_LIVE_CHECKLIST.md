@@ -122,3 +122,32 @@ review comes back asking for anything specific.
 Being seeded directly into the licensing schema once you give me the number
 — see the live conversation. This file will be updated once that's locked
 in, since it's a one-line change, not a multi-step external process.
+
+---
+
+## 6. Dev/Sandbox/Live Pipeline VPS + Domain (Phase 19)
+
+**Goal:** one server the platform owner controls for trying changes safely
+before they ever reach a real tenant — separate from any individual
+tenant's own server in §1.
+
+1. A domain (can be the same one used for tenant subdomains, or a separate
+   one — e.g. `yourpos-internal.com`) and a **2GB RAM** VPS (5 Node
+   processes run on it at once — Dev, Sandbox, Live, plus a shared
+   non-production and a production `licensing_server`).
+2. Point 5 DNS A records at it: `dev.`, `sandbox.`, `app.`, `license-dev.`,
+   `license.` — see `deploy/README.md` §8.1 for exactly what each hosts.
+3. Follow `deploy/README.md` §8.2 top to bottom (Node/PM2/Nginx/Certbot
+   setup, 5 git checkouts, 5 PM2 apps, 5 Nginx vhosts + TLS) — already
+   written, same shape as the §1-7 single-tenant runbook, just repeated
+   5 times.
+4. In the GitHub repo: add secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`
+   and variable `PIPELINE_DOMAIN`, then create a `production` Environment
+   with required reviewers (Settings → Environments) so Live deploys need a
+   manual approval click.
+
+**Hand back to me:** nothing required to build this out further — the
+workflows (`cd-dev.yml`, `cd-sandbox.yml`, `cd-live.yml`) and deploy script
+are already written and waiting on this server to exist. Once you're SSH'd
+into a fresh VPS, I can walk the `deploy/README.md` §8.2 steps with you the
+same way as §1.
