@@ -12,26 +12,44 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `5f99916` — Phase 20.1: customer identity/auth, shared billing math,
-  hardening (2026-08-08). Committed on branch `phase-20.1-customer-auth`, **not yet merged into
-  `main`** and not pushed — `main` is still at `e4999bc` (Phase 19).
-- **Uncommitted in tree (as of 2026-08-08):** nothing. The whole Phase 20.1 working set — all 50
-  paths, including `backend/customerAuth.js`, `backend/defaultSettings.js`,
-  `backend/test_billing_math.js`, `frontend/js/lib/billingMath.js`, `docs/brain/`,
-  `docs/FOUNDATION.md` and root `CLAUDE.md` — went into `5f99916`.
+- **Latest commit:** Phase 21 — credential redaction, dependency bumps, first HTTP route suite
+  (2026-08-08). **`main` now contains Phases 1–21**, fast-forwarded past `e4999bc` (Phase 19) to
+  pick up `5f99916` + `a3ad346` (Phase 20.1: customer identity/auth) and this Phase 21 commit in
+  one move. Not pushed — `origin/main` is still at `e4999bc`.
+- **Branches:** `phase-21-hardening` was fast-forward-merged into `main` and deleted; its
+  worktree at `../gold-pos-hardening` was removed. `phase-20.1-customer-auth` still exists and is
+  fully contained in `main` — it is the branch the main checkout sits on, so it was left alone.
+- **⚠️ Uncommitted in the main checkout, as of 2026-08-08:** a concurrent session's in-flight
+  work, **not reviewed or committed by the Phase 21 session** — a `writeJSONTransaction()`
+  crash-recovery layer in `backend/db.js`, advance-ledger status helpers
+  (`normalizeAdvanceStatus`, `ADVANCE_STATUS`) in `frontend/js/lib/billingMath.js`, ~318 lines of
+  `backend/server.js`, a new `backend/.env.example`, and `helmet@^8.3.0` added to
+  `backend/package.json` but not yet imported anywhere.
+  - That work predates the Phase 21 merge, so **`backend/db.js`, `backend/server.js` and
+    `backend/package.json` in the working tree may now be stale against `main`.** Diff them
+    against `main` before committing — Phase 21 touched the settings routes in `server.js`, the
+    `DATA_DIR`/`LOGS_DIR` constants in `db.js`, and the dependency block in `package.json`.
+  - `helmet` would take the dependency budget from 6 to 7 (CLAUDE.md §0) — a deliberate call
+    someone still needs to make.
 - **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060).
-- **Concurrent-session risk:** this tree sees edits from the user and other agents. Run
-  `git status`/`git diff` and stage only files you reviewed — never `git add -A`.
-- **Last unit of work:** Phase 20.1 — customer identity & authentication (2026-08-08). The
-  customer portal now requires a password; `/api/customer/*` is session-scoped; four
-  previously-public endpoints are gated. Verified live (53 API + 20 post-restart + 29 Playwright
-  checks, all green, `backend/data/` restored byte-identical). See `CHANGELOG.md` [Unreleased],
-  `docs/SCHEME_MODULE_PLAN.md` §20.1, `docs/TESTING_CHECKLIST.md` §12.
-- **Next session should start with:** deciding whether `phase-20.1-customer-auth` merges into
-  `main` (both suites were green at commit time — 57 billing checks + 6 integration tests). The
-  scheme module's remaining phases
-  (20.2 onward) are still blocked on the seven product decisions in `SCHEME_MODULE_PLAN.md` §7;
-  `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the unblocked queue.
+- **Concurrent-session risk:** actively realised right now, see above. Run `git status`/`git diff`
+  and stage only files you reviewed — never `git add -A`.
+- **Last unit of work:** Phase 21 — credential redaction, dependency bumps, first HTTP route
+  suite (2026-08-08, merged to `main`). Closes audit findings 8–10:
+  `GET /api/settings` no longer serves the Razorpay secret, SMTP password or admin PIN to the
+  browser (masked via `redactSettings()`/`unredactSettings()` in `backend/defaultSettings.js`,
+  with a round-trip that stops a save from overwriting an untouched secret); nodemailer 6→9 and
+  node-cron 3→4 take `npm audit` to zero after empirically probing this codebase's actual call
+  shapes; and `backend/test_routes.js` boots the real server against a temp data dir for 27
+  route/auth-boundary/persistence-failure checks. 57 billing + 6 integration + 27 route checks
+  green. Detail in `docs/LEDGER.md`; manual steps in `docs/TESTING_CHECKLIST.md` §0, §5, §8, §9.
+- **Next session should start with:** reconciling the concurrent session's uncommitted set
+  (above) against the new `main`, since Phase 21 moved three of the same files underneath it.
+  After that, `main` is a candidate for its first push — `origin/main` is 21 phases behind, and
+  nothing in the repo has ever been pushed past `e4999bc`. The scheme module's phases (20.2–20.5,
+  note the numbering: Phase 21 deliberately skips past them) remain blocked on the seven product
+  decisions in `SCHEME_MODULE_PLAN.md` §7; `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the
+  unblocked queue.
 
 ---
 

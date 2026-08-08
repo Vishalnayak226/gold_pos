@@ -311,6 +311,7 @@ export class SettingsManager {
                     <input type="text" id="set-admin-pin" class="form-control" value="${s.adminPin || '1234'}" maxlength="8">
                 </div>
             </div>
+            <p class="text-muted-small">The saved Admin PIN is masked and never sent to this screen. Leave <code>••••••••</code> as-is to keep it; type over it to set a new one.</p>
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-invoice-prefix">Invoice Prefix</label>
@@ -388,6 +389,7 @@ export class SettingsManager {
                 </div>
             </div>
             <p class="text-muted-small">The demo pair <code>rzp_test_xxxxxx</code> / <code>rzp_test_xxxxxx_secret</code> auto-mocks checkout for local testing. Any other value is sent to the real Razorpay API.</p>
+            <p class="text-muted-small">A saved Key Secret is masked and never sent to this screen. Leave it untouched to keep it; type over it to replace it. An empty box means no secret is configured yet.</p>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Manual UPI Fallback</h3>
             <div class="form-group" style="max-width:300px;">
@@ -453,6 +455,7 @@ export class SettingsManager {
                     <input type="text" id="set-smtp-fromname" class="form-control" value="${smtp.fromName || ''}">
                 </div>
             </div>
+            <p class="text-muted-small">A saved SMTP Password is masked and never sent to this screen. Leave it untouched to keep it; type over it to replace it. An empty box means no password is configured yet.</p>
             <button type="button" id="save-backup-btn" class="btn btn-primary">Save Backup & Email Settings</button>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Manual Actions</h3>

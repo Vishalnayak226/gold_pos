@@ -6,16 +6,17 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_billing_math.js && node test_suite.js",
+    "test": "node test_billing_math.js && node test_suite.js && node test_routes.js",
     "test:billing": "node test_billing_math.js",
-    "test:integration": "node test_suite.js"
+    "test:integration": "node test_suite.js",
+    "test:routes": "node test_routes.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
-    "node-cron": "^3.0.3",
-    "nodemailer": "^6.9.13",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.5",
     "qrcode": "^1.5.4"
   },
   "engines": {

@@ -30,9 +30,11 @@ working version. See `backend/updateEngine.js`.
 
 ## [Unreleased]
 
-Customer identity and authentication (Phase 20.1). Ships as a **`security`**
-channel release when cut — it closes an unauthenticated data-exposure hole,
-and it changes who may call four existing endpoints.
+Customer identity and authentication (Phase 20.1), plus credential redaction
+and dependency hardening (Phase 20.2). Ships as a **`security`** channel
+release when cut — it closes an unauthenticated data-exposure hole, stops
+credentials being served to the browser, and it changes who may call four
+existing endpoints.
 
 ### Security
 
@@ -63,6 +65,26 @@ and it changes who may call four existing endpoints.
   accounts. Sign-in responses are identical for "no such account" and "wrong
   password", so the endpoint cannot be used to discover which mobile numbers
   belong to the store's customers.
+- **Stored credentials are no longer sent to the browser.** `GET /api/settings`
+  returned `settings.json` verbatim, putting the Razorpay key secret, the SMTP
+  password and the admin PIN into the Settings page — readable in DevTools and
+  captured by any HAR or screen recording. The route is admin-gated, so this
+  was exposure rather than an open door, but the credentials had no reason to
+  leave the server at all. They are now masked as `••••••••` on the way out;
+  the Settings screen posts the mask back untouched and the server restores
+  the stored value, so saving an unrelated field cannot overwrite a secret.
+  Retyping a field still replaces it normally, and an unconfigured credential
+  stays blank so "not set" and "set but hidden" remain distinguishable.
+- **The Level-2 diagnostics export no longer carries live credentials.**
+  Settings inside the encrypted support bundle are masked the same way,
+  following the precedent already set for `customer_auth.json`: diagnosing a
+  tenant needs to know whether SMTP and Razorpay are *configured*, never what
+  the values are.
+- **`npm audit` is clean.** nodemailer `6.x` → `9.x` clears eight advisories
+  including SMTP command injection via `envelope.size` and CRLF header
+  injection; node-cron `3.x` → `4.x` clears a transitive `uuid` buffer bounds
+  check. Both are major-version bumps and were verified against this
+  codebase's actual usage before landing; no application code changed.
 
 ### Added
 

@@ -5,6 +5,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { readJSON, writeJSON, logError, logTelemetry, DATA_DIR } from './db.js';
+import { redactSettings, unredactSettings } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
 import https from 'https';
@@ -513,14 +514,16 @@ app.get('/api/settings/public', (req, res) => {
 
 /**
  * GET /api/settings
- * Retrieves the full system configuration (tax slabs, overrides, SMTP, payment
- * secrets, admin PIN). Admin-only — contains credentials, never expose publicly.
+ * Retrieves the system configuration (tax slabs, overrides, SMTP host/user,
+ * payment key id). Admin-only, and every credential is masked on the way out
+ * — see redactSettings() in defaultSettings.js. The plaintext Razorpay
+ * secret, SMTP password and admin PIN never leave the server.
  */
 app.get('/api/settings', requireAdminSession, (req, res) => {
     try {
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const settings = readJSON(settingsFile, {});
-        res.json(settings);
+        res.json(redactSettings(settings));
     } catch (err) {
         logError('Error getting settings: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve settings' });
@@ -554,6 +557,12 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         const newSettings = { ...currentSettings, ...req.body };
         delete newSettings.confirmDestructive; // request-only flag, never persisted
 
+        // The Settings screen renders what GET returned and posts it back, so
+        // masked secrets arrive here as the sentinel. Restore them from disk
+        // before persisting — otherwise saving any unrelated section would
+        // overwrite the tenant's real credentials with a row of bullets.
+        unredactSettings(newSettings, currentSettings);
+
         // Store the tax mode in canonical form. Billing tolerates any casing,
         // but settings.json stays the single tidy source of truth that the
         // Settings dropdown reads back and preselects correctly.
@@ -571,8 +580,10 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         if (!writeJSON(settingsFile, newSettings)) {
             return res.status(500).json({ error: 'Failed to persist settings. Please retry.' });
         }
+        // Extensions get the real document; the browser gets the masked one,
+        // so the client's cached copy round-trips safely on the next save.
         fireHook('onSettingsUpdated', newSettings);
-        res.json({ success: true, settings: newSettings });
+        res.json({ success: true, settings: redactSettings(newSettings) });
     } catch (err) {
         logError('Error updating settings: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to save settings' });
@@ -1308,10 +1319,14 @@ app.get('/api/diagnostics/export', requireAdminSession, (req, res) => {
             salesData[f] = readJSON(path.join(DATA_DIR, f), []);
         });
 
-        // Pack sensitive databases together
+        // Pack sensitive databases together. Settings are masked even here:
+        // diagnosing a tenant needs to know whether SMTP/Razorpay are
+        // configured, never what the credentials are, and the mask preserves
+        // exactly that distinction (empty string = unset). Keeps live tenant
+        // credentials out of support bundles that get emailed around.
         const bundle = {
             timestamp: Date.now(),
-            settings: readJSON(settingsFile, {}),
+            settings: redactSettings(readJSON(settingsFile, {})),
             advances: readJSON(advancesFile, []),
             sales: salesData
         };

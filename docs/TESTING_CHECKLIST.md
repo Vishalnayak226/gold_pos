@@ -31,6 +31,9 @@ should have caught it before you got here.
 
 ## 0. Setup
 
+- [ ] `cd backend && npm test` is green. Three suites run in order: `test_billing_math.js` (pricing/rounding), `test_suite.js` (helper-level integration), then `test_routes.js` (HTTP routes + auth boundary). The third boots a real server on an ephemeral port against a temp data directory, so it is safe to run with a dev server already up on :5000.
+  Result: _____  Notes: ______________________________________________
+
 - [ ] Server starts cleanly (`Restart_Server.bat` or `node backend/server.js`), no red errors in console except the expected "Licensing sync connection failed" if licensing_server isn't running.
   Result: _____  Notes: ______________________________________________
 
@@ -159,6 +162,12 @@ should have caught it before you got here.
 - [ ] Click "Clear Logo" → preview clears; Save → logo removed from invoice too.
   Result: _____  Notes: ______________________________________________
 
+- [ ] **Admin PIN is masked.** The Admin PIN box shows `••••••••`, not the real PIN. Edit Company Name only and Save, then log out and log back in with your *existing* PIN → it still works (saving an unrelated field must not overwrite the PIN with the mask).
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Type a new PIN over the mask (e.g. `4321`) → Save → log out → the new PIN works and the old one does not. Set it back afterwards.
+  Result: _____  Notes: ______________________________________________
+
 ---
 
 ## 6. Settings → Gold Pricing & Overrides
@@ -198,6 +207,12 @@ should have caught it before you got here.
 - [ ] Set a UPI ID (e.g. `teststore@upi`), Save → go to Customer Portal deposit flow, select Manual UPI → a real scannable QR now renders (previously showed "not configured").
   Result: _____  Notes: ______________________________________________
 
+- [ ] **Key Secret is masked.** Key ID stays readable (it is public by design); Key Secret shows as a masked field. With DevTools → Network open, reload Settings and inspect the `GET /api/settings` response → `razorpayKeySecret` is `••••••••` and the real secret appears nowhere in the payload.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Change only the UPI ID and Save → mock checkout still works, proving the untouched Key Secret was preserved rather than overwritten by the mask.
+  Result: _____  Notes: ______________________________________________
+
 ---
 
 ## 9. Settings → Backup & Email Reports
@@ -209,6 +224,12 @@ should have caught it before you got here.
   Result: _____  Notes: ______________________________________________
 
 - [ ] (Optional, needs a real/test SMTP account e.g. Ethereal or Gmail App Password — see `docs/GO_LIVE_CHECKLIST.md` §"Email Reports") Fill SMTP host/port/user/pass, Save, then "Send Daily Report Now" again → status shows success and the report actually arrives at Report Email Address.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **SMTP Password is masked.** After the save above, reload Settings → the password box shows a mask, and `GET /api/settings` in DevTools → Network contains no plaintext password. Before it was configured the box was empty — an empty box means "not set", a mask means "set but hidden".
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Change only the "From" Display Name and Save, then "Send Daily Report Now" → the email still sends, proving the masked password round-tripped instead of being overwritten.
   Result: _____  Notes: ______________________________________________
 
 ---
@@ -231,7 +252,7 @@ should have caught it before you got here.
 - [ ] Click "Pull Technical Logs" (Level 1) → debug drawer logs uptime, heap usage, telemetry count, recent error count.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Click the Level 2 encrypted database export button → drawer confirms an encrypted envelope was generated (not human-readable here by design — decrypted offline only).
+- [ ] Click the Level 2 encrypted database export button → drawer confirms an encrypted envelope was generated (not human-readable here by design — decrypted offline only). Note: the settings inside the bundle are credential-masked, so a decrypted support export shows whether SMTP/Razorpay are configured but never the values.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Click the black-box flight-recorder export button → drawer confirms export ready, decryptable only via `developer_blackbox_keys/analyze_blackbox.js`.
