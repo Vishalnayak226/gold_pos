@@ -19,21 +19,27 @@ This document contains key architectural details, non-negotiable design guidelin
 - **Run `cd backend && npm install` after checking out `main`.** Phase 21 bumped nodemailer to
   `^9.0.5` and node-cron to `^4.6.0`; a `node_modules/` left over from before the merge still has
   nodemailer 6 / node-cron 3 and will pass tests while running the old, vulnerable code.
-- **Branches:** `phase-21-hardening` was fast-forward-merged into `main` and deleted; its
-  worktree at `../gold-pos-hardening` was removed. `phase-20.1-customer-auth` still exists and is
-  fully contained in `main` — it is the branch the main checkout sits on, so it was left alone.
-- **⚠️ Uncommitted in the main checkout, as of 2026-08-08:** a concurrent session's in-flight
-  work, **not reviewed or committed by the Phase 21 session** — a `writeJSONTransaction()`
-  crash-recovery layer in `backend/db.js`, advance-ledger status helpers
-  (`normalizeAdvanceStatus`, `ADVANCE_STATUS`) in `frontend/js/lib/billingMath.js`, ~318 lines of
-  `backend/server.js`, a new `backend/.env.example`, and `helmet@^8.3.0` added to
-  `backend/package.json` but not yet imported anywhere.
-  - That work predates the Phase 21 merge, so **`backend/db.js`, `backend/server.js` and
-    `backend/package.json` in the working tree may now be stale against `main`.** Diff them
-    against `main` before committing — Phase 21 touched the settings routes in `server.js`, the
-    `DATA_DIR`/`LOGS_DIR` constants in `db.js`, and the dependency block in `package.json`.
-  - `helmet` would take the dependency budget from 6 to 7 (CLAUDE.md §0) — a deliberate call
-    someone still needs to make.
+- **Branches:** `phase-21-hardening` was fast-forward-merged into `main` and deleted, and its
+  worktree removed. `develop` and `staging` are both still back at `e4999bc` (Phase 19).
+- **⚠️ `phase-20.1-customer-auth` has DIVERGED from `main` — it is not a leftover label.** A
+  concurrent session committed `5bfc950` "Harden payments and make sales atomic" onto it during
+  the Phase 21 build. Both branches share the merge base `a3ad346` and each has moved on since:
+
+  | Branch | Tip | Contains |
+  | :--- | :--- | :--- |
+  | `main` | `1e64642` | Phases 1–21 (redaction, dep bumps, route suite) |
+  | `phase-20.1-customer-auth` | `5bfc950` | `a3ad346` + payments/atomic-sales hardening |
+
+  `5bfc950` adds a `writeJSONTransaction()` crash-recovery layer to `backend/db.js`,
+  advance-ledger status helpers (`normalizeAdvanceStatus`, `ADVANCE_STATUS`) to
+  `frontend/js/lib/billingMath.js`, ~325 lines to `backend/server.js`, a `backend/.env.example`,
+  and `helmet@^8.3.0` to `backend/package.json`. **It was not reviewed by the Phase 21 session.**
+  - **Merging it into `main` will conflict.** `backend/db.js`, `backend/server.js` and
+    `backend/package.json` were modified by both sides. Phase 21 touched the settings routes in
+    `server.js`, the `DATA_DIR`/`LOGS_DIR` constants in `db.js`, and the dependency block in
+    `package.json` — expect to resolve all three by hand rather than trusting a clean auto-merge.
+  - `helmet` is in that commit's `package.json` but imported nowhere, and would take the
+    dependency budget from 6 to 7 (CLAUDE.md §0) — a deliberate call someone still needs to make.
 - **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060).
 - **Concurrent-session risk:** actively realised right now, see above. Run `git status`/`git diff`
   and stage only files you reviewed — never `git add -A`.
@@ -46,13 +52,14 @@ This document contains key architectural details, non-negotiable design guidelin
   shapes; and `backend/test_routes.js` boots the real server against a temp data dir for 27
   route/auth-boundary/persistence-failure checks. 57 billing + 6 integration + 27 route checks
   green. Detail in `docs/LEDGER.md`; manual steps in `docs/TESTING_CHECKLIST.md` §0, §5, §8, §9.
-- **Next session should start with:** reconciling the concurrent session's uncommitted set
-  (above) against the new `main`, since Phase 21 moved three of the same files underneath it.
+- **Next session should start with:** merging `phase-20.1-customer-auth` (`5bfc950`) into `main`
+  and resolving the three-file conflict described above — that is the one outstanding piece of
+  work, and it gets more painful the longer the two tips sit apart. Run `cd backend && npm test`
+  after resolving; the route suite will catch it if the settings routes get mangled in the merge.
   After that, `main` is a candidate for its first push — `origin/main` is 21 phases behind, and
-  nothing in the repo has ever been pushed past `e4999bc`. The scheme module's phases (20.2–20.5,
-  note the numbering: Phase 21 deliberately skips past them) remain blocked on the seven product
-  decisions in `SCHEME_MODULE_PLAN.md` §7; `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the
-  unblocked queue.
+  nothing has ever been pushed past `e4999bc`. The scheme module's phases (20.2–20.5, note the
+  numbering: Phase 21 deliberately skips past them) remain blocked on the seven product decisions
+  in `SCHEME_MODULE_PLAN.md` §7; `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the unblocked queue.
 
 ---
 
