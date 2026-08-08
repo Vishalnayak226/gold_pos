@@ -403,12 +403,24 @@ app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
             amount,
             paymentMethod: 'UPI',
             referenceId: String(referenceId).trim().slice(0, 100),
+            // PENDING, not approved. Nothing here has been verified: the customer
+            // has typed an amount and a reference they assert they sent. Crediting
+            // that instantly made the portal a self-service way to award yourself
+            // an arbitrary advance balance and redeem it against a real bill.
             status: ADVANCE_STATUS.PENDING
         });
         if (!result.success) {
-            return res.status(result.error.startsWith('Failed to persist') ? 500 : 400).json({ error: result.error });
+            const status = result.code === 'DUPLICATE_REFERENCE' ? 409
+                : result.error.startsWith('Failed to persist') ? 500 : 400;
+            return res.status(status).json({ error: result.error, code: result.code });
         }
-        res.json({ success: true, id: result.deposit.id, deposit: result.deposit });
+        res.json({
+            success: true,
+            id: result.deposit.id,
+            deposit: result.deposit,
+            status: result.deposit.status,
+            message: 'Submitted for verification. Your balance updates once the store confirms the transfer.'
+        });
     } catch (err) {
         logError('Customer advance deposit failed: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to submit your deposit.' });
@@ -1166,11 +1178,86 @@ function createRazorpayOrder(amount, keyId, keySecret) {
     });
 }
 
+/* --------------------------------------------------------------------------
+   Payment order records
+
+   The gateway handshake spans two requests: the browser asks us to create an
+   order, then comes back claiming it paid. Nothing tied those two halves
+   together before, so /api/payment/verify had to believe req.body.amount —
+   meaning a customer could create a ₹100 order, pay ₹100, and post back
+   amount: 500000 to have half a lakh credited to their ledger. The signature
+   could not catch it: Razorpay's HMAC covers order_id|payment_id only, with no
+   amount in the signed text at all.
+
+   Persisting what each order was actually FOR closes that. Verification reads
+   the amount from this file and ignores the body's entirely.
+   -------------------------------------------------------------------------- */
+
+const PAYMENT_ORDERS_FILE = () => path.join(DATA_DIR, 'payment_orders.json');
+
+// An order is a short-lived intent, not history worth keeping — the ledger is
+// the permanent record. Keeping the file bounded stops an abandoned-checkout
+// habit growing it without limit.
+const PAYMENT_ORDER_TTL_MS = 24 * 60 * 60 * 1000;
+const PAYMENT_ORDER_MAX_ROWS = 2000;
+
+/**
+ * Records what an order was created for, so verification has an
+ * server-side amount to trust instead of the client's claim.
+ * @returns {boolean} false if the record could not be persisted
+ */
+function recordPaymentOrder({ orderId, customerPhone, amount }) {
+    const file = PAYMENT_ORDERS_FILE();
+    const now = Date.now();
+    const orders = readJSON(file, [])
+        // Prune on write — a settled or long-expired order has no further use,
+        // and this is the only moment the file is already open.
+        .filter(o => o && o.orderId &&
+            (now - (o.createdAt || 0) < PAYMENT_ORDER_TTL_MS) &&
+            o.orderId !== orderId)
+        .slice(-PAYMENT_ORDER_MAX_ROWS);
+
+    orders.push({
+        orderId,
+        customerPhone,
+        amount: round2(amount),
+        status: 'created',
+        createdAt: now
+    });
+    return writeJSONTransaction([{ filepath: file, data: orders }]);
+}
+
+/** The stored order behind an order id, or null if we never created it. */
+function findPaymentOrder(orderId) {
+    return readJSON(PAYMENT_ORDERS_FILE(), [])
+        .find(o => o && o.orderId === orderId) || null;
+}
+
+/** Marks an order settled, linking it to the payment and the ledger row. */
+function markPaymentOrderPaid(orderId, paymentId, depositId) {
+    const file = PAYMENT_ORDERS_FILE();
+    const orders = readJSON(file, []);
+    const index = orders.findIndex(o => o && o.orderId === orderId);
+    if (index === -1) return;
+    orders[index] = {
+        ...orders[index],
+        status: 'paid',
+        paymentId,
+        depositId,
+        paidAt: Date.now()
+    };
+    writeJSONTransaction([{ filepath: file, data: orders }]);
+}
+
 /**
  * POST /api/payment/order
  * Initiates order with Razorpay. Returns orderId. Customer-session-gated: an
  * unauthenticated caller could otherwise mint orders against the store's
  * Razorpay account at will.
+ *
+ * The order is recorded against the session's phone before the id goes back to
+ * the browser — that record is what binds the eventual payment to both a
+ * customer and an amount.
  */
 app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
     const startTime = Date.now();
@@ -1199,17 +1286,30 @@ app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
         // Local/demo checkout is never reachable in a production process.
         if (MOCK_PAYMENTS_ENABLED && keyId === MOCK_RAZORPAY_KEY_ID && keySecret === MOCK_RAZORPAY_SECRET) {
             const mockOrderId = 'order_mock_' + Math.random().toString(36).substring(2, 9);
-            logTelemetry('PAYMENT_ORDER_MOCKED', 0, `Order: ${mockOrderId}, Amt: ${amount}`);
+            // Mock orders are persisted too, so the demo path exercises the same
+            // amount-binding the real one does instead of diverging from it.
+            if (!recordPaymentOrder({ orderId: mockOrderId, customerPhone: req.customerPhone, amount: numAmount })) {
+                return res.status(500).json({ error: 'Could not start the payment. Please retry.' });
+            }
+            logTelemetry('PAYMENT_ORDER_MOCKED', 0, `Order: ${mockOrderId}, Amt: ${numAmount}`);
             return res.json({
                 success: true,
                 keyId,
-                order: { id: mockOrderId, amount: parseFloat(amount) * 100 }
+                order: { id: mockOrderId, amount: Math.round(numAmount * 100) }
             });
         }
 
-        const order = await createRazorpayOrder(amount, keyId, keySecret);
-        
-        logTelemetry('PAYMENT_ORDER_CREATED', Date.now() - startTime, `Order: ${order.id}, Amt: ${amount}`);
+        const order = await createRazorpayOrder(numAmount, keyId, keySecret);
+
+        // Recorded BEFORE the id reaches the browser: an order the customer can
+        // pay but that we have no record of would be unverifiable, and the
+        // customer would be out of pocket with nothing to show for it.
+        if (!recordPaymentOrder({ orderId: order.id, customerPhone: req.customerPhone, amount: numAmount })) {
+            logError(`Razorpay order ${order.id} was created at the gateway but could not be recorded locally — not returning it to the customer.`);
+            return res.status(500).json({ error: 'Could not start the payment. Please retry.' });
+        }
+
+        logTelemetry('PAYMENT_ORDER_CREATED', Date.now() - startTime, `Order: ${order.id}, Amt: ${numAmount}`);
         res.json({
             success: true,
             keyId,
@@ -1229,21 +1329,22 @@ app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
  */
 app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
     try {
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, amount } = req.body;
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
         const customerPhone = req.customerPhone;
         const customerName = (req.customerAccount && req.customerAccount.name) || 'Regular Customer';
 
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amount) {
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
             return res.status(400).json({ error: 'Missing payment details for verification' });
-        }
-        const numAmount = parseFloat(amount);
-        if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
-            return res.status(400).json({ error: 'Valid payment amount required' });
         }
 
         // Idempotency: a retried or replayed verify call (flaky mobile network,
         // a double-tapped handler, a captured request) must not credit the
         // same gateway payment twice.
+        //
+        // Deliberately ahead of the order lookup below: order records are pruned
+        // after PAYMENT_ORDER_TTL_MS, so a late replay of a payment that WAS
+        // credited must still be answered with its ledger row rather than the
+        // "order not recognised" error a pruned lookup would produce.
         const alreadyRecorded = readJSON(path.join(DATA_DIR, 'advances.json'), [])
             .find(a => a.referenceId && a.referenceId === razorpay_payment_id);
         if (alreadyRecorded) {
@@ -1254,6 +1355,29 @@ app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
                 duplicate: true,
                 message: 'This payment was already recorded.'
             });
+        }
+
+        // The amount comes from the order WE created and stored, never from the
+        // request body — see the payment order records block above for why the
+        // signature cannot police this. req.body.amount is deliberately not
+        // read here at all; the portal no longer sends it.
+        const storedOrder = findPaymentOrder(razorpay_order_id);
+        if (!storedOrder) {
+            logTelemetry('PAYMENT_VERIFY_UNKNOWN_ORDER', 0, `Order: ${razorpay_order_id}`);
+            return res.status(400).json({
+                error: 'This payment order is not recognised. If you were charged, contact the store with your payment ID: ' + razorpay_payment_id
+            });
+        }
+        // An order belongs to the customer who opened it. Without this a signed-in
+        // customer could verify somebody else's order id and take the credit.
+        if (storedOrder.customerPhone !== customerPhone) {
+            logError(`Customer ${customerPhone} attempted to verify payment order ${razorpay_order_id}, which belongs to another customer.`);
+            return res.status(403).json({ error: 'This payment order does not belong to your account.' });
+        }
+        const numAmount = parseFloat(storedOrder.amount);
+        if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
+            logError(`Payment order ${razorpay_order_id} carries an unusable stored amount (${storedOrder.amount}).`);
+            return res.status(500).json({ error: 'This payment order is not in a verifiable state. Please contact the store.' });
         }
 
         const settingsFile = path.join(DATA_DIR, 'settings.json');
@@ -1286,12 +1410,16 @@ app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
         }
 
         // Success! Log the advance deposit through the shared write path.
+        // Approved on arrival, with no counter review: a matching signature is
+        // proof the gateway took the money, which is exactly the confirmation a
+        // cashier would otherwise be supplying by hand for a manual UPI claim.
         const result = recordAdvanceDeposit({
             customerPhone,
             customerName,
             amount: numAmount,
             paymentMethod: 'Razorpay',
-            referenceId: razorpay_payment_id
+            referenceId: razorpay_payment_id,
+            status: ADVANCE_STATUS.APPROVED
         });
 
         if (!result.success) {
@@ -1302,10 +1430,16 @@ app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
             return res.status(500).json({ error: 'Payment verified but could not be recorded. Please contact support with your payment ID: ' + razorpay_payment_id });
         }
 
+        // Settle the order record last: the ledger row above is the entry that
+        // matters, and a failure to annotate the order must not fail a payment
+        // that has already been credited.
+        markPaymentOrderPaid(razorpay_order_id, razorpay_payment_id, result.deposit.id);
+
         logTelemetry('PAYMENT_VERIFIED_SUCCESS', 0, `Invoice: ${result.deposit.id}, PayId: ${razorpay_payment_id}`);
         res.json({
             success: true,
             id: result.deposit.id,
+            amount: result.deposit.amount,
             message: 'Payment verified and logged successfully'
         });
     } catch (err) {

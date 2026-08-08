@@ -19,7 +19,13 @@ import {
     makingChargeFromPercent,
     makingPercentFromAmount,
     normalizeTaxMode,
-    round2
+    round2,
+    ADVANCE_STATUS,
+    advanceEntryDelta,
+    computeAdvanceBalance,
+    isCountableAdvance,
+    normalizeAdvanceStatus,
+    summarizeAdvanceLedger
 } from '../frontend/js/lib/billingMath.js';
 
 /* ==========================================================================
@@ -634,6 +640,122 @@ check('a sub-paise advance cannot leave a fractional balance owing', () => {
     });
     if (!isPaiseExact(t.appliedAdvance)) throw new Error(`appliedAdvance ${t.appliedAdvance}`);
     if (!isPaiseExact(t.totalAmount)) throw new Error(`totalAmount ${t.totalAmount}`);
+});
+
+/* ==========================================================================
+   Advance ledger status arithmetic
+
+   The rule under test: a deposit only becomes spendable balance once the store
+   has confirmed it. The portal used to credit a customer-asserted UPI transfer
+   instantly, which made it a self-service way to mint an advance balance and
+   redeem it against a real bill.
+
+   The backward-compatibility case is the one that matters most in practice —
+   every advance row already sitting in a live backend/data/advances.json
+   predates the status field and is real money the store took.
+   ========================================================================== */
+group('11. Advance ledger deposit status');
+
+const deposit = (amount, status) => ({ type: 'deposit', amount, ...(status ? { status } : {}) });
+const redeem = (amount) => ({ type: 'redeem', amount });
+
+check('a status-less deposit still counts — existing ledgers keep their balances', () => {
+    if (normalizeAdvanceStatus(deposit(5000)) !== ADVANCE_STATUS.APPROVED) {
+        throw new Error('a missing status must read as approved');
+    }
+    exact(computeAdvanceBalance([deposit(5000), deposit(2500)]), 7500, 'legacy balance');
+});
+
+check('an approved deposit counts toward the balance', () => {
+    exact(computeAdvanceBalance([deposit(5000, 'approved')]), 5000, 'approved balance');
+});
+
+check('a pending deposit contributes nothing — the whole point of the state', () => {
+    if (isCountableAdvance(deposit(5000, 'pending'))) throw new Error('pending must not be countable');
+    exact(advanceEntryDelta(deposit(5000, 'pending')), 0, 'pending delta');
+    exact(computeAdvanceBalance([deposit(5000, 'pending')]), 0, 'pending balance');
+});
+
+check('a rejected deposit contributes nothing', () => {
+    exact(advanceEntryDelta(deposit(5000, 'rejected')), 0, 'rejected delta');
+    exact(computeAdvanceBalance([deposit(5000, 'rejected')]), 0, 'rejected balance');
+});
+
+check('a mixed ledger counts only what the store has confirmed', () => {
+    const ledger = [
+        deposit(10000),             // legacy row, counts
+        deposit(5000, 'approved'),  // counts
+        deposit(50000, 'pending'),  // must NOT count
+        deposit(9000, 'rejected'),  // must NOT count
+        redeem(3000)                // subtracts
+    ];
+    exact(computeAdvanceBalance(ledger), 12000, 'mixed balance');
+});
+
+check('an unapproved claim cannot be redeemed against a bill', () => {
+    // The end-to-end version of the exploit: a customer submits ₹50,000 they
+    // never sent, then tries to spend it. The balance the invoice pipeline is
+    // handed must be 0, so the redemption clamps to nothing.
+    const balance = computeAdvanceBalance([deposit(50000, 'pending')]);
+    const t = computeInvoiceTotals({
+        metalValue: 60000, appliedAdvance: 50000, customerAdvanceBalance: balance
+    });
+    exact(t.appliedAdvance, 0, 'appliedAdvance');
+    exact(t.totalAmount, 60000, 'totalAmount');
+});
+
+check('redemptions always count — they carry no approval step', () => {
+    if (!isCountableAdvance(redeem(1000))) throw new Error('a redemption must always count');
+    exact(advanceEntryDelta(redeem(1000)), -1000, 'redeem delta');
+});
+
+check('status matching is case- and whitespace-insensitive', () => {
+    for (const variant of ['PENDING', ' pending ', 'Pending']) {
+        exact(computeAdvanceBalance([deposit(5000, variant)]), 0, `variant "${variant}"`);
+    }
+});
+
+check('an unrecognised status falls back to approved, never to silently zero', () => {
+    // Safe direction: a garbled or hand-edited status must not make real money
+    // disappear from a customer's balance.
+    exact(computeAdvanceBalance([deposit(5000, 'garbage')]), 5000, 'unknown status balance');
+});
+
+check('the balance never goes negative', () => {
+    exact(computeAdvanceBalance([deposit(1000), redeem(5000)]), 0, 'over-redeemed balance');
+});
+
+check('a negative or absurd amount cannot inflate the balance', () => {
+    // A hand-edited or corrupted row must not turn a redemption into a credit.
+    exact(advanceEntryDelta({ type: 'redeem', amount: -5000 }), -5000, 'negative redeem');
+    exact(advanceEntryDelta({ type: 'deposit', amount: -5000 }), 5000, 'negative deposit magnitude');
+    exact(computeAdvanceBalance([deposit('not a number')]), 0, 'non-numeric amount');
+});
+
+check('summarizeAdvanceLedger reports pending separately from the balance', () => {
+    const s = summarizeAdvanceLedger([
+        deposit(10000, 'approved'),
+        deposit(2500, 'pending'),
+        deposit(1500, 'pending'),
+        deposit(9000, 'rejected')
+    ]);
+    exact(s.balance, 10000, 'balance');
+    exact(s.pendingTotal, 4000, 'pendingTotal');
+    exact(s.pendingCount, 2, 'pendingCount');
+});
+
+check('an empty or malformed ledger summarises to zeroes rather than NaN', () => {
+    exact(computeAdvanceBalance([]), 0, 'empty balance');
+    exact(computeAdvanceBalance(null), 0, 'null balance');
+    const s = summarizeAdvanceLedger([null, undefined, {}, { type: 'deposit' }]);
+    if (!Number.isFinite(s.balance) || !Number.isFinite(s.pendingTotal)) {
+        throw new Error(`summary produced a non-finite figure: ${JSON.stringify(s)}`);
+    }
+});
+
+check('pending totals settle to paise', () => {
+    const s = summarizeAdvanceLedger([deposit(1000.005, 'pending'), deposit(0.004, 'pending')]);
+    if (!isPaiseExact(s.pendingTotal)) throw new Error(`pendingTotal ${s.pendingTotal}`);
 });
 
 /* ==========================================================================

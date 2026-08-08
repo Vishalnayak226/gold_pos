@@ -1,4 +1,7 @@
 import { logTelemetry, adminFetch } from '../app.js';
+import {
+    ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus, summarizeAdvanceLedger
+} from '../lib/billingMath.js';
 
 const PURITY_LABELS = { '24K': '24K Gold', '22K': '22K Gold', '18K': '18K Gold' };
 const PURITY_SWATCH_CLASS = { '24K': 'swatch-24k', '22K': 'swatch-22k', '18K': 'swatch-18k' };
@@ -54,6 +57,7 @@ export class Dashboard {
                     <h3 class="stat-tile-label">Outstanding Advances</h3>
                     <p class="stat-tile-value" id="stat-outstanding-advances">₹0.00</p>
                     <p class="stat-tile-sub" id="stat-outstanding-customers">0 customers</p>
+                    <p class="stat-tile-sub" id="stat-pending-advances" style="color:var(--color-warning); font-weight:600;"></p>
                 </div>
                 <div class="stat-tile">
                     <h3 class="stat-tile-label">Active Gold Rate (22K)</h3>
@@ -142,11 +146,13 @@ export class Dashboard {
         this.setText('stat-mtd-revenue', `₹${sum(mtdSales).toLocaleString('en-IN')}`);
         this.setText('stat-mtd-count', `${mtdSales.length} invoice${mtdSales.length === 1 ? '' : 's'}`);
 
-        // Outstanding advance balance per customer: deposits minus redemptions, floored at 0
+        // Outstanding advance balance per customer: deposits minus redemptions,
+        // floored at 0. advanceEntryDelta() is the shared rule — it returns 0 for
+        // a deposit still awaiting counter approval, so an unverified customer
+        // claim cannot inflate the store's liability figure on this tile.
         const balances = new Map();
         advances.forEach(a => {
-            const delta = a.type === 'deposit' ? parseFloat(a.amount) : -parseFloat(a.amount);
-            balances.set(a.customerPhone, (balances.get(a.customerPhone) || 0) + (delta || 0));
+            balances.set(a.customerPhone, (balances.get(a.customerPhone) || 0) + advanceEntryDelta(a));
         });
         let outstandingTotal = 0;
         let outstandingCustomers = 0;
@@ -158,6 +164,17 @@ export class Dashboard {
         });
         this.setText('stat-outstanding-advances', `₹${outstandingTotal.toLocaleString('en-IN')}`);
         this.setText('stat-outstanding-customers', `${outstandingCustomers} customer${outstandingCustomers === 1 ? '' : 's'}`);
+
+        // Awaiting-approval callout: money customers say they have sent that no
+        // one has confirmed yet. Deliberately NOT added to the tile above — the
+        // point of the pending state is that it is not yet a liability.
+        const pendingSummary = summarizeAdvanceLedger(advances);
+        const pendingNote = document.getElementById('stat-pending-advances');
+        if (pendingNote) {
+            pendingNote.textContent = pendingSummary.pendingCount > 0
+                ? `₹${pendingSummary.pendingTotal.toLocaleString('en-IN')} awaiting approval (${pendingSummary.pendingCount})`
+                : '';
+        }
 
         if (rate) {
             this.setText('stat-gold-rate', `₹${(rate.price22K || 0).toLocaleString('en-IN')}/g`);
@@ -248,18 +265,27 @@ export class Dashboard {
             return;
         }
 
-        list.innerHTML = recentDeposits.map(a => `
-            <div class="recent-list-item">
+        list.innerHTML = recentDeposits.map(a => {
+            // An unapproved claim in this list must not read as money received.
+            const counts = advanceEntryDelta(a) !== 0;
+            const status = normalizeAdvanceStatus(a);
+            const tag = counts ? ''
+                : status === ADVANCE_STATUS.REJECTED
+                    ? ' <span style="font-size:10px; font-weight:700; color:var(--color-danger);">REJECTED</span>'
+                    : ' <span style="font-size:10px; font-weight:700; color:var(--color-warning);">PENDING</span>';
+            return `
+            <div class="recent-list-item"${counts ? '' : ' style="opacity:0.6;"'}>
                 <div>
-                    <strong>${escapeHtml(a.customerName || 'Regular Customer')}</strong>
+                    <strong>${escapeHtml(a.customerName || 'Regular Customer')}</strong>${tag}
                     <div class="text-muted-small">${escapeHtml(a.customerPhone || '')} · ${escapeHtml(a.paymentMethod || 'UPI')}</div>
                 </div>
                 <div class="text-right">
-                    <strong>₹${(parseFloat(a.amount) || 0).toLocaleString('en-IN')}</strong>
+                    <strong${counts ? '' : ' style="text-decoration:line-through; color:var(--color-text-light);"'}>₹${(parseFloat(a.amount) || 0).toLocaleString('en-IN')}</strong>
                     <div class="text-muted-small">${new Date(a.timestamp).toLocaleString()}</div>
                 </div>
             </div>
-        `).join('');
+            `;
+        }).join('');
     }
 
     setText(id, text) {

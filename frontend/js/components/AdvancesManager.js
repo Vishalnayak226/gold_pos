@@ -1,4 +1,7 @@
 import { adminFetch, logTelemetry } from '../app.js';
+import {
+    ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus, summarizeAdvanceLedger
+} from '../lib/billingMath.js';
 
 /**
  * Escapes HTML-significant characters. Advance records can contain
@@ -24,6 +27,7 @@ function escapeHtml(value) {
 export class AdvancesManager {
     constructor() {
         this.advances = [];
+        this.pending = [];
         this.expandedPhone = null;
         this.render();
     }
@@ -33,6 +37,8 @@ export class AdvancesManager {
         if (!container) return;
 
         container.innerHTML = `
+            <div id="pending-approvals"></div>
+
             <div class="advances-toolbar">
                 <input type="text" id="advances-search" class="form-control" placeholder="Search by phone or name...">
                 <button type="button" id="advances-refresh-btn" class="btn btn-secondary">Refresh</button>
@@ -96,12 +102,134 @@ export class AdvancesManager {
 
     async refresh() {
         try {
-            const res = await adminFetch('/api/advances');
-            this.advances = res.ok ? await res.json() : [];
+            const [ledgerRes, pendingRes] = await Promise.all([
+                adminFetch('/api/advances'),
+                adminFetch('/api/advances/pending')
+            ]);
+            this.advances = ledgerRes.ok ? await ledgerRes.json() : [];
+            this.pending = pendingRes.ok ? await pendingRes.json() : [];
+            this.renderPendingApprovals();
             this.renderTable();
-            logTelemetry('Advances ledger refreshed.');
+            logTelemetry(`Advances ledger refreshed (${this.pending.length} awaiting approval).`);
         } catch (err) {
             console.error('Failed to load advances ledger:', err);
+        }
+    }
+
+    /**
+     * The approval queue, above the ledger because it is the only part of this
+     * tab with work outstanding in it. Customer-submitted UPI deposits arrive
+     * unverified and hold no balance until a cashier confirms the transfer
+     * landed — see ADVANCE_STATUS in frontend/js/lib/billingMath.js.
+     */
+    renderPendingApprovals() {
+        const host = document.getElementById('pending-approvals');
+        if (!host) return;
+
+        if (!this.pending || this.pending.length === 0) {
+            host.innerHTML = '';
+            return;
+        }
+
+        const total = this.pending.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+
+        host.innerHTML = `
+            <div style="border:1px solid var(--color-warning); background:var(--color-warning-bg); border-radius:10px; padding:18px; margin-bottom:22px;">
+                <div style="display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:6px;">
+                    <h3 style="margin:0; font-size:14px; color:var(--color-warning); text-transform:uppercase; letter-spacing:0.03em;">
+                        ${this.pending.length} deposit${this.pending.length === 1 ? '' : 's'} awaiting verification
+                    </h3>
+                    <strong style="font-size:15px; color:var(--color-text-main);">₹${total.toLocaleString('en-IN')}</strong>
+                </div>
+                <p style="font-size:12px; color:var(--color-text-muted); margin:0 0 14px; max-width:80ch;">
+                    Customers submitted these from the portal. Check each reference against the store's bank or UPI
+                    statement before approving — <strong>none of this money is in any customer's balance yet</strong>,
+                    and approving is what credits it.
+                </p>
+                <div style="display:flex; flex-direction:column; gap:10px;">
+                    ${this.pending.map(p => this.renderPendingRow(p)).join('')}
+                </div>
+            </div>
+        `;
+
+        host.querySelectorAll('.approve-deposit-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.reviewDeposit(btn.getAttribute('data-id'), 'approve'));
+        });
+        host.querySelectorAll('.reject-deposit-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.reviewDeposit(btn.getAttribute('data-id'), 'reject'));
+        });
+    }
+
+    renderPendingRow(p) {
+        const waitedMs = Date.now() - (p.timestamp || 0);
+        const waitedHours = Math.floor(waitedMs / 3600000);
+        const waited = waitedHours >= 24
+            ? `${Math.floor(waitedHours / 24)}d ago`
+            : waitedHours >= 1 ? `${waitedHours}h ago` : 'just now';
+
+        return `
+            <div style="background:var(--color-bg-panel); border:1px solid var(--color-border-dark); border-radius:8px; padding:12px 14px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
+                <div style="min-width:0;">
+                    <strong style="font-size:14px;">₹${(parseFloat(p.amount) || 0).toLocaleString('en-IN')}</strong>
+                    <span style="color:var(--color-text-muted); font-size:13px;"> · ${escapeHtml(p.customerName || 'Regular Customer')} (${escapeHtml(p.customerPhone)})</span>
+                    <div class="text-muted-small" style="margin-top:3px;">
+                        ${escapeHtml(p.paymentMethod || 'UPI')} · Ref: <span style="font-family:var(--font-mono);">${escapeHtml(p.referenceId || '—')}</span> · submitted ${waited}
+                    </div>
+                </div>
+                <div style="display:flex; gap:8px; flex-shrink:0;">
+                    <button type="button" class="btn btn-primary btn-sm approve-deposit-btn" data-id="${escapeHtml(p.id)}">Approve</button>
+                    <button type="button" class="btn btn-danger btn-sm reject-deposit-btn" data-id="${escapeHtml(p.id)}">Reject</button>
+                </div>
+            </div>
+        `;
+    }
+
+    /**
+     * Approving credits real money, so it is confirmed rather than one-click.
+     * Rejecting requires a reason the server enforces — the customer has to be
+     * told something more useful than "declined".
+     */
+    async reviewDeposit(depositId, decision) {
+        const entry = this.pending.find(p => p.id === depositId);
+        if (!entry) return;
+        const amount = (parseFloat(entry.amount) || 0).toLocaleString('en-IN');
+        let note = '';
+
+        if (decision === 'approve') {
+            const ok = confirm(
+                `Approve ₹${amount} for ${entry.customerName || entry.customerPhone}?\n\n` +
+                `Reference: ${entry.referenceId || '—'}\n\n` +
+                `This credits the money to their advance balance, where it can be redeemed against a bill. ` +
+                `Only approve once you have found this transfer on the store's statement.`
+            );
+            if (!ok) return;
+        } else {
+            note = (prompt(
+                `Reject ₹${amount} from ${entry.customerName || entry.customerPhone}?\n\n` +
+                `Give a reason (the store's record of why this claim was not credited):`
+            ) || '').trim();
+            if (!note) return;
+        }
+
+        try {
+            const res = await adminFetch(`/api/advances/${encodeURIComponent(depositId)}/${decision}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ note })
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                alert(`Could not ${decision} the deposit: ` + (err.error || `HTTP ${res.status}`));
+                await this.refresh();
+                return;
+            }
+            alert(decision === 'approve'
+                ? `Success: ₹${amount} credited to ${entry.customerPhone}.`
+                : `Deposit rejected. ${entry.customerPhone} has not been credited.`);
+            await this.refresh();
+            if (window.dashboard) window.dashboard.refresh();
+        } catch (err) {
+            alert(`Connection failed while trying to ${decision} the deposit.`);
         }
     }
 
@@ -115,15 +243,20 @@ export class AdvancesManager {
         const map = new Map();
         this.advances.forEach(a => {
             if (!map.has(a.customerPhone)) {
-                map.set(a.customerPhone, { phone: a.customerPhone, name: a.customerName, balance: 0, lastActivity: 0, entries: [] });
+                map.set(a.customerPhone, { phone: a.customerPhone, name: a.customerName, balance: 0, pendingTotal: 0, lastActivity: 0, entries: [] });
             }
             const c = map.get(a.customerPhone);
-            const delta = a.type === 'deposit' ? parseFloat(a.amount) : -parseFloat(a.amount);
-            c.balance += (delta || 0);
+            // Shared with the server's computeAdvanceLedger and the Dashboard
+            // tile: a pending deposit contributes 0 here, so an unverified claim
+            // can never appear as a balance a cashier might redeem against.
+            c.balance += advanceEntryDelta(a);
             c.lastActivity = Math.max(c.lastActivity, a.timestamp || 0);
             c.entries.push(a);
             if (a.type === 'deposit' && a.customerName) c.name = a.customerName;
         });
+        // Second pass so each row can show what is awaiting approval alongside
+        // the spendable figure, rather than the two being indistinguishable.
+        map.forEach(c => { c.pendingTotal = summarizeAdvanceLedger(c.entries).pendingTotal; });
         return Array.from(map.values()).sort((a, b) => b.lastActivity - a.lastActivity);
     }
 
@@ -148,7 +281,10 @@ export class AdvancesManager {
             <tr class="advances-row" data-phone="${escapeHtml(c.phone)}">
                 <td>${escapeHtml(c.phone)}</td>
                 <td>${escapeHtml(c.name || 'Regular Customer')}</td>
-                <td class="text-right">₹${Math.max(0, c.balance).toLocaleString('en-IN')}</td>
+                <td class="text-right">
+                    ₹${Math.max(0, c.balance).toLocaleString('en-IN')}
+                    ${c.pendingTotal > 0 ? `<div class="text-muted-small" style="color:var(--color-warning);">+₹${c.pendingTotal.toLocaleString('en-IN')} pending</div>` : ''}
+                </td>
                 <td>${new Date(c.lastActivity).toLocaleDateString()}</td>
                 <td class="text-right"><button type="button" class="btn btn-secondary btn-sm expand-btn" data-phone="${escapeHtml(c.phone)}">${this.expandedPhone === c.phone ? 'Hide' : 'View'}</button></td>
             </tr>
@@ -170,18 +306,31 @@ export class AdvancesManager {
             <tr class="advances-detail-row">
                 <td colspan="5">
                     <div class="ledger-drilldown">
-                        ${entries.map(e => `
-                            <div class="recent-list-item">
+                        ${entries.map(e => {
+                            const status = normalizeAdvanceStatus(e);
+                            const counts = advanceEntryDelta(e) !== 0;
+                            // A row that holds no balance is greyed and struck
+                            // through, so scanning the ledger cannot leave the
+                            // impression an unverified claim is money on hand.
+                            const tag = e.type !== 'deposit' ? ''
+                                : status === ADVANCE_STATUS.PENDING
+                                    ? ` <span style="font-size:10px; font-weight:700; color:var(--color-warning); background:var(--color-warning-bg); padding:1px 6px; border-radius:8px;">AWAITING APPROVAL</span>`
+                                    : status === ADVANCE_STATUS.REJECTED
+                                        ? ` <span style="font-size:10px; font-weight:700; color:var(--color-danger); background:var(--color-danger-bg); padding:1px 6px; border-radius:8px;">REJECTED</span>`
+                                        : '';
+                            return `
+                            <div class="recent-list-item"${counts ? '' : ' style="opacity:0.6;"'}>
                                 <div>
-                                    <strong>${e.type === 'deposit' ? 'Deposit' : 'Redeemed at Billing'}</strong>
-                                    <div class="text-muted-small">${escapeHtml(e.paymentMethod || (e.invoiceId ? 'Invoice ' + e.invoiceId : ''))}${e.referenceId ? ' · Ref: ' + escapeHtml(e.referenceId) : ''}</div>
+                                    <strong>${e.type === 'deposit' ? 'Deposit' : 'Redeemed at Billing'}</strong>${tag}
+                                    <div class="text-muted-small">${escapeHtml(e.paymentMethod || (e.invoiceId ? 'Invoice ' + e.invoiceId : ''))}${e.referenceId ? ' · Ref: ' + escapeHtml(e.referenceId) : ''}${e.reviewNote ? ' · ' + escapeHtml(e.reviewNote) : ''}</div>
                                 </div>
                                 <div class="text-right">
-                                    <strong class="${e.type === 'deposit' ? 'ledger-amount-positive' : 'ledger-amount-negative'}">${e.type === 'deposit' ? '+' : '-'}₹${(parseFloat(e.amount) || 0).toLocaleString('en-IN')}</strong>
+                                    <strong class="${!counts ? '' : e.type === 'deposit' ? 'ledger-amount-positive' : 'ledger-amount-negative'}"${counts ? '' : ' style="text-decoration:line-through; color:var(--color-text-light);"'}>${e.type === 'deposit' ? '+' : '-'}₹${(parseFloat(e.amount) || 0).toLocaleString('en-IN')}</strong>
                                     <div class="text-muted-small">${new Date(e.timestamp).toLocaleString()}</div>
                                 </div>
                             </div>
-                        `).join('')}
+                            `;
+                        }).join('')}
                     </div>
                 </td>
             </tr>

@@ -106,6 +106,20 @@ existing endpoints.
   customer a valid token pointing at somebody else's site.
 - **Account tab in the portal** — edit name/email, set email notification
   preference, change password.
+- **"Customer Logins" tab in the admin terminal.** The two counter-issued-login
+  endpoints above shipped without any screen behind them, so issuing a login to
+  a customer who already had deposit history — the only supported way for such a
+  customer to get one — was not actually possible from the app. The tab lists
+  every portal login with its state (active, temporary password not yet
+  changed, or locked out and for how long), issues and resets logins, and shows
+  the one-time temporary password in the page rather than in a dismissible
+  alert.
+- **Pending-deposit approval queue** in the Advances tab, showing each claimed
+  transfer with its reference and how long it has been waiting, plus
+  `GET /api/advances/pending` and `POST /api/advances/:id/approve|reject`.
+- New `backend/data/payment_orders.json`, seeded on boot — what each payment
+  order was created for. Pruned automatically (24-hour retention); the advance
+  ledger remains the permanent record.
 - New `backend/data/customer_auth.json`, seeded on boot. Excluded from the
   Level-2 diagnostics export bundle: a support export should never carry
   credential material off the tenant's machine, even encrypted. Only scrypt
@@ -120,10 +134,39 @@ existing endpoints.
 - The portal's onboarding screen (first/last name, DOB, anniversary) is gone —
   the name now comes from the account at registration. The DOB and anniversary
   fields were never persisted anywhere, so no data is lost.
-- **Known gap, unchanged by this release:** a manual-UPI deposit still posts a
-  real ledger credit on nothing more than a customer-typed reference string.
-  Converting it to a pending claim awaiting manager reconciliation is tracked
-  as a P0 in `docs/PRODUCTION_READINESS_ROADMAP.md` §3.
+- **A manual-UPI deposit is now a claim, not a credit** (this closes the gap
+  this section previously listed as outstanding). Submitting a UPI reference
+  from the portal records the deposit as **pending**: the customer sees the
+  amount acknowledged as "awaiting the store's confirmation", but it adds
+  nothing to their balance and cannot be redeemed against a bill until a
+  cashier approves it. Previously an authenticated customer could type any
+  amount with any invented reference and immediately hold spendable credit.
+  Approve/reject lives in the Advances tab; rejecting requires a reason and the
+  row is kept for the record rather than deleted.
+- **Payment amounts are bound to the order the store created.** Razorpay's
+  signature covers `order_id|payment_id` only — the amount is not in the signed
+  text — so `POST /api/payment/verify` used to credit whatever `amount` the
+  caller put in the request body. A customer could create a ₹100 order, pay it,
+  and post back ₹500,000. Orders are now persisted at creation with the
+  customer and the amount, and verification credits the **stored** amount,
+  ignoring the body entirely. An order can also only be verified by the
+  customer who opened it, and an unrecognised order id is refused.
+- **A payment reference can only be used once.** The same UTR submitted twice
+  is refused (case- and whitespace-insensitive), so one real transfer cannot be
+  claimed repeatedly across several plausible-looking rows.
+- **Deposit rows gained a `status` field.** Existing rows without one are
+  treated as approved, so no tenant's balances change on upgrade — this is
+  additive and backward-compatible.
+
+### Fixed
+
+- **The Dashboard's "Outstanding Advances" tile, the Advances tab's
+  per-customer balances, and the server's own ledger calculation each summed
+  the advances file separately.** They now share one set of helpers in
+  `frontend/js/lib/billingMath.js`, so a deposit awaiting approval cannot show
+  up as spendable credit in one place while being excluded in another. The
+  customer portal's Gold Appreciation panel uses the same rule, so the grams it
+  reports match the balance shown above it.
 
 ## [1.2.0] — 2026-08-07
 

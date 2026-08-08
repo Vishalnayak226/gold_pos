@@ -7,6 +7,7 @@
 import { BillingDesk } from './components/BillingDesk.js';
 import { Dashboard } from './components/Dashboard.js';
 import { AdvancesManager } from './components/AdvancesManager.js';
+import { CustomerAccountsManager } from './components/CustomerAccountsManager.js';
 import { SettingsManager } from './components/SettingsManager.js';
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -18,10 +19,12 @@ document.addEventListener('DOMContentLoaded', () => {
     window.billingDesk = new BillingDesk();
     window.dashboard = new Dashboard();
     window.advancesManager = new AdvancesManager();
+    window.customerAccountsManager = new CustomerAccountsManager();
     window.settingsManager = new SettingsManager();
     if (sessionStorage.getItem('adminToken')) {
         window.dashboard.refresh();
         window.advancesManager.refresh();
+        window.customerAccountsManager.refresh();
         window.settingsManager.refresh();
     }
 
@@ -48,6 +51,7 @@ async function loadFrontendExtension() {
                 billingDesk: window.billingDesk,
                 dashboard: window.dashboard,
                 advancesManager: window.advancesManager,
+                customerAccountsManager: window.customerAccountsManager,
                 settingsManager: window.settingsManager,
                 adminFetch,
                 logTelemetry
@@ -120,6 +124,7 @@ function initAdminAuth() {
                 pinInput.value = '';
                 if (window.dashboard) window.dashboard.refresh();
                 if (window.advancesManager) window.advancesManager.refresh();
+                if (window.customerAccountsManager) window.customerAccountsManager.refresh();
                 if (window.settingsManager) window.settingsManager.refresh();
                 if (window.billingDesk) window.billingDesk.fetchSettings();
             } else {
@@ -177,6 +182,9 @@ function initNavigation() {
             }
             if (targetId === 'advances-tab' && window.advancesManager && sessionStorage.getItem('adminToken')) {
                 window.advancesManager.refresh();
+            }
+            if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && sessionStorage.getItem('adminToken')) {
+                window.customerAccountsManager.refresh();
             }
             if (targetId === 'settings-tab' && window.settingsManager && sessionStorage.getItem('adminToken')) {
                 window.settingsManager.refresh();

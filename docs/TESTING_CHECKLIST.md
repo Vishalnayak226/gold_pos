@@ -19,7 +19,7 @@ This runs two suites and exits non-zero on any failure:
 
 | Suite | Covers |
 | --- | --- |
-| `npm run test:billing` | Invoice money math — discount ordering, GST inclusive/exclusive, advance capping, making-charge %/₹ conversion, NaN hardening, printed rows reconciling to the Grand Total, paise settlement (57 checks) |
+| `npm run test:billing` | Invoice money math — discount ordering, GST inclusive/exclusive, advance capping, making-charge %/₹ conversion, NaN hardening, printed rows reconciling to the Grand Total, paise settlement, and advance-deposit status arithmetic (pending/rejected hold no balance; a missing status still counts, so existing ledgers keep their balances) (71 checks) |
 | `npm run test:integration` | Troy-ounce conversion, licensing grace periods, crypto envelopes, customer password hashing (scrypt round-trip, salt uniqueness, tampered-hash rejection), login-lockout escalation |
 
 Items below marked **[math automated]** have their *arithmetic* verified by
@@ -315,7 +315,7 @@ Playwright pass; you are confirming they hold in a real browser on your machine.
 - [ ] Enter amount ≤ ₹100 → blocked ("Minimum deposit amount is ₹100").
   Result: _____  Notes: ______________________________________________
 
-- [ ] **[auto]** Enter a valid amount (e.g. `5000`) on "Online Payment (Razorpay)" → demo keys auto-mock: "TEST MODE: Razorpay mock payment verified successfully!" and the balance updates immediately.
+- [ ] **[auto]** Enter a valid amount (e.g. `5000`) on "Online Payment (Razorpay)" → demo keys auto-mock: "TEST MODE: Razorpay mock payment verified successfully!" and the balance updates immediately. A gateway payment needs no counter approval — the signature is the confirmation.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Switch to "Manual UPI" → QR renders (once a UPI ID is set per Module 8) with the amount encoded; changing the amount live-updates the QR.
@@ -324,7 +324,13 @@ Playwright pass; you are confirming they hold in a real browser on your machine.
 - [ ] Submit Manual UPI with no Transaction Reference ID → blocked.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Submit Manual UPI with a reference ID → success; the deposit appears on the admin Advances tab under **your account's** name, not anything typed in the request. *(Known gap: this still posts real credit on an unverified reference — see `docs/PRODUCTION_READINESS_ROADMAP.md` §3 P0 "Manual UPI creates unverified credit".)*
+- [x] Submit Manual UPI with a reference ID → the alert says **"Submitted for verification"** and states the money is *not yet* in your balance. **The balance figure does not move.** A yellow "₹X awaiting the store's confirmation" note appears under it, and the History row reads **AWAITING APPROVAL**, struck through. *Verified 2026-08-08 by live run: submitted ₹50,000 against a customer whose balance was ₹11,000 → balance stayed ₹11,000, `pendingTotal` 50,000.* (Phase 20.2 — this used to post instant real credit on an unverified reference.)
+  Result: _____  Notes: ______________________________________________
+
+- [x] Submit the **same reference ID a second time** (also try it with different capitalisation and surrounding spaces) → refused: "That transaction reference has already been submitted." *Verified 2026-08-08: both the exact repeat and a ` utr-test-9001 ` case/space variant returned 409 `DUPLICATE_REFERENCE`.*
+  Result: _____  Notes: ______________________________________________
+
+- [ ] While that deposit is pending, check the **Gold Appreciation** panel on Profile → "Total Grams Locked" does **not** include the pending amount. That panel and the balance above it must describe the same money.
   Result: _____  Notes: ______________________________________________
 
 - [ ] **[auto]** History tab lists your deposits with date, ref ID, type, amount — and **only** yours.
@@ -360,7 +366,81 @@ Playwright pass; you are confirming they hold in a real browser on your machine.
 
 ---
 
-## 13. Cross-cutting / edge cases
+## 13. Customer Logins tab (admin) — Phase 20.2
+
+The store-side screen for portal logins. Before 20.2 these endpoints existed but had no UI at all.
+
+- [x] Sidebar shows a **Customer Logins** tab between Customer Advances and Settings; opening it lists every account with name, email, state, active device count and creation date. *Verified 2026-08-08: `GET /api/customer-accounts` returns exactly the fields the table renders.*
+  Result: _____  Notes: ______________________________________________
+
+- [ ] With no accounts yet → the table shows "No customer has a portal login yet", not an empty grid.
+  Result: _____  Notes: ______________________________________________
+
+- [x] **Issue Login** for a number that already has deposit history → succeeds and shows a one-time temporary password **in the page** (not an alert you can dismiss and lose). The account's state reads **Temp password**. *Verified 2026-08-08 for a legacy customer carrying ₹11,000 of pre-existing deposits.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] Sign in to the portal with that temporary password → you are forced to set your own password before any data loads; API calls before the change return `PASSWORD_CHANGE_REQUIRED`. *Verified 2026-08-08: a deposit attempt on a temp-password session was refused.*
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Reset password** on an existing account → confirmation prompt warns it signs the customer out of every device; after confirming, a new temporary password is shown and that customer's other session stops working.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Issue a login for a number that already has one **without** using the Reset button → you are asked to confirm, then it behaves as a reset. (This is the `CONFIRMATION_REQUIRED` round-trip.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Set a customer's name to something containing `<script>` from the portal's Account tab, then reload this tab → renders as literal text, not executed.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 14. Pending deposit approvals (admin Advances tab) — Phase 20.2
+
+- [x] After a customer submits a Manual UPI deposit, the **Advances** tab shows a yellow "N deposits awaiting verification" block above the ledger, with the amount, customer, reference and how long it has been waiting. *Verified 2026-08-08 via `GET /api/advances/pending`.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] The customer's row in the ledger below shows the **spendable** balance, with "+₹X pending" beneath it — the pending amount is *not* added into the balance. Same on the Dashboard: "Outstanding Advances" excludes pending, and a separate line reports what is awaiting approval. *Verified 2026-08-08.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] **Approve** → confirmation prompt names the amount and reference; after confirming, the money lands in the customer's balance and the queue block disappears. *Verified 2026-08-08: ₹11,000 → ₹61,000 on approving ₹50,000.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] Approving the **same deposit twice** (e.g. two tabs open) → the second attempt is refused with "already approved and cannot be reviewed again", not a double credit. *Verified 2026-08-08: 409.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] **Reject** with no reason typed → refused; the reason is required. With a reason → the row reads REJECTED with the reason shown, and the balance does **not** change. *Verified 2026-08-08: 400 without a note; balance unchanged at ₹61,400 after rejecting ₹7,777.*
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Open a customer's ledger drill-down → pending and rejected rows are greyed with struck-through amounts, so scanning the list cannot leave the impression an unverified claim is money on hand.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **The redemption check that matters:** with a pending deposit outstanding and no approved balance, go to Billing Desk, look up that customer and try to apply their advance → nothing is applied (the pending money is not available to redeem).
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 15. Payment amount binding (Phase 20.2)
+
+These need a REST client (or the browser console) because the point is what happens when the
+*client lies* — you cannot express that through the normal UI.
+
+- [x] Create an order for ₹100 via `POST /api/payment/order`, then call `POST /api/payment/verify` for it with `amount: 500000` in the body → **₹100 is credited, not ₹500,000.** The amount now comes from the stored order record, never the body. *Verified 2026-08-08 with the mock keys: response reported `amount: 100`.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] Sign in as a second customer and try to verify the first customer's order id → **403**, "This payment order does not belong to your account." *Verified 2026-08-08.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] Verify a made-up order id → **400**, "This payment order is not recognised", quoting the payment id to take to the store. *Verified 2026-08-08.*
+  Result: _____  Notes: ______________________________________________
+
+- [x] Send the same successful verify request twice → second returns `duplicate: true` with the original ledger row id and no second credit. *Verified 2026-08-08.*
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Check `backend/data/payment_orders.json` → each order carries the customer's phone and the amount it was created for, and settles to `status: "paid"` with the payment and deposit ids after verification.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 16. Cross-cutting / edge cases
 
 - [ ] Open `http://localhost:5000/api/settings` directly in browser (no auth header) → should be rejected (401), confirming admin-gated endpoints aren't accessible unauthenticated.
   Result: _____  Notes: ______________________________________________

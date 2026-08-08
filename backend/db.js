@@ -363,6 +363,11 @@ export function initDatabaseFiles() {
     // export bundle in server.js: a support export should never carry
     // credential material off the tenant's machine, even encrypted.
     readJSON(path.join(DATA_DIR, 'customer_auth.json'), []);
+    // Razorpay order intents, keyed to the customer and amount each order was
+    // created for. /api/payment/verify reads the amount to credit from here
+    // rather than from the request body, which the gateway signature cannot
+    // police. Short-lived — pruned on write, not permanent history.
+    readJSON(path.join(DATA_DIR, 'payment_orders.json'), []);
 }
 
 // Auto run initialization on import

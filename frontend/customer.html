@@ -323,6 +323,7 @@
                         <h2 style="font-size: 18px; margin-bottom: 15px; color: var(--color-text-main);">Welcome, <span id="greet-name"></span>!</h2>
                         <h3>Total Advance Credit Balance</h3>
                         <div class="balance-amount" id="customer-balance-val">₹0.00</div>
+                        <p id="customer-pending-note" style="display:none; font-size:13px; font-weight:600; color:#b45309; background:#fffbeb; border:1px solid #fcd34d; border-radius:8px; padding:8px 10px; margin:10px 0 0;"></p>
                         <p class="text-muted-small" id="customer-profile-info">Phone: -</p>
                     </div>
 
@@ -434,6 +435,11 @@
                         <div class="form-group" id="ref-group" style="margin-top: 15px; display: none;">
                             <label for="pay-ref">Transaction Reference ID (e.g. UPI Ref / Card Auth)</label>
                             <input type="text" id="pay-ref" class="form-control" placeholder="Enter 12-Digit Reference Number">
+                            <p class="text-muted-small" style="margin-top: 8px; line-height: 1.5;">
+                                A manual deposit is checked against the store's account before it is credited, so
+                                <strong>your balance updates after they confirm it</strong>, not immediately. Each
+                                reference can only be submitted once. Card and netbanking payments are credited straight away.
+                            </p>
                         </div>
 
                         <button id="pay-submit-btn" class="btn btn-primary btn-block">PAY & SUBMIT DEPOSIT</button>
@@ -464,6 +470,9 @@
 
     <script type="module">
         import { drawQR } from './js/qrGenerator.js';
+        // Same status rules the store side and the server use, so the portal can
+        // never show a customer a balance the counter disagrees with.
+        import { ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus } from './js/lib/billingMath.js';
 
         const TOKEN_KEY = 'customerToken';
 
@@ -848,6 +857,19 @@
                 document.getElementById('customer-profile-info').textContent =
                     `Phone: ${customerPhone.replace(/(\d{5})(\d{5})/, '$1-$2')}`;
 
+                // Without this, a customer who has just submitted a UPI reference
+                // sees an unchanged balance and concludes their money is lost.
+                const pendingNote = document.getElementById('customer-pending-note');
+                if (data.pendingCount > 0) {
+                    pendingNote.style.display = 'block';
+                    pendingNote.textContent =
+                        `₹${Number(data.pendingTotal).toLocaleString('en-IN')} awaiting the store's confirmation` +
+                        `${data.pendingCount > 1 ? ` (${data.pendingCount} deposits)` : ''}. ` +
+                        `It is added to your balance once they verify the transfer.`;
+                } else {
+                    pendingNote.style.display = 'none';
+                }
+
                 let totalGramsLocked = 0;
                 let totalCashDeposited = 0;
 
@@ -866,30 +888,44 @@
                     data.history.sort((a, b) => b.timestamp - a.timestamp);
                     data.history.forEach(item => {
                         const isDeposit = item.type === 'deposit';
-                        const typeColor = isDeposit
-                            ? 'color: var(--color-success); font-weight: 600;'
-                            : 'color: var(--color-danger);';
+                        const status = normalizeAdvanceStatus(item);
+                        // A deposit awaiting the store's confirmation holds no
+                        // credit, so it must not contribute grams to the Gold
+                        // Appreciation figure either — that panel and the balance
+                        // above it have to describe the same money.
+                        const counts = advanceEntryDelta(item) !== 0;
+                        const typeColor = !counts
+                            ? 'color: var(--color-text-light); text-decoration: line-through;'
+                            : isDeposit
+                                ? 'color: var(--color-success); font-weight: 600;'
+                                : 'color: var(--color-danger);';
 
-                        if (isDeposit) {
+                        if (counts) {
                             const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
-                            totalGramsLocked += (item.amount / lockedRate);
-                            totalCashDeposited += item.amount;
-                        } else {
-                            const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
-                            totalGramsLocked -= (item.amount / lockedRate);
-                            totalCashDeposited -= item.amount;
+                            if (isDeposit) {
+                                totalGramsLocked += (item.amount / lockedRate);
+                                totalCashDeposited += item.amount;
+                            } else {
+                                totalGramsLocked -= (item.amount / lockedRate);
+                                totalCashDeposited -= item.amount;
+                            }
                         }
 
                         // textContent throughout: referenceId is customer- and
                         // gateway-supplied, and this table renders it back out.
                         const row = document.createElement('tr');
+                        if (!counts) row.style.opacity = '0.7';
                         const dateCell = document.createElement('td');
                         dateCell.textContent = new Date(item.timestamp).toLocaleDateString();
                         const idCell = document.createElement('td');
                         idCell.textContent = item.id;
                         const typeCell = document.createElement('td');
                         typeCell.style.cssText = typeColor;
-                        typeCell.textContent = String(item.type || '').toUpperCase();
+                        typeCell.textContent = isDeposit && status === ADVANCE_STATUS.PENDING
+                            ? 'AWAITING APPROVAL'
+                            : isDeposit && status === ADVANCE_STATUS.REJECTED
+                                ? 'NOT RECEIVED'
+                                : String(item.type || '').toUpperCase();
                         const amountCell = document.createElement('td');
                         amountCell.className = 'text-right';
                         amountCell.style.cssText = typeColor;
@@ -1098,11 +1134,12 @@
                         const verifyRes = await customerFetch('/api/payment/verify', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
+                            // No amount: the server credits what the stored order
+                            // was created for, and ignores anything sent here.
                             body: JSON.stringify({
                                 razorpay_order_id: orderData.order.id,
                                 razorpay_payment_id: 'pay_mock_' + Math.random().toString(36).substring(2, 9),
-                                razorpay_signature: 'mock_signature',
-                                amount
+                                razorpay_signature: 'mock_signature'
                             })
                         });
                         if (verifyRes.ok) {
@@ -1130,11 +1167,12 @@
                                 const verifyRes = await customerFetch('/api/payment/verify', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
+                                    // No amount: the server credits the stored
+                                    // order's amount, not a client-supplied one.
                                     body: JSON.stringify({
                                         razorpay_order_id: response.razorpay_order_id,
                                         razorpay_payment_id: response.razorpay_payment_id,
-                                        razorpay_signature: response.razorpay_signature,
-                                        amount
+                                        razorpay_signature: response.razorpay_signature
                                     })
                                 });
 
@@ -1184,14 +1222,23 @@
                         body: JSON.stringify({ amount, referenceId: refId })
                     });
 
+                    const data = await res.json().catch(() => ({}));
                     if (res.ok) {
-                        alert('Advance payment submitted successfully for verification!');
+                        // Says "not yet credited" explicitly: the balance above
+                        // deliberately will not move until the store confirms,
+                        // and a vaguer message would read as a failure.
+                        alert(
+                            `Submitted for verification.\n\n` +
+                            `₹${amount.toLocaleString('en-IN')} against reference ${refId} has been sent to the store. ` +
+                            `It is not yet in your balance — it is added once they confirm the transfer.`
+                        );
                         amountInput.value = '';
                         refInput.value = '';
                         await loadCustomerData();
+                    } else if (data.code === 'DUPLICATE_REFERENCE') {
+                        alert('That transaction reference has already been submitted. Each transfer can only be claimed once — check your history below.');
                     } else {
-                        const err = await res.json();
-                        alert('Failed to submit payment: ' + (err.error || err.message));
+                        alert('Failed to submit payment: ' + (data.error || data.message || `HTTP ${res.status}`));
                     }
                 } catch (err) {
                     alert('Connection failure to POS servers.');
