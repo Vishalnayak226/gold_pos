@@ -41,7 +41,7 @@ The Gold Business POS is a lightweight, responsive SaaS system designed for prec
 *   **Discounts & Advances:** Support flat discount entries (defaulting to `0`) and lookup/deduction of available customer advances.
 
 ### 3.3 Customer Advances Portal
-*   **Access Gate:** Secure mobile login using 10-digit phone number validations.
+*   **Access Gate:** 10-digit mobile number **plus a password** (scrypt-hashed server-side), with a bearer session scoped to that customer. A customer with existing store records is issued their login at the counter rather than self-registering, so nobody can claim someone else's ledger. Revised 2026-08-08 — the original phone-number-only gate validated the *format* of the number and nothing else, which meant no gate at all.
 *   **Ledger Listing:** Scrollable payment history sheet formatted like a high-contrast printed PDF.
 *   **Double Payment Protocol:**
     *   *Online Pay:* Razorpay checkout integration with backend HMAC-SHA256 signature verification.

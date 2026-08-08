@@ -204,9 +204,11 @@ export class AdvancesManager {
         }
 
         try {
-            // Public endpoint (also used by the customer portal) — an admin
-            // counter deposit is functionally identical to a customer's own.
-            const res = await fetch('/api/advances', {
+            // Admin-gated since Phase 20.1: a counter deposit can name any
+            // customer's phone, so it needs a cashier session. The customer
+            // portal posts its own deposits to /api/customer/advances, which
+            // can only ever credit the phone on that customer's session.
+            const res = await adminFetch('/api/advances', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ customerPhone: phone, customerName: name, amount, paymentMethod: method })

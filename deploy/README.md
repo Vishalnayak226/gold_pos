@@ -126,26 +126,70 @@ comfortably gives.
 
 ### 8.2 One-time provisioning
 
-1. Do §1 once (Node, PM2, Nginx, Certbot) on the pipeline VPS.
+**Use the script.** `deploy/provision-pipeline.sh` performs every step below
+in one idempotent run, on a fresh Ubuntu 22.04+ VPS, as root:
+
+```bash
+./deploy/provision-pipeline.sh --domain yourpos.com --email you@example.com \
+    --ssh-pubkey "ssh-ed25519 AAAA... gold-pos-ci-deploy"
+```
+
+It ends with a health check of all 5 processes and prints the generated
+licensing `ADMIN_SECRET`s and the exact GitHub secret/variable values to
+set. Re-running it is safe: existing checkouts are fetched rather than
+re-cloned, and existing `.env` files and certificates are left untouched.
+`docs/GO_LIVE_CHECKLIST.md` Track A is the operator-facing version with
+costs and click paths.
+
+What it does, i.e. what to do by hand if you'd rather:
+
+1. §1 once (Node 20, PM2, Nginx, Certbot) + `ufw` allowing only OpenSSH and
+   Nginx — all 5 Node processes bind `127.0.0.1`, so their ports must never
+   be publicly reachable.
 2. DNS: 5 A records (table above) → the VPS IP.
 3. Create a low-privilege `deploy` Linux user for CI to SSH in as (not
-   root), scoped to `/opt/gold-pos/`. Generate an SSH keypair for it — the
-   private key becomes the `VPS_SSH_KEY` GitHub Actions secret (§8.4).
-4. For each of the 5 rows in the table, as the `deploy` user:
+   root), owning `/opt/gold-pos/`, with the CI public key in its
+   `~/.ssh/authorized_keys`. The matching private key becomes the
+   `VPS_SSH_KEY` GitHub Actions secret (§8.4).
+4. For each of the 5 rows, as the `deploy` user. **The directory name is
+   not free-form** — `.github/workflows/cd-*.yml` hardcodes these exact
+   paths, and they are deliberately *not* the same strings as the PM2 app
+   names in the §8.1 table:
+
+   | Directory | Branch | Module | PORT | LICENSING_SERVER_URL |
+   |---|---|---|---|---|
+   | `/opt/gold-pos/dev-backend` | `develop` | `backend` | 5001 | `https://license-dev.<domain>` |
+   | `/opt/gold-pos/sandbox-backend` | `staging` | `backend` | 5002 | `https://license-dev.<domain>` |
+   | `/opt/gold-pos/live-backend` | `main` | `backend` | 5000 | `https://license.<domain>` |
+   | `/opt/gold-pos/nonprod-licensing` | `develop` | `licensing_server` | 6061 | — (set `ADMIN_SECRET`) |
+   | `/opt/gold-pos/live-licensing` | `main` | `licensing_server` | 6060 | — (set `ADMIN_SECRET`) |
+
    ```bash
-   git clone -b <branch> <this repo> /opt/gold-pos/<name>
-   cd /opt/gold-pos/<name>/<backend-or-licensing_server>
+   git clone -b <branch> <this repo> /opt/gold-pos/<directory>
+   cd /opt/gold-pos/<directory>/<module>
    npm ci --omit=dev
-   cp .env.example .env
-   # edit .env: set PORT and (for backend rows) LICENSING_SERVER_URL per
-   # the table above, plus ENV_NAME=<dev|sandbox|live|nonprod> so GET
-   # /api/health reports which instance you hit
+   cp .env.example .env   # then set PORT + the column above
    ```
-5. `pm2 start deploy/ecosystem.<name>.config.cjs` for each (see the 5
-   `deploy/ecosystem.*.config.cjs` files — each just sets a unique PM2 app
-   name so all 5 processes coexist on one PM2 daemon without colliding).
-   `pm2 save`, `pm2 startup` once.
-6. 5 Nginx vhosts from `deploy/nginx.conf.template` (§4), one per row,
+   `.env` is gitignored, so it survives the `git reset --hard` that every
+   deploy runs. `ENV_NAME` and `NODE_ENV` come from the PM2 config, not
+   `.env` — `dotenv` does not override variables PM2 already exported.
+5. `pm2 startOrRestart deploy/ecosystem.<name>.config.cjs` from each
+   checkout root (the 5 `deploy/ecosystem.*.config.cjs` files each set a
+   unique PM2 app name so all 5 coexist on one PM2 daemon without
+   colliding). Then `pm2 save`, and `pm2 startup systemd -u deploy` once.
+6. **Signing keys — easy to miss, breaks everything if skipped.** Start the
+   two licensing servers *first*: each generates its own license- and
+   release-signing keypairs on first boot, because `keys/*private*.pem` is
+   gitignored and therefore absent from a fresh clone. The backends verify
+   activations and release manifests against the *committed*
+   `backend/keys/*_public.pem`, which were generated on a dev laptop and
+   match nothing on this server. So copy each licensing server's real
+   `license_public.pem` and `release_public.pem` into the backends that
+   point at it (non-prod → dev + sandbox, live → live), **and** stage a copy
+   in `/opt/gold-pos/keys/<directory>/` — `remote-deploy.sh` re-applies that
+   overlay after every `git reset --hard`, since those public PEMs are
+   tracked files and would otherwise be reverted on the next deploy.
+7. 5 Nginx vhosts from `deploy/nginx.conf.template` (§4), one per row,
    `certbot --nginx -d <subdomain>` for each.
 
 ### 8.3 Deploying a build

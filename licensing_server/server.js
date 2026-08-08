@@ -113,6 +113,11 @@ function isNewerVersion(a, b) {
 }
 
 const app = express();
+// Trust the loopback reverse proxy (Nginx, see deploy/nginx.conf.template)
+// so req.ip resolves the real client IP from X-Forwarded-For — required for
+// authenticateAdmin's brute-force lockout to key per real caller instead of
+// locking every user out globally (same reasoning as backend/server.js).
+app.set('trust proxy', 'loopback');
 app.use(cors());
 app.use(express.json());
 
@@ -269,12 +274,59 @@ app.get('/api/releases/latest', (req, res) => {
    API Routes: Management & Control Panel
    ========================================================================== */
 
+// This token now gates far more than license management — since Phase 18 it
+// can also publish signed "security"-channel releases that every tenant
+// auto-applies (see backend/updateEngine.js). A leaked or default-left
+// ADMIN_SECRET is effectively remote-code-execution across the whole
+// tenant fleet, so this deserves the same brute-force lockout as the POS
+// client's own admin PIN, plus a timing-safe comparison (a naive `!==`
+// string compare leaks a byte-by-byte timing signal) and a loud startup
+// warning if the well-known default was never changed.
+if (ADMIN_SECRET === 'MASTER-ADMIN-SECRET-12345') {
+    console.warn('[Licensing Server] WARNING: ADMIN_SECRET is still the documented default. This token can publish code releases that auto-apply to every tenant — set a real secret via the ADMIN_SECRET env var before any real deployment.');
+}
+
+const MAX_FAILED_ADMIN_ATTEMPTS = 5;
+const BASE_ADMIN_LOCKOUT_MS = 30 * 1000;
+const MAX_ADMIN_LOCKOUT_MS = 15 * 60 * 1000;
+const failedAdminAttempts = new Map(); // ip -> { count, lockedUntil }
+
+function timingSafeStringEqual(a, b) {
+    const bufA = Buffer.from(String(a));
+    const bufB = Buffer.from(String(b));
+    // Buffers must be equal length for timingSafeEqual — pad the shorter
+    // one so length itself isn't a distinguishing timing signal, then
+    // still require the real lengths to match.
+    const maxLen = Math.max(bufA.length, bufB.length);
+    const paddedA = Buffer.alloc(maxLen); bufA.copy(paddedA);
+    const paddedB = Buffer.alloc(maxLen); bufB.copy(paddedB);
+    return bufA.length === bufB.length && crypto.timingSafeEqual(paddedA, paddedB);
+}
+
 // Simple Admin Authenticator Middleware
 const authenticateAdmin = (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || authHeader !== `Bearer ${ADMIN_SECRET}`) {
+    const key = req.ip || 'unknown';
+    const entry = failedAdminAttempts.get(key);
+    if (entry && entry.lockedUntil && Date.now() < entry.lockedUntil) {
+        const remaining = Math.ceil((entry.lockedUntil - Date.now()) / 1000);
+        return res.status(429).json({ error: 'TOO_MANY_ATTEMPTS', message: `Too many failed admin attempts. Try again in ${remaining}s.` });
+    }
+
+    const authHeader = req.headers.authorization || '';
+    const providedToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+
+    if (!providedToken || !timingSafeStringEqual(providedToken, ADMIN_SECRET)) {
+        const e = entry || { count: 0, lockedUntil: 0 };
+        e.count += 1;
+        if (e.count >= MAX_FAILED_ADMIN_ATTEMPTS) {
+            const extra = e.count - MAX_FAILED_ADMIN_ATTEMPTS;
+            e.lockedUntil = Date.now() + Math.min(BASE_ADMIN_LOCKOUT_MS * Math.pow(2, extra), MAX_ADMIN_LOCKOUT_MS);
+        }
+        failedAdminAttempts.set(key, e);
         return res.status(401).json({ error: 'Unauthorized administrative token' });
     }
+
+    failedAdminAttempts.delete(key);
     next();
 };
 
@@ -342,6 +394,18 @@ app.post('/api/admin/releases', authenticateAdmin, (req, res) => {
         }
         if (!VALID_CHANNELS.includes(channel)) {
             return res.status(400).json({ error: `channel must be one of: ${VALID_CHANNELS.join(', ')}` });
+        }
+        if (!/^\d+\.\d+\.\d+$/.test(version)) {
+            return res.status(400).json({ error: 'version must be a semver string like 1.2.3' });
+        }
+        if (!/^https?:\/\//.test(downloadUrl) || downloadUrl.length > 2000) {
+            return res.status(400).json({ error: 'downloadUrl must be a valid http(s) URL' });
+        }
+        if (!/^[a-f0-9]{64}$/i.test(sha256)) {
+            return res.status(400).json({ error: 'sha256 must be a 64-character hex string' });
+        }
+        if (changelog && String(changelog).length > 5000) {
+            return res.status(400).json({ error: 'changelog is too long (max 5000 characters)' });
         }
 
         const manifest = {
@@ -565,6 +629,19 @@ app.get('/', (req, res) => {
         <script>
             let adminToken = '';
 
+            // Every field below can contain admin-submitted free text
+            // (license customerName, a release's version/channel/changelog)
+            // — escape before ever going into innerHTML. Never build
+            // onclick="...('${value}')" attribute strings from this data
+            // either (that's a second, attribute/JS-context injection point
+            // distinct from HTML-context) — use data-* attributes and a
+            // real event listener instead, as done below for Revoke.
+            function escapeHtml(value) {
+                return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+                    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+                }[ch]));
+            }
+
             function login() {
                 const pass = document.getElementById('admin-pass').value;
                 adminToken = pass;
@@ -584,18 +661,21 @@ app.get('/', (req, res) => {
                     data.forEach(k => {
                         const tr = document.createElement('tr');
                         tr.innerHTML = \`
-                            <td><strong>\${k.licenseKey}</strong></td>
-                            <td>\${k.customerName}</td>
-                            <td>\${k.expiryDate}</td>
-                            <td><span class="badge badge-\${k.status}">\${k.status.toUpperCase()}</span></td>
-                            <td>\${k.billingCycle || '—'}</td>
-                            <td>\${k.amount ? k.amount.toLocaleString() : '—'}</td>
-                            <td>\${k.nextDueDate || '—'}</td>
+                            <td><strong>\${escapeHtml(k.licenseKey)}</strong></td>
+                            <td>\${escapeHtml(k.customerName)}</td>
+                            <td>\${escapeHtml(k.expiryDate)}</td>
+                            <td><span class="badge badge-\${escapeHtml(k.status)}">\${escapeHtml((k.status || '').toUpperCase())}</span></td>
+                            <td>\${escapeHtml(k.billingCycle || '—')}</td>
+                            <td>\${k.amount ? escapeHtml(k.amount.toLocaleString()) : '—'}</td>
+                            <td>\${escapeHtml(k.nextDueDate || '—')}</td>
                             <td>
-                                <button onclick="deleteKey('\${k.licenseKey}')" style="background:#ef4444; padding: 4px 8px; font-size:11px;">Revoke</button>
+                                <button class="revoke-btn" data-key="\${escapeHtml(k.licenseKey)}" style="background:#ef4444; padding: 4px 8px; font-size:11px;">Revoke</button>
                             </td>
                         \`;
                         tbody.appendChild(tr);
+                    });
+                    tbody.querySelectorAll('.revoke-btn').forEach(btn => {
+                        btn.addEventListener('click', () => deleteKey(btn.getAttribute('data-key')));
                     });
                 } else {
                     alert('Invalid admin credentials.');
@@ -619,10 +699,10 @@ app.get('/', (req, res) => {
                 const tbody = document.getElementById('releases-tbody');
                 tbody.innerHTML = releases.map(r => \`
                     <tr>
-                        <td><strong>\${r.version}</strong></td>
-                        <td>\${r.channel}</td>
+                        <td><strong>\${escapeHtml(r.version)}</strong></td>
+                        <td>\${escapeHtml(r.channel)}</td>
                         <td>\${new Date(r.publishedAt).toLocaleString()}</td>
-                        <td>\${(r.changelog || '').replace(/</g,'&lt;')}</td>
+                        <td>\${escapeHtml(r.changelog || '')}</td>
                     </tr>
                 \`).join('') || '<tr><td colspan="4" style="color:#94a3b8;">No releases published yet.</td></tr>';
             }

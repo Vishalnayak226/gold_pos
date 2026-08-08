@@ -1,6 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+    getDefaultSettings,
+    RETIRED_SETTINGS_KEYS,
+    NESTED_SETTINGS_KEYS,
+    SUPPORTED_GOLD_PROVIDERS
+} from './defaultSettings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const DATA_DIR = path.join(__dirname, 'data');
@@ -138,47 +144,67 @@ export function writeJSON(filepath, data) {
 }
 
 /**
+ * Brings an existing tenant's settings.json up to the current template.
+ *
+ * Without this, a key added to the template only ever reaches installs whose
+ * settings.json did not exist yet — every already-running tenant would keep
+ * reading `undefined` until someone happened to open Settings and press Save.
+ *
+ * Existing values always win; this only fills gaps, drops retired keys, and
+ * normalizes enums whose accepted values have narrowed.
+ * @returns {object} the current (possibly migrated) settings
+ */
+export function migrateSettings() {
+    const settingsFile = path.join(DATA_DIR, 'settings.json');
+    const defaults = getDefaultSettings();
+
+    // Seeds the file with the full template when this is a fresh install.
+    const existing = readJSON(settingsFile, defaults);
+    if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+        writeJSON(settingsFile, defaults);
+        return defaults;
+    }
+
+    const merged = { ...defaults, ...existing };
+
+    // Nested objects need the same treatment one level down, otherwise a
+    // tenant's older `smtp` block would shadow any newly added sub-key.
+    NESTED_SETTINGS_KEYS.forEach(key => {
+        const existingBlock = existing[key];
+        merged[key] = (existingBlock && typeof existingBlock === 'object' && !Array.isArray(existingBlock))
+            ? { ...defaults[key], ...existingBlock }
+            : { ...defaults[key] };
+    });
+
+    const removed = RETIRED_SETTINGS_KEYS.filter(key => key in merged);
+    removed.forEach(key => { delete merged[key]; });
+
+    // Legacy paid providers ('goldapi', 'metalsdev') no longer exist — fall
+    // back to the keyless public source rather than to mocked prices.
+    if (!SUPPORTED_GOLD_PROVIDERS.includes(merged.goldApiProvider)) {
+        merged.goldApiProvider = defaults.goldApiProvider;
+    }
+
+    const added = Object.keys(merged).filter(key => !(key in existing));
+    if (JSON.stringify(merged) === JSON.stringify(existing)) {
+        return existing;
+    }
+
+    if (!writeJSON(settingsFile, merged)) {
+        // Non-fatal: the server still boots and serves, it just reads the
+        // in-memory merge this once and retries the write on next start.
+        logError('Settings migration could not be persisted; continuing with in-memory defaults for this run.');
+        return merged;
+    }
+
+    logTelemetry('SETTINGS_MIGRATED', 0, `added: [${added.join(', ')}], removed: [${removed.join(', ')}]`);
+    return merged;
+}
+
+/**
  * Initialize Database files with their templates if missing
  */
 export function initDatabaseFiles() {
-    const defaultSettings = {
-        companyName: "Universal Gold POS Ltd",
-        address: "100 Gold Plaza, Retail District",
-        phone: "9999999999",
-        gstNumber: "29AABCDE1234F1Z",
-        goldTaxSlab: 3.0,
-        invoicePrefix: "GOLD",
-        invoiceSeqStart: 1,
-        reportEmail: "reports@goldpos.com",
-        // Report emails (backupEngine's daily/monthly summaries) are skipped
-        // gracefully whenever host/user/pass are blank — see emailReporter.js.
-        smtp: {
-            host: "",
-            port: 587,
-            secure: false,
-            user: "",
-            pass: "",
-            fromName: ""
-        },
-        goldApiProvider: "public",
-        goldApiKey: "",
-        // Demo/mock placeholders. Mock checkout only activates on this EXACT pair
-        // (see /api/payment/order and /api/payment/verify in server.js) — any other
-        // non-empty value (including a tenant's real Razorpay test/sandbox key) is
-        // sent to the real Razorpay API instead of being intercepted.
-        razorpayKeyId: "rzp_test_xxxxxx",
-        razorpayKeySecret: "rzp_test_xxxxxx_secret",
-        upiId: "",
-        adminPin: "1234",
-        overrideGoldPrice: {
-            active: false,
-            price24K: 0.0,
-            price22K: 0.0,
-            price18K: 0.0
-        },
-        currency: "INR"
-    };
-
     const defaultLicense = {
         licenseKey: "DEMO-KEY-12345",
         activated: false,
@@ -187,9 +213,14 @@ export function initDatabaseFiles() {
         lastHandshakeTime: 0
     };
 
-    readJSON(path.join(DATA_DIR, 'settings.json'), defaultSettings);
+    migrateSettings();
     readJSON(path.join(DATA_DIR, 'license.json'), defaultLicense);
     readJSON(path.join(DATA_DIR, 'advances.json'), []);
+    // Customer portal logins (scrypt hashes + hashed session/reset tokens —
+    // never plaintext). Deliberately excluded from the Level-2 diagnostics
+    // export bundle in server.js: a support export should never carry
+    // credential material off the tenant's machine, even encrypted.
+    readJSON(path.join(DATA_DIR, 'customer_auth.json'), []);
 }
 
 // Auto run initialization on import

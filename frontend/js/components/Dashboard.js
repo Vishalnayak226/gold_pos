@@ -62,11 +62,7 @@ export class Dashboard {
                 </div>
             </div>
 
-            <div class="dashboard-section">
-                <h3 class="dashboard-section-title">Purity Mix — Lifetime Revenue Share</h3>
-                <div class="purity-mix-bar" id="purity-mix-bar"></div>
-                <div class="purity-mix-legend" id="purity-mix-legend"></div>
-            </div>
+
 
             <div class="dashboard-columns">
                 <div class="dashboard-section">
@@ -110,7 +106,7 @@ export class Dashboard {
             const rate = rateRes.ok ? await rateRes.json() : null;
 
             this.renderStatTiles(sales, advances, rate);
-            this.renderPurityMix(sales);
+            // this.renderPurityMix(sales); // Removed as per user request
             this.renderRecentTransactions(sales);
             this.renderRecentAdvances(advances);
 

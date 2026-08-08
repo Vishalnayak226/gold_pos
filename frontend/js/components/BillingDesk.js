@@ -1,4 +1,25 @@
 import { logTelemetry, adminFetch } from '../app.js';
+import {
+    computeInvoiceTotals,
+    makingChargeFromPercent,
+    makingPercentFromAmount,
+    normalizeTaxMode,
+    round2
+} from '../lib/billingMath.js';
+
+/**
+ * Money for the invoice, always to the paise.
+ *
+ * Every figure reaching this point is already rounded by billingMath, so the
+ * fixed 2 decimals are a display guarantee rather than a second rounding: the
+ * printed rows line up in a column and never render a third decimal.
+ */
+function money(value) {
+    return `₹${Number(value || 0).toLocaleString('en-IN', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    })}`;
+}
 
 export class BillingDesk {
     constructor() {
@@ -8,7 +29,10 @@ export class BillingDesk {
         this.makingChargePercent = 10; // Default 10%
         this.makingChargeAmount = 0;
         this.taxSlab = 3; // Default 3% GST
-        this.discount = 0;
+        this.taxMode = 'Exclusive'; // Default
+        this.defaultDiscountConfig = 0;
+        this.discountPercent = 0;
+        this.discountAmount = 0;
         this.totalAmount = 0;
         this.appliedAdvance = 0;
         this.customerAdvanceBalance = 0;
@@ -56,9 +80,37 @@ export class BillingDesk {
                         nameEl.style.display = 'none';
                     }
                 }
+                
+                if (settings.goldTaxSlab !== undefined) {
+                    this.taxSlab = parseFloat(settings.goldTaxSlab) || 0;
+                    const taxInput = document.getElementById('tax-slab');
+                    if (taxInput) taxInput.value = this.taxSlab;
+                }
+                
+                this.taxMode = normalizeTaxMode(settings.taxMode);
+                
+                if (settings.defaultDiscountPercent !== undefined) {
+                    this.defaultDiscountConfig = parseInt(settings.defaultDiscountPercent, 10) || 0;
+                    this.discountPercent = this.defaultDiscountConfig;
+                    const discountInput = document.getElementById('manual-discount');
+                    if (discountInput) discountInput.value = this.discountPercent;
+                    
+                    const toggleBtn = document.getElementById('toggle-discount-btn');
+                    if (toggleBtn) {
+                        if (this.defaultDiscountConfig > 0) {
+                            toggleBtn.style.display = 'block';
+                            toggleBtn.textContent = 'Remove';
+                            toggleBtn.className = 'btn btn-secondary btn-small';
+                        } else {
+                            toggleBtn.style.display = 'none';
+                        }
+                    }
+                }
+                
+                this.recalculate();
             }
         } catch (err) {
-            console.error('Failed to fetch settings for logo', err);
+            console.error('Failed to fetch settings', err);
         }
     }
 
@@ -122,7 +174,14 @@ export class BillingDesk {
                             </div>
                             <div class="form-group">
                                 <label for="tax-slab">GST Tax Slab (%)</label>
-                                <input type="number" id="tax-slab" class="form-control" value="3.0" step="0.1" min="0">
+                                <select id="tax-slab" class="form-control" disabled>
+                                    <option value="0">0%</option>
+                                    <option value="3" selected>3% (Gold & Silver)</option>
+                                    <option value="5">5%</option>
+                                    <option value="12">12%</option>
+                                    <option value="18">18%</option>
+                                    <option value="28">28%</option>
+                                </select>
                             </div>
                         </div>
 
@@ -140,8 +199,11 @@ export class BillingDesk {
                                 </div>
                             </div>
                             <div class="form-group">
-                                <label for="manual-discount">Manual Discount (₹)</label>
-                                <input type="number" id="manual-discount" class="form-control" value="0" min="0" step="1">
+                                <label for="manual-discount">Discount (%)</label>
+                                <div style="display:flex; align-items:center; gap:8px;">
+                                    <input type="number" id="manual-discount" class="form-control" value="0" min="0" step="1" max="99" disabled style="flex:1;">
+                                    <button type="button" id="toggle-discount-btn" class="btn btn-secondary btn-small" style="padding: 6px 12px; display: none;">Remove</button>
+                                </div>
                             </div>
                         </div>
                     </form>
@@ -181,22 +243,35 @@ export class BillingDesk {
                             </tbody>
                         </table>
                         
+                        <!--
+                            The rows below are what window.print() puts in the
+                            customer's hand, so they must add up: every visible
+                            line is stated NET of GST, the tax is added once at
+                            the bottom, and the sum is the grand total. In
+                            inclusive mode that means these lines are the quoted
+                            prices with the embedded tax carved out — hence the
+                            "(net of GST)" qualifier, which only appears there.
+                        -->
                         <div class="invoice-summary">
                             <div class="summary-row">
-                                <span>Metal Value:</span>
+                                <span>Metal Value<span class="sum-net-note"></span>:</span>
                                 <span id="sum-metal-value">₹0.00</span>
                             </div>
                             <div class="summary-row">
-                                <span>Making Charges (<span id="sum-making-percent">10</span>%):</span>
+                                <span>Making Charges (<span id="sum-making-percent">10</span>%)<span class="sum-net-note"></span>:</span>
                                 <span id="sum-making-amount">₹0.00</span>
                             </div>
-                            <div class="summary-row">
-                                <span>GST Tax (<span id="sum-tax-slab">3</span>%):</span>
-                                <span id="sum-tax-amount">₹0.00</span>
-                            </div>
                             <div class="summary-row" id="summary-discount-row" style="display: none;">
-                                <span>Manual Discount:</span>
+                                <span>Discount (<span id="sum-discount-percent">0</span>%)<span class="sum-net-note"></span>:</span>
                                 <span id="sum-discount-amount">-₹0.00</span>
+                            </div>
+                            <div class="summary-row summary-subtotal">
+                                <span>Taxable Value:</span>
+                                <span id="sum-taxable-amount">₹0.00</span>
+                            </div>
+                            <div class="summary-row">
+                                <span>GST Tax (<span id="sum-tax-slab">3</span>% <span id="sum-tax-mode" style="font-size: 0.85em; opacity: 0.8;"></span>):</span>
+                                <span id="sum-tax-amount">₹0.00</span>
                             </div>
                             <div class="summary-row" id="summary-advance-row" style="display: none;">
                                 <span>Advance Redeemed:</span>
@@ -262,17 +337,32 @@ export class BillingDesk {
         // Weight changes
         weightInput.addEventListener('input', () => this.recalculate());
 
-        // GST Tax changes
-        taxInput.addEventListener('input', () => {
+        // GST Tax changes (now disabled in UI, but kept here for programmatic updates)
+        taxInput.addEventListener('change', () => {
             this.taxSlab = parseFloat(taxInput.value) || 0;
             this.recalculate();
         });
 
-        // Discount changes
-        discountInput.addEventListener('input', () => {
-            this.discount = parseFloat(discountInput.value) || 0;
-            this.recalculate();
-        });
+        // Discount Toggle
+        const toggleDiscountBtn = document.getElementById('toggle-discount-btn');
+        if (toggleDiscountBtn) {
+            toggleDiscountBtn.addEventListener('click', () => {
+                if (!this.defaultDiscountConfig) return;
+                
+                if (this.discountPercent > 0) {
+                    this.discountPercent = 0;
+                    toggleDiscountBtn.textContent = 'Apply';
+                    toggleDiscountBtn.className = 'btn btn-primary btn-small';
+                } else {
+                    this.discountPercent = this.defaultDiscountConfig;
+                    toggleDiscountBtn.textContent = 'Remove';
+                    toggleDiscountBtn.className = 'btn btn-secondary btn-small';
+                }
+                
+                if (discountInput) discountInput.value = this.discountPercent;
+                this.recalculate();
+            });
+        }
 
         // Customer details
         nameInput.addEventListener('input', (e) => {
@@ -310,20 +400,18 @@ export class BillingDesk {
 
         // Bi-directional Making Charges
         const updateMakingChargeFromPercent = () => {
-            let intPart = parseInt(percentIntInput.value) || 0;
-            let decStr = percentDecInput.value || '0';
-            let pct = parseFloat(`${intPart}.${decStr}`);
-            
-            if (isNaN(pct)) pct = 0;
-            if (pct < 1) pct = 1;
-            if (pct > 100) pct = 100;
-            
-            this.makingChargePercent = pct;
-            
-            // Recalculate amount from percentage
-            this.makingChargeAmount = this.metalValue * (pct / 100);
-            amountInput.value = Math.round(this.makingChargeAmount * 100) / 100;
-            
+            const intPart = parseInt(percentIntInput.value) || 0;
+            const decStr = percentDecInput.value || '0';
+
+            const { percent, amount } = makingChargeFromPercent(
+                this.metalValue,
+                parseFloat(`${intPart}.${decStr}`)
+            );
+
+            this.makingChargePercent = percent;
+            this.makingChargeAmount = amount;
+            amountInput.value = round2(amount);
+
             this.recalculateSummaryOnly();
         };
 
@@ -331,20 +419,19 @@ export class BillingDesk {
         if (percentDecInput) percentDecInput.addEventListener('input', updateMakingChargeFromPercent);
 
         amountInput.addEventListener('input', (e) => {
-            let amt = parseFloat(e.target.value) || 0;
-            if (amt < 0) amt = 0;
-            e.target.value = amt;
+            const { percent, amount } = makingPercentFromAmount(
+                parseFloat(e.target.value),
+                this.metalValue
+            );
 
-            this.makingChargeAmount = amt;
+            e.target.value = amount;
+            this.makingChargeAmount = amount;
 
-            // Recalculate percentage from amount
-            if (this.metalValue > 0) {
-                let pct = (amt / this.metalValue) * 100;
-                // Clamp display value of percent 1-100
-                pct = Math.max(1, Math.min(100, pct));
-                this.makingChargePercent = Math.round(pct * 100) / 100;
-                
-                let pctStr = this.makingChargePercent.toString().split('.');
+            // `percent` is null while there is no metal value to divide by —
+            // leave the percentage boxes alone until a weight is entered.
+            if (percent !== null) {
+                this.makingChargePercent = percent;
+                const pctStr = percent.toString().split('.');
                 percentIntInput.value = pctStr[0] || '0';
                 percentDecInput.value = pctStr[1] || '0';
             }
@@ -363,7 +450,7 @@ export class BillingDesk {
                     applyAdvanceBtn.classList.add('btn-secondary');
                 } else {
                     // Apply advance (up to total before advance)
-                    const totalBeforeAdvance = this.metalValue + this.makingChargeAmount + (this.metalValue + this.makingChargeAmount) * (this.taxSlab / 100) - this.discount;
+                    const totalBeforeAdvance = this.totalAmount + this.appliedAdvance;
                     this.appliedAdvance = Math.min(this.customerAdvanceBalance, totalBeforeAdvance);
                     applyAdvanceBtn.textContent = 'Remove Advance';
                     applyAdvanceBtn.classList.remove('btn-secondary');
@@ -379,7 +466,9 @@ export class BillingDesk {
 
     async lookupCustomerAdvance(phone) {
         try {
-            const res = await fetch(`/api/advances/lookup?phone=${phone}`);
+            // Admin-gated since Phase 20.1 — reading an arbitrary customer's
+            // ledger by phone number is a cashier action, not a public one.
+            const res = await adminFetch(`/api/advances/lookup?phone=${phone}`);
             if (res.ok) {
                 const data = await res.json();
                 this.customerAdvanceBalance = parseFloat(data.balance) || 0;
@@ -424,10 +513,10 @@ export class BillingDesk {
         this.metalValue = weight * rateVal;
 
         // 2. Making Charges recalculation based on percent
-        this.makingChargeAmount = this.metalValue * (this.makingChargePercent / 100);
+        this.makingChargeAmount = makingChargeFromPercent(this.metalValue, this.makingChargePercent).amount;
         const amountInput = document.getElementById('making-amount');
         if (amountInput) {
-            amountInput.value = Math.round(this.makingChargeAmount * 100) / 100;
+            amountInput.value = round2(this.makingChargeAmount);
         }
 
         this.recalculateSummaryOnly();
@@ -438,19 +527,29 @@ export class BillingDesk {
         const weight = parseFloat(weightInput?.value) || 0;
         const rateVal = this.goldRate[this.selectedPurity] || 0;
 
-        // Compute tax
-        const taxableAmount = this.metalValue + this.makingChargeAmount;
-        const taxAmount = taxableAmount * (this.taxSlab / 100);
+        // All money math lives in lib/billingMath.js (discount → tax → advance).
+        const totals = computeInvoiceTotals({
+            metalValue: this.metalValue,
+            makingChargeAmount: this.makingChargeAmount,
+            discountPercent: this.discountPercent,
+            taxSlab: this.taxSlab,
+            taxMode: this.taxMode,
+            appliedAdvance: this.appliedAdvance,
+            customerAdvanceBalance: this.customerAdvanceBalance
+        });
 
-        // Adjust applied advance if it exceeds the remaining total
-        if (this.appliedAdvance > 0) {
-            const totalBeforeAdvance = taxableAmount + taxAmount - this.discount;
-            this.appliedAdvance = Math.min(this.customerAdvanceBalance, Math.max(0, totalBeforeAdvance));
-        }
+        this.discountAmount = totals.discountAmount;
+        this.appliedAdvance = totals.appliedAdvance;
+        this.totalAmount = totals.totalAmount;
+        this.taxableAmount = totals.taxableAmount;
+        this.taxAmount = totals.taxAmount;
+        const taxAmount = totals.taxAmount;
 
-        // Calculate grand total
-        this.totalAmount = taxableAmount + taxAmount - this.discount - this.appliedAdvance;
-        if (this.totalAmount < 0) this.totalAmount = 0;
+        // Line items as they must PRINT: net of the GST shown below them. In
+        // exclusive mode these are the gross figures unchanged; in inclusive
+        // mode the embedded tax has been carved out so the rows sum correctly.
+        const lines = totals.components;
+        const isInclusive = totals.taxMode === 'Inclusive';
 
         // Update previews
         const previewWeight = document.getElementById('preview-weight');
@@ -458,9 +557,12 @@ export class BillingDesk {
         const previewMetalVal = document.getElementById('preview-metal-val');
         const previewPurity = document.getElementById('preview-purity');
 
+        // The item table quotes the catalogue price the cashier actually keyed
+        // in, which in inclusive mode is the tax-bearing figure — the carving
+        // happens in the summary rows below, not here.
         if (previewWeight) previewWeight.textContent = `${weight.toFixed(3)} g`;
-        if (previewRate) previewRate.textContent = `₹${rateVal.toLocaleString('en-IN')}`;
-        if (previewMetalVal) previewMetalVal.textContent = `₹${this.metalValue.toLocaleString('en-IN')}`;
+        if (previewRate) previewRate.textContent = money(rateVal);
+        if (previewMetalVal) previewMetalVal.textContent = money(lines.grossMetalValue);
         if (previewPurity) previewPurity.textContent = this.selectedPurity === 'price24K' ? '24K' : this.selectedPurity === 'price22K' ? '22K' : '18K';
 
         // Update invoice summary fields
@@ -468,34 +570,47 @@ export class BillingDesk {
         const sumMakingPct = document.getElementById('sum-making-percent');
         const sumMakingAmt = document.getElementById('sum-making-amount');
         const sumTaxSlab = document.getElementById('sum-tax-slab');
+        const sumTaxMode = document.getElementById('sum-tax-mode');
         const sumTaxAmt = document.getElementById('sum-tax-amount');
         const sumDiscountRow = document.getElementById('summary-discount-row');
+        const sumDiscountPercent = document.getElementById('sum-discount-percent');
         const sumDiscountAmt = document.getElementById('sum-discount-amount');
+        const sumTaxableAmt = document.getElementById('sum-taxable-amount');
         const sumAdvanceRow = document.getElementById('summary-advance-row');
         const sumAdvanceAmt = document.getElementById('sum-advance-amount');
         const sumGrandTotal = document.getElementById('sum-grand-total');
 
-        if (sumMetal) sumMetal.textContent = `₹${this.metalValue.toLocaleString('en-IN')}`;
+        if (sumMetal) sumMetal.textContent = money(lines.metalValue);
         if (sumMakingPct) sumMakingPct.textContent = this.makingChargePercent;
-        if (sumMakingAmt) sumMakingAmt.textContent = `₹${this.makingChargeAmount.toLocaleString('en-IN')}`;
+        if (sumMakingAmt) sumMakingAmt.textContent = money(lines.makingChargeAmount);
+
+        // Only inclusive pricing restates its lines, so only inclusive pricing
+        // needs to say so on the invoice.
+        const netNote = isInclusive ? ' (net of GST)' : '';
+        document.querySelectorAll('.invoice-summary .sum-net-note')
+            .forEach(el => { el.textContent = netNote; });
+
+        if (sumTaxableAmt) sumTaxableAmt.textContent = money(this.taxableAmount);
         if (sumTaxSlab) sumTaxSlab.textContent = this.taxSlab;
-        if (sumTaxAmt) sumTaxAmt.textContent = `₹${taxAmount.toLocaleString('en-IN')}`;
-        
-        if (this.discount > 0 && sumDiscountRow && sumDiscountAmt) {
-            sumDiscountAmt.textContent = `-₹${this.discount.toLocaleString('en-IN')}`;
+        if (sumTaxMode) sumTaxMode.textContent = isInclusive ? 'Incl' : 'Excl';
+        if (sumTaxAmt) sumTaxAmt.textContent = money(taxAmount);
+
+        if (this.discountPercent > 0 && sumDiscountRow && sumDiscountAmt) {
+            if (sumDiscountPercent) sumDiscountPercent.textContent = this.discountPercent;
+            sumDiscountAmt.textContent = `-${money(lines.discountAmount)}`;
             sumDiscountRow.style.display = 'flex';
         } else if (sumDiscountRow) {
             sumDiscountRow.style.display = 'none';
         }
 
         if (this.appliedAdvance > 0 && sumAdvanceRow && sumAdvanceAmt) {
-            sumAdvanceAmt.textContent = `-₹${this.appliedAdvance.toLocaleString('en-IN')}`;
+            sumAdvanceAmt.textContent = `-${money(this.appliedAdvance)}`;
             sumAdvanceRow.style.display = 'flex';
         } else if (sumAdvanceRow) {
             sumAdvanceRow.style.display = 'none';
         }
 
-        if (sumGrandTotal) sumGrandTotal.textContent = `₹${this.totalAmount.toLocaleString('en-IN')}`;
+        if (sumGrandTotal) sumGrandTotal.textContent = money(this.totalAmount);
     }
 
     async submitSale() {
@@ -517,7 +632,9 @@ export class BillingDesk {
             makingChargePercent: this.makingChargePercent,
             makingChargeAmount: this.makingChargeAmount,
             taxPercent: this.taxSlab,
-            discount: this.discount,
+            taxMode: this.taxMode,
+            discountPercent: this.discountPercent,
+            discount: this.discountAmount,
             appliedAdvance: this.appliedAdvance,
             totalAmount: this.totalAmount,
             timestamp: Date.now()
@@ -533,7 +650,19 @@ export class BillingDesk {
 
             if (response.ok) {
                 logTelemetry('SAVE_SALE_SUCCESS', Date.now() - startPost);
-                alert('Invoice Saved Successfully!');
+                const result = await response.json();
+                if (result.totalCorrected && result.sale) {
+                    // The server recomputed a different total (almost always a
+                    // stale tab whose tax settings changed underneath it). Say
+                    // so rather than let the printed slip disagree with the ledger.
+                    alert(
+                        `Invoice ${result.invoiceId} saved, but the server recalculated the total to ` +
+                        `₹${result.sale.totalAmount.toLocaleString('en-IN')} using the current tax settings.\n\n` +
+                        `Please reprint the invoice — the preview on screen is out of date.`
+                    );
+                } else {
+                    alert('Invoice Saved Successfully!');
+                }
                 this.resetForm();
             } else {
                 const err = await response.json();
@@ -550,7 +679,17 @@ export class BillingDesk {
         if (form) form.reset();
         this.customerName = '';
         this.customerPhone = '';
-        this.discount = 0;
+        this.discountPercent = this.defaultDiscountConfig;
+        const discountInput = document.getElementById('manual-discount');
+        if (discountInput) discountInput.value = this.discountPercent;
+        
+        const toggleBtn = document.getElementById('toggle-discount-btn');
+        if (toggleBtn && this.defaultDiscountConfig > 0) {
+            toggleBtn.textContent = 'Remove';
+            toggleBtn.className = 'btn btn-secondary btn-small';
+        }
+        
+        this.discountAmount = 0;
         this.appliedAdvance = 0;
         this.customerAdvanceBalance = 0;
         

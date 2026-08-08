@@ -83,7 +83,7 @@ body {
     flex-direction: column;
     justify-content: space-between;
     border-right: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 20px;
+    padding: 10px;
 }
 
 .sidebar-header h2 {
@@ -112,8 +112,8 @@ body {
 .sidebar-nav {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-top: 40px;
+    gap: 4px;
+    margin-top: 20px;
     flex-grow: 1;
 }
 
@@ -216,7 +216,7 @@ body {
     left: 0;
     right: 0;
     bottom: 0;
-    padding: 30px;
+    padding: 10px;
     overflow: hidden;
 }
 
@@ -225,7 +225,7 @@ body {
 }
 
 .panel-header {
-    margin-bottom: 20px;
+    margin-bottom: 10px;
     flex-shrink: 0;
 }
 
@@ -241,7 +241,7 @@ body {
     background-color: var(--color-bg-panel);
     border: 1px solid var(--color-border);
     border-radius: 12px;
-    padding: 24px;
+    padding: 10px;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
 }
 
@@ -379,9 +379,9 @@ body {
 .form-group {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 4px;
     flex: 1;
-    margin-bottom: 12px;
+    margin-bottom: 8px;
 }
 
 .form-group label {
@@ -394,7 +394,7 @@ body {
 
 .form-control {
     width: 100%;
-    padding: 10px 12px;
+    padding: 6px 12px;
     border-radius: 6px;
     border: 1px solid var(--color-border);
     font-family: var(--font-sans);
@@ -488,10 +488,14 @@ body {
     text-transform: uppercase;
     border-bottom: 1px solid var(--color-border);
     padding-bottom: 6px;
+    position: sticky;
+    top: -10px;
+    z-index: 10;
+    background-color: var(--color-bg-panel);
 }
 
 .invoice-table td {
-    padding: 10px 0;
+    padding: 4px 0;
     border-bottom: 1px solid var(--color-accent-light);
     color: var(--color-text-main);
 }
@@ -519,6 +523,23 @@ body {
     font-weight: 700;
     font-size: 16px;
     color: var(--color-text-main);
+}
+
+/* Taxable Value — the line the rows above add up to, and the base the GST
+   line below is charged on. Ruled off so the two halves read as a sum. */
+.summary-row.summary-subtotal {
+    padding-top: 6px;
+    border-top: 1px solid var(--color-border);
+    font-weight: 600;
+    color: var(--color-text-main);
+}
+
+/* "(net of GST)" qualifier — inclusive mode only; empty and invisible
+   otherwise, since the element is always present in the markup. */
+.sum-net-note {
+    font-size: 0.85em;
+    opacity: 0.8;
+    font-style: italic;
 }
 
 /* Dynamic Alert box for advances lookup */
@@ -558,7 +579,7 @@ body {
     display: inline-block;
     background: none;
     border: none;
-    padding: 8px 14px;
+    padding: 6px 12px;
     font-family: var(--font-sans);
     font-size: 12px;
     font-weight: 600;
@@ -571,7 +592,7 @@ body {
 .btn-primary {
     background-color: var(--color-bg-sidebar);
     color: #ffffff;
-    padding: 12px 20px;
+    padding: 8px 16px;
     font-size: 13px;
     border: 1px solid var(--color-bg-sidebar);
 }
@@ -613,6 +634,13 @@ body {
     align-items: center;
     gap: 12px;
     margin-bottom: 20px;
+    position: sticky;
+    top: -10px;
+    z-index: 20;
+    background: var(--color-bg-panel);
+    padding: 10px 0;
+    margin-top: -10px;
+    border-bottom: 1px solid var(--color-border);
 }
 
 .dashboard-grid {
@@ -786,7 +814,7 @@ body {
 
 .advances-table th {
     text-align: left;
-    padding: 10px 12px;
+    padding: 6px 8px;
     background-color: var(--color-accent-light);
     color: var(--color-text-muted);
     font-weight: 700;
@@ -794,10 +822,13 @@ body {
     text-transform: uppercase;
     letter-spacing: 0.03em;
     border-bottom: 2px solid var(--color-border-dark);
+    position: sticky;
+    top: -10px;
+    z-index: 10;
 }
 
 .advances-table td {
-    padding: 12px;
+    padding: 6px 8px;
     border-bottom: 1px solid var(--color-border);
     color: var(--color-text-main);
 }
@@ -813,7 +844,7 @@ body {
 
 .advances-detail-row td {
     background-color: var(--color-bg-base);
-    padding: 4px 20px 16px;
+    padding: 4px 20px 8px;
 }
 
 .ledger-drilldown {

@@ -88,6 +88,42 @@ function buildSummaryHtml(summary, periodLabel, companyName) {
 }
 
 /**
+ * Sends one arbitrary transactional email through the tenant's configured
+ * SMTP transport — the customer password-reset mail, and later the scheme
+ * due/overdue reminders, all share this one path.
+ *
+ * Follows the same "degrade, don't crash" contract as sendSummaryReport():
+ * returns `{success:false, reason}` when SMTP isn't configured instead of
+ * throwing, so a store that never set up email still gets a clear message
+ * rather than a 500.
+ */
+export async function sendMailIfConfigured({ to, subject, html }) {
+    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const transporter = getTransporter(settings);
+    if (!transporter) {
+        return { success: false, reason: 'SMTP is not configured on this store. Please contact the store directly.' };
+    }
+    if (!to) {
+        return { success: false, reason: 'No recipient email address available.' };
+    }
+
+    const fromName = (settings.smtp && settings.smtp.fromName) || settings.companyName || 'Gold POS';
+    try {
+        await transporter.sendMail({
+            from: `"${fromName}" <${settings.smtp.user}>`,
+            to,
+            subject,
+            html
+        });
+        logTelemetry('TRANSACTIONAL_EMAIL_SENT', 0, `Subject: ${subject}`);
+        return { success: true };
+    } catch (err) {
+        logError(`Failed to send transactional email "${subject}": ${err.message}`, err.stack);
+        return { success: false, reason: err.message };
+    }
+}
+
+/**
  * Sends a Daily or Monthly summary report. Returns a result object rather
  * than throwing, so callers (cron ticks, the manual "send now" endpoint)
  * can report success/skip/failure without a try/catch at every call site.

@@ -33,6 +33,19 @@ cd "$CHECKOUT_PATH"
 git fetch origin "$BRANCH"
 git reset --hard "origin/$BRANCH"
 
+# Re-apply this environment's real signing keys. backend/keys/*_public.pem are
+# tracked files, so the reset above just reverted them to the ones generated on
+# a dev laptop — which do not match the keypair this VPS's licensing server
+# generated on its own first boot. Without this, every license activation fails
+# signature verification and updateEngine.js rejects every release. The overlay
+# is written once by deploy/provision-pipeline.sh and lives outside any
+# checkout so no deploy can clobber it.
+KEY_OVERLAY_DIR="${KEY_OVERLAY_DIR:-/opt/gold-pos/keys}/$(basename "$CHECKOUT_PATH")"
+if [[ -d "$KEY_OVERLAY_DIR" ]]; then
+    echo "==> Restoring pinned signing keys from $KEY_OVERLAY_DIR"
+    cp -f "$KEY_OVERLAY_DIR"/*.pem "$MODULE_DIR/keys/"
+fi
+
 echo "==> Installing $MODULE_DIR dependencies"
 (cd "$MODULE_DIR" && npm ci --omit=dev --no-audit --no-fund)
 

@@ -11,6 +11,10 @@ gold_pos_release.zip
 backups/
 licensing_server/data/
 graphify-out/
+skill-observations/
+
+# Agent scratch dirs occasionally materialised in the repo root by mistake
+UsersABCDAppDataLocalTemp*/
 
 # Private keys and offline developer-only material must never be committed
 developer_doomsday_keys/*.pem

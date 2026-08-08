@@ -1,11 +1,14 @@
 {
   "name": "gold-pos-backend",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Lightweight, future-proof backend server for SaaS Gold POS",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test_billing_math.js && node test_suite.js",
+    "test:billing": "node test_billing_math.js",
+    "test:integration": "node test_suite.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -1,4 +1,5 @@
 import { adminFetch, logTelemetry } from '../app.js';
+import { normalizeTaxMode } from '../lib/billingMath.js';
 
 function escapeHtmlAttr(value) {
     return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
@@ -105,7 +106,14 @@ export class SettingsManager {
             </div>
             <div class="form-group" style="max-width:150px;">
                 <label for="set-currency">Currency</label>
-                <input type="text" id="set-currency" class="form-control" value="${s.currency || 'INR'}">
+                <select id="set-currency" class="form-control">
+                    <option value="INR" ${(!s.currency || s.currency === 'INR') ? 'selected' : ''}>INR (₹)</option>
+                    <option value="USD" ${s.currency === 'USD' ? 'selected' : ''}>USD ($)</option>
+                    <option value="EUR" ${s.currency === 'EUR' ? 'selected' : ''}>EUR (€)</option>
+                    <option value="GBP" ${s.currency === 'GBP' ? 'selected' : ''}>GBP (£)</option>
+                    <option value="AED" ${s.currency === 'AED' ? 'selected' : ''}>AED (د.إ)</option>
+                    <option value="SGD" ${s.currency === 'SGD' ? 'selected' : ''}>SGD (S$)</option>
+                </select>
             </div>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Company Logo</h3>
@@ -180,14 +188,8 @@ export class SettingsManager {
                     <label for="set-gold-provider">API Provider</label>
                     <select id="set-gold-provider" class="form-control">
                         <option value="public" ${s.goldApiProvider === 'public' ? 'selected' : ''}>Public (Yahoo Finance, keyless)</option>
-                        <option value="goldapi" ${s.goldApiProvider === 'goldapi' ? 'selected' : ''}>GoldAPI.io</option>
-                        <option value="metalsdev" ${s.goldApiProvider === 'metalsdev' ? 'selected' : ''}>Metals.dev</option>
                         <option value="mock" ${s.goldApiProvider === 'mock' ? 'selected' : ''}>Mock (testing only)</option>
                     </select>
-                </div>
-                <div class="form-group">
-                    <label for="set-gold-key">API Key (if required)</label>
-                    <input type="text" id="set-gold-key" class="form-control" value="${s.goldApiKey || ''}">
                 </div>
             </div>
             <button type="button" id="sync-gold-price-btn" class="btn btn-secondary">Sync Price Now</button>
@@ -260,7 +262,6 @@ export class SettingsManager {
         document.getElementById('save-price-override').addEventListener('click', async () => {
             const payload = {
                 goldApiProvider: document.getElementById('set-gold-provider').value,
-                goldApiKey: document.getElementById('set-gold-key').value,
                 overrideGoldPrice: {
                     active: document.getElementById('set-override-active').checked,
                     price24K: parseFloat(document.getElementById('price-override-24k').value) || 0,
@@ -283,7 +284,27 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-tax-slab">Default GST Tax Slab (%)</label>
-                    <input type="number" id="set-tax-slab" class="form-control" value="${s.goldTaxSlab ?? 3}" step="0.1" min="0">
+                    <select id="set-tax-slab" class="form-control">
+                        <option value="0" ${s.goldTaxSlab == 0 ? 'selected' : ''}>0%</option>
+                        <option value="3" ${s.goldTaxSlab == 3 || s.goldTaxSlab == null ? 'selected' : ''}>3% (Gold & Silver)</option>
+                        <option value="5" ${s.goldTaxSlab == 5 ? 'selected' : ''}>5%</option>
+                        <option value="12" ${s.goldTaxSlab == 12 ? 'selected' : ''}>12%</option>
+                        <option value="18" ${s.goldTaxSlab == 18 ? 'selected' : ''}>18%</option>
+                        <option value="28" ${s.goldTaxSlab == 28 ? 'selected' : ''}>28%</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="set-tax-mode">Tax Mode</label>
+                    <select id="set-tax-mode" class="form-control">
+                        <option value="Exclusive" ${normalizeTaxMode(s.taxMode) !== 'Inclusive' ? 'selected' : ''}>Exclusive (Added to Total)</option>
+                        <option value="Inclusive" ${normalizeTaxMode(s.taxMode) === 'Inclusive' ? 'selected' : ''}>Inclusive (Included in Total)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-default-discount">Default Discount (%)</label>
+                    <input type="number" id="set-default-discount" class="form-control" value="${s.defaultDiscountPercent ?? 0}" step="1" min="0" max="99">
                 </div>
                 <div class="form-group">
                     <label for="set-admin-pin">Admin PIN</label>
@@ -306,12 +327,31 @@ export class SettingsManager {
     }
 
     wireBillingSection() {
+        const discountInput = document.getElementById('set-default-discount');
+        if (discountInput) {
+            discountInput.addEventListener('input', (e) => {
+                let val = parseInt(e.target.value, 10);
+                if (isNaN(val)) {
+                    e.target.value = '';
+                } else {
+                    if (val > 99) val = 99;
+                    if (val < 0) val = 0;
+                    e.target.value = val;
+                }
+            });
+        }
+
         document.getElementById('save-billing-btn').addEventListener('click', async () => {
             const requestedSeq = parseInt(document.getElementById('set-invoice-seq').value) || 1;
             const currentSeq = parseInt(this.settings.invoiceSeqStart) || 1;
 
+            let discountPct = parseInt(document.getElementById('set-default-discount').value, 10) || 0;
+            if (discountPct >= 100) discountPct = 99;
+
             const payload = {
                 goldTaxSlab: parseFloat(document.getElementById('set-tax-slab').value) || 0,
+                taxMode: document.getElementById('set-tax-mode').value,
+                defaultDiscountPercent: discountPct,
                 adminPin: document.getElementById('set-admin-pin').value || '1234',
                 invoicePrefix: document.getElementById('set-invoice-prefix').value || 'GOLD',
                 invoiceSeqStart: requestedSeq

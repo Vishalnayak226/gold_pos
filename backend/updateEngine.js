@@ -137,6 +137,19 @@ function isProtectedRelativePath(relPath) {
 }
 
 /**
+ * True if a path relative to the root resolves OUTSIDE that root (a
+ * "zip-slip" style escape, e.g. "../../../etc/passwd") or is itself
+ * absolute. Extraction tools (Expand-Archive, unzip) already refuse to
+ * write such entries to disk in the first place — verified experimentally
+ * — so this should never actually trigger in practice. It's kept as an
+ * independent, tool-agnostic backstop rather than relying solely on
+ * whichever OS utility happens to be extracting the archive.
+ */
+function escapesRoot(relPath) {
+    return relPath.startsWith('..') || path.isAbsolute(relPath);
+}
+
+/**
  * Recursively copies a directory, skipping any path that matches
  * PROTECTED_PATHS (compared relative to `rootForProtection`, which should
  * always be the project root regardless of which subtree is being copied —
@@ -145,6 +158,10 @@ function isProtectedRelativePath(relPath) {
  */
 function copyTreeExcludingProtected(src, dest, rootForProtection) {
     const relFromRoot = path.relative(rootForProtection, dest);
+    if (relFromRoot && escapesRoot(relFromRoot)) {
+        logError(`updateEngine: refusing to write outside the project root during apply/restore: ${dest}`);
+        return;
+    }
     if (relFromRoot && isProtectedRelativePath(relFromRoot)) {
         return; // never descend into or overwrite a protected path
     }
@@ -198,12 +215,27 @@ function snapshotTree(src, dest) {
     }
 }
 
+/**
+ * Extracts a zip, failing loudly on ANY problem — including a malicious or
+ * malformed entry (e.g. a path-traversal "zip-slip" entry like
+ * "../../../evil.txt"). Verified experimentally: PowerShell's
+ * Expand-Archive already refuses to write such an entry outside destDir
+ * (good), but by default that rejection is a non-terminating warning —
+ * the process still exits 0 and execSync would NOT throw, meaning
+ * applyUpdate() would treat a silently-partial extraction as a full
+ * success and apply an inconsistent, never-tested mix of old/new files to
+ * every tenant. `$ErrorActionPreference = 'Stop'` (plus `-ErrorAction
+ * Stop` on the cmdlet itself) turns that into a real thrown exception, so
+ * the existing rollback path in applyUpdate() actually engages instead.
+ */
 function extractZip(zipPath, destDir) {
     if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
     if (process.platform === 'win32') {
-        execSync(`powershell -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force"`);
+        execSync(`powershell -Command "$ErrorActionPreference = 'Stop'; Expand-Archive -Path '${zipPath}' -DestinationPath '${destDir}' -Force -ErrorAction Stop"`);
     } else {
-        execSync(`unzip -o '${zipPath}' -d '${destDir}'`);
+        // -q: quiet; a non-zero exit (including for skipped/refused
+        // entries) makes execSync throw, same fail-loud guarantee as above.
+        execSync(`unzip -q -o '${zipPath}' -d '${destDir}'`);
     }
 }
 

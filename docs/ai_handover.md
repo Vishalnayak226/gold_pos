@@ -2,6 +2,37 @@
 
 This document contains key architectural details, non-negotiable design guidelines, and developer context for the completed **Gold Business POS** SaaS platform. Any incoming AI agent or developer must strictly adhere to these instructions.
 
+> **Fresh session: read §0 only.** The rest of this file is ~5k tokens of reference you almost
+> never need up front. Standing rules live in root `CLAUDE.md` (auto-loaded); the reasoning
+> behind them lives in `docs/FOUNDATION.md`.
+
+---
+
+## 0. Version Control & Handover Status
+
+*Keep this section current whenever a unit of work finishes. Absolute dates only.*
+
+- **Latest commit:** `e4999bc` — Phase 19: Dev/Sandbox/Live deployment pipeline (2026-07-17)
+- **Uncommitted in tree (as of 2026-08-08):** ~35 paths. Modified: `backend/` (db, server,
+  priceEngine, updateEngine, emailReporter), `frontend/` (index.html, app.css, BillingDesk,
+  Dashboard, SettingsManager, AdvancesManager), `licensing_server/server.js`,
+  `release_pipeline.js`, several `docs/`. New and untracked: `backend/customerAuth.js`,
+  `backend/defaultSettings.js`, `backend/test_billing_math.js`, `frontend/js/lib/`,
+  `frontend/package.json`, `deploy/provision-pipeline.sh`, `docs/PRODUCTION_READINESS_ROADMAP.md`,
+  `docs/SCHEME_MODULE_PLAN.md`, `docs/TESTING_CHECKLIST.md`.
+- **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060).
+- **Concurrent-session risk:** this tree sees edits from the user and other agents. Run
+  `git status`/`git diff` and stage only files you reviewed — never `git add -A`.
+- **Last unit of work:** Phase 20.1 — customer identity & authentication (2026-08-08). The
+  customer portal now requires a password; `/api/customer/*` is session-scoped; four
+  previously-public endpoints are gated. Verified live (53 API + 20 post-restart + 29 Playwright
+  checks, all green, `backend/data/` restored byte-identical). See `CHANGELOG.md` [Unreleased],
+  `docs/SCHEME_MODULE_PLAN.md` §20.1, `docs/TESTING_CHECKLIST.md` §12.
+- **Next session should start with:** confirming which of the untracked Phase-20 files are
+  finished enough to commit, then `cd backend && npm test`. The scheme module's remaining phases
+  (20.2 onward) are still blocked on the seven product decisions in `SCHEME_MODULE_PLAN.md` §7;
+  `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the unblocked queue.
+
 ---
 
 ## 1. Directory Structure Layout
@@ -85,6 +116,21 @@ The standard project folder hierarchy is organized as follows:
 ### B. Two-Tier Diagnostics
 *   **Level 1 (Telemetry):** Technical profiles (latencies, errors, memory) contain zero customer details. Accessible in plain text by developers at `/api/diagnostics/telemetry`.
 *   **Level 2 (Database Export):** Sensitive JSON databases are bundled on request, encrypted with an ephemeral AES-256 key, and packaged into an envelope where the AES key is encrypted using the Developer's RSA-4096 Public Key. Decryptable only offline by the developer's private key (`developer_private.pem`).
+*   `backend/data/customer_auth.json` is deliberately **not** in the Level-2 bundle. A support export should never carry credential material off a tenant's machine, even encrypted. If you extend the bundle, keep it out.
+
+### C. Two Session Systems, Deliberately Different (added 2026-08-08)
+Both issue an opaque bearer token checked by an Express middleware; they differ where the two audiences differ.
+
+| | Admin / cashier (`adminAuth.js`) | Customer (`customerAuth.js`) |
+|---|---|---|
+| Credential | One shared PIN from `settings.adminPin` | Per-account password, scrypt-hashed (`scrypt$N$r$p$hex` + separate salt) |
+| Sessions | In memory, 12h, lost on restart | Persisted as SHA-256 hashes on the account record, 30 days, max 5 devices, survive a restart |
+| Lockout | Per-IP, in memory | Per-account (persisted, survives a restart) **and** per-IP (in memory, against stuffing) |
+| Middleware | `requireAdminSession` | `requireCustomerSession`; `requireEstablishedCustomer` additionally blocks a counter-issued temporary password from doing anything but changing itself |
+
+The rule that matters: **every `/api/customer/*` handler reads the phone from `req.customerPhone`, which the middleware sets from the session.** Never from `req.body` or `req.query`. Routes that legitimately name an arbitrary customer's phone (`GET /api/advances/lookup`, `POST /api/advances`) are admin-gated instead, because that is a cashier action.
+
+An existing customer cannot self-register: `POST /api/customer/register` refuses a number that already has store history (`409 CLAIM_REQUIRES_STORE`) and the store issues the login at the counter via `POST /api/customer-accounts/issue-login`. Without an SMS gateway, that is what stops a stranger claiming someone else's ledger. When an SMS provider is chosen, OTP verification replaces this restriction rather than layering on top of it.
 
 ---
 
@@ -164,7 +210,8 @@ exercised end-to-end as of 2026-07-17 — no VPS/domain provisioned yet.
 Details that aren't obvious from reading the API/architecture alone — merged in from an earlier parallel handover doc, verified against current source.
 
 ### A. Customer Portal (`customer.html`)
-*   **Layout:** 100vh mobile-app layout with a fixed bottom tab bar (Profile, Deposit, Payment History). `body` is locked (`overflow: hidden`); only the inner `#portal-view` scrolls, to prevent layout clipping on mobile browsers.
+*   **Authentication (Phase 20.1, 2026-08-08):** phone + password, not phone alone. Three views swap in the same container — `#auth-view` (Sign In / Create Account / Forgot panes), `#force-change-view` (a counter-issued temporary password cannot reach any data until it is replaced), and `#portal-view`. The session token lives in `localStorage` and every call goes through the local `customerFetch()` helper, which attaches the bearer and drops back to sign-in on a 401 — the customer-side counterpart of `adminFetch()` in `app.js`. Server side: `backend/customerAuth.js`, routes under `/api/customer/*`.
+*   **Layout:** 100vh mobile-app layout with a fixed bottom tab bar (Profile, Deposit, History, Account). `body` is locked (`overflow: hidden`); only the inner `#portal-view` scrolls, to prevent layout clipping on mobile browsers.
 *   **Gold Appreciation Calculator (Profile tab):** shows how much a customer's cash deposits have appreciated. On deposit, the backend snapshots that day's `lockedGoldRate22K` onto the advance record (see `getActiveGoldRates().price22K` in `POST /api/advances` and `POST /api/payment/verify`, `backend/server.js`). On profile view, the frontend fetches the *live* 22K rate and computes `Current Worth = (Deposit / Locked Rate) * Live Rate`.
 *   **UI Alerts:** the global `window.alert` is overridden with a custom blurry modal overlay (success icon, etc.) instead of the native browser popup.
 *   **Testing tip:** to see the Gold Appreciation Calculator move, manually lower `lockedGoldRate22K` on an existing entry in `backend/data/advances.json`, then reload the profile view.

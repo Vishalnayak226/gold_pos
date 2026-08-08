@@ -1,0 +1,6 @@
+{
+  "name": "gold-pos-frontend",
+  "private": true,
+  "type": "module",
+  "description": "Marks the frontend sources as ES modules. The browser already treats them as such via <script type=\"module\">; this file exists so Node (backend/test_billing_math.js) can import the DOM-free helpers under js/lib/ without a SyntaxError. No dependencies, not installed, not bundled."
+}

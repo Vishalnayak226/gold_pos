@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { getDefaultSettings } from './backend/defaultSettings.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -68,7 +69,13 @@ const backendExcludes = [
     'developer_doomsday_keys',
     'keys/developer_private.pem',
     'backups',
-    'data/sales_' // exclude transaction partitions
+    'data/sales_', // exclude transaction partitions
+    // Customer credentials (scrypt hashes + hashed session/reset tokens). The
+    // clean templates written in step 7 below overwrite settings/license/
+    // advances after this copy, but a file with no clean-template counterpart
+    // would ride along untouched — so it is excluded here as well as seeded
+    // empty below. Belt and braces on purpose: this one leaks credentials.
+    'data/customer_auth.json'
 ];
 
 const licensingExcludes = [
@@ -106,26 +113,15 @@ fs.copyFileSync(
     path.join(DIST_DIR, 'backend', 'keys', 'developer_public.pem')
 );
 
-// Populate default settings schemas
+// Populate default settings schemas. Derived from the canonical template in
+// backend/defaultSettings.js so a newly added key can never be missing here —
+// only the production-specific overrides are spelled out below.
 const cleanSettings = {
-    companyName: "Universal Gold POS Ltd",
-    address: "100 Gold Plaza, Retail District",
-    phone: "9999999999",
-    gstNumber: "29AABCDE1234F1Z",
-    goldTaxSlab: 3.0,
-    reportEmail: "reports@goldpos.com",
-    smtp: null,
-    goldApiProvider: "public",
-    goldApiKey: "",
+    ...getDefaultSettings(),
+    // Never ship the demo Razorpay pair: in the client backend that exact pair
+    // switches checkout into mock mode, which must not happen on a real till.
     razorpayKeyId: "",
-    razorpayKeySecret: "",
-    overrideGoldPrice: {
-        active: false,
-        price24K: 0.0,
-        price22K: 0.0,
-        price18K: 0.0
-    },
-    currency: "INR"
+    razorpayKeySecret: ""
 };
 
 const cleanLicense = {
@@ -139,6 +135,7 @@ const cleanLicense = {
 fs.writeFileSync(path.join(prodDataDir, 'settings.json'), JSON.stringify(cleanSettings, null, 2));
 fs.writeFileSync(path.join(prodDataDir, 'license.json'), JSON.stringify(cleanLicense, null, 2));
 fs.writeFileSync(path.join(prodDataDir, 'advances.json'), JSON.stringify([], null, 2));
+fs.writeFileSync(path.join(prodDataDir, 'customer_auth.json'), JSON.stringify([], null, 2));
 
 // 8. Compress package using system utilities (ZIP)
 console.log('[Pipeline] Compressing clean bundle into zip archive...');

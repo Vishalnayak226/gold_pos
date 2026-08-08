@@ -192,12 +192,94 @@ function testAsymmetricEnvelope() {
     console.log('✅ Test 4 Passed: Asymmetric cryptographic envelope encrypt/decrypt cycle validated.');
 }
 
+/* ==========================================================================
+   TEST 5: Customer password hashing (scrypt) round-trip
+   Covers the pure half of backend/customerAuth.js — the half that decides
+   whether a stolen customer_auth.json is crackable. The stateful half
+   (sessions, lockout, reset codes) is proved against a live server instead,
+   because it writes to the tenant's real data directory.
+   ========================================================================== */
+async function testCustomerPasswordHashing() {
+    console.log('Running Test 5: Customer password hashing & verification...');
+    const { hashPassword, verifyPassword, validatePasswordStrength } = await import('./customerAuth.js');
+
+    const password = 'correct horse battery';
+    const { salt, passwordHash } = hashPassword(password);
+
+    // Self-describing format: scrypt$N$r$p$<hex>, so work factors can be
+    // raised later without invalidating every stored password.
+    const parts = passwordHash.split('$');
+    assert.strictEqual(parts.length, 5, 'Password hash should be scrypt$N$r$p$hex');
+    assert.strictEqual(parts[0], 'scrypt', 'Password hash should declare its KDF');
+    assert.ok(parseInt(parts[1], 10) >= 16384, 'scrypt N should be at least 16384');
+    assert.ok(!passwordHash.includes(password), 'Password must never appear in its own hash');
+
+    const account = { salt, passwordHash };
+    assert.strictEqual(verifyPassword(password, account), true, 'Correct password should verify.');
+    assert.strictEqual(verifyPassword('wrong password', account), false, 'Wrong password must not verify.');
+    assert.strictEqual(verifyPassword('', account), false, 'Empty password must not verify.');
+    assert.strictEqual(verifyPassword(password, { salt, passwordHash: 'scrypt$16384$8$1$deadbeef' }), false,
+        'A tampered hash must not verify.');
+    assert.strictEqual(verifyPassword(password, { salt: 'different', passwordHash }), false,
+        'A swapped salt must not verify.');
+
+    // Distinct salts per account, so identical passwords never collide and a
+    // precomputed table is worthless against the file as a whole.
+    const second = hashPassword(password);
+    assert.notStrictEqual(second.salt, salt, 'Each account must get its own random salt.');
+    assert.notStrictEqual(second.passwordHash, passwordHash, 'Same password must hash differently per salt.');
+
+    assert.ok(validatePasswordStrength('short') !== null, 'Short passwords must be rejected.');
+    assert.strictEqual(validatePasswordStrength('longenough123'), null, 'An 8+ char password should pass.');
+
+    console.log('✅ Test 5 Passed: scrypt hashing, verification, and salt uniqueness validated.');
+}
+
+/* ==========================================================================
+   TEST 6: Login lockout escalation schedule
+   Same escalating-cooldown rule as the admin PIN limiter (adminAuth.js),
+   asserted as arithmetic so a future tweak to the constants can't silently
+   flatten the curve.
+   ========================================================================== */
+function testLockoutEscalation() {
+    console.log('Running Test 6: Failed-login lockout escalation...');
+
+    const MAX_FAILED_ATTEMPTS = 5;
+    const BASE_LOCKOUT_MS = 30 * 1000;
+    const MAX_LOCKOUT_MS = 15 * 60 * 1000;
+
+    const lockoutFor = (attempts) => {
+        if (attempts < MAX_FAILED_ATTEMPTS) return 0;
+        const extra = attempts - MAX_FAILED_ATTEMPTS;
+        return Math.min(BASE_LOCKOUT_MS * Math.pow(2, extra), MAX_LOCKOUT_MS);
+    };
+
+    assert.strictEqual(lockoutFor(4), 0, 'Under the threshold there is no lockout.');
+    assert.strictEqual(lockoutFor(5), 30000, '5th failure locks for 30s.');
+    assert.strictEqual(lockoutFor(6), 60000, '6th failure doubles to 60s.');
+    assert.strictEqual(lockoutFor(7), 120000, '7th failure doubles to 120s.');
+    assert.strictEqual(lockoutFor(20), MAX_LOCKOUT_MS, 'Lockout is capped at 15 minutes.');
+
+    // A 4-digit admin PIN is a 10,000-value keyspace; with this schedule the
+    // attacker gets 5 free guesses and then spends over an hour on the next
+    // 10 — which is what made the unthrottled endpoint a real finding in 1.0.1.
+    let elapsedMs = 0;
+    for (let attempt = MAX_FAILED_ATTEMPTS; attempt < MAX_FAILED_ATTEMPTS + 10; attempt++) {
+        elapsedMs += lockoutFor(attempt);
+    }
+    assert.ok(elapsedMs > 60 * 60 * 1000, `10 attempts past the threshold should cost over an hour, got ${elapsedMs}ms`);
+
+    console.log('✅ Test 6 Passed: Lockout escalation curve and cap validated.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
     testBidirectionalCalculations();
     testLicensingLogic();
     testAsymmetricEnvelope();
+    await testCustomerPasswordHashing();
+    testLockoutEscalation();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');

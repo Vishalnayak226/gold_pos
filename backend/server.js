@@ -13,9 +13,22 @@ import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseCh
 import { initBackupScheduler, createBackup } from './backupEngine.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import { requireAdminSession, verifyAdminPin, createAdminSession, destroyAdminSession, loginRateLimiter, recordLoginResult } from './adminAuth.js';
-import { initReportScheduler, sendSummaryReport } from './emailReporter.js';
+import {
+    requireCustomerSession, requireEstablishedCustomer, customerLoginRateLimiter,
+    loginCustomer, destroyCustomerSession, destroyAllCustomerSessions,
+    createCustomerAccount, setCustomerPassword, updateCustomerProfile,
+    issueResetToken, consumeResetToken, findAccount, accountExists,
+    publicAccountView, verifyPassword, validatePasswordStrength,
+    generateTemporaryPassword, isValidPhone, CUSTOMER_PASSWORD_MIN_LENGTH
+} from './customerAuth.js';
+import { initReportScheduler, sendSummaryReport, sendMailIfConfigured } from './emailReporter.js';
 import { logBlackBoxEvent, exportBlackBoxEnvelope } from './blackBoxLogger.js';
 import { loadExtensions, fireHook } from './extensions/index.js';
+// Shared invoice arithmetic — the exact module the Billing Desk renders its
+// preview from, so the persisted ledger and the cashier's screen can never
+// drift apart. Lives under frontend/ because release_pipeline.js and
+// updateEngine.js ship and replace backend/ and frontend/ as a pair.
+import { computeInvoiceTotals, normalizeTaxMode, round2 } from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
 
 const app = express();
@@ -115,6 +128,330 @@ app.post('/api/admin/logout', (req, res) => {
 });
 
 /* ==========================================================================
+   API Routes: Customer Identity & Session Authentication
+
+   Everything under /api/customer/ is scoped to the phone on the session —
+   never a phone taken from the body or query string. Before this existed,
+   typing any 10-digit number into customer.html opened that customer's whole
+   ledger, which is the hole this closes. See backend/customerAuth.js.
+   ========================================================================== */
+
+/**
+ * Whether the store already holds business records against this phone.
+ * Self-service registration is refused for such numbers so that an outsider
+ * cannot register a number they don't own and inherit an existing customer's
+ * deposit history; those customers get their login issued at the counter
+ * instead (POST /api/customer-accounts/issue-login).
+ */
+function phoneHasStoreHistory(phone) {
+    const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
+    return advances.some(a => a.customerPhone === phone);
+}
+
+/**
+ * POST /api/customer/register
+ * Self-service signup, allowed only for a number with no existing store
+ * history (see above). Returns a live session so the customer lands straight
+ * in the portal.
+ */
+app.post('/api/customer/register', customerLoginRateLimiter, (req, res) => {
+    try {
+        const { phone, password, name, email } = req.body || {};
+        if (!isValidPhone(phone)) {
+            return res.status(400).json({ error: 'A valid 10-digit mobile number is required.' });
+        }
+        if (!name || !String(name).trim()) {
+            return res.status(400).json({ error: 'Your name is required.' });
+        }
+        const pwError = validatePasswordStrength(password);
+        if (pwError) return res.status(400).json({ error: pwError });
+
+        if (accountExists(phone)) {
+            return res.status(409).json({
+                error: 'ACCOUNT_EXISTS',
+                message: 'An account already exists for this mobile number. Please sign in, or use "Forgot password".'
+            });
+        }
+        if (phoneHasStoreHistory(phone)) {
+            return res.status(409).json({
+                error: 'CLAIM_REQUIRES_STORE',
+                message: 'This mobile number already has records with the store. For your security, please ask the store to set up your login at the counter.'
+            });
+        }
+
+        const created = createCustomerAccount({ phone, password, name: String(name).trim(), email });
+        if (!created.success) return res.status(400).json({ error: created.error });
+
+        const login = loginCustomer(phone, password, req.ip);
+        if (!login.success) return res.status(500).json({ error: login.error });
+
+        res.json({ success: true, token: login.token, customer: publicAccountView(login.account) });
+    } catch (err) {
+        logError('Customer registration failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not create your account. Please retry.' });
+    }
+});
+
+/**
+ * POST /api/customer/login
+ * Phone + password. Responses are deliberately identical for "no such
+ * account" and "wrong password" so this cannot be used to discover which
+ * mobile numbers are customers of the store.
+ */
+app.post('/api/customer/login', customerLoginRateLimiter, (req, res) => {
+    try {
+        const { phone, password } = req.body || {};
+        const result = loginCustomer(phone, password, req.ip);
+        if (!result.success) {
+            const status = result.code === 'ACCOUNT_LOCKED' ? 429 : 401;
+            return res.status(status).json({ error: result.code || 'INVALID_CREDENTIALS', message: result.error });
+        }
+        res.json({ success: true, token: result.token, customer: publicAccountView(result.account) });
+    } catch (err) {
+        logError('Customer login failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Sign-in failed. Please retry.' });
+    }
+});
+
+/** POST /api/customer/logout — invalidates just this device's session. */
+app.post('/api/customer/logout', (req, res) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    destroyCustomerSession(token);
+    res.json({ success: true });
+});
+
+/** GET /api/customer/me — the signed-in customer's own profile. */
+app.get('/api/customer/me', requireCustomerSession, (req, res) => {
+    res.json({ customer: publicAccountView(req.customerAccount) });
+});
+
+/** PATCH /api/customer/me — name, email, and notification preferences. */
+app.patch('/api/customer/me', requireEstablishedCustomer, (req, res) => {
+    try {
+        const { name, email, notifyEmail, notifyPush } = req.body || {};
+        const result = updateCustomerProfile(req.customerPhone, { name, email, notifyEmail, notifyPush });
+        if (!result.success) return res.status(400).json({ error: result.error });
+        res.json({ success: true, customer: publicAccountView(result.account) });
+    } catch (err) {
+        logError('Customer profile update failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not save your profile. Please retry.' });
+    }
+});
+
+/**
+ * POST /api/customer/password/change
+ * Requires the current password even though the session is already proven —
+ * so a borrowed unlocked phone cannot be used to lock the real owner out.
+ * Succeeding signs every device out, including this one.
+ */
+app.post('/api/customer/password/change', requireCustomerSession, (req, res) => {
+    try {
+        const { currentPassword, newPassword } = req.body || {};
+        if (!verifyPassword(currentPassword, req.customerAccount)) {
+            return res.status(401).json({ error: 'Your current password is incorrect.' });
+        }
+        const result = setCustomerPassword(req.customerPhone, newPassword);
+        if (!result.success) return res.status(400).json({ error: result.error });
+        res.json({ success: true, message: 'Password updated. Please sign in again.' });
+    } catch (err) {
+        logError('Customer password change failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not change your password. Please retry.' });
+    }
+});
+
+/**
+ * POST /api/customer/password/forgot
+ * Emails a short, single-use reset code to the address on the account. The
+ * response is identical whether or not the account exists — the only failure
+ * it will admit to is the store not having configured SMTP at all, which is
+ * a store-level fact and leaks nothing about any customer.
+ */
+app.post('/api/customer/password/forgot', customerLoginRateLimiter, async (req, res) => {
+    const GENERIC_OK = {
+        success: true,
+        message: 'If an account with that mobile number and a registered email exists, a reset code has been sent to it.'
+    };
+    try {
+        const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        if (!settings.smtp || !settings.smtp.host || !settings.smtp.user || !settings.smtp.pass) {
+            return res.status(400).json({
+                error: 'EMAIL_UNAVAILABLE',
+                message: 'This store has not enabled password reset emails yet. Please contact the store to have your password reset at the counter.'
+            });
+        }
+
+        const { phone } = req.body || {};
+        if (!isValidPhone(phone)) return res.json(GENERIC_OK);
+
+        const account = findAccount(phone);
+        if (!account || !account.email) return res.json(GENERIC_OK);
+
+        const issued = issueResetToken(phone);
+        if (!issued) return res.json(GENERIC_OK);
+
+        await sendMailIfConfigured({
+            to: account.email,
+            subject: `Password reset code — ${settings.companyName || 'Gold Savings Portal'}`,
+            html: `
+                <div style="font-family:Arial,sans-serif; max-width:520px; margin:0 auto; color:#1e293b;">
+                    <h2 style="border-bottom:2px solid #0f172a; padding-bottom:10px;">Password reset</h2>
+                    <p style="font-size:14px;">Enter this code in the portal to set a new password:</p>
+                    <p style="font-family:monospace; font-size:26px; letter-spacing:3px; font-weight:bold; background:#f1f5f9; padding:14px; text-align:center; border-radius:6px;">${issued.code}</p>
+                    <p style="font-size:13px; color:#64748b;">This code expires in 30 minutes and can only be used once. If you did not request it, you can safely ignore this email — your password has not changed.</p>
+                </div>
+            `
+        });
+
+        res.json(GENERIC_OK);
+    } catch (err) {
+        logError('Customer password reset request failed: ' + err.message, err.stack);
+        res.json(GENERIC_OK);
+    }
+});
+
+/** POST /api/customer/password/reset — completes the reset with the emailed code. */
+app.post('/api/customer/password/reset', customerLoginRateLimiter, (req, res) => {
+    try {
+        const { phone, code, newPassword } = req.body || {};
+        if (!isValidPhone(phone)) {
+            return res.status(400).json({ error: 'A valid 10-digit mobile number is required.' });
+        }
+        const result = consumeResetToken(phone, code, newPassword);
+        if (!result.success) return res.status(400).json({ error: result.error });
+        res.json({ success: true, message: 'Password updated. Please sign in with your new password.' });
+    } catch (err) {
+        logError('Customer password reset failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not reset your password. Please retry.' });
+    }
+});
+
+/**
+ * GET /api/customer/advances
+ * The signed-in customer's own balance and ledger. The session-scoped
+ * replacement for the portal's old GET /api/advances/lookup?phone= call.
+ */
+app.get('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
+    try {
+        res.json(computeAdvanceLedger(req.customerPhone));
+    } catch (err) {
+        logError('Customer advance lookup failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to load your balance.' });
+    }
+});
+
+/**
+ * POST /api/customer/advances
+ * Manual-UPI deposit submitted from the portal. Phone and name come from the
+ * account, never the body — which also removes the customer-supplied-name
+ * route that produced the stored-XSS finding in 1.0.1.
+ */
+app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
+    try {
+        const { amount, referenceId } = req.body || {};
+        if (!referenceId || !String(referenceId).trim()) {
+            return res.status(400).json({ error: 'A transaction reference ID is required.' });
+        }
+        const result = recordAdvanceDeposit({
+            customerPhone: req.customerPhone,
+            customerName: (req.customerAccount && req.customerAccount.name) || 'Regular Customer',
+            amount,
+            paymentMethod: 'UPI',
+            referenceId: String(referenceId).trim().slice(0, 100)
+        });
+        if (!result.success) {
+            return res.status(result.error.startsWith('Failed to persist') ? 500 : 400).json({ error: result.error });
+        }
+        res.json({ success: true, id: result.deposit.id, deposit: result.deposit });
+    } catch (err) {
+        logError('Customer advance deposit failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to submit your deposit.' });
+    }
+});
+
+/* ==========================================================================
+   API Routes: Customer Login Administration (store-side)
+
+   Deliberately mounted at /api/customer-accounts rather than /api/admin/… —
+   the license gate exempts everything under /api/admin so that activation
+   still works on a locked system, and customer account management has no
+   business staying open once a tenant's license lapses.
+   ========================================================================== */
+
+/**
+ * GET /api/customer-accounts
+ * Which customers have a portal login, and the state of each. Never returns
+ * password hashes, session tokens, or reset codes.
+ */
+app.get('/api/customer-accounts', requireAdminSession, (req, res) => {
+    try {
+        const accounts = readJSON(path.join(DATA_DIR, 'customer_auth.json'), []);
+        res.json(accounts.map(a => ({
+            ...publicAccountView(a),
+            activeSessions: (a.sessions || []).length,
+            lockedUntil: a.lockedUntil || 0,
+            updatedAt: a.updatedAt || 0
+        })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+    } catch (err) {
+        logError('Failed to list customer accounts: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list customer logins' });
+    }
+});
+
+/**
+ * POST /api/customer-accounts/issue-login
+ * Creates — or, with confirmDestructive, resets — a customer's portal login
+ * at the counter, returning a one-time temporary password to hand over. This
+ * is the only path by which a number that already has store history can get a
+ * login, which is what stops an outsider claiming an existing customer's
+ * ledger by self-registering their number.
+ *
+ * Resetting an existing account signs all of that customer's devices out, so
+ * it is confirmation-gated the same way lowering the invoice sequence is.
+ */
+app.post('/api/customer-accounts/issue-login', requireAdminSession, (req, res) => {
+    try {
+        const { phone, name, email, confirmDestructive } = req.body || {};
+        if (!isValidPhone(phone)) {
+            return res.status(400).json({ error: 'A valid 10-digit mobile number is required.' });
+        }
+
+        const tempPassword = generateTemporaryPassword();
+        const existing = findAccount(phone);
+
+        if (existing) {
+            if (!confirmDestructive) {
+                return res.status(409).json({
+                    error: 'CONFIRMATION_REQUIRED',
+                    message: `${phone} already has a portal login. Reissuing sets a new temporary password and signs the customer out of every device. Resubmit with confirmDestructive: true after explicit user confirmation.`
+                });
+            }
+            const reset = setCustomerPassword(phone, tempPassword, { mustChangePassword: true });
+            if (!reset.success) return res.status(500).json({ error: reset.error });
+            if (name !== undefined || email !== undefined) {
+                updateCustomerProfile(phone, { name, email });
+            }
+            destroyAllCustomerSessions(phone);
+            logTelemetry('CUSTOMER_LOGIN_REISSUED', 0, `Phone: ******${phone.slice(-4)}`);
+            return res.json({ success: true, reissued: true, phone, tempPassword });
+        }
+
+        const created = createCustomerAccount({
+            phone,
+            password: tempPassword,
+            name: name || '',
+            email: email || '',
+            mustChangePassword: true
+        });
+        if (!created.success) return res.status(400).json({ error: created.error });
+        res.json({ success: true, reissued: false, phone, tempPassword });
+    } catch (err) {
+        logError('Issuing a customer login failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not issue a customer login. Please retry.' });
+    }
+});
+
+/* ==========================================================================
    API Routes: Gold Price Engine
    ========================================================================== */
 
@@ -161,7 +498,12 @@ app.get('/api/settings/public', (req, res) => {
         res.json({
             companyName: settings.companyName,
             upiId: settings.upiId || '',
-            currency: settings.currency || 'INR'
+            currency: settings.currency || 'INR',
+            // Lets the portal state the password rule up front instead of
+            // only failing the customer after they've typed one.
+            passwordMinLength: CUSTOMER_PASSWORD_MIN_LENGTH,
+            // Whether "Forgot password" can work at all on this tenant.
+            passwordResetAvailable: !!(settings.smtp && settings.smtp.host && settings.smtp.user && settings.smtp.pass)
         });
     } catch (err) {
         logError('Error getting public settings: ' + err.message, err.stack);
@@ -211,6 +553,13 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
 
         const newSettings = { ...currentSettings, ...req.body };
         delete newSettings.confirmDestructive; // request-only flag, never persisted
+
+        // Store the tax mode in canonical form. Billing tolerates any casing,
+        // but settings.json stays the single tidy source of truth that the
+        // Settings dropdown reads back and preselects correctly.
+        if (newSettings.taxMode !== undefined) {
+            newSettings.taxMode = normalizeTaxMode(newSettings.taxMode);
+        }
 
         // Ensure manual overrides maintain float structures
         if (newSettings.overrideGoldPrice) {
@@ -289,6 +638,14 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         if (!Number.isFinite(numAppliedAdvance) || numAppliedAdvance < 0) {
             return res.status(400).json({ error: 'Applied advance must be a valid non-negative amount.' });
         }
+        const numMakingCharge = req.body.makingChargeAmount === undefined ? 0 : Number(req.body.makingChargeAmount);
+        if (!Number.isFinite(numMakingCharge) || numMakingCharge < 0) {
+            return res.status(400).json({ error: 'Making charge must be a valid non-negative amount.' });
+        }
+        const numDiscountPercent = req.body.discountPercent === undefined ? 0 : Number(req.body.discountPercent);
+        if (!Number.isFinite(numDiscountPercent) || numDiscountPercent < 0 || numDiscountPercent > 100) {
+            return res.status(400).json({ error: 'Discount percent must be between 0 and 100.' });
+        }
         if (customerPhone && !/^\d{10}$/.test(customerPhone)) {
             return res.status(400).json({ error: 'Customer phone must be exactly 10 digits if provided.' });
         }
@@ -298,6 +655,47 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
 
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const settings = readJSON(settingsFile, {});
+
+        // 0. Recompute the money server-side. The browser renders a live
+        // preview with this same shared module, but what gets persisted to the
+        // ledger is always the server's own arithmetic over the server's own
+        // tax configuration — a stale cached bundle or a tampered payload can
+        // no longer write a total that disagrees with the tax slab and tax
+        // mode actually configured in Settings.
+        const taxSlab = Number(settings.goldTaxSlab) || 0;
+        // Canonicalised through the shared helper, so a settings.json written
+        // by an older build, edited by hand, or restored from a backup with
+        // 'inclusive' in it cannot leave the server billing Exclusive while
+        // the browser bills Inclusive.
+        const taxMode = normalizeTaxMode(settings.taxMode);
+        const totals = computeInvoiceTotals({
+            metalValue: numMetalValue,
+            makingChargeAmount: numMakingCharge,
+            discountPercent: numDiscountPercent,
+            taxSlab,
+            taxMode,
+            appliedAdvance: numAppliedAdvance,
+            // The client decides how much advance to redeem (it knows the
+            // customer's balance); the server's job here is only to stop that
+            // redemption exceeding the bill and driving the total negative.
+            // Verifying the amount against advances.json is a separate
+            // reconciliation concern, deliberately not folded in here.
+            customerAdvanceBalance: numAppliedAdvance
+        });
+
+        // A mismatch means the client's math and the server's disagree — the
+        // server's value is what gets stored either way, but it is worth a
+        // loud log line: it is the signature of a stale cached frontend or a
+        // settings change mid-session.
+        const serverTotal = round2(totals.totalAmount);
+        const totalWasCorrected = Math.abs(round2(numTotal) - serverTotal) > 0.01;
+        if (totalWasCorrected) {
+            logError(
+                `Sale total mismatch — client submitted ${round2(numTotal)}, server computed ${serverTotal} ` +
+                `(taxSlab ${taxSlab}%, taxMode ${taxMode}, discount ${numDiscountPercent}%). Persisting the server value.`
+            );
+            logTelemetry('SALE_TOTAL_MISMATCH', 0, `client: ${round2(numTotal)}, server: ${serverTotal}`);
+        }
 
         // 1. Generate Incrementing Serial Invoice ID
         const prefix = settings.invoicePrefix || 'GOLD';
@@ -316,16 +714,24 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             return res.status(500).json({ error: 'Failed to persist invoice sequence. Sale was not saved — please retry.' });
         }
 
-        // 2. Prepare Sale Record (numeric fields normalized to clean numbers
-        // regardless of what was submitted, now that they've passed validation)
+        // 2. Prepare Sale Record. Every money field is the server's own
+        // recomputed, paise-rounded figure — the request body only survives
+        // for descriptive fields (customer, purity, timestamp, extensions).
         const sale = {
             id: invoiceId,
             ...req.body,
             weightGrams: numWeight,
             goldPricePerGram: numRate,
-            metalValue: numMetalValue,
-            totalAmount: numTotal,
-            appliedAdvance: numAppliedAdvance
+            metalValue: round2(numMetalValue),
+            makingChargeAmount: round2(numMakingCharge),
+            taxPercent: taxSlab,
+            taxMode,
+            taxableAmount: round2(totals.taxableAmount),
+            taxAmount: round2(totals.taxAmount),
+            discountPercent: numDiscountPercent,
+            discount: round2(totals.discountAmount),
+            appliedAdvance: round2(totals.appliedAdvance),
+            totalAmount: serverTotal
         };
 
         // 3. Save to partitioned annual file (e.g. sales_2026.json)
@@ -365,7 +771,9 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
 
         logTelemetry('SAVE_SALE', 0, `Invoice: ${invoiceId}, Total: ${sale.totalAmount}`);
         fireHook('onSaleSaved', sale);
-        res.json({ success: true, invoiceId, sale });
+        // `totalCorrected` lets the cashier know the printed preview no longer
+        // matches what was filed, instead of the two silently diverging.
+        res.json({ success: true, invoiceId, sale, totalCorrected: totalWasCorrected });
     } catch (err) {
         logError('Error saving sale transaction: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to process sale transaction: ' + err.message });
@@ -394,31 +802,84 @@ app.get('/api/advances', requireAdminSession, (req, res) => {
 });
 
 /**
- * GET /api/advances/lookup
- * Calculates and returns a customer's available advance credit balance and log ledger history.
+ * Computes one customer's advance balance and ledger history from the flat
+ * advances.json file. Shared by the admin lookup (Billing Desk redemption)
+ * and the session-scoped customer portal route so the cashier's screen and
+ * the customer's screen can never show different balances.
  */
-app.get('/api/advances/lookup', (req, res) => {
+function computeAdvanceLedger(phone) {
+    const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
+    const history = advances.filter(a => a.customerPhone === phone);
+    const balance = history.reduce((sum, item) => {
+        if (item.type === 'deposit') return sum + parseFloat(item.amount);
+        if (item.type === 'redeem') return sum - parseFloat(item.amount);
+        return sum;
+    }, 0);
+    return { phone, balance: Math.max(0, balance), history };
+}
+
+/**
+ * Appends a single deposit row to the advances ledger. This is the one write
+ * path for every deposit source — counter entry, customer manual UPI, and
+ * verified Razorpay — so the row shape and the locked-rate snapshot that the
+ * Gold Appreciation calculator depends on are identical whichever door the
+ * money came through.
+ * @returns {{success: boolean, error?: string, deposit?: object}}
+ */
+function recordAdvanceDeposit({ customerPhone, customerName, amount, paymentMethod, referenceId }) {
+    if (!isValidPhone(customerPhone)) {
+        return { success: false, error: 'Valid 10-digit customer phone number required' };
+    }
+    const numAmount = parseFloat(amount);
+    if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
+        return { success: false, error: 'Valid deposit amount required' };
+    }
+    if (customerName && String(customerName).length > 200) {
+        return { success: false, error: 'Customer name is too long (max 200 characters).' };
+    }
+
+    const advancesFile = path.join(DATA_DIR, 'advances.json');
+    const advances = readJSON(advancesFile, []);
+    const depositId = 'ADV-' + Math.random().toString(36).substring(2, 9).toUpperCase();
+
+    const deposit = {
+        id: depositId,
+        customerPhone,
+        customerName: customerName || 'Regular Customer',
+        type: 'deposit',
+        amount: numAmount,
+        paymentMethod: paymentMethod || 'UPI',
+        referenceId: referenceId || '',
+        lockedGoldRate22K: getActiveGoldRates().price22K,
+        timestamp: Date.now()
+    };
+
+    advances.push(deposit);
+    if (!writeJSON(advancesFile, advances)) {
+        return { success: false, error: 'Failed to persist advance deposit. Please retry.' };
+    }
+
+    logTelemetry('SAVE_ADVANCE_DEPOSIT', 0, `Amount: ${numAmount}, Method: ${deposit.paymentMethod}`);
+    fireHook('onAdvanceDeposit', deposit);
+    return { success: true, deposit };
+}
+
+/**
+ * GET /api/advances/lookup?phone=
+ * Any customer's balance + ledger, by phone. Admin-only: this is the Billing
+ * Desk's redemption lookup, where a cashier legitimately reads a customer's
+ * account. Customers read their *own* ledger through the session-scoped
+ * GET /api/customer/advances instead — before Phase 20.1 this route was
+ * public, which is precisely what let anyone read any customer's history by
+ * typing their phone number.
+ */
+app.get('/api/advances/lookup', requireAdminSession, (req, res) => {
     try {
         const { phone } = req.query;
-        if (!phone || !/^\d{10}$/.test(phone)) {
+        if (!isValidPhone(phone)) {
             return res.status(400).json({ error: 'Valid 10-digit phone number required' });
         }
-
-        const advancesFile = path.join(DATA_DIR, 'advances.json');
-        const advances = readJSON(advancesFile, []);
-
-        const history = advances.filter(a => a.customerPhone === phone);
-        const balance = history.reduce((sum, item) => {
-            if (item.type === 'deposit') return sum + parseFloat(item.amount);
-            if (item.type === 'redeem') return sum - parseFloat(item.amount);
-            return sum;
-        }, 0);
-
-        res.json({
-            phone,
-            balance: Math.max(0, balance),
-            history
-        });
+        res.json(computeAdvanceLedger(phone));
     } catch (err) {
         logError('Error looking up customer advance balance: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to lookup customer balance' });
@@ -427,47 +888,17 @@ app.get('/api/advances/lookup', (req, res) => {
 
 /**
  * POST /api/advances
- * Submits a new customer advance deposit record (UPI or Card), storing it in advances.json.
+ * Counter deposit entry, keyed to any customer phone. Admin-only for the same
+ * reason as the lookup above — a customer depositing through the portal posts
+ * to POST /api/customer/advances, which can only ever credit their own phone.
  */
-app.post('/api/advances', (req, res) => {
+app.post('/api/advances', requireAdminSession, (req, res) => {
     try {
-        const { customerPhone, customerName, amount, paymentMethod, referenceId } = req.body;
-        if (!customerPhone || !/^\d{10}$/.test(customerPhone)) {
-            return res.status(400).json({ error: 'Valid 10-digit customer phone number required' });
+        const result = recordAdvanceDeposit(req.body || {});
+        if (!result.success) {
+            return res.status(result.error.startsWith('Failed to persist') ? 500 : 400).json({ error: result.error });
         }
-        const numAmount = parseFloat(amount);
-        if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
-            return res.status(400).json({ error: 'Valid deposit amount required' });
-        }
-        if (customerName && String(customerName).length > 200) {
-            return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
-        }
-
-        const advancesFile = path.join(DATA_DIR, 'advances.json');
-        const advances = readJSON(advancesFile, []);
-
-        const depositId = 'ADV-' + Math.random().toString(36).substring(2, 9).toUpperCase();
-
-        const deposit = {
-            id: depositId,
-            customerPhone,
-            customerName: customerName || 'Regular Customer',
-            type: 'deposit',
-            amount: numAmount,
-            paymentMethod: paymentMethod || 'UPI',
-            referenceId: referenceId || '',
-            lockedGoldRate22K: getActiveGoldRates().price22K,
-            timestamp: Date.now()
-        };
-
-        advances.push(deposit);
-        if (!writeJSON(advancesFile, advances)) {
-            return res.status(500).json({ error: 'Failed to persist advance deposit. Please retry.' });
-        }
-
-        logTelemetry('SAVE_ADVANCE_DEPOSIT', 0, `Cust: ${customerPhone}, Amount: ${amount}, Ref: ${referenceId}`);
-        fireHook('onAdvanceDeposit', deposit);
-        res.json({ success: true, id: depositId, deposit });
+        res.json({ success: true, id: result.deposit.id, deposit: result.deposit });
     } catch (err) {
         logError('Error saving advance deposit transaction: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to submit advance deposit' });
@@ -528,13 +959,16 @@ function createRazorpayOrder(amount, keyId, keySecret) {
 
 /**
  * POST /api/payment/order
- * Initiates order with Razorpay. Returns orderId.
+ * Initiates order with Razorpay. Returns orderId. Customer-session-gated: an
+ * unauthenticated caller could otherwise mint orders against the store's
+ * Razorpay account at will.
  */
-app.post('/api/payment/order', async (req, res) => {
+app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
     const startTime = Date.now();
     try {
         const { amount } = req.body;
-        if (!amount || parseFloat(amount) <= 0) {
+        const numAmount = parseFloat(amount);
+        if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
             return res.status(400).json({ error: 'Valid amount is required' });
         }
 
@@ -575,24 +1009,37 @@ app.post('/api/payment/order', async (req, res) => {
 
 /**
  * POST /api/payment/verify
- * Verifies Razorpay payment signature and logs deposit in advances.json on success.
+ * Verifies Razorpay payment signature and logs deposit in advances.json on
+ * success. Customer-session-gated, and the deposit is always credited to the
+ * *session's* phone — the body can no longer name whose account gets the money.
  */
-app.post('/api/payment/verify', (req, res) => {
+app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
     try {
-        const { customerPhone, customerName, razorpay_order_id, razorpay_payment_id, razorpay_signature, amount } = req.body;
-        
-        if (!customerPhone || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amount) {
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, amount } = req.body;
+        const customerPhone = req.customerPhone;
+        const customerName = (req.customerAccount && req.customerAccount.name) || 'Regular Customer';
+
+        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !amount) {
             return res.status(400).json({ error: 'Missing payment details for verification' });
-        }
-        if (!/^\d{10}$/.test(customerPhone)) {
-            return res.status(400).json({ error: 'Valid 10-digit customer phone number required' });
         }
         const numAmount = parseFloat(amount);
         if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
             return res.status(400).json({ error: 'Valid payment amount required' });
         }
-        if (customerName && String(customerName).length > 200) {
-            return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
+
+        // Idempotency: a retried or replayed verify call (flaky mobile network,
+        // a double-tapped handler, a captured request) must not credit the
+        // same gateway payment twice.
+        const alreadyRecorded = readJSON(path.join(DATA_DIR, 'advances.json'), [])
+            .find(a => a.referenceId && a.referenceId === razorpay_payment_id);
+        if (alreadyRecorded) {
+            logTelemetry('PAYMENT_VERIFY_REPLAYED', 0, `PayId: ${razorpay_payment_id}`);
+            return res.json({
+                success: true,
+                id: alreadyRecorded.id,
+                duplicate: true,
+                message: 'This payment was already recorded.'
+            });
         }
 
         const settingsFile = path.join(DATA_DIR, 'settings.json');
@@ -616,26 +1063,16 @@ app.post('/api/payment/verify', (req, res) => {
             return res.status(400).json({ error: 'Payment signature verification failed. Possible fraud attempt.' });
         }
 
-        // Success! Log the advance deposit
-        const advancesFile = path.join(DATA_DIR, 'advances.json');
-        const advances = readJSON(advancesFile, []);
-        
-        const depositId = 'ADV-' + Math.random().toString(36).substring(2, 9).toUpperCase();
-        
-        const deposit = {
-            id: depositId,
+        // Success! Log the advance deposit through the shared write path.
+        const result = recordAdvanceDeposit({
             customerPhone,
-            customerName: customerName || 'Regular Customer',
-            type: 'deposit',
+            customerName,
             amount: numAmount,
             paymentMethod: 'Razorpay',
-            referenceId: razorpay_payment_id,
-            lockedGoldRate22K: getActiveGoldRates().price22K,
-            timestamp: Date.now()
-        };
+            referenceId: razorpay_payment_id
+        });
 
-        advances.push(deposit);
-        if (!writeJSON(advancesFile, advances)) {
+        if (!result.success) {
             // The customer's money has already moved via Razorpay at this point
             // (signature verified above) — this is now an urgent reconciliation
             // case, not a simple retry, so log it loudly and say so plainly.
@@ -643,11 +1080,10 @@ app.post('/api/payment/verify', (req, res) => {
             return res.status(500).json({ error: 'Payment verified but could not be recorded. Please contact support with your payment ID: ' + razorpay_payment_id });
         }
 
-        logTelemetry('PAYMENT_VERIFIED_SUCCESS', 0, `Invoice: ${depositId}, PayId: ${razorpay_payment_id}`);
-        fireHook('onAdvanceDeposit', deposit);
+        logTelemetry('PAYMENT_VERIFIED_SUCCESS', 0, `Invoice: ${result.deposit.id}, PayId: ${razorpay_payment_id}`);
         res.json({
             success: true,
-            id: depositId,
+            id: result.deposit.id,
             message: 'Payment verified and logged successfully'
         });
     } catch (err) {

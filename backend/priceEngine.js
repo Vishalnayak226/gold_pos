@@ -17,13 +17,17 @@ readJSON(RATES_FILE, defaultRates);
 
 /**
  * Fetches gold price from external API and updates rates.json.
- * Uses a free public Forex API as fallback or configures custom gold APIs if keys are in settings.
+ *
+ * Two providers only, both keyless: 'public' (Yahoo Finance gold futures) and
+ * 'mock' (a small synthetic drift, for testing). The paid GoldAPI.io and
+ * Metals.dev integrations were removed in 1.2.0 along with the API-key field;
+ * any legacy provider value in a tenant's settings is normalized to 'public'
+ * by migrateSettings() and treated as 'public' here regardless.
  */
 export async function syncGoldPrice() {
     const startTime = Date.now();
     const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
-    const apiKey = settings.goldApiKey;
-    const provider = settings.goldApiProvider || 'public'; // 'public', 'goldapi', 'metalsdev', or 'mock'
+    const provider = settings.goldApiProvider === 'mock' ? 'mock' : 'public';
 
     logTelemetry('PRICE_SYNC_START', 0, `Provider: ${provider}`);
 
@@ -57,30 +61,8 @@ export async function syncGoldPrice() {
             } else {
                 throw new Error(`Yahoo Finance API returned status: ${response.status}`);
             }
-        } else if (provider === 'goldapi' && apiKey) {
-            const response = await fetch('https://www.goldapi.io/api/XAU/USD', {
-                headers: { 'x-access-token': apiKey }
-            });
-            if (response.ok) {
-                const data = await response.json();
-                if (data.price) {
-                    goldPriceUSDPerOunce = data.price;
-                }
-            } else {
-                throw new Error(`GoldAPI returned status: ${response.status}`);
-            }
-        } else if (provider === 'metalsdev' && apiKey) {
-            const response = await fetch(`https://api.metals.dev/v1/latest?api_key=${apiKey}&currency=USD`);
-            if (response.ok) {
-                const data = await response.json();
-                if (data.rates && data.rates.gold) {
-                    goldPriceUSDPerOunce = 1 / data.rates.gold; // metals.dev rates are in ounces per USD
-                }
-            } else {
-                throw new Error(`Metals.dev returned status: ${response.status}`);
-            }
         } else {
-            // Mock provider or missing API key -> Generate a slight daily float to simulate auto-updating
+            // Mock provider -> Generate a slight daily float to simulate auto-updating
             const variance = (Math.random() - 0.5) * 15.0; // +/- $7.50 troy ounce
             goldPriceUSDPerOunce = 2350.0 + variance;
             logTelemetry('PRICE_SYNC_MOCK', 0, 'Mock gold price pulled.');

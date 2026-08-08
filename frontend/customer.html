@@ -11,7 +11,7 @@
         // Custom UI Alert Override
         window.alert = function(message) {
             if (document.getElementById('custom-alert-box')) return;
-            
+
             const isSuccess = message.toLowerCase().includes('success');
             const icon = isSuccess ? '✓' : '!';
             const iconBg = isSuccess ? '#dcfce7' : '#f1f5f9';
@@ -20,13 +20,29 @@
             const overlay = document.createElement('div');
             overlay.id = 'custom-alert-box';
             overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(15,23,42,0.8);display:flex;align-items:center;justify-content:center;z-index:999999;backdrop-filter:blur(2px);';
-            overlay.innerHTML = `
-                <div style="background:#ffffff; border-radius:8px; padding:25px; width:90%; max-width:400px; box-shadow:0 10px 25px rgba(0,0,0,0.2); text-align:center; border:1px solid #cbd5e1; font-family:'Outfit',sans-serif;">
-                    <div style="width:40px; height:40px; border-radius:50%; background:${iconBg}; color:${iconColor}; display:flex; align-items:center; justify-content:center; margin:0 auto 15px; font-weight:bold; font-size:20px;">${icon}</div>
-                    <p style="color:#1e293b; font-size:14px; line-height:1.5; margin-bottom:20px; font-weight:500;">${message}</p>
-                    <button style="background:#0f172a; color:#fff; border:none; padding:10px 25px; border-radius:6px; cursor:pointer; font-weight:600; width:100%; font-family:'Outfit',sans-serif;" onclick="document.getElementById('custom-alert-box').remove()">OK</button>
-                </div>
-            `;
+
+            // Built with DOM nodes, not innerHTML: `message` can carry a
+            // server-supplied string (an account name, an error detail), and
+            // this override is the one place every portal message funnels
+            // through. textContent makes that structurally un-injectable.
+            const card = document.createElement('div');
+            card.style.cssText = "background:#ffffff; border-radius:8px; padding:25px; width:90%; max-width:400px; box-shadow:0 10px 25px rgba(0,0,0,0.2); text-align:center; border:1px solid #cbd5e1; font-family:'Outfit',sans-serif;";
+
+            const badge = document.createElement('div');
+            badge.style.cssText = `width:40px; height:40px; border-radius:50%; background:${iconBg}; color:${iconColor}; display:flex; align-items:center; justify-content:center; margin:0 auto 15px; font-weight:bold; font-size:20px;`;
+            badge.textContent = icon;
+
+            const text = document.createElement('p');
+            text.style.cssText = 'color:#1e293b; font-size:14px; line-height:1.5; margin-bottom:20px; font-weight:500;';
+            text.textContent = message;
+
+            const okBtn = document.createElement('button');
+            okBtn.style.cssText = "background:#0f172a; color:#fff; border:none; padding:10px 25px; border-radius:6px; cursor:pointer; font-weight:600; width:100%; font-family:'Outfit',sans-serif;";
+            okBtn.textContent = 'OK';
+            okBtn.addEventListener('click', () => overlay.remove());
+
+            card.append(badge, text, okBtn);
+            overlay.appendChild(card);
             document.body.appendChild(overlay);
         };
     </script>
@@ -68,6 +84,55 @@
             flex-direction: column;
             gap: 15px;
             flex-grow: 1;
+        }
+        /* Auth panes are scrollable on short viewports without unlocking the
+           body scroll the whole portal design depends on. */
+        #auth-view {
+            min-height: 0;
+            overflow-y: auto;
+        }
+        .auth-tabs {
+            display: flex;
+            border: 1px solid var(--color-border-dark);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-bottom: 5px;
+            flex-shrink: 0;
+        }
+        .auth-tabs button {
+            flex: 1;
+            padding: 10px;
+            border: none;
+            background: transparent;
+            font-family: 'Outfit', sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--color-text-muted);
+            cursor: pointer;
+        }
+        .auth-tabs button.active {
+            background: #0f172a;
+            color: #fff;
+        }
+        .link-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            color: #0284c7;
+            font-family: 'Outfit', sans-serif;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .notice-box {
+            border: 1px solid var(--color-border-dark);
+            background: var(--color-accent-light);
+            border-radius: 6px;
+            padding: 12px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--color-text-muted);
         }
         .balance-card {
             background-color: var(--color-accent-light);
@@ -132,44 +197,121 @@
             <p class="text-muted-small">Manage Monthly Gold Advances</p>
         </div>
 
-        <!-- Phone Verification / Login Screen -->
-        <div id="login-view" class="login-card">
-            <div class="form-group">
-                <label for="login-phone">Verify Mobile Number</label>
-                <input type="tel" id="login-phone" class="form-control" placeholder="Enter 10-Digit Mobile" maxlength="10">
-                <span class="input-error-msg" id="login-phone-error"></span>
+        <!-- ============================================================
+             Authentication. Replaces the old phone-only "login", which
+             accepted any 10-digit number and opened that customer's ledger.
+             ============================================================ -->
+        <div id="auth-view" class="login-card">
+            <div class="auth-tabs">
+                <button id="auth-tab-login" class="active" type="button">Sign In</button>
+                <button id="auth-tab-register" type="button">Create Account</button>
             </div>
-            <button id="login-submit-btn" class="btn btn-primary btn-block">LOGIN</button>
-            <p class="text-muted-small" style="text-align: center; margin-top: 10px;">Verify balance, review deposit history, or make monthly payments.</p>
+
+            <!-- Sign in -->
+            <div id="pane-login">
+                <div class="form-group">
+                    <label for="login-phone">Mobile Number</label>
+                    <input type="tel" id="login-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10" autocomplete="username">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label for="login-password">Password</label>
+                    <input type="password" id="login-password" class="form-control" placeholder="Your password" autocomplete="current-password">
+                    <span class="input-error-msg" id="login-error"></span>
+                </div>
+                <button id="login-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SIGN IN</button>
+                <p style="text-align: center; margin-top: 12px;">
+                    <button type="button" class="link-btn" id="show-forgot-btn">Forgot password?</button>
+                </p>
+            </div>
+
+            <!-- Create account -->
+            <div id="pane-register" style="display: none;">
+                <div class="notice-box" style="margin-bottom: 15px;">
+                    Creating an account secures your deposit history behind a password.
+                    If you have <strong>already deposited with this store</strong>, please ask
+                    at the counter to have your login set up — we cannot open an
+                    existing customer's records from a self-service signup.
+                </div>
+                <div class="form-group">
+                    <label for="reg-name">Full Name <span style="color:#b91c1c;">*</span></label>
+                    <input type="text" id="reg-name" class="form-control" placeholder="Your name">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label for="reg-phone">Mobile Number <span style="color:#b91c1c;">*</span></label>
+                    <input type="tel" id="reg-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label for="reg-email">Email <span class="text-muted-small">(needed to reset a forgotten password)</span></label>
+                    <input type="email" id="reg-email" class="form-control" placeholder="you@example.com">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label for="reg-password">Password</label>
+                    <input type="password" id="reg-password" class="form-control" placeholder="Choose a password" autocomplete="new-password">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label for="reg-password2">Confirm Password</label>
+                    <input type="password" id="reg-password2" class="form-control" placeholder="Re-enter password" autocomplete="new-password">
+                    <span class="input-error-msg" id="register-error"></span>
+                </div>
+                <button id="register-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">CREATE ACCOUNT</button>
+            </div>
+
+            <!-- Forgot password -->
+            <div id="pane-forgot" style="display: none;">
+                <div id="forgot-step-1">
+                    <p class="text-muted-small" style="margin-bottom: 15px;">
+                        We'll email a single-use reset code to the address registered on your account.
+                    </p>
+                    <div class="form-group">
+                        <label for="forgot-phone">Mobile Number</label>
+                        <input type="tel" id="forgot-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10">
+                        <span class="input-error-msg" id="forgot-error"></span>
+                    </div>
+                    <button id="forgot-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SEND RESET CODE</button>
+                </div>
+                <div id="forgot-step-2" style="display: none;">
+                    <div class="notice-box" style="margin-bottom: 15px;" id="forgot-sent-note"></div>
+                    <div class="form-group">
+                        <label for="reset-code">Reset Code</label>
+                        <input type="text" id="reset-code" class="form-control" placeholder="Code from your email" maxlength="12" style="font-family: var(--font-mono); letter-spacing: 2px;">
+                    </div>
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label for="reset-password">New Password</label>
+                        <input type="password" id="reset-password" class="form-control" autocomplete="new-password">
+                    </div>
+                    <div class="form-group" style="margin-top: 12px;">
+                        <label for="reset-password2">Confirm New Password</label>
+                        <input type="password" id="reset-password2" class="form-control" autocomplete="new-password">
+                        <span class="input-error-msg" id="reset-error"></span>
+                    </div>
+                    <button id="reset-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SET NEW PASSWORD</button>
+                </div>
+                <p style="text-align: center; margin-top: 12px;">
+                    <button type="button" class="link-btn" id="back-to-login-btn">Back to sign in</button>
+                </p>
+            </div>
         </div>
 
-        <!-- Onboarding Screen -->
-        <div id="onboarding-view" class="portal-card" style="display: none; align-items: center; justify-content: center;">
-            <div style="background: var(--color-bg-panel); border: 1px solid var(--color-border); padding: 25px; border-radius: 8px; width: 100%; box-shadow: 0 4px 10px rgba(0,0,0,0.05);">
-                <h2 style="font-size: 18px; text-align: center; margin-bottom: 5px;">Complete Your Profile</h2>
-                <p class="text-muted-small" style="text-align: center; margin-bottom: 20px;">Help us serve you better.</p>
-                
-                <div class="form-group" style="margin-bottom: 15px;">
-                    <label>First Name <span style="color:red;">*</span></label>
-                    <input type="text" id="ob-fname" class="form-control" placeholder="Required">
-                </div>
-                <div class="form-group" style="margin-bottom: 15px;">
-                    <label>Last Name</label>
-                    <input type="text" id="ob-lname" class="form-control" placeholder="Optional">
-                </div>
-                <div class="form-group" style="margin-bottom: 15px;">
-                    <label>Date of Birth</label>
-                    <input type="date" id="ob-dob" class="form-control">
-                </div>
-                <div class="form-group" style="margin-bottom: 20px;">
-                    <label>Anniversary Date</label>
-                    <input type="date" id="ob-doa" class="form-control">
-                </div>
-                <div style="display: flex; gap: 10px;">
-                    <button id="ob-skip-btn" class="btn btn-secondary" style="flex:1;">Skip Optional</button>
-                    <button id="ob-save-btn" class="btn btn-primary" style="flex:1;">Save Profile</button>
-                </div>
+        <!-- ============================================================
+             Forced password change — shown when the store issued a
+             temporary password at the counter. No portal data loads until
+             the customer has set their own password.
+             ============================================================ -->
+        <div id="force-change-view" class="login-card" style="display: none;">
+            <div class="notice-box" style="margin-bottom: 15px;">
+                Your login was set up at the store with a temporary password.
+                Please choose your own password to continue.
             </div>
+            <div class="form-group">
+                <label for="fc-password">New Password</label>
+                <input type="password" id="fc-password" class="form-control" autocomplete="new-password">
+            </div>
+            <div class="form-group" style="margin-top: 12px;">
+                <label for="fc-password2">Confirm New Password</label>
+                <input type="password" id="fc-password2" class="form-control" autocomplete="new-password">
+                <span class="input-error-msg" id="fc-error"></span>
+            </div>
+            <button id="fc-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SET PASSWORD & CONTINUE</button>
         </div>
 
         <!-- Logged-in Customer Dashboard Screen -->
@@ -183,11 +325,11 @@
                         <div class="balance-amount" id="customer-balance-val">₹0.00</div>
                         <p class="text-muted-small" id="customer-profile-info">Phone: -</p>
                     </div>
-                    
+
                     <div class="portal-card" style="background: linear-gradient(135deg, #fef3c7, #fde68a); border: 1px solid #fcd34d; padding: 20px; border-radius: 12px; margin-bottom: 20px; color: #92400e;">
                         <h3 style="font-size: 16px; margin-bottom: 10px; font-weight: 600;">Money Worth in Gold</h3>
                         <p style="font-size: 13px; margin-bottom: 15px;">We track the 22K market price on the exact day of your deposits.</p>
-                        
+
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; font-size: 14px;">
                             <span>Total Grams Locked:</span>
                             <strong id="gold-grams-locked">0.000 g</strong>
@@ -199,6 +341,45 @@
                         <div style="text-align: center; font-size: 15px; font-weight: 700; background: #fffbeb; padding: 10px; border-radius: 8px;">
                             Appreciation: <span id="gold-appreciation" style="color: #166534;">+₹0.00</span>
                         </div>
+                    </div>
+                </div>
+
+                <!-- TAB: ACCOUNT -->
+                <div id="tab-account" style="display: none;">
+                    <div class="form-section">
+                        <h3>Your Details</h3>
+                        <div class="form-group">
+                            <label for="acct-name">Full Name</label>
+                            <input type="text" id="acct-name" class="form-control">
+                        </div>
+                        <div class="form-group" style="margin-top: 12px;">
+                            <label for="acct-email">Email</label>
+                            <input type="email" id="acct-email" class="form-control" placeholder="you@example.com">
+                        </div>
+                        <div class="form-group" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
+                            <input type="checkbox" id="acct-notify-email" style="width: auto; margin: 0;">
+                            <label for="acct-notify-email" style="margin: 0;">Email me about my deposits and dues</label>
+                        </div>
+                        <button id="acct-save-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SAVE DETAILS</button>
+                    </div>
+
+                    <div class="form-section" style="margin-top: 20px;">
+                        <h3>Change Password</h3>
+                        <div class="form-group">
+                            <label for="cp-current">Current Password</label>
+                            <input type="password" id="cp-current" class="form-control" autocomplete="current-password">
+                        </div>
+                        <div class="form-group" style="margin-top: 12px;">
+                            <label for="cp-new">New Password</label>
+                            <input type="password" id="cp-new" class="form-control" autocomplete="new-password">
+                        </div>
+                        <div class="form-group" style="margin-top: 12px;">
+                            <label for="cp-new2">Confirm New Password</label>
+                            <input type="password" id="cp-new2" class="form-control" autocomplete="new-password">
+                            <span class="input-error-msg" id="cp-error"></span>
+                        </div>
+                        <p class="text-muted-small" style="margin-top: 10px;">Changing your password signs you out of every device.</p>
+                        <button id="cp-submit-btn" class="btn btn-secondary btn-block" style="margin-top: 12px;">CHANGE PASSWORD</button>
                     </div>
                 </div>
 
@@ -232,10 +413,6 @@
                             <label for="pay-amount">Deposit Amount (₹)</label>
                             <input type="number" id="pay-amount" class="form-control" placeholder="Enter Deposit Amount (e.g. 5000)" min="100">
                         </div>
-                        <div class="form-group" id="name-group">
-                            <label for="pay-name">Your Full Name (Mandatory for first deposit)</label>
-                            <input type="text" id="pay-name" class="form-control" placeholder="Enter Customer Name">
-                        </div>
                         <div class="form-group">
                             <label for="pay-method">Payment Method</label>
                             <select id="pay-method" class="form-control">
@@ -244,7 +421,7 @@
                             </select>
                         </div>
 
-                        <!-- UPI QR Code simulated container (hidden by default) -->
+                        <!-- UPI QR Code container (hidden by default) -->
                         <div id="upi-payment-box" class="payment-box" style="display: none;">
                             <p class="text-muted-small" style="text-align: center;">Scan QR Code using your UPI App to make payment</p>
                             <div class="qr-wrapper">
@@ -266,16 +443,19 @@
 
             <!-- Bottom Tab Navigation -->
             <div style="background: #0f172a; display: flex; justify-content: space-around; padding: 15px 0; border-top-left-radius: 12px; border-top-right-radius: 12px; z-index: 10; margin-top: auto; flex-shrink: 0; margin-left: -20px; margin-right: -20px;">
-                <button onclick="window.switchTab('profile')" id="nav-profile" style="background: none; border: none; color: #fff; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                <button onclick="window.switchTab('profile')" id="nav-profile" style="background: none; border: none; color: #fff; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">👤</span> Profile
                 </button>
-                <button onclick="window.switchTab('deposit')" id="nav-deposit" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                <button onclick="window.switchTab('deposit')" id="nav-deposit" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">💰</span> Deposit
                 </button>
-                <button onclick="window.switchTab('history')" id="nav-history" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
-                    <span style="font-size: 20px;">📜</span> Payment History
+                <button onclick="window.switchTab('history')" id="nav-history" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                    <span style="font-size: 20px;">📜</span> History
                 </button>
-                <button id="logout-btn" style="background: none; border: none; color: #ef4444; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit';">
+                <button onclick="window.switchTab('account')" id="nav-account" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                    <span style="font-size: 20px;">⚙️</span> Account
+                </button>
+                <button id="logout-btn" style="background: none; border: none; color: #ef4444; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">🚪</span> Logout
                 </button>
             </div>
@@ -285,54 +465,368 @@
     <script type="module">
         import { drawQR } from './js/qrGenerator.js';
 
+        const TOKEN_KEY = 'customerToken';
+
         let customerPhone = '';
-        let customerName = 'Regular Customer';
+        let customerName = '';
         let balance = 0;
-        let merchantSettings = { companyName: 'Universal Gold POS', upiId: '' };
+        let merchantSettings = {
+            companyName: 'Universal Gold POS',
+            upiId: '',
+            passwordMinLength: 8,
+            passwordResetAvailable: false
+        };
+        // Held only in memory for the duration of the forced-change screen, so
+        // the change-password call can supply the temporary password the
+        // customer just signed in with instead of asking them to retype it.
+        let pendingTempPassword = '';
 
         (async function loadMerchantSettings() {
             try {
                 const res = await fetch('/api/settings/public');
                 if (res.ok) {
-                    merchantSettings = await res.json();
+                    merchantSettings = { ...merchantSettings, ...(await res.json()) };
                 }
             } catch (err) {
-                console.error('Failed to load merchant settings for UPI QR:', err);
+                console.error('Failed to load merchant settings:', err);
             }
         })();
 
+        /* ==================================================================
+           Session plumbing
+           ================================================================== */
+
+        function getToken() {
+            return localStorage.getItem(TOKEN_KEY) || '';
+        }
+
+        function setToken(token) {
+            if (token) localStorage.setItem(TOKEN_KEY, token);
+            else localStorage.removeItem(TOKEN_KEY);
+        }
+
+        /**
+         * fetch() with the customer bearer session attached. A 401 means the
+         * session expired or was revoked (password change, admin reissue) —
+         * clear it and drop back to the sign-in screen rather than leaving a
+         * half-loaded portal on screen.
+         */
+        async function customerFetch(url, options = {}) {
+            const headers = {
+                ...(options.headers || {}),
+                'Authorization': `Bearer ${getToken()}`
+            };
+            const res = await fetch(url, { ...options, headers });
+            if (res.status === 401) {
+                setToken('');
+                showAuthView();
+            }
+            return res;
+        }
+
+        function showAuthView() {
+            document.getElementById('auth-view').style.display = 'flex';
+            document.getElementById('force-change-view').style.display = 'none';
+            document.getElementById('portal-view').style.display = 'none';
+        }
+
+        function showForceChangeView() {
+            document.getElementById('auth-view').style.display = 'none';
+            document.getElementById('force-change-view').style.display = 'flex';
+            document.getElementById('portal-view').style.display = 'none';
+        }
+
+        function showPortalView() {
+            document.getElementById('auth-view').style.display = 'none';
+            document.getElementById('force-change-view').style.display = 'none';
+            document.getElementById('portal-view').style.display = 'flex';
+        }
+
+        function switchAuthPane(pane) {
+            ['login', 'register', 'forgot'].forEach(p => {
+                document.getElementById('pane-' + p).style.display = (p === pane) ? 'block' : 'none';
+            });
+            document.getElementById('auth-tab-login').classList.toggle('active', pane === 'login');
+            document.getElementById('auth-tab-register').classList.toggle('active', pane === 'register');
+        }
+
+        /**
+         * Applies a successful authentication: stores the session, records
+         * who we are, and routes to the forced-change screen or the portal.
+         */
+        async function onAuthenticated(token, customer, usedPassword = '') {
+            setToken(token);
+            customerPhone = customer.phone;
+            customerName = customer.name || '';
+            if (customer.mustChangePassword) {
+                pendingTempPassword = usedPassword;
+                showForceChangeView();
+                return;
+            }
+            pendingTempPassword = '';
+            applyProfileToUI(customer);
+            showPortalView();
+            window.switchTab('profile');
+            await loadCustomerData();
+        }
+
+        function applyProfileToUI(customer) {
+            customerName = customer.name || '';
+            document.getElementById('greet-name').textContent = customerName || 'Customer';
+            document.getElementById('acct-name').value = customerName;
+            document.getElementById('acct-email').value = customer.email || '';
+            document.getElementById('acct-notify-email').checked = customer.notifyEmail !== false;
+        }
+
+        /** Restores an existing session on load, if one is still valid. */
+        (async function restoreSession() {
+            if (!getToken()) return;
+            try {
+                const res = await customerFetch('/api/customer/me');
+                if (!res.ok) return;
+                const data = await res.json();
+                await onAuthenticated(getToken(), data.customer);
+            } catch (err) {
+                // Offline or server down — the sign-in screen is already showing.
+            }
+        })();
+
+        /* ==================================================================
+           Auth screen wiring
+           ================================================================== */
+
+        document.getElementById('auth-tab-login').addEventListener('click', () => switchAuthPane('login'));
+        document.getElementById('auth-tab-register').addEventListener('click', () => switchAuthPane('register'));
+        document.getElementById('show-forgot-btn').addEventListener('click', () => {
+            if (!merchantSettings.passwordResetAvailable) {
+                alert('This store has not enabled password reset emails. Please contact the store to have your password reset at the counter.');
+                return;
+            }
+            switchAuthPane('forgot');
+        });
+        document.getElementById('back-to-login-btn').addEventListener('click', () => {
+            document.getElementById('forgot-step-1').style.display = 'block';
+            document.getElementById('forgot-step-2').style.display = 'none';
+            switchAuthPane('login');
+        });
+
+        document.getElementById('login-submit-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('login-submit-btn');
+            const errorEl = document.getElementById('login-error');
+            const phone = document.getElementById('login-phone').value.replace(/\D/g, '');
+            const password = document.getElementById('login-password').value;
+
+            errorEl.textContent = '';
+            if (phone.length !== 10) {
+                errorEl.textContent = 'Please enter a valid 10-digit mobile number.';
+                return;
+            }
+            if (!password) {
+                errorEl.textContent = 'Please enter your password.';
+                return;
+            }
+
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/customer/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, password })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorEl.textContent = data.message || 'Sign-in failed.';
+                    return;
+                }
+                document.getElementById('login-password').value = '';
+                await onAuthenticated(data.token, data.customer, password);
+            } catch (err) {
+                errorEl.textContent = 'Could not reach the store server. Please try again.';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('register-submit-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('register-submit-btn');
+            const errorEl = document.getElementById('register-error');
+            const name = document.getElementById('reg-name').value.trim();
+            const phone = document.getElementById('reg-phone').value.replace(/\D/g, '');
+            const email = document.getElementById('reg-email').value.trim();
+            const password = document.getElementById('reg-password').value;
+            const password2 = document.getElementById('reg-password2').value;
+
+            errorEl.textContent = '';
+            if (!name) { errorEl.textContent = 'Please enter your name.'; return; }
+            if (phone.length !== 10) { errorEl.textContent = 'Please enter a valid 10-digit mobile number.'; return; }
+            if (password.length < merchantSettings.passwordMinLength) {
+                errorEl.textContent = `Password must be at least ${merchantSettings.passwordMinLength} characters.`;
+                return;
+            }
+            if (password !== password2) { errorEl.textContent = 'The two passwords do not match.'; return; }
+
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/customer/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, phone, email, password })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorEl.textContent = data.message || data.error || 'Could not create your account.';
+                    return;
+                }
+                document.getElementById('reg-password').value = '';
+                document.getElementById('reg-password2').value = '';
+                await onAuthenticated(data.token, data.customer, password);
+            } catch (err) {
+                errorEl.textContent = 'Could not reach the store server. Please try again.';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('forgot-submit-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('forgot-submit-btn');
+            const errorEl = document.getElementById('forgot-error');
+            const phone = document.getElementById('forgot-phone').value.replace(/\D/g, '');
+
+            errorEl.textContent = '';
+            if (phone.length !== 10) {
+                errorEl.textContent = 'Please enter a valid 10-digit mobile number.';
+                return;
+            }
+
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/customer/password/forgot', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorEl.textContent = data.message || 'Could not send a reset code.';
+                    return;
+                }
+                document.getElementById('forgot-sent-note').textContent = data.message;
+                document.getElementById('forgot-step-1').style.display = 'none';
+                document.getElementById('forgot-step-2').style.display = 'block';
+            } catch (err) {
+                errorEl.textContent = 'Could not reach the store server. Please try again.';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('reset-submit-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('reset-submit-btn');
+            const errorEl = document.getElementById('reset-error');
+            const phone = document.getElementById('forgot-phone').value.replace(/\D/g, '');
+            const code = document.getElementById('reset-code').value.trim();
+            const newPassword = document.getElementById('reset-password').value;
+            const confirm = document.getElementById('reset-password2').value;
+
+            errorEl.textContent = '';
+            if (!code) { errorEl.textContent = 'Please enter the reset code from your email.'; return; }
+            if (newPassword.length < merchantSettings.passwordMinLength) {
+                errorEl.textContent = `Password must be at least ${merchantSettings.passwordMinLength} characters.`;
+                return;
+            }
+            if (newPassword !== confirm) { errorEl.textContent = 'The two passwords do not match.'; return; }
+
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/customer/password/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone, code, newPassword })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorEl.textContent = data.error || 'Could not reset your password.';
+                    return;
+                }
+                alert('Password updated successfully! Please sign in with your new password.');
+                document.getElementById('forgot-step-1').style.display = 'block';
+                document.getElementById('forgot-step-2').style.display = 'none';
+                document.getElementById('login-phone').value = phone;
+                switchAuthPane('login');
+            } catch (err) {
+                errorEl.textContent = 'Could not reach the store server. Please try again.';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('fc-submit-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('fc-submit-btn');
+            const errorEl = document.getElementById('fc-error');
+            const newPassword = document.getElementById('fc-password').value;
+            const confirm = document.getElementById('fc-password2').value;
+
+            errorEl.textContent = '';
+            if (newPassword.length < merchantSettings.passwordMinLength) {
+                errorEl.textContent = `Password must be at least ${merchantSettings.passwordMinLength} characters.`;
+                return;
+            }
+            if (newPassword !== confirm) { errorEl.textContent = 'The two passwords do not match.'; return; }
+
+            btn.disabled = true;
+            try {
+                const res = await customerFetch('/api/customer/password/change', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ currentPassword: pendingTempPassword, newPassword })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorEl.textContent = data.error || 'Could not set your password.';
+                    return;
+                }
+
+                // The change invalidated every session including this one, so
+                // sign straight back in with the new password rather than
+                // bouncing the customer to a login screen they just came from.
+                const loginRes = await fetch('/api/customer/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phone: customerPhone, password: newPassword })
+                });
+                const loginData = await loginRes.json();
+                document.getElementById('fc-password').value = '';
+                document.getElementById('fc-password2').value = '';
+                if (loginRes.ok) {
+                    await onAuthenticated(loginData.token, loginData.customer, newPassword);
+                } else {
+                    setToken('');
+                    showAuthView();
+                    alert('Password set successfully! Please sign in.');
+                }
+            } catch (err) {
+                errorEl.textContent = 'Could not reach the store server. Please try again.';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        /* ==================================================================
+           Portal
+           ================================================================== */
+
         window.switchTab = function(tabName) {
-            document.getElementById('tab-profile').style.display = 'none';
-            document.getElementById('tab-deposit').style.display = 'none';
-            document.getElementById('tab-history').style.display = 'none';
-            
-            document.getElementById('nav-profile').style.color = '#64748b';
-            document.getElementById('nav-deposit').style.color = '#64748b';
-            document.getElementById('nav-history').style.color = '#64748b';
-            
+            ['profile', 'deposit', 'history', 'account'].forEach(t => {
+                document.getElementById('tab-' + t).style.display = 'none';
+                document.getElementById('nav-' + t).style.color = '#64748b';
+            });
             document.getElementById('tab-' + tabName).style.display = 'block';
             document.getElementById('nav-' + tabName).style.color = '#fff';
         };
 
-        document.getElementById('login-submit-btn').addEventListener('click', async () => {
-            const phoneInput = document.getElementById('login-phone');
-            const errorEl = document.getElementById('login-phone-error');
-            const phone = phoneInput.value.replace(/\D/g, '');
-
-            if (phone.length !== 10) {
-                errorEl.textContent = 'Please enter a valid 10-digit phone number.';
-                return;
-            }
-
-            errorEl.textContent = '';
-            customerPhone = phone;
-
-            await loadCustomerData();
-        });
-
         async function loadCustomerData() {
             try {
-                // Fetch Live Gold Price for Appreciation Calculator
+                // Live 22K rate for the Gold Appreciation calculator
                 let currentLiveRate22K = 7000;
                 try {
                     const priceRes = await fetch('/api/gold-price');
@@ -340,99 +834,185 @@
                         const priceData = await priceRes.json();
                         currentLiveRate22K = priceData.rates.price22K;
                     }
-                } catch(e) {}
+                } catch (e) {}
 
-                const res = await fetch(`/api/advances/lookup?phone=${customerPhone}`);
-                if (res.ok) {
-                    const data = await res.json();
-                    balance = data.balance;
-                    
-                    // Display profile info
-                    document.getElementById('customer-balance-val').textContent = `₹${balance.toLocaleString('en-IN')}`;
-                    document.getElementById('customer-profile-info').textContent = `Phone: ${customerPhone.replace(/(\d{5})(\d{5})/, '$1-$2')}`;
-                    
-                    // Populate ledger table rows & Calculate Gold Appreciation
-                    let totalGramsLocked = 0;
-                    let totalCashDeposited = 0;
+                // Session-scoped: the server decides whose ledger this is from
+                // the bearer token — the phone is never sent by the client.
+                const res = await customerFetch('/api/customer/advances');
+                if (!res.ok) return;
 
-                    const tbody = document.getElementById('customer-ledger-rows');
-                    tbody.innerHTML = '';
-                    if (data.history.length === 0) {
-                        tbody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--color-text-light);">No deposit history found.</td></tr>`;
-                    } else {
-                        // Sort history descending by timestamp
-                        data.history.sort((a,b) => b.timestamp - a.timestamp);
-                        data.history.forEach(item => {
-                            const date = new Date(item.timestamp).toLocaleDateString();
-                            const row = document.createElement('tr');
-                            const typeColor = item.type === 'deposit' ? 'color: var(--color-success); font-weight: 600;' : 'color: var(--color-danger);';
-                            
-                            // Math for Appreciation
-                            if (item.type === 'deposit') {
-                                const lockedRate = item.lockedGoldRate22K || currentLiveRate22K; // fallback to today if old data
-                                totalGramsLocked += (item.amount / lockedRate);
-                                totalCashDeposited += item.amount;
-                            } else if (item.type === 'deduction') {
-                                const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
-                                totalGramsLocked -= (item.amount / lockedRate);
-                                totalCashDeposited -= item.amount;
-                            }
+                const data = await res.json();
+                balance = data.balance;
 
-                            row.innerHTML = `
-                                <td>${date}</td>
-                                <td>${item.id}</td>
-                                <td style="${typeColor}">${item.type.toUpperCase()}</td>
-                                <td class="text-right" style="${typeColor}">₹${item.amount.toLocaleString('en-IN')}</td>
-                            `;
-                            tbody.appendChild(row);
-                        });
-                    }
+                document.getElementById('customer-balance-val').textContent = `₹${balance.toLocaleString('en-IN')}`;
+                document.getElementById('customer-profile-info').textContent =
+                    `Phone: ${customerPhone.replace(/(\d{5})(\d{5})/, '$1-$2')}`;
 
-                    // Render Gold Math
-                    const currentWorth = totalGramsLocked * currentLiveRate22K;
-                    const profit = currentWorth - totalCashDeposited;
-                    
-                    document.getElementById('gold-grams-locked').textContent = totalGramsLocked.toFixed(3) + ' g';
-                    document.getElementById('gold-current-worth').textContent = '₹' + currentWorth.toLocaleString('en-IN', {maximumFractionDigits:0});
-                    
-                    const appreciationEl = document.getElementById('gold-appreciation');
-                    if (profit >= 0) {
-                        appreciationEl.textContent = '+₹' + profit.toLocaleString('en-IN', {maximumFractionDigits:0});
-                        appreciationEl.style.color = '#166534';
-                    } else {
-                        appreciationEl.textContent = '-₹' + Math.abs(profit).toLocaleString('en-IN', {maximumFractionDigits:0});
-                        appreciationEl.style.color = '#b91c1c';
-                    }
+                let totalGramsLocked = 0;
+                let totalCashDeposited = 0;
 
-                    // Check if onboarding is needed
-                    if (data.history.length === 0 || !data.history[0].customerName || data.history[0].customerName === 'Regular Customer') {
-                        document.getElementById('login-view').style.display = 'none';
-                        document.getElementById('onboarding-view').style.display = 'flex';
-                    } else {
-                        customerName = data.history[0].customerName;
-                        document.getElementById('pay-name').value = customerName;
-                        document.getElementById('name-group').style.display = 'none';
-                        
-                        document.getElementById('greet-name').textContent = customerName;
-                        document.getElementById('login-view').style.display = 'none';
-                        document.getElementById('portal-view').style.display = 'flex';
-                        updateQR();
-                    }
+                const tbody = document.getElementById('customer-ledger-rows');
+                tbody.innerHTML = '';
+
+                if (data.history.length === 0) {
+                    const empty = document.createElement('tr');
+                    const cell = document.createElement('td');
+                    cell.colSpan = 4;
+                    cell.style.cssText = 'text-align: center; color: var(--color-text-light);';
+                    cell.textContent = 'No deposit history found.';
+                    empty.appendChild(cell);
+                    tbody.appendChild(empty);
+                } else {
+                    data.history.sort((a, b) => b.timestamp - a.timestamp);
+                    data.history.forEach(item => {
+                        const isDeposit = item.type === 'deposit';
+                        const typeColor = isDeposit
+                            ? 'color: var(--color-success); font-weight: 600;'
+                            : 'color: var(--color-danger);';
+
+                        if (isDeposit) {
+                            const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
+                            totalGramsLocked += (item.amount / lockedRate);
+                            totalCashDeposited += item.amount;
+                        } else {
+                            const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
+                            totalGramsLocked -= (item.amount / lockedRate);
+                            totalCashDeposited -= item.amount;
+                        }
+
+                        // textContent throughout: referenceId is customer- and
+                        // gateway-supplied, and this table renders it back out.
+                        const row = document.createElement('tr');
+                        const dateCell = document.createElement('td');
+                        dateCell.textContent = new Date(item.timestamp).toLocaleDateString();
+                        const idCell = document.createElement('td');
+                        idCell.textContent = item.id;
+                        const typeCell = document.createElement('td');
+                        typeCell.style.cssText = typeColor;
+                        typeCell.textContent = String(item.type || '').toUpperCase();
+                        const amountCell = document.createElement('td');
+                        amountCell.className = 'text-right';
+                        amountCell.style.cssText = typeColor;
+                        amountCell.textContent = `₹${Number(item.amount).toLocaleString('en-IN')}`;
+
+                        row.append(dateCell, idCell, typeCell, amountCell);
+                        tbody.appendChild(row);
+                    });
                 }
+
+                const currentWorth = totalGramsLocked * currentLiveRate22K;
+                const profit = currentWorth - totalCashDeposited;
+
+                document.getElementById('gold-grams-locked').textContent = totalGramsLocked.toFixed(3) + ' g';
+                document.getElementById('gold-current-worth').textContent =
+                    '₹' + currentWorth.toLocaleString('en-IN', { maximumFractionDigits: 0 });
+
+                const appreciationEl = document.getElementById('gold-appreciation');
+                if (profit >= 0) {
+                    appreciationEl.textContent = '+₹' + profit.toLocaleString('en-IN', { maximumFractionDigits: 0 });
+                    appreciationEl.style.color = '#166534';
+                } else {
+                    appreciationEl.textContent = '-₹' + Math.abs(profit).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+                    appreciationEl.style.color = '#b91c1c';
+                }
+
+                updateQR();
             } catch (err) {
-                alert('Connection error. Server diagnostics console updated.');
+                alert('Connection error. Please try again in a moment.');
             }
         }
 
-        // Handle logout
-        document.getElementById('logout-btn').addEventListener('click', () => {
+        document.getElementById('logout-btn').addEventListener('click', async () => {
+            const token = getToken();
+            setToken('');
             customerPhone = '';
+            customerName = '';
             document.getElementById('login-phone').value = '';
-            document.getElementById('portal-view').style.display = 'none';
-            document.getElementById('login-view').style.display = 'flex';
+            document.getElementById('login-password').value = '';
+            switchAuthPane('login');
+            showAuthView();
+            try {
+                await fetch('/api/customer/logout', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+            } catch (err) {
+                // Local session is already cleared either way.
+            }
         });
 
-        // Toggle payment fields
+        document.getElementById('acct-save-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('acct-save-btn');
+            btn.disabled = true;
+            try {
+                const res = await customerFetch('/api/customer/me', {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        name: document.getElementById('acct-name').value.trim(),
+                        email: document.getElementById('acct-email').value.trim(),
+                        notifyEmail: document.getElementById('acct-notify-email').checked
+                    })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    applyProfileToUI(data.customer);
+                    alert('Your details were saved successfully.');
+                } else {
+                    alert('Could not save: ' + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Could not reach the store server.');
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        document.getElementById('cp-submit-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('cp-submit-btn');
+            const errorEl = document.getElementById('cp-error');
+            const currentPassword = document.getElementById('cp-current').value;
+            const newPassword = document.getElementById('cp-new').value;
+            const confirm = document.getElementById('cp-new2').value;
+
+            errorEl.textContent = '';
+            if (newPassword.length < merchantSettings.passwordMinLength) {
+                errorEl.textContent = `Password must be at least ${merchantSettings.passwordMinLength} characters.`;
+                return;
+            }
+            if (newPassword !== confirm) { errorEl.textContent = 'The two passwords do not match.'; return; }
+
+            btn.disabled = true;
+            try {
+                const res = await customerFetch('/api/customer/password/change', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ currentPassword, newPassword })
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    errorEl.textContent = data.error || 'Could not change your password.';
+                    return;
+                }
+                setToken('');
+                document.getElementById('cp-current').value = '';
+                document.getElementById('cp-new').value = '';
+                document.getElementById('cp-new2').value = '';
+                document.getElementById('login-phone').value = customerPhone;
+                switchAuthPane('login');
+                showAuthView();
+                alert('Password changed successfully! Please sign in again.');
+            } catch (err) {
+                errorEl.textContent = 'Could not reach the store server. Please try again.';
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        /* ==================================================================
+           Deposit flow
+           ================================================================== */
+
         document.getElementById('pay-method').addEventListener('change', (e) => {
             const upiBox = document.getElementById('upi-payment-box');
             const refGroup = document.getElementById('ref-group');
@@ -446,7 +1026,6 @@
             }
         });
 
-        // Recalculate QR on amount change
         document.getElementById('pay-amount').addEventListener('input', () => {
             if (document.getElementById('pay-method').value === 'UPI') {
                 updateQR();
@@ -455,7 +1034,7 @@
 
         function updateQR() {
             const amountInput = document.getElementById('pay-amount');
-            const amount = parseFloat(amountInput.value) || 1000; // default to 1000 for QR preview if empty
+            const amount = parseFloat(amountInput.value) || 1000; // preview default
             const displayEl = document.getElementById('upi-string-display');
             const canvas = document.getElementById('qr-canvas');
 
@@ -478,52 +1057,17 @@
             if (displayEl) {
                 displayEl.textContent = `UPI: ${merchantSettings.upiId} | ₹${amount}`;
             }
-
-            // Draw the real QR code (rendered server-side, see js/qrGenerator.js)
             if (canvas) {
                 drawQR(canvas, upiLink);
             }
         }
 
-        function proceedToPortal() {
-            document.getElementById('onboarding-view').style.display = 'none';
-            document.getElementById('portal-view').style.display = 'flex';
-            document.getElementById('greet-name').textContent = customerName;
-            document.getElementById('pay-name').value = customerName;
-            document.getElementById('name-group').style.display = 'none';
-            updateQR();
-        }
-
-        document.getElementById('ob-save-btn').addEventListener('click', () => {
-            const fname = document.getElementById('ob-fname').value.trim();
-            const lname = document.getElementById('ob-lname').value.trim();
-            if (!fname) {
-                alert('First Name is mandatory to save your profile.');
-                return;
-            }
-            customerName = fname + (lname ? ' ' + lname : '');
-            proceedToPortal();
-        });
-
-        document.getElementById('ob-skip-btn').addEventListener('click', () => {
-            const fname = document.getElementById('ob-fname').value.trim();
-            if (!fname) {
-                alert('First Name is mandatory even if you skip optional fields.');
-                return;
-            }
-            customerName = fname;
-            proceedToPortal();
-        });
-
-        // Submit Advance Payment Deposit
         document.getElementById('pay-submit-btn').addEventListener('click', async () => {
             const amountInput = document.getElementById('pay-amount');
-            const nameInput = document.getElementById('pay-name');
             const methodSelect = document.getElementById('pay-method');
             const refInput = document.getElementById('pay-ref');
 
             const amount = parseFloat(amountInput.value) || 0;
-            const name = nameInput.value.trim() || customerName;
             const method = methodSelect.value;
             const refId = refInput.value.trim();
 
@@ -533,10 +1077,9 @@
             }
 
             if (method === 'RAZORPAY') {
-                // Razorpay Payment Flow
                 try {
-                    // 1. Create order on backend
-                    const orderRes = await fetch('/api/payment/order', {
+                    // 1. Create order on backend (customer-session gated)
+                    const orderRes = await customerFetch('/api/payment/order', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ amount })
@@ -544,19 +1087,18 @@
 
                     if (!orderRes.ok) {
                         const err = await orderRes.json();
-                        alert('Order initiation failed: ' + err.error);
+                        alert('Order initiation failed: ' + (err.error || err.message || 'Unknown error'));
                         return;
                     }
 
                     const orderData = await orderRes.json();
-                    
+
                     // MOCK FRONTEND BYPASS FOR DUMMY KEYS
                     if (orderData.keyId === 'rzp_test_xxxxxx') {
-                        const verifyRes = await fetch('/api/payment/verify', {
+                        const verifyRes = await customerFetch('/api/payment/verify', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
-                                customerPhone, customerName: name,
                                 razorpay_order_id: orderData.order.id,
                                 razorpay_payment_id: 'pay_mock_' + Math.random().toString(36).substring(2, 9),
                                 razorpay_signature: 'mock_signature',
@@ -569,7 +1111,7 @@
                             await loadCustomerData();
                         } else {
                             const err = await verifyRes.json();
-                            alert('Mock Verification failed: ' + err.error);
+                            alert('Mock Verification failed: ' + (err.error || err.message));
                         }
                         return;
                     }
@@ -579,18 +1121,16 @@
                         "key": orderData.keyId,
                         "amount": orderData.order.amount,
                         "currency": "INR",
-                        "name": "Universal Gold POS",
+                        "name": merchantSettings.companyName || "Universal Gold POS",
                         "description": "Monthly Gold Advance Deposit",
                         "order_id": orderData.order.id,
                         "handler": async function (response) {
                             // 3. Verify on backend
                             try {
-                                const verifyRes = await fetch('/api/payment/verify', {
+                                const verifyRes = await customerFetch('/api/payment/verify', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({
-                                        customerPhone,
-                                        customerName: name,
                                         razorpay_order_id: response.razorpay_order_id,
                                         razorpay_payment_id: response.razorpay_payment_id,
                                         razorpay_signature: response.razorpay_signature,
@@ -604,14 +1144,14 @@
                                     await loadCustomerData();
                                 } else {
                                     const err = await verifyRes.json();
-                                    alert('Payment verification failed: ' + err.error);
+                                    alert('Payment verification failed: ' + (err.error || err.message));
                                 }
                             } catch (e) {
                                 alert('Error verifying payment.');
                             }
                         },
                         "prefill": {
-                            "name": name,
+                            "name": customerName,
                             "contact": customerPhone
                         },
                         "theme": {
@@ -620,7 +1160,7 @@
                     };
 
                     const rzp = new window.Razorpay(options);
-                    rzp.on('payment.failed', function (response){
+                    rzp.on('payment.failed', function (response) {
                         alert("Payment failed: " + response.error.description);
                     });
                     rzp.open();
@@ -635,19 +1175,13 @@
                     return;
                 }
 
-                const payload = {
-                    customerPhone,
-                    customerName: name,
-                    amount,
-                    paymentMethod: method,
-                    referenceId: refId
-                };
-
                 try {
-                    const res = await fetch('/api/advances', {
+                    // Phone and name come from the session server-side — this
+                    // request cannot credit anyone else's account.
+                    const res = await customerFetch('/api/customer/advances', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
+                        body: JSON.stringify({ amount, referenceId: refId })
                     });
 
                     if (res.ok) {
@@ -657,7 +1191,7 @@
                         await loadCustomerData();
                     } else {
                         const err = await res.json();
-                        alert('Failed to submit payment: ' + err.error);
+                        alert('Failed to submit payment: ' + (err.error || err.message));
                     }
                 } catch (err) {
                     alert('Connection failure to POS servers.');
