@@ -154,6 +154,136 @@ export function writeJSON(filepath, data) {
     return false;
 }
 
+const TRANSACTION_JOURNAL_FILE = path.join(DATA_DIR, '.json-transaction.json');
+
+function removeIfPresent(filepath) {
+    try {
+        if (fs.existsSync(filepath)) fs.unlinkSync(filepath);
+    } catch (_) {}
+}
+
+function isDataFilePath(filepath) {
+    const relative = path.relative(DATA_DIR, path.resolve(filepath));
+    return relative !== '' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
+}
+
+/**
+ * Restores every file in an interrupted multi-file transaction to its
+ * pre-transaction state. The journal is written before the first destination
+ * is replaced, so startup can also recover from a process or power failure.
+ */
+function rollbackJSONTransaction(entries) {
+    let restored = true;
+    for (const entry of entries) {
+        try {
+            if (entry.hadOriginal) {
+                if (!fs.existsSync(entry.backupFile)) {
+                    restored = false;
+                    logError(`Cannot roll back JSON transaction file ${entry.filepath}: backup is missing.`);
+                    continue;
+                }
+                fs.copyFileSync(entry.backupFile, entry.filepath);
+            } else if (!entry.hadOriginal && fs.existsSync(entry.filepath)) {
+                fs.unlinkSync(entry.filepath);
+            }
+        } catch (err) {
+            restored = false;
+            logError(`Failed to roll back JSON transaction file ${entry.filepath}: ${err.message}`, err.stack);
+        }
+    }
+    return restored;
+}
+
+function cleanupJSONTransaction(entries) {
+    for (const entry of entries) {
+        removeIfPresent(entry.stagedFile);
+        removeIfPresent(entry.backupFile);
+    }
+}
+
+/**
+ * Commits a related set of JSON documents as one crash-recoverable unit.
+ * Callers see either every new document or none: a failed write is rolled
+ * back immediately, and an interrupted commit is rolled back on next boot.
+ *
+ * @param {Array<{filepath: string, data: unknown}>} writes
+ * @returns {boolean}
+ */
+export function writeJSONTransaction(writes) {
+    if (!Array.isArray(writes) || writes.length === 0) return false;
+
+    const uniqueFiles = new Set(writes.map(write => path.resolve(write.filepath)));
+    const pathsAreSafe = writes.every(write => write && typeof write.filepath === 'string' && isDataFilePath(write.filepath));
+    if (!pathsAreSafe || uniqueFiles.size !== writes.length || fs.existsSync(TRANSACTION_JOURNAL_FILE)) {
+        logError('Refusing invalid or overlapping JSON transaction.');
+        return false;
+    }
+
+    const transactionId = `${process.pid}-${Date.now()}-${cryptoRandomSuffix()}`;
+    const entries = writes.map(write => ({
+        filepath: path.resolve(write.filepath),
+        stagedFile: path.resolve(write.filepath) + `.txn-${transactionId}.new`,
+        backupFile: path.resolve(write.filepath) + `.txn-${transactionId}.bak`,
+        hadOriginal: fs.existsSync(write.filepath),
+        data: write.data
+    }));
+
+    try {
+        // Prepare every replacement and every rollback copy before touching a
+        // live database file.
+        for (const entry of entries) {
+            fs.writeFileSync(entry.stagedFile, JSON.stringify(entry.data, null, 2), 'utf8');
+            if (entry.hadOriginal) fs.copyFileSync(entry.filepath, entry.backupFile);
+        }
+
+        const journal = entries.map(({ filepath, stagedFile, backupFile, hadOriginal }) => ({
+            filepath, stagedFile, backupFile, hadOriginal
+        }));
+        const journalTemp = TRANSACTION_JOURNAL_FILE + '.tmp';
+        fs.writeFileSync(journalTemp, JSON.stringify(journal, null, 2), 'utf8');
+        fs.renameSync(journalTemp, TRANSACTION_JOURNAL_FILE);
+
+        for (const entry of entries) fs.renameSync(entry.stagedFile, entry.filepath);
+
+        // Removing the journal is the commit point. Any crash before this line
+        // is treated as an unacknowledged transaction and restored on boot.
+        fs.unlinkSync(TRANSACTION_JOURNAL_FILE);
+        cleanupJSONTransaction(entries);
+        return true;
+    } catch (err) {
+        logError(`JSON transaction failed: ${err.message}`, err.stack);
+        const restored = rollbackJSONTransaction(entries);
+        if (restored) removeIfPresent(TRANSACTION_JOURNAL_FILE);
+        cleanupJSONTransaction(entries);
+        return false;
+    }
+}
+
+function cryptoRandomSuffix() {
+    return Math.random().toString(36).slice(2, 10);
+}
+
+function recoverInterruptedJSONTransaction() {
+    if (!fs.existsSync(TRANSACTION_JOURNAL_FILE)) return;
+    try {
+        const entries = JSON.parse(fs.readFileSync(TRANSACTION_JOURNAL_FILE, 'utf8'));
+        if (!Array.isArray(entries)) throw new Error('Transaction journal is malformed');
+        if (!entries.every(entry => entry && isDataFilePath(entry.filepath) &&
+            isDataFilePath(entry.stagedFile) && isDataFilePath(entry.backupFile))) {
+            throw new Error('Transaction journal contains an unsafe path');
+        }
+        if (!rollbackJSONTransaction(entries)) {
+            logError('Interrupted JSON transaction could not be fully restored; journal retained for the next startup.');
+            return;
+        }
+        cleanupJSONTransaction(entries);
+        fs.unlinkSync(TRANSACTION_JOURNAL_FILE);
+        logTelemetry('JSON_TRANSACTION_RECOVERED', 0, `files: ${entries.length}`);
+    } catch (err) {
+        logError(`Failed to recover interrupted JSON transaction: ${err.message}`, err.stack);
+    }
+}
+
 /**
  * Brings an existing tenant's settings.json up to the current template.
  *
@@ -216,6 +346,7 @@ export function migrateSettings() {
  * Initialize Database files with their templates if missing
  */
 export function initDatabaseFiles() {
+    recoverInterruptedJSONTransaction();
     const defaultLicense = {
         licenseKey: "DEMO-KEY-12345",
         activated: false,

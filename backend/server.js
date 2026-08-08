@@ -1,10 +1,11 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { readJSON, writeJSON, logError, logTelemetry, DATA_DIR } from './db.js';
+import { readJSON, writeJSON, writeJSONTransaction, logError, logTelemetry, DATA_DIR } from './db.js';
 import { redactSettings, unredactSettings } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
@@ -29,11 +30,18 @@ import { loadExtensions, fireHook } from './extensions/index.js';
 // preview from, so the persisted ledger and the cashier's screen can never
 // drift apart. Lives under frontend/ because release_pipeline.js and
 // updateEngine.js ship and replace backend/ and frontend/ as a pair.
-import { computeInvoiceTotals, normalizeTaxMode, round2 } from '../frontend/js/lib/billingMath.js';
+import {
+    computeInvoiceTotals, normalizeTaxMode, round2,
+    ADVANCE_STATUS, normalizeAdvanceStatus, summarizeAdvanceLedger
+} from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const MOCK_RAZORPAY_KEY_ID = 'rzp_test_xxxxxx';
+const MOCK_RAZORPAY_SECRET = 'rzp_test_xxxxxx_secret';
+const MOCK_PAYMENTS_ENABLED = !IS_PRODUCTION;
 
 // Sanity ceiling for a single advance deposit/redemption amount (10 crore
 // INR) — not a business rule, just a guard against fat-finger/malicious
@@ -47,8 +55,44 @@ const MAX_SANE_AMOUNT = 100000000;
 // to key lockouts per real caller instead of globally locking every user.
 app.set('trust proxy', 'loopback');
 
-// Enable CORS and body parsers
-app.use(cors());
+// Browser hardening. This frontend is normally same-origin; deployments that
+// intentionally split it onto another origin must list that exact origin (or
+// origins, comma-separated) in CORS_ORIGINS.
+const allowedCorsOrigins = new Set(
+    (process.env.CORS_ORIGINS || '').split(',').map(origin => origin.trim()).filter(Boolean)
+);
+app.use(cors({
+    origin(origin, callback) {
+        callback(null, !origin || allowedCorsOrigins.has(origin));
+    },
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    maxAge: 600
+}));
+app.use(helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            baseUri: ["'self'"],
+            objectSrc: ["'none'"],
+            frameAncestors: ["'none'"],
+            formAction: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'", 'https://checkout.razorpay.com'],
+            // Inline handlers remain in the legacy HTML. Keep them working
+            // while still enforcing the rest of the CSP boundary.
+            scriptSrcAttr: ["'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            fontSrc: ["'self'", 'https://fonts.gstatic.com'],
+            imgSrc: ["'self'", 'data:', 'https:'],
+            connectSrc: ["'self'", 'https://*.razorpay.com'],
+            frameSrc: ["'self'", 'https://*.razorpay.com'],
+            // Safari upgrades localhost subresources too, which breaks the
+            // HTTP-only local development server.
+            upgradeInsecureRequests: IS_PRODUCTION ? [] : null
+        }
+    }
+}));
 app.use(express.json({ limit: '5mb' }));
 
 // Track simple API response time telemetry
@@ -358,7 +402,8 @@ app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
             customerName: (req.customerAccount && req.customerAccount.name) || 'Regular Customer',
             amount,
             paymentMethod: 'UPI',
-            referenceId: String(referenceId).trim().slice(0, 100)
+            referenceId: String(referenceId).trim().slice(0, 100),
+            status: ADVANCE_STATUS.PENDING
         });
         if (!result.success) {
             return res.status(result.error.startsWith('Failed to persist') ? 500 : 400).json({ error: result.error });
@@ -679,6 +724,23 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         // 'inclusive' in it cannot leave the server billing Exclusive while
         // the browser bills Inclusive.
         const taxMode = normalizeTaxMode(settings.taxMode);
+        let advancesFile = null;
+        let advances = null;
+        let customerAdvanceBalance = 0;
+        if (numAppliedAdvance > 0) {
+            if (!customerPhone) {
+                return res.status(400).json({ error: 'Customer phone is required when redeeming an advance.' });
+            }
+            advancesFile = path.join(DATA_DIR, 'advances.json');
+            advances = readJSON(advancesFile, []);
+            customerAdvanceBalance = computeAdvanceLedger(customerPhone, advances).balance;
+            if (round2(numAppliedAdvance) > round2(customerAdvanceBalance)) {
+                return res.status(400).json({
+                    error: `Applied advance exceeds the customer's available balance of ${round2(customerAdvanceBalance)}.`
+                });
+            }
+        }
+
         const totals = computeInvoiceTotals({
             metalValue: numMetalValue,
             makingChargeAmount: numMakingCharge,
@@ -686,12 +748,7 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             taxSlab,
             taxMode,
             appliedAdvance: numAppliedAdvance,
-            // The client decides how much advance to redeem (it knows the
-            // customer's balance); the server's job here is only to stop that
-            // redemption exceeding the bill and driving the total negative.
-            // Verifying the amount against advances.json is a separate
-            // reconciliation concern, deliberately not folded in here.
-            customerAdvanceBalance: numAppliedAdvance
+            customerAdvanceBalance
         });
 
         // A mismatch means the client's math and the server's disagree — the
@@ -715,15 +772,9 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
 
         const invoiceId = `${prefix}-${startSeq.toString().padStart(6, '0')}-${currentYearShort}`;
 
-        // Increment and save start sequence. If this write doesn't actually
-        // persist (e.g. transient Windows file-lock contention exhausting
-        // writeJSON's retries), the next request would silently recompute
-        // and hand out this same invoiceId again — bail out loudly instead
-        // of reporting a false success on a since-duplicated invoice number.
+        // The increment is committed together with the sale and any advance
+        // redemption below; no invoice can exist in only one of those ledgers.
         settings.invoiceSeqStart = startSeq + 1;
-        if (!writeJSON(settingsFile, settings)) {
-            return res.status(500).json({ error: 'Failed to persist invoice sequence. Sale was not saved — please retry.' });
-        }
 
         // 2. Prepare Sale Record. Every money field is the server's own
         // recomputed, paise-rounded figure — the request body only survives
@@ -750,22 +801,8 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         const salesFile = path.join(DATA_DIR, `sales_${year}.json`);
         const sales = readJSON(salesFile, []);
         sales.push(sale);
-        if (!writeJSON(salesFile, sales)) {
-            // The invoice sequence above already advanced, so this invoiceId
-            // is now permanently consumed as a gap rather than reused — an
-            // acceptable, auditable outcome versus silently reporting a sale
-            // as saved when it was not actually written to disk.
-            return res.status(500).json({ error: 'Failed to persist sale record. Please retry — invoice number ' + invoiceId + ' will be skipped.' });
-        }
-
-        // 4. Handle Customer Advance Redemption. Best-effort: the sale itself
-        // is already durably saved at this point, so a failure here (logged
-        // by writeJSON internally) shouldn't un-report the successful sale —
-        // it would only leave the redemption ledger entry to be reconciled.
+        // 4. Prepare Customer Advance Redemption in the same transaction.
         if (sale.appliedAdvance > 0 && sale.customerPhone) {
-            const advancesFile = path.join(DATA_DIR, 'advances.json');
-            const advances = readJSON(advancesFile, []);
-
             advances.push({
                 id: 'RED-' + Math.random().toString(36).substring(2, 9).toUpperCase(),
                 customerPhone: sale.customerPhone,
@@ -775,9 +812,17 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
                 invoiceId: invoiceId,
                 timestamp: Date.now()
             });
-            if (!writeJSON(advancesFile, advances)) {
-                logError(`Sale ${invoiceId} saved but its advance redemption entry failed to persist — reconcile customer ${sale.customerPhone}'s advance ledger manually.`);
-            }
+        }
+
+        const transactionWrites = [
+            { filepath: settingsFile, data: settings },
+            { filepath: salesFile, data: sales }
+        ];
+        if (advancesFile && advances) transactionWrites.push({ filepath: advancesFile, data: advances });
+        if (!writeJSONTransaction(transactionWrites)) {
+            return res.status(500).json({
+                error: 'Failed to persist the complete sale transaction. Nothing was saved; please retry.'
+            });
         }
 
         logTelemetry('SAVE_SALE', 0, `Invoice: ${invoiceId}, Total: ${sale.totalAmount}`);
@@ -818,15 +863,18 @@ app.get('/api/advances', requireAdminSession, (req, res) => {
  * and the session-scoped customer portal route so the cashier's screen and
  * the customer's screen can never show different balances.
  */
-function computeAdvanceLedger(phone) {
-    const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
+function computeAdvanceLedger(phone, advances = readJSON(path.join(DATA_DIR, 'advances.json'), [])) {
     const history = advances.filter(a => a.customerPhone === phone);
-    const balance = history.reduce((sum, item) => {
-        if (item.type === 'deposit') return sum + parseFloat(item.amount);
-        if (item.type === 'redeem') return sum - parseFloat(item.amount);
-        return sum;
-    }, 0);
-    return { phone, balance: Math.max(0, balance), history };
+    // Shared with the Dashboard tile and the Advances tab rollup — a pending
+    // deposit must not read as spendable credit in any of the three.
+    const summary = summarizeAdvanceLedger(history);
+    return {
+        phone,
+        balance: summary.balance,
+        pendingTotal: summary.pendingTotal,
+        pendingCount: summary.pendingCount,
+        history
+    };
 }
 
 /**
@@ -835,9 +883,21 @@ function computeAdvanceLedger(phone) {
  * verified Razorpay — so the row shape and the locked-rate snapshot that the
  * Gold Appreciation calculator depends on are identical whichever door the
  * money came through.
- * @returns {{success: boolean, error?: string, deposit?: object}}
+ *
+ * `status` is what separates money the store has actually seen from a
+ * customer's unverified claim to have sent it:
+ *   - counter entry and signature-verified Razorpay → 'approved' (the default)
+ *   - customer-submitted manual UPI → 'pending', credited only once a cashier
+ *     approves it at POST /api/advances/:id/approve
+ * See ADVANCE_STATUS in frontend/js/lib/billingMath.js for how the balance
+ * arithmetic treats each state.
+ *
+ * @returns {{success: boolean, error?: string, code?: string, deposit?: object}}
  */
-function recordAdvanceDeposit({ customerPhone, customerName, amount, paymentMethod, referenceId }) {
+function recordAdvanceDeposit({
+    customerPhone, customerName, amount, paymentMethod, referenceId,
+    status = ADVANCE_STATUS.APPROVED
+}) {
     if (!isValidPhone(customerPhone)) {
         return { success: false, error: 'Valid 10-digit customer phone number required' };
     }
@@ -851,7 +911,31 @@ function recordAdvanceDeposit({ customerPhone, customerName, amount, paymentMeth
 
     const advancesFile = path.join(DATA_DIR, 'advances.json');
     const advances = readJSON(advancesFile, []);
+    const cleanReference = String(referenceId || '').trim();
+
+    // A payment reference identifies one real-world transfer, so it may appear
+    // in the ledger exactly once. Without this, a customer could submit the
+    // same UTR on three separate deposits and — since each row looks
+    // individually plausible to whoever approves it — be credited three times
+    // for one transfer. Enforced here rather than at the routes so every
+    // present and future caller of this function inherits it.
+    if (cleanReference) {
+        const clash = advances.find(a =>
+            a.type === 'deposit' && a.referenceId &&
+            String(a.referenceId).trim().toLowerCase() === cleanReference.toLowerCase() &&
+            normalizeAdvanceStatus(a) !== ADVANCE_STATUS.REJECTED
+        );
+        if (clash) {
+            return {
+                success: false,
+                code: 'DUPLICATE_REFERENCE',
+                error: `Reference "${cleanReference}" has already been submitted against deposit ${clash.id}. Each transaction reference can only be used once.`
+            };
+        }
+    }
+
     const depositId = 'ADV-' + Math.random().toString(36).substring(2, 9).toUpperCase();
+    const resolvedStatus = normalizeAdvanceStatus({ type: 'deposit', status });
 
     const deposit = {
         id: depositId,
@@ -860,19 +944,72 @@ function recordAdvanceDeposit({ customerPhone, customerName, amount, paymentMeth
         type: 'deposit',
         amount: numAmount,
         paymentMethod: paymentMethod || 'UPI',
-        referenceId: referenceId || '',
+        referenceId: cleanReference,
+        status: resolvedStatus,
+        // Snapshotted at submission, NOT at approval: the customer's money moved
+        // when they sent it, so the Gold Appreciation figure they were shown at
+        // that moment is the one they are owed. A rate move during the approval
+        // wait is the store's timing, not the customer's.
         lockedGoldRate22K: getActiveGoldRates().price22K,
         timestamp: Date.now()
     };
 
     advances.push(deposit);
-    if (!writeJSON(advancesFile, advances)) {
+    // Committed through the journalled path rather than a bare writeJSON so
+    // advances.json has exactly one writer mechanism: /api/sales already
+    // commits this same file inside a transaction when a sale redeems an
+    // advance, and two different write mechanisms on one ledger is the kind of
+    // parallel path that eventually loses a row.
+    if (!writeJSONTransaction([{ filepath: advancesFile, data: advances }])) {
         return { success: false, error: 'Failed to persist advance deposit. Please retry.' };
     }
 
-    logTelemetry('SAVE_ADVANCE_DEPOSIT', 0, `Amount: ${numAmount}, Method: ${deposit.paymentMethod}`);
-    fireHook('onAdvanceDeposit', deposit);
+    logTelemetry('SAVE_ADVANCE_DEPOSIT', 0, `Amount: ${numAmount}, Method: ${deposit.paymentMethod}, Status: ${resolvedStatus}`);
+    // Only settled money fires the deposit hook — an extension sending a
+    // "deposit received" receipt must not fire on a claim awaiting approval.
+    if (resolvedStatus === ADVANCE_STATUS.APPROVED) fireHook('onAdvanceDeposit', deposit);
     return { success: true, deposit };
+}
+
+/**
+ * Moves a pending deposit to approved or rejected, in one read-modify-write so
+ * a double-tapped Approve button cannot credit the same claim twice.
+ * @returns {{success: boolean, error?: string, status?: number, deposit?: object}}
+ */
+function reviewPendingDeposit(depositId, decision, note) {
+    const advancesFile = path.join(DATA_DIR, 'advances.json');
+    const advances = readJSON(advancesFile, []);
+    const index = advances.findIndex(a => a.id === depositId && a.type === 'deposit');
+
+    if (index === -1) {
+        return { success: false, status: 404, error: 'No such deposit in the advances ledger.' };
+    }
+    const current = advances[index];
+    const currentStatus = normalizeAdvanceStatus(current);
+    if (currentStatus !== ADVANCE_STATUS.PENDING) {
+        return {
+            success: false,
+            status: 409,
+            error: `Deposit ${depositId} is already ${currentStatus} and cannot be reviewed again.`
+        };
+    }
+
+    const reviewed = {
+        ...current,
+        status: decision,
+        reviewedAt: Date.now(),
+        reviewNote: String(note || '').trim().slice(0, 300)
+    };
+    advances[index] = reviewed;
+    if (!writeJSONTransaction([{ filepath: advancesFile, data: advances }])) {
+        return { success: false, status: 500, error: 'Failed to save the review. Please retry.' };
+    }
+
+    logTelemetry('REVIEW_ADVANCE_DEPOSIT', 0, `Deposit: ${depositId}, Decision: ${decision}, Amount: ${reviewed.amount}`);
+    // The hook deliberately fires here, on approval, rather than at submission:
+    // this is the moment the credit becomes real for the customer.
+    if (decision === ADVANCE_STATUS.APPROVED) fireHook('onAdvanceDeposit', reviewed);
+    return { success: true, deposit: reviewed };
 }
 
 /**
@@ -905,14 +1042,75 @@ app.get('/api/advances/lookup', requireAdminSession, (req, res) => {
  */
 app.post('/api/advances', requireAdminSession, (req, res) => {
     try {
-        const result = recordAdvanceDeposit(req.body || {});
+        // A cashier at the counter has seen the money, so a counter entry is
+        // approved on arrival. `status` is pinned here rather than read from the
+        // body so this route can never be used to inject a pending row.
+        const result = recordAdvanceDeposit({ ...(req.body || {}), status: ADVANCE_STATUS.APPROVED });
         if (!result.success) {
-            return res.status(result.error.startsWith('Failed to persist') ? 500 : 400).json({ error: result.error });
+            const status = result.code === 'DUPLICATE_REFERENCE' ? 409
+                : result.error.startsWith('Failed to persist') ? 500 : 400;
+            return res.status(status).json({ error: result.error, code: result.code });
         }
         res.json({ success: true, id: result.deposit.id, deposit: result.deposit });
     } catch (err) {
         logError('Error saving advance deposit transaction: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to submit advance deposit' });
+    }
+});
+
+/**
+ * GET /api/advances/pending
+ * The counter's approval queue: every customer-submitted UPI deposit still
+ * awaiting verification, oldest first so nobody's money sits at the bottom of
+ * a stack indefinitely.
+ */
+app.get('/api/advances/pending', requireAdminSession, (req, res) => {
+    try {
+        const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
+        const pending = advances
+            .filter(a => a.type === 'deposit' && normalizeAdvanceStatus(a) === ADVANCE_STATUS.PENDING)
+            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        res.json(pending);
+    } catch (err) {
+        logError('Error retrieving pending advance deposits: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to retrieve pending deposits' });
+    }
+});
+
+/**
+ * POST /api/advances/:id/approve
+ * Credits a pending deposit once the cashier has confirmed the transfer landed
+ * in the store's account. This is the point the money becomes spendable.
+ */
+app.post('/api/advances/:id/approve', requireAdminSession, (req, res) => {
+    try {
+        const result = reviewPendingDeposit(req.params.id, ADVANCE_STATUS.APPROVED, (req.body || {}).note);
+        if (!result.success) return res.status(result.status).json({ error: result.error });
+        res.json({ success: true, deposit: result.deposit });
+    } catch (err) {
+        logError('Error approving advance deposit: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to approve the deposit' });
+    }
+});
+
+/**
+ * POST /api/advances/:id/reject
+ * Marks a claimed transfer as not received. The row is kept rather than deleted
+ * — a rejected claim is exactly the history worth being able to look back on,
+ * and a reason is required so the customer can be told something specific.
+ */
+app.post('/api/advances/:id/reject', requireAdminSession, (req, res) => {
+    try {
+        const note = String((req.body || {}).note || '').trim();
+        if (!note) {
+            return res.status(400).json({ error: 'A reason is required when rejecting a deposit claim.' });
+        }
+        const result = reviewPendingDeposit(req.params.id, ADVANCE_STATUS.REJECTED, note);
+        if (!result.success) return res.status(result.status).json({ error: result.error });
+        res.json({ success: true, deposit: result.deposit });
+    } catch (err) {
+        logError('Error rejecting advance deposit: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to reject the deposit' });
     }
 });
 
@@ -993,8 +1191,13 @@ app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
             return res.status(400).json({ error: 'Razorpay API credentials are not configured in system settings.' });
         }
 
-        // MOCK CHECKOUT ENGINE FOR DUMMY KEYS
-        if (keyId === 'rzp_test_xxxxxx') {
+        if (IS_PRODUCTION && (keyId === MOCK_RAZORPAY_KEY_ID || keySecret === MOCK_RAZORPAY_SECRET)) {
+            logError('Blocked Razorpay order creation because demo credentials are configured in production.');
+            return res.status(503).json({ error: 'Razorpay production credentials are not configured.' });
+        }
+
+        // Local/demo checkout is never reachable in a production process.
+        if (MOCK_PAYMENTS_ENABLED && keyId === MOCK_RAZORPAY_KEY_ID && keySecret === MOCK_RAZORPAY_SECRET) {
             const mockOrderId = 'order_mock_' + Math.random().toString(36).substring(2, 9);
             logTelemetry('PAYMENT_ORDER_MOCKED', 0, `Order: ${mockOrderId}, Amt: ${amount}`);
             return res.json({
@@ -1060,6 +1263,10 @@ app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
         if (!keySecret) {
             return res.status(500).json({ error: 'Razorpay secret key is not configured' });
         }
+        if (IS_PRODUCTION && keySecret === MOCK_RAZORPAY_SECRET) {
+            logError('Blocked Razorpay verification because a demo secret is configured in production.');
+            return res.status(503).json({ error: 'Razorpay production credentials are not configured.' });
+        }
 
         // Verify SHA-256 HMAC signature
         const text = razorpay_order_id + "|" + razorpay_payment_id;
@@ -1068,8 +1275,12 @@ app.post('/api/payment/verify', requireEstablishedCustomer, (req, res) => {
             .update(text)
             .digest('hex');
 
-        // MOCK BYPASS: Ignore signature match if using dummy secrets
-        if (generated_signature !== razorpay_signature && keySecret !== 'rzp_test_xxxxxx_secret') {
+        const signatureMatches = generated_signature.length === String(razorpay_signature).length &&
+            crypto.timingSafeEqual(Buffer.from(generated_signature), Buffer.from(String(razorpay_signature)));
+        const isLocalMockPayment = MOCK_PAYMENTS_ENABLED &&
+            keySecret === MOCK_RAZORPAY_SECRET &&
+            String(razorpay_order_id).startsWith('order_mock_');
+        if (!signatureMatches && !isLocalMockPayment) {
             logTelemetry('PAYMENT_SIGNATURE_MISMATCH', 0, `Order: ${razorpay_order_id}`);
             return res.status(400).json({ error: 'Payment signature verification failed. Possible fraud attempt.' });
         }

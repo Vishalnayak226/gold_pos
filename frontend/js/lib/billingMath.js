@@ -74,6 +74,91 @@ function clampMakingPercent(percent) {
     return pct;
 }
 
+/* ==========================================================================
+   Advance ledger arithmetic
+
+   A deposit row's `status` decides whether it is spendable money or only a
+   customer's claim to have paid. Three places used to sum advances.json by
+   hand — computeAdvanceLedger() server-side, the Dashboard's outstanding
+   tile, and the Advances tab's per-customer rollup — so a pending row would
+   have counted as real credit in whichever of them was missed. They all route
+   through here now instead.
+   ========================================================================== */
+
+export const ADVANCE_STATUS = {
+    PENDING: 'pending',
+    APPROVED: 'approved',
+    REJECTED: 'rejected'
+};
+
+/**
+ * The status of a ledger row, normalised.
+ *
+ * A MISSING status reads as APPROVED, and that is the load-bearing part: every
+ * advance row already on disk in a live backend/data/advances.json predates
+ * this field, and each one is money the store has genuinely taken. Defaulting
+ * the other way would silently zero every existing customer's balance the
+ * moment this version shipped. New rows are always written with an explicit
+ * status (see recordAdvanceDeposit in backend/server.js), so the default only
+ * ever applies to pre-existing history.
+ */
+export function normalizeAdvanceStatus(entry) {
+    const raw = String((entry && entry.status) ?? '').trim().toLowerCase();
+    if (raw === ADVANCE_STATUS.PENDING) return ADVANCE_STATUS.PENDING;
+    if (raw === ADVANCE_STATUS.REJECTED) return ADVANCE_STATUS.REJECTED;
+    return ADVANCE_STATUS.APPROVED;
+}
+
+/** Whether a row is settled money that belongs in a spendable balance. */
+export function isCountableAdvance(entry) {
+    if (!entry) return false;
+    // Redemptions are cashier-side facts with no approval step — they always
+    // count. Only deposits carry a reviewable status.
+    if (entry.type === 'redeem') return true;
+    if (entry.type !== 'deposit') return false;
+    return normalizeAdvanceStatus(entry) === ADVANCE_STATUS.APPROVED;
+}
+
+/**
+ * A single row's signed effect on the balance: a countable deposit adds, a
+ * redemption subtracts, and a pending or rejected deposit contributes nothing.
+ */
+export function advanceEntryDelta(entry) {
+    if (!isCountableAdvance(entry)) return 0;
+    const amount = round2(Math.abs(num(entry.amount)));
+    return entry.type === 'redeem' ? -amount : amount;
+}
+
+/**
+ * Spendable balance across a set of ledger rows, floored at zero.
+ *
+ * Floored because a negative advance balance is not a debt this system tracks
+ * — it would only ever come from a reconciliation error, and letting it go
+ * negative would silently discount the customer's next bill.
+ */
+export function computeAdvanceBalance(entries) {
+    const total = (entries || []).reduce((sum, entry) => sum + advanceEntryDelta(entry), 0);
+    return Math.max(0, round2(total));
+}
+
+/**
+ * Balance plus the awaiting-approval figures the UI shows beside it, so a
+ * customer who has submitted a UPI reference can see that their money is
+ * acknowledged but not yet credited — the alternative is a deposit that
+ * appears to have vanished.
+ */
+export function summarizeAdvanceLedger(entries) {
+    const rows = entries || [];
+    const pending = rows.filter(e =>
+        e && e.type === 'deposit' && normalizeAdvanceStatus(e) === ADVANCE_STATUS.PENDING
+    );
+    return {
+        balance: computeAdvanceBalance(rows),
+        pendingTotal: round2(pending.reduce((sum, e) => sum + Math.abs(num(e.amount)), 0)),
+        pendingCount: pending.length
+    };
+}
+
 /**
  * The invoice pipeline, in the order the numbers must be applied:
  *
