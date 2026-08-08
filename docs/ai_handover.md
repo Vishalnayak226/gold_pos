@@ -12,14 +12,13 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `e4999bc` — Phase 19: Dev/Sandbox/Live deployment pipeline (2026-07-17)
-- **Uncommitted in tree (as of 2026-08-08):** ~35 paths. Modified: `backend/` (db, server,
-  priceEngine, updateEngine, emailReporter), `frontend/` (index.html, app.css, BillingDesk,
-  Dashboard, SettingsManager, AdvancesManager), `licensing_server/server.js`,
-  `release_pipeline.js`, several `docs/`. New and untracked: `backend/customerAuth.js`,
-  `backend/defaultSettings.js`, `backend/test_billing_math.js`, `frontend/js/lib/`,
-  `frontend/package.json`, `deploy/provision-pipeline.sh`, `docs/PRODUCTION_READINESS_ROADMAP.md`,
-  `docs/SCHEME_MODULE_PLAN.md`, `docs/TESTING_CHECKLIST.md`.
+- **Latest commit:** `5f99916` — Phase 20.1: customer identity/auth, shared billing math,
+  hardening (2026-08-08). Committed on branch `phase-20.1-customer-auth`, **not yet merged into
+  `main`** and not pushed — `main` is still at `e4999bc` (Phase 19).
+- **Uncommitted in tree (as of 2026-08-08):** nothing. The whole Phase 20.1 working set — all 50
+  paths, including `backend/customerAuth.js`, `backend/defaultSettings.js`,
+  `backend/test_billing_math.js`, `frontend/js/lib/billingMath.js`, `docs/brain/`,
+  `docs/FOUNDATION.md` and root `CLAUDE.md` — went into `5f99916`.
 - **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060).
 - **Concurrent-session risk:** this tree sees edits from the user and other agents. Run
   `git status`/`git diff` and stage only files you reviewed — never `git add -A`.
@@ -28,8 +27,9 @@ This document contains key architectural details, non-negotiable design guidelin
   previously-public endpoints are gated. Verified live (53 API + 20 post-restart + 29 Playwright
   checks, all green, `backend/data/` restored byte-identical). See `CHANGELOG.md` [Unreleased],
   `docs/SCHEME_MODULE_PLAN.md` §20.1, `docs/TESTING_CHECKLIST.md` §12.
-- **Next session should start with:** confirming which of the untracked Phase-20 files are
-  finished enough to commit, then `cd backend && npm test`. The scheme module's remaining phases
+- **Next session should start with:** deciding whether `phase-20.1-customer-auth` merges into
+  `main` (both suites were green at commit time — 57 billing checks + 6 integration tests). The
+  scheme module's remaining phases
   (20.2 onward) are still blocked on the seven product decisions in `SCHEME_MODULE_PLAN.md` §7;
   `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the unblocked queue.
 
