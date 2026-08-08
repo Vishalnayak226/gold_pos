@@ -12,10 +12,13 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** Phase 21 — credential redaction, dependency bumps, first HTTP route suite
-  (2026-08-08). **`main` now contains Phases 1–21**, fast-forwarded past `e4999bc` (Phase 19) to
-  pick up `5f99916` + `a3ad346` (Phase 20.1: customer identity/auth) and this Phase 21 commit in
-  one move. Not pushed — `origin/main` is still at `e4999bc`.
+- **Latest commit:** `0bd3487` — Phase 21: credential redaction, dependency bumps, first HTTP
+  route suite (2026-08-08). **`main` now contains Phases 1–21**, fast-forwarded past `e4999bc`
+  (Phase 19) to pick up `5f99916` + `a3ad346` (Phase 20.1: customer identity/auth) and `0bd3487`
+  in one move. Not pushed — `origin/main` is still at `e4999bc`.
+- **Run `cd backend && npm install` after checking out `main`.** Phase 21 bumped nodemailer to
+  `^9.0.5` and node-cron to `^4.6.0`; a `node_modules/` left over from before the merge still has
+  nodemailer 6 / node-cron 3 and will pass tests while running the old, vulnerable code.
 - **Branches:** `phase-21-hardening` was fast-forward-merged into `main` and deleted; its
   worktree at `../gold-pos-hardening` was removed. `phase-20.1-customer-auth` still exists and is
   fully contained in `main` — it is the branch the main checkout sits on, so it was left alone.
