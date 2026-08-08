@@ -9,7 +9,7 @@ separate, single, platform-owner-operated deployment — see §5 below.
 
 ## 1. Prerequisites (once per server)
 
-- A Linux VPS (Ubuntu 22.04+ recommended) or any host with Node.js >= 18.
+- A Linux VPS (Ubuntu 22.04+ recommended) or any host with Node.js >= 20.
 - [PM2](https://pm2.keymetrics.io/) process manager: `npm install -g pm2`
 - Nginx (reverse proxy + TLS termination): `apt-get install nginx`
 - [Certbot](https://certbot.eff.org/) for free TLS certs: `apt-get install certbot python3-certbot-nginx`

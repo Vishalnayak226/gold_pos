@@ -23,7 +23,7 @@ import net from 'net';
 import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { getDefaultSettings, REDACTED_SENTINEL } from './defaultSettings.js';
+import { getDefaultSettings } from './defaultSettings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -257,10 +257,13 @@ try {
     /* ---------- Group 3: secrets never reach the browser ---------- */
     console.log('\nGroup 3: Secret redaction');
 
-    check('GET /api/settings masks every credential', () => {
-        assert.strictEqual(authed.json.razorpayKeySecret, REDACTED_SENTINEL, 'razorpayKeySecret not masked');
-        assert.strictEqual(authed.json.adminPin, REDACTED_SENTINEL, 'adminPin not masked');
-        assert.strictEqual(authed.json.smtp.pass, REDACTED_SENTINEL, 'smtp.pass not masked');
+    check('GET /api/settings redacts every credential with configured metadata', () => {
+        assert.strictEqual(authed.json.razorpayKeySecret, null, 'razorpayKeySecret not redacted');
+        assert.strictEqual(authed.json.adminPin, null, 'adminPin not redacted');
+        assert.strictEqual(authed.json.smtp.pass, null, 'smtp.pass not redacted');
+        assert.strictEqual(authed.json.razorpayKeySecretConfigured, true);
+        assert.strictEqual(authed.json.adminPinConfigured, true);
+        assert.strictEqual(authed.json.smtp.passConfigured, true);
     });
 
     check('GET /api/settings response contains no plaintext secret anywhere', () => {
@@ -277,24 +280,24 @@ try {
     });
 
     /* ---------- Group 4: the read-modify-write round trip ---------- */
-    console.log('\nGroup 4: Masked round-trip must not destroy credentials');
+    console.log('\nGroup 4: Write-only round-trip must not destroy credentials');
 
     // Exactly what the Settings screen does: post back the object it was
     // given, with one unrelated field edited.
     const echoed = { ...authed.json, companyName: 'Renamed Jewellers' };
     const save = await call('POST', '/api/settings', { token, body: echoed });
-    check('POST /api/settings accepts the masked payload the UI echoes back', () => {
+    check('POST /api/settings accepts null write-only fields echoed by the UI', () => {
         assert.strictEqual(save.status, 200);
         assert.strictEqual(save.json.success, true);
     });
 
     check('POST response is itself redacted (no secret echoed back)', () => {
         assertNoSecretsIn(save.text, 'POST /api/settings response');
-        assert.strictEqual(save.json.settings.razorpayKeySecret, REDACTED_SENTINEL);
-        assert.strictEqual(save.json.settings.smtp.pass, REDACTED_SENTINEL);
+        assert.strictEqual(save.json.settings.razorpayKeySecret, null);
+        assert.strictEqual(save.json.settings.smtp.pass, null);
     });
 
-    check('The real credentials on disk survived the masked round-trip', () => {
+    check('The real credentials on disk survived the null round-trip', () => {
         const disk = readDiskSettings(dataDir);
         assert.strictEqual(disk.companyName, 'Renamed Jewellers', 'the edit should have applied');
         assert.strictEqual(disk.razorpayKeySecret, REAL.razorpaySecret, 'razorpayKeySecret was overwritten by the mask!');
@@ -311,7 +314,7 @@ try {
         token,
         body: { razorpayKeySecret: 'rzp_live_ROTATED_secret', smtp: { ...authed.json.smtp, pass: 'rotated-pw' } }
     });
-    check('A genuinely retyped secret is saved (mask only protects untouched fields)', () => {
+    check('A genuinely retyped secret is saved (null only protects untouched fields)', () => {
         assert.strictEqual(rotate.status, 200);
         const disk = readDiskSettings(dataDir);
         assert.strictEqual(disk.razorpayKeySecret, 'rzp_live_ROTATED_secret');
@@ -319,10 +322,11 @@ try {
     });
 
     const cleared = await call('POST', '/api/settings', { token, body: { razorpayKeySecret: '' } });
-    check('An unset secret reads back as empty, not as a mask', () => {
+    check('An explicitly cleared secret reads back as unconfigured', () => {
         assert.strictEqual(cleared.status, 200);
-        assert.strictEqual(cleared.json.settings.razorpayKeySecret, '',
-            'an empty credential must stay empty so the UI can show "not configured"');
+        assert.strictEqual(cleared.json.settings.razorpayKeySecret, null);
+        assert.strictEqual(cleared.json.settings.razorpayKeySecretConfigured, false);
+        assert.strictEqual(readDiskSettings(dataDir).razorpayKeySecret, '');
     });
 
     /* ---------- Group 5: persistence failure is reported, not swallowed ---------- */

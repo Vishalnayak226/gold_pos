@@ -6,7 +6,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { readJSON, writeJSON, writeJSONTransaction, logError, logTelemetry, DATA_DIR } from './db.js';
-import { redactSettings, unredactSettings } from './defaultSettings.js';
+import { redactSettings } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
 import https from 'https';
@@ -546,6 +546,33 @@ app.post('/api/gold-price/sync', requireAdminSession, async (req, res) => {
    ========================================================================== */
 
 /**
+ * Settings sent to the browser retain their public shape, but write-only
+ * credentials are replaced with null plus a boolean configured indicator.
+ * The indicators let the form distinguish "already configured" from "not
+ * configured" without ever receiving the credential itself.
+ */
+function redactSettingsForBrowser(settings) {
+    const safe = {
+        ...settings,
+        adminPin: null,
+        adminPinConfigured: !!settings.adminPin,
+        razorpayKeySecret: null,
+        razorpayKeySecretConfigured: !!settings.razorpayKeySecret,
+        smtp: {
+            ...(settings.smtp || {}),
+            pass: null,
+            passConfigured: !!(settings.smtp && settings.smtp.pass)
+        }
+    };
+    return safe;
+}
+
+/** Null or an absent key means "leave this write-only value unchanged". */
+function preserveWriteOnlyValue(requested, current) {
+    return requested === undefined || requested === null ? current : requested;
+}
+
+/**
  * GET /api/settings/public
  * Public-safe subset of settings for customer-facing pages (no secrets).
  */
@@ -571,16 +598,15 @@ app.get('/api/settings/public', (req, res) => {
 
 /**
  * GET /api/settings
- * Retrieves the system configuration (tax slabs, overrides, SMTP host/user,
- * payment key id). Admin-only, and every credential is masked on the way out
- * — see redactSettings() in defaultSettings.js. The plaintext Razorpay
- * secret, SMTP password and admin PIN never leave the server.
+ * Retrieves system configuration for the admin form. Credentials are
+ * write-only: null means "not returned", while the adjacent *Configured flag
+ * tells the form whether a stored value already exists.
  */
 app.get('/api/settings', requireAdminSession, (req, res) => {
     try {
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const settings = readJSON(settingsFile, {});
-        res.json(redactSettings(settings));
+        res.json(redactSettingsForBrowser(settings));
     } catch (err) {
         logError('Error getting settings: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve settings' });
@@ -611,14 +637,22 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
             }
         }
 
-        const newSettings = { ...currentSettings, ...req.body };
+        const newSettings = {
+            ...currentSettings,
+            ...req.body,
+            adminPin: preserveWriteOnlyValue(req.body.adminPin, currentSettings.adminPin),
+            razorpayKeySecret: preserveWriteOnlyValue(req.body.razorpayKeySecret, currentSettings.razorpayKeySecret),
+            smtp: req.body.smtp ? {
+                ...(currentSettings.smtp || {}),
+                ...req.body.smtp,
+                pass: preserveWriteOnlyValue(req.body.smtp.pass, currentSettings.smtp && currentSettings.smtp.pass)
+            } : currentSettings.smtp
+        };
         delete newSettings.confirmDestructive; // request-only flag, never persisted
-
-        // The Settings screen renders what GET returned and posts it back, so
-        // masked secrets arrive here as the sentinel. Restore them from disk
-        // before persisting — otherwise saving any unrelated section would
-        // overwrite the tenant's real credentials with a row of bullets.
-        unredactSettings(newSettings, currentSettings);
+        // Response-only metadata must never be accepted back into settings.json.
+        delete newSettings.adminPinConfigured;
+        delete newSettings.razorpayKeySecretConfigured;
+        if (newSettings.smtp) delete newSettings.smtp.passConfigured;
 
         // Store the tax mode in canonical form. Billing tolerates any casing,
         // but settings.json stays the single tidy source of truth that the
@@ -640,7 +674,7 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         // Extensions get the real document; the browser gets the masked one,
         // so the client's cached copy round-trips safely on the next save.
         fireHook('onSettingsUpdated', newSettings);
-        res.json({ success: true, settings: redactSettings(newSettings) });
+        res.json({ success: true, settings: redactSettingsForBrowser(newSettings) });
     } catch (err) {
         logError('Error updating settings: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to save settings' });
@@ -1716,24 +1750,36 @@ app.get('/api/diagnostics/blackbox-export', requireAdminSession, (req, res) => {
    Server Bootstrap & Scheduler Init
    ========================================================================== */
 
-// Initialize pricing, backup, report-email, and update-check schedulers
-initPriceScheduler();
-initBackupScheduler();
-initReportScheduler();
-initUpdateScheduler();
+export { app };
 
-// Trigger initial SaaS license sync & database backup on startup
-syncLicenseStatus().catch(err => {
-    console.warn('[Server] Initial license sync failed, operating under local grace checks.');
-});
-createBackup();
+/** Starts the HTTP listener. Exported so route tests can use an ephemeral port. */
+export function startServer(port = PORT, host = '127.0.0.1') {
+    const server = app.listen(port, host, () => {
+        const address = server.address();
+        const listeningPort = typeof address === 'object' && address ? address.port : port;
+        console.log(`[Server] Gold POS backend running on port ${listeningPort}`);
+        logTelemetry('SERVER_BOOTSTRAP', 0, `Listening on port ${listeningPort}`);
+    });
+    return server;
+}
 
-// Load any tenant-specific extensions (backend/extensions/*.extension.js —
-// see backend/extensions/README.md) and notify them the server has booted.
-loadExtensions().then(() => fireHook('onServerBoot', {}));
+function bootstrapServer() {
+    // Initialize pricing, backup, report-email, and update-check schedulers.
+    initPriceScheduler();
+    initBackupScheduler();
+    initReportScheduler();
+    initUpdateScheduler();
 
-// Start Server listening
-app.listen(PORT, '127.0.0.1', () => {
-    console.log(`[Server] Gold POS backend running on port ${PORT}`);
-    logTelemetry('SERVER_BOOTSTRAP', 0, `Listening on port ${PORT}`);
-});
+    // Trigger initial SaaS license sync & database backup on startup.
+    syncLicenseStatus().catch(() => {
+        console.warn('[Server] Initial license sync failed, operating under local grace checks.');
+    });
+    createBackup();
+
+    // Load tenant-specific extensions and notify them the server has booted.
+    loadExtensions().then(() => fireHook('onServerBoot', {}));
+    return startServer();
+}
+
+// Tests import the real Express app but own its ephemeral listener and data.
+if (process.env.GOLD_POS_DISABLE_BOOTSTRAP !== '1') bootstrapServer();

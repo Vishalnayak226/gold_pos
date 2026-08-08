@@ -6,10 +6,11 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_billing_math.js && node test_suite.js && node test_routes.js",
+    "test": "node test_billing_math.js && node test_suite.js && node test_routes.js && node test_http.js",
     "test:billing": "node test_billing_math.js",
     "test:integration": "node test_suite.js",
-    "test:routes": "node test_routes.js"
+    "test:routes": "node test_routes.js",
+    "test:http": "node test_http.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -21,6 +22,6 @@
     "qrcode": "^1.5.4"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

@@ -9,19 +9,15 @@ import {
 } from './defaultSettings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Both default to the in-tree directories — that is what every tenant install
-// resolves to, and nothing in the shipped product sets these variables. The
-// overrides exist so test_routes.js can boot a real server against a
-// throwaway directory: the HTTP suite writes settings, sales and advances,
-// and fixture debris left in a live backend/data/ looks exactly like a real
-// bug (see CLAUDE.md §8).
-export const DATA_DIR = process.env.GOLDPOS_DATA_DIR
-    ? path.resolve(process.env.GOLDPOS_DATA_DIR)
-    : path.join(__dirname, 'data');
-export const LOGS_DIR = process.env.GOLDPOS_LOGS_DIR
-    ? path.resolve(process.env.GOLDPOS_LOGS_DIR)
-    : path.join(__dirname, 'logs');
+// Test and recovery tooling can point the process at an isolated database.
+// Both historical and underscored names are accepted because the two HTTP
+// suites predate one another. Production leaves them unset.
+export const DATA_DIR = path.resolve(
+    process.env.GOLD_POS_DATA_DIR || process.env.GOLDPOS_DATA_DIR || path.join(__dirname, 'data')
+);
+export const LOGS_DIR = path.resolve(
+    process.env.GOLD_POS_LOGS_DIR || process.env.GOLDPOS_LOGS_DIR || path.join(__dirname, 'logs')
+);
 
 // Ensure database and logs directories exist on import
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -106,7 +102,7 @@ function sleepSync(ms) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
     } catch (_) {
         // Extremely defensive fallback; Atomics.wait is available in every
-        // Node >=18 target this project supports.
+        // Node >=20 target supported here.
     }
 }
 

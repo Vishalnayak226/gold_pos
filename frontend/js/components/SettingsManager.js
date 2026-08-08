@@ -308,10 +308,10 @@ export class SettingsManager {
                 </div>
                 <div class="form-group">
                     <label for="set-admin-pin">Admin PIN</label>
-                    <input type="text" id="set-admin-pin" class="form-control" value="${s.adminPin || '1234'}" maxlength="8">
+                    <input type="password" id="set-admin-pin" class="form-control" value="" maxlength="8" placeholder="${s.adminPinConfigured ? 'Configured — leave blank to keep' : 'Enter a new PIN'}">
                 </div>
             </div>
-            <p class="text-muted-small">The saved Admin PIN is masked and never sent to this screen. Leave <code>••••••••</code> as-is to keep it; type over it to set a new one.</p>
+            <p class="text-muted-small">The saved Admin PIN is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-invoice-prefix">Invoice Prefix</label>
@@ -353,7 +353,7 @@ export class SettingsManager {
                 goldTaxSlab: parseFloat(document.getElementById('set-tax-slab').value) || 0,
                 taxMode: document.getElementById('set-tax-mode').value,
                 defaultDiscountPercent: discountPct,
-                adminPin: document.getElementById('set-admin-pin').value || '1234',
+                adminPin: document.getElementById('set-admin-pin').value.trim() || null,
                 invoicePrefix: document.getElementById('set-invoice-prefix').value || 'GOLD',
                 invoiceSeqStart: requestedSeq
             };
@@ -385,11 +385,11 @@ export class SettingsManager {
                 </div>
                 <div class="form-group">
                     <label for="set-rzp-secret">Key Secret</label>
-                    <input type="password" id="set-rzp-secret" class="form-control" value="${s.razorpayKeySecret || ''}">
+                    <input type="password" id="set-rzp-secret" class="form-control" value="" placeholder="${s.razorpayKeySecretConfigured ? 'Configured — leave blank to keep' : 'Enter key secret'}">
                 </div>
             </div>
             <p class="text-muted-small">The demo pair <code>rzp_test_xxxxxx</code> / <code>rzp_test_xxxxxx_secret</code> auto-mocks checkout for local testing. Any other value is sent to the real Razorpay API.</p>
-            <p class="text-muted-small">A saved Key Secret is masked and never sent to this screen. Leave it untouched to keep it; type over it to replace it. An empty box means no secret is configured yet.</p>
+            <p class="text-muted-small">A saved Key Secret is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Manual UPI Fallback</h3>
             <div class="form-group" style="max-width:300px;">
@@ -406,7 +406,7 @@ export class SettingsManager {
         document.getElementById('save-payment-btn').addEventListener('click', async () => {
             const payload = {
                 razorpayKeyId: document.getElementById('set-rzp-key').value,
-                razorpayKeySecret: document.getElementById('set-rzp-secret').value,
+                razorpayKeySecret: document.getElementById('set-rzp-secret').value || null,
                 upiId: document.getElementById('set-upi-id').value
             };
             await this.saveSettings(payload, 'Payment settings saved!');
@@ -448,14 +448,14 @@ export class SettingsManager {
                 </div>
                 <div class="form-group">
                     <label for="set-smtp-pass">SMTP Password</label>
-                    <input type="password" id="set-smtp-pass" class="form-control" value="${smtp.pass || ''}">
+                    <input type="password" id="set-smtp-pass" class="form-control" value="" placeholder="${smtp.passConfigured ? 'Configured — leave blank to keep' : 'Enter SMTP password'}">
                 </div>
                 <div class="form-group">
                     <label for="set-smtp-fromname">"From" Display Name</label>
                     <input type="text" id="set-smtp-fromname" class="form-control" value="${smtp.fromName || ''}">
                 </div>
             </div>
-            <p class="text-muted-small">A saved SMTP Password is masked and never sent to this screen. Leave it untouched to keep it; type over it to replace it. An empty box means no password is configured yet.</p>
+            <p class="text-muted-small">A saved SMTP Password is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>
             <button type="button" id="save-backup-btn" class="btn btn-primary">Save Backup & Email Settings</button>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Manual Actions</h3>
@@ -477,7 +477,7 @@ export class SettingsManager {
                     port: parseInt(document.getElementById('set-smtp-port').value) || 587,
                     secure: document.getElementById('set-smtp-secure').checked,
                     user: document.getElementById('set-smtp-user').value,
-                    pass: document.getElementById('set-smtp-pass').value,
+                    pass: document.getElementById('set-smtp-pass').value || null,
                     fromName: document.getElementById('set-smtp-fromname').value
                 }
             };
