@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import {
     getDefaultSettings,
@@ -23,11 +24,45 @@ export const LOGS_DIR = path.resolve(
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
 
+/* ==========================================================================
+   Document identifiers
+
+   Every financial row's id used to be `PREFIX-` + Math.random().toString(36),
+   which is seven base-36 characters drawn from a non-cryptographic PRNG. That
+   is roughly 78 billion values, so by the birthday bound a busy ledger starts
+   colliding in the low hundreds of thousands of rows — and because Math.random
+   is seeded from observable state, an id is also guessable rather than merely
+   unlikely. Ledger ids appear in URLs, receipts and approval calls, so both
+   properties matter.
+
+   randomUUID() is the stdlib answer: 122 bits of CSPRNG entropy, collision
+   probability negligible at any volume this platform will ever see, no
+   dependency. The compact form below keeps ids readable on a printed slip
+   while staying comfortably above the birthday bound.
+   ========================================================================== */
+
+/**
+ * A cryptographically strong, prefixed document id — e.g. `newId('ADV')`.
+ *
+ * Callers must not build ids any other way: this is the single generator so
+ * that a future change to id shape (or a move to full UUIDs when the ledger
+ * migrates to SQL) is one edit rather than a sweep of every write path.
+ *
+ * @param {string} prefix short uppercase document class, e.g. 'ADV', 'RED'
+ * @returns {string}
+ */
+export function newId(prefix) {
+    // 12 hex chars = 48 bits. At 10 million rows the collision probability is
+    // about 1 in 5,600 — and it is checked against, not relied on, wherever a
+    // duplicate would move money.
+    return `${prefix}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
+}
+
 /**
  * Standardized Error Logging Engine
  * Writes exceptions, stack traces, and warnings to flat log files.
- * @param {string} message 
- * @param {string} [stack] 
+ * @param {string} message
+ * @param {string} [stack]
  */
 export function logError(message, stack = '') {
     try {
@@ -256,7 +291,7 @@ export function writeJSONTransaction(writes) {
 }
 
 function cryptoRandomSuffix() {
-    return Math.random().toString(36).slice(2, 10);
+    return crypto.randomBytes(4).toString('hex');
 }
 
 function recoverInterruptedJSONTransaction() {
@@ -364,6 +399,12 @@ export function initDatabaseFiles() {
     // rather than from the request body, which the gateway signature cannot
     // police. Short-lived — pruned on write, not permanent history.
     readJSON(path.join(DATA_DIR, 'payment_orders.json'), []);
+    // Razorpay webhook deliveries, keyed by the gateway's own event id. This is
+    // the idempotency record for server-to-server callbacks: the gateway
+    // retries a delivery until it gets a 2xx, and retries are expected, not
+    // exceptional. Without a durable record of which event ids have been
+    // applied, every retry of a payment.captured would credit the ledger again.
+    readJSON(path.join(DATA_DIR, 'payment_events.json'), []);
 }
 
 // Auto run initialization on import

@@ -2,11 +2,31 @@
   "$comment": "The only hand-edited brain file. Regions claim files by glob, so a new file in an existing area usually needs no edit at all. Redraw with: node docs/brain/build-brain.mjs",
   "project": "Gold POS",
   "lobes": [
-    { "id": "pos", "name": "The POS Terminal", "blurb": "What the shop actually runs: the Express API, the JSON store, pricing math, and the cashier UI." },
-    { "id": "customer", "name": "The Customer Surface", "blurb": "What a customer touches: the mobile portal, its authentication, and payment collection." },
-    { "id": "platform", "name": "The SaaS Platform", "blurb": "Licensing, signed updates, cryptography, and the tenant extension surface. Spans both servers." },
-    { "id": "ops", "name": "Build & Operations", "blurb": "Packaging, deployment, CI, tests, and the local dev loop." },
-    { "id": "knowledge", "name": "Docs & Agent Config", "blurb": "The trackers, the reference docs, and the rules an agent session loads." }
+    {
+      "id": "pos",
+      "name": "The POS Terminal",
+      "blurb": "What the shop actually runs: the Express API, the JSON store, pricing math, and the cashier UI."
+    },
+    {
+      "id": "customer",
+      "name": "The Customer Surface",
+      "blurb": "What a customer touches: the mobile portal, its authentication, and payment collection."
+    },
+    {
+      "id": "platform",
+      "name": "The SaaS Platform",
+      "blurb": "Licensing, signed updates, cryptography, and the tenant extension surface. Spans both servers."
+    },
+    {
+      "id": "ops",
+      "name": "Build & Operations",
+      "blurb": "Packaging, deployment, CI, tests, and the local dev loop."
+    },
+    {
+      "id": "knowledge",
+      "name": "Docs & Agent Config",
+      "blurb": "The trackers, the reference docs, and the rules an agent session loads."
+    }
   ],
   "regions": [
     {
@@ -14,56 +34,82 @@
       "lobe": "pos",
       "name": "POS API Router",
       "role": "The single Express router for the shop terminal — sales, payments, analytics, settings, and every /api route the cashier UI calls. The choke point most cross-cutting fixes belong at.",
-      "match": ["backend/server.js"]
+      "match": [
+        "backend/server.js"
+      ]
     },
     {
       "id": "persistence",
       "lobe": "pos",
       "name": "Persistence & Settings",
-      "role": "Atomic JSON file writers, the error/telemetry logs, and the settings default-merge-and-retire mechanism that stands in for schema migrations. Every tenant's live data passes through here.",
-      "match": ["backend/db.js", "backend/defaultSettings.js"]
+      "role": "Atomic JSON file writers, the error/telemetry logs, and the settings default-merge-and-retire mechanism that stands in for schema migrations. Every tenant's live data passes through here. seed.js generates the deterministic synthetic fixture database the E2E suite and manual QA run against.",
+      "match": [
+        "backend/db.js",
+        "backend/defaultSettings.js",
+        "backend/seed.js"
+      ]
     },
     {
       "id": "pricing",
       "lobe": "pos",
       "name": "Pricing & Billing Math",
       "role": "Gold rate sync, rate overrides, and the DOM-free billing helpers shared by the browser and the Node test suite. Making charges, wastage, GST, and bi-directional rounding live here.",
-      "match": ["backend/priceEngine.js", "frontend/js/lib/*.js"]
+      "match": [
+        "backend/priceEngine.js",
+        "frontend/js/lib/*.js"
+      ]
     },
     {
       "id": "pos-ui",
       "lobe": "pos",
       "name": "Cashier UI Shell",
       "role": "The admin single-page terminal: boot sequence, license gate, navigation controller, and the whole visual vocabulary. Vanilla JS/CSS served straight off disk.",
-      "match": ["frontend/index.html", "frontend/js/app.js", "frontend/css/*.css"]
+      "match": [
+        "frontend/index.html",
+        "frontend/js/app.js",
+        "frontend/css/*.css"
+      ]
     },
     {
       "id": "pos-components",
       "lobe": "pos",
       "name": "Cashier UI Components",
       "role": "The screens themselves — billing desk, dashboard, advances ledger, settings. The pattern any new screen should copy rather than reinvent.",
-      "match": ["frontend/js/components/*.js"]
+      "match": [
+        "frontend/js/components/*.js"
+      ]
     },
     {
       "id": "customer-portal",
       "lobe": "customer",
       "name": "Customer Portal",
       "role": "The customer-facing mobile page, its password-gated session flow, and offline UPI QR generation. Session-scoped as of Phase 20.1 — previously-public endpoints are now gated.",
-      "match": ["frontend/customer.html", "backend/customerAuth.js", "frontend/js/qrGenerator.js"]
+      "match": [
+        "frontend/customer.html",
+        "backend/customerAuth.js",
+        "frontend/js/qrGenerator.js"
+      ]
     },
     {
       "id": "licensing",
       "lobe": "platform",
       "name": "Licensing",
       "role": "The RSA handshake that decides whether a tenant may run: the central signing service on :6060, the client-side signature verification, and the 7-day grace window.",
-      "match": ["backend/licenseChecker.js", "licensing_server/**"]
+      "match": [
+        "backend/licenseChecker.js",
+        "licensing_server/**"
+      ]
     },
     {
       "id": "updates",
       "lobe": "platform",
       "name": "Release & Update Engine",
       "role": "Packaging a release, signing it, and the tiered auto/manual apply-and-rollback path on the tenant side. Security-channel releases apply themselves; feature and patch ones ask.",
-      "match": ["backend/updateEngine.js", "release_pipeline.js", "CHANGELOG.md"]
+      "match": [
+        "backend/updateEngine.js",
+        "release_pipeline.js",
+        "CHANGELOG.md"
+      ]
     },
     {
       "id": "security",
@@ -77,7 +123,8 @@
         "backend/keys/*.pem",
         "backend/developer_doomsday_keys/**",
         "developer_blackbox_keys/**",
-        "**.env.example"
+        "**.env.example",
+        "backend/productionGuard.js"
       ]
     },
     {
@@ -85,28 +132,43 @@
       "lobe": "platform",
       "name": "Tenant Extension Surface",
       "role": "The hook dispatcher and drop-in surface that lets a tenant customise behaviour without forking. Deliberately never overwritten by an update.",
-      "match": ["backend/extensions/**", "frontend/js/extensions/**", "docs/THIRD_PARTY_DEVELOPER_GUIDE.md"]
+      "match": [
+        "backend/extensions/**",
+        "frontend/js/extensions/**",
+        "docs/THIRD_PARTY_DEVELOPER_GUIDE.md"
+      ]
     },
     {
       "id": "maintenance",
       "lobe": "platform",
       "name": "Backups & Reporting",
       "role": "The scheduled jobs: daily dated backups with 7-day pruning, and the emailed operational reports.",
-      "match": ["backend/backupEngine.js", "backend/emailReporter.js"]
+      "match": [
+        "backend/backupEngine.js",
+        "backend/emailReporter.js"
+      ]
     },
     {
       "id": "deploy",
       "lobe": "ops",
       "name": "Deploy & CI Pipeline",
       "role": "The owner's internal Dev → Sandbox → Live pipeline: PM2 ecosystem files, nginx template, the SSH deploy script, and the four GitHub workflows. Live is gated on a manual approval click.",
-      "match": ["deploy/**", ".github/**"]
+      "match": [
+        "deploy/**",
+        ".github/**"
+      ]
     },
     {
       "id": "tests",
       "lobe": "ops",
       "name": "Test Suites",
-      "role": "Assert-driven, no framework: billing math assertions plus the system integration suite. Anything touching money must be covered here before it is called done.",
-      "match": ["backend/test_*.js", "test.bat"],
+      "role": "Assert-driven, no framework: billing math, helper integration, HTTP routes/auth, the money paths and Razorpay webhook, and the fail-closed production startup guard — all five run by npm test against temp data dirs, never backend/data/. Playwright end-to-end journeys live under tests/e2e/ and run separately (npm run test:e2e) because they need a browser binary. Anything touching money must be covered here before it is called done.",
+      "match": [
+        "backend/test_*.js",
+        "test.bat",
+        "backend/playwright.config.js",
+        "backend/tests/**"
+      ],
       "priority": 100
     },
     {
@@ -114,14 +176,21 @@
       "lobe": "ops",
       "name": "Local Dev Loop & Manifests",
       "role": "The scripts that start and restart the thing locally, plus the dependency manifests that define the budget in CLAUDE.md §0. Restart_Server.bat frees port 5000 before relaunching, which is the safe way to restart after a code change.",
-      "match": ["Restart_Server.bat", "backend/package*.json", "frontend/package.json", ".gitignore"]
+      "match": [
+        "Restart_Server.bat",
+        "backend/package*.json",
+        "frontend/package.json",
+        ".gitignore"
+      ]
     },
     {
       "id": "mobile",
       "lobe": "ops",
       "name": "Mobile Wrapper",
       "role": "A Capacitor shell around the same web frontend. Carries no business logic of its own and must never grow any.",
-      "match": ["mobile/**"]
+      "match": [
+        "mobile/**"
+      ]
     },
     {
       "id": "trackers",
@@ -140,14 +209,26 @@
       "lobe": "knowledge",
       "name": "Reference Docs",
       "role": "Architecture, requirements, and the handover snapshot. ai_handover.md §0 is the first and usually only thing a fresh session should read.",
-      "match": ["docs/ai_handover.md", "docs/BRD.md", "docs/credentials.md", "**README.md"]
+      "match": [
+        "docs/ai_handover.md",
+        "docs/BRD.md",
+        "docs/credentials.md",
+        "**README.md",
+        "docs/archive/**"
+      ]
     },
     {
       "id": "agent-config",
       "lobe": "knowledge",
       "name": "Agent Operating Rules",
       "role": "The rules a session loads and the mechanism that enforces them: standing rules, the reasoning behind them, the guard hooks, the vendored skill, and this brain.",
-      "match": ["CLAUDE.md", "docs/CLAUDE.md", "docs/FOUNDATION.md", ".claude/**", "docs/brain/**"],
+      "match": [
+        "CLAUDE.md",
+        "docs/CLAUDE.md",
+        "docs/FOUNDATION.md",
+        ".claude/**",
+        "docs/brain/**"
+      ],
       "priority": 100
     }
   ],
@@ -186,22 +267,42 @@
   "pathways": [
     {
       "name": "Boot",
-      "steps": ["pos-ui", "pos-api", "licensing", "persistence"],
+      "steps": [
+        "pos-ui",
+        "pos-api",
+        "licensing",
+        "persistence"
+      ],
       "note": "The UI boots, hits the API, which verifies the license signature and grace window before the terminal is usable."
     },
     {
       "name": "A sale",
-      "steps": ["pos-components", "pricing", "pos-api", "persistence"],
+      "steps": [
+        "pos-components",
+        "pricing",
+        "pos-api",
+        "persistence"
+      ],
       "note": "Billing desk computes with the shared math helpers, posts to the router, which writes the partitioned annual sales file."
     },
     {
       "name": "A customer payment",
-      "steps": ["customer-portal", "pos-api", "persistence", "maintenance"],
+      "steps": [
+        "customer-portal",
+        "pos-api",
+        "persistence",
+        "maintenance"
+      ],
       "note": "Portal collects, router records against the advances ledger, the backup job captures it that night."
     },
     {
       "name": "An update",
-      "steps": ["updates", "licensing", "security", "persistence"],
+      "steps": [
+        "updates",
+        "licensing",
+        "security",
+        "persistence"
+      ],
       "note": "Engine polls the registry, verifies the release signature against release_public.pem, snapshots to _rollback/, then applies."
     }
   ]

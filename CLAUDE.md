@@ -14,7 +14,8 @@ not every turn. This file is auto-loaded on every request, so it stays tight.
 - Data store: **flat JSON files under `backend/data/`, written via `backend/db.js`. No SQL, no ORM, no DB server.**
 - Frontend posture: **vanilla JS/CSS/HTML in `frontend/`, served statically off disk by `backend/server.js`. No framework.**
 - Build step: **none.** `frontend/package.json` exists only to mark `js/lib/` as ESM so Node tests can import it — it is never installed and never bundled.
-- Dependency budget: **the 6 in `backend/package.json` (cors, dotenv, express, node-cron, nodemailer, qrcode) + the 3 in `licensing_server/`. That is the whole budget.** Adding a tenth is a deliberate, announced decision.
+- Dependency budget: **the 7 runtime deps in `backend/package.json` (cors, dotenv, express, helmet, node-cron, nodemailer, qrcode) + the 3 in `licensing_server/`. That is the whole budget.** Adding another is a deliberate, announced decision.
+  - **One devDependency**, `@playwright/test`, is exempt from that budget because it ships nowhere: it is not imported by any runtime file, not in the release bundle, and not needed by `npm test`. That exemption covers exactly this one package — a *runtime* dependency is still a permanent liability and still needs the argument.
 
 Three separately-run Node processes, not one app: `backend/` (POS, :5000), `licensing_server/`
 (central licensing + release publishing, :6060), `mobile/` (Capacitor wrapper, no logic of its own).
@@ -199,10 +200,26 @@ wrong answers.
 
 ## 8. Testing posture
 
-- `cd backend && npm test` runs both suites: `test_billing_math.js` (pricing/rounding assertions)
-  then `test_suite.js` (integration).
-- The integration suite touches `backend/data/`. Do not run it in parallel with a live dev server
-  against the same data directory — fixture debris looks exactly like a real bug.
+- `cd backend && npm test` runs five suites in order and exits non-zero on any failure:
+  `test_billing_math.js` (pricing/rounding) → `test_suite.js` (helper-level integration) →
+  `test_routes.js` (routes + auth boundary) → `test_http.js` (money paths, Razorpay webhook,
+  returns/refunds) → `test_production_guard.js` (fail-closed startup). **216 checks as of
+  2026-08-11.**
+- **No suite touches `backend/data/`.** Each one that needs a database makes its own temp
+  directory via `GOLD_POS_DATA_DIR`, so all of them are safe to run alongside a dev server on
+  :5000. Keep it that way — fixture debris in a real ledger looks exactly like a real bug.
+  **Set that env var at the TOP of a suite file, before anything imports `db.js`** — `db.js`
+  resolves `DATA_DIR` once at import and ESM caches the module, so redirecting it inside a test
+  function is too late and silently writes into the tenant's real ledger.
+- **`npm run test:e2e` (Playwright) is deliberately NOT in `npm test`.** It needs an installed
+  browser binary, and `npm test` must keep running on a bare checkout with nothing installed.
+  One-off setup: `npm install && npx playwright install chromium`. **43 journeys as of
+  2026-08-11** (cashier, customer portal at desktop + 390px mobile, reprint desk, return desk).
+- `npm run seed` builds a deterministic, synthetic database to click through by hand. It refuses
+  to write into `backend/data/` without `--force`.
+- Money math changes still have to land in `test_billing_math.js` (§2) — including anything
+  touching `toPaise`/`fromPaise`/`computeMetalValue`/`computeReturnRefund`, which live in
+  `frontend/js/lib/billingMath.js` with the rest of it, not in `server.js`.
 - Record known-flaky, known-benign failures here by name with the reason. An unexplained red test
   trains everyone to ignore red tests.
   <!-- none recorded yet -->

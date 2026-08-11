@@ -12,54 +12,119 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `0bd3487` — Phase 21: credential redaction, dependency bumps, first HTTP
-  route suite (2026-08-08). **`main` now contains Phases 1–21**, fast-forwarded past `e4999bc`
-  (Phase 19) to pick up `5f99916` + `a3ad346` (Phase 20.1: customer identity/auth) and `0bd3487`
-  in one move. Not pushed — `origin/main` is still at `e4999bc`.
-- **Run `cd backend && npm install` after checking out `main`.** Phase 21 bumped nodemailer to
-  `^9.0.5` and node-cron to `^4.6.0`; a `node_modules/` left over from before the merge still has
-  nodemailer 6 / node-cron 3 and will pass tests while running the old, vulnerable code.
-- **Branches:** `phase-21-hardening` was fast-forward-merged into `main` and deleted, and its
-  worktree removed. `develop` and `staging` are both still back at `e4999bc` (Phase 19).
-- **⚠️ `phase-20.1-customer-auth` has DIVERGED from `main` — it is not a leftover label.** A
-  concurrent session committed `5bfc950` "Harden payments and make sales atomic" onto it during
-  the Phase 21 build. Both branches share the merge base `a3ad346` and each has moved on since:
-
-  | Branch | Tip | Contains |
-  | :--- | :--- | :--- |
-  | `main` | `1e64642` | Phases 1–21 (redaction, dep bumps, route suite) |
-  | `phase-20.1-customer-auth` | `5bfc950` | `a3ad346` + payments/atomic-sales hardening |
-
-  `5bfc950` adds a `writeJSONTransaction()` crash-recovery layer to `backend/db.js`,
-  advance-ledger status helpers (`normalizeAdvanceStatus`, `ADVANCE_STATUS`) to
-  `frontend/js/lib/billingMath.js`, ~325 lines to `backend/server.js`, a `backend/.env.example`,
-  and `helmet@^8.3.0` to `backend/package.json`. **It was not reviewed by the Phase 21 session.**
-  - **Merging it into `main` will conflict.** `backend/db.js`, `backend/server.js` and
-    `backend/package.json` were modified by both sides. Phase 21 touched the settings routes in
-    `server.js`, the `DATA_DIR`/`LOGS_DIR` constants in `db.js`, and the dependency block in
-    `package.json` — expect to resolve all three by hand rather than trusting a clean auto-merge.
-  - `helmet` is in that commit's `package.json` but imported nowhere, and would take the
-    dependency budget from 6 to 7 (CLAUDE.md §0) — a deliberate call someone still needs to make.
+- **Latest commit:** `818b401` — "Secure settings and add HTTP money-path tests" (2026-08-08).
+  `main` contains Phases 1–21 plus 20.2. The earlier divergence between `main` and
+  `phase-20.1-customer-auth` is **resolved**: `f04f138` (payments/atomic-sales hardening) and
+  `7bf4df3` (Phase 20.2) are both in `main`, and the two branch tips now hold the same tree.
+- **⚠️ UNCOMMITTED WORK IS IN THE TREE RIGHT NOW (2026-08-11).** THREE units of work are sitting
+  uncommitted, all finished and fully tested: the Phase 0 remediation, Phase 22 on top of it, and
+  Phase 23 (Returns & Refunds) on top of that. `git status` shows ~30 modified files and 8 new
+  paths (`backend/productionGuard.js`, `backend/seed.js`, `backend/test_production_guard.js`,
+  `backend/playwright.config.js`, `backend/tests/`, `frontend/js/components/ReprintDesk.js`,
+  `frontend/js/components/ReturnDesk.js`, `backend/tests/e2e/return-desk.spec.js`). Review and
+  commit before starting anything else, or a concurrent session will trip over it.
+- **`backend/data/` is clean.** An early run of the new `test_suite.js` Test 7 wrote a synthetic
+  `9000000123 / Reset Tester` account into `customer_auth.json` before the data-directory
+  redirect was fixed; the row was removed on 2026-08-09 with the user's confirmation (CLAUDE.md
+  §6), after verifying no other data file referenced it. The cause is fixed — see the §8 note
+  about setting `GOLD_POS_DATA_DIR` before anything imports `db.js`.
+- **Run `cd backend && npm install` after checking out `main`.** Two reasons now: the Phase 21
+  nodemailer `^9.0.5` / node-cron `^4.6.0` bumps, and the new `@playwright/test` **devDependency**.
+  Runtime deps are unchanged. Playwright additionally needs `npx playwright install chromium`
+  (one-off, ~130 MB) before `npm run test:e2e` will run; `npm test` does not need it.
+- **Branches:** `develop`, `staging`, `origin/main`, `origin/develop` and `origin/staging` are ALL
+  still at `e4999bc` (Phase 19). Local `main` is **8 commits ahead of `origin/main`** and nothing
+  has ever been pushed past Phase 19.
 - **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060).
-- **Concurrent-session risk:** actively realised right now, see above. Run `git status`/`git diff`
+- **Concurrent-session risk:** high — see the uncommitted work above. Run `git status`/`git diff`
   and stage only files you reviewed — never `git add -A`.
-- **Last unit of work:** Phase 21 — credential redaction, dependency bumps, first HTTP route
-  suite (2026-08-08, merged to `main`). Closes audit findings 8–10:
-  `GET /api/settings` no longer serves the Razorpay secret, SMTP password or admin PIN to the
-  browser (masked via `redactSettings()`/`unredactSettings()` in `backend/defaultSettings.js`,
-  with a round-trip that stops a save from overwriting an untouched secret); nodemailer 6→9 and
-  node-cron 3→4 take `npm audit` to zero after empirically probing this codebase's actual call
-  shapes; and `backend/test_routes.js` boots the real server against a temp data dir for 27
-  route/auth-boundary/persistence-failure checks. 57 billing + 6 integration + 27 route checks
-  green. Detail in `docs/LEDGER.md`; manual steps in `docs/TESTING_CHECKLIST.md` §0, §5, §8, §9.
-- **Next session should start with:** merging `phase-20.1-customer-auth` (`5bfc950`) into `main`
-  and resolving the three-file conflict described above — that is the one outstanding piece of
-  work, and it gets more painful the longer the two tips sit apart. Run `cd backend && npm test`
-  after resolving; the route suite will catch it if the settings routes get mangled in the merge.
-  After that, `main` is a candidate for its first push — `origin/main` is 21 phases behind, and
-  nothing has ever been pushed past `e4999bc`. The scheme module's phases (20.2–20.5, note the
-  numbering: Phase 21 deliberately skips past them) remain blocked on the seven product decisions
-  in `SCHEME_MODULE_PLAN.md` §7; `PRODUCTION_READINESS_ROADMAP.md` Phase 0 is the unblocked queue.
+- **Last unit of work:** **Phase 23 — Returns & Refunds** (2026-08-11, uncommitted, on top of
+  Phase 22 below).
+  - **New Return Desk tab** (`frontend/js/components/ReturnDesk.js`) and a new year-partitioned
+    ledger `returns_YYYY.json`, filed under the year the **refund** happened, not the invoice's
+    year. Routes: `POST /api/returns`, `GET /api/returns` (both admin-gated) and the
+    session-scoped `GET /api/customer/returns` (read-only — there is deliberately no customer
+    way to raise one).
+  - **The refund is priced by the original invoice, never by today.** `computeReturnRefund()` in
+    `billingMath.js` rebuilds it from the stored sale's own rate/making/discount/slab/mode through
+    the same `computeInvoiceTotals()` that priced the sale. The browser previews with it; the
+    route re-runs it authoritatively and files *its* answer.
+  - **The refunded gross is `totalAmount + appliedAdvance`.** An advance spent on the original
+    bill was the customer's own money, so it is part of the value owed back — re-crediting it
+    separately would pay the same rupees out twice.
+  - **Partial returns by weight, cumulative.** State is *derived* from the returns ledger
+    (`summarizeInvoiceReturns` / `withReturnState`); the sale record is never rewritten, so a
+    reprint still reproduces the original. The closing return is trued up to the exact unrefunded
+    remainder, so refunds against one invoice always sum to its filed gross to the paise.
+  - **Two modes.** `cash` writes only the return row. `gold` also credits the advance ledger as an
+    approved deposit with a locked 22K rate, in the **same** `writeJSONTransaction` — extracted
+    `buildAdvanceDepositRow()` so a refund credit and a counter deposit are one row shape.
+  - **Mobile:** `customer.html` history merges cash refunds as their own rows and relabels gold
+    refunds as `RETURN CREDIT` against their invoice. A gold refund appears **once** (the credit
+    row that moved the balance), never twice.
+  - **Also netted through:** the email summary report subtracts refunds from revenue, and the
+    Level-2 diagnostics export bundles `returns_*.json`.
+  - **Verified:** `npm test` → **5/5 green, 216 checks** (114 billing / integration / 27 route /
+    44 HTTP / 16 guard); `npm run test:e2e` → **43/43** (31 desktop + 12 mobile). `npm run seed`
+    ships 3 returns (2 cash, 1 gold credit). Brain redrawn — 106 files, 100% coverage.
+- **Previous unit of work:** **Phase 22 — self-service password reset, 10-digit customer number,
+  tax-base proof, Reprint Desk** (2026-08-09, uncommitted, on top of the Phase 0 work below).
+  - **Customer password reset no longer needs the counter.** The "Forgot password?" pane always
+    opens (it used to `alert()` and refuse when the tenant had no SMTP), self-registration
+    requires an email, the portal's landing tab prompts an email-less customer to add one, and
+    `issue-login` returns `hasEmail` so the counter screen can tell the cashier to ask for it.
+    Settings' SMTP block now states whether customer self-service reset is live.
+  - **`test_suite.js` Test 7** covers the reset-code lifecycle, which had *no* coverage despite
+    Test 5's comment claiming otherwise. It also fixes the suite writing into the real
+    `backend/data/` — `db.js` resolves `DATA_DIR` at import and ESM caches it, so the env
+    redirect has to happen at the top of the file, not inside a test.
+  - **Billing Desk rejects a 1–9 digit customer number** before POSTing, reading the value off
+    the input rather than off `this.customerPhone` (autofill/paste never fire `input`).
+  - **Tax on metal + making was already correct** in `computeInvoiceTotals()` and is unchanged;
+    `test_billing_math.js` group 11 (8 checks) now proves it in isolation in both modes. Invoice
+    line relabelled `Taxable Value (Metal + Making)`.
+  - **New Reprint Desk** — `GET /api/sales/lookup` + `frontend/js/components/ReprintDesk.js`,
+    nav tab between Billing Desk and Customer Advances. Prints the **stored** record stamped
+    `DUPLICATE — REPRINT`, never re-priced against today's settings. Pre-Phase-20 records show
+    their tax lines as *not recorded* rather than ₹0.00.
+  - **`PRINT INVOICE` had been printing a blank page.** The print stylesheet hid
+    `.tab-panel:not(#tab-billing)`, and `#tab-billing` matches nothing (the panel is
+    `#sales-tab`), so it hid the sheet it meant to show. Now keyed off `.tab-panel.active`.
+  - **Verified:** `npm test` → **5/5 suites green** (91 billing + integration incl. Test 7 +
+    27 route + 25 HTTP + 16 guard); `npm run test:e2e` → **30/30** (21 desktop + 9 mobile),
+    including new `reprint-desk.spec.js`.
+- **Earlier unit of work:** **Production-readiness Phase 0 remediation** (2026-08-09, uncommitted).
+  Closes seven roadmap items in `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 0:
+  - **Razorpay webhook + capture confirmation.** `POST /api/payment/webhook` (HMAC over the raw
+    body, event-id idempotency, out-of-order tolerant, licence-gate exempt), and
+    `/api/payment/verify` now asks the gateway whether the payment was actually *captured* for
+    the order's exact amount instead of treating a valid signature as proof of payment.
+  - **Server-authoritative rate, metal value and time.** `/api/sales` derives the rate from
+    `getActiveGoldRates()` and the metal value from weight × rate; the `...req.body` spread is
+    gone, replaced by an explicit allowlist, so a client can no longer backdate an invoice or
+    inject ledger fields.
+  - **Fail-closed production startup.** `backend/productionGuard.js` — the process exits 1 rather
+    than booting with demo keys, the default PIN, a mock rate provider, no webhook secret, no
+    https public URL, or a `NODE_ENV`/`ENV_NAME` mismatch.
+  - **Strong IDs and paise.** `newId()` in `db.js` (CSPRNG) replaces `Math.random()` ledger ids;
+    payment orders persist `amountPaise`, `currency`, `status` and `expiresAt`.
+  - **Seeded dev/test data.** `backend/seed.js` (`npm run seed`) — deterministic, synthetic,
+    refuses to write over `backend/data/`.
+  - **Playwright journeys.** `backend/tests/e2e/` — cashier + customer, desktop and 390px mobile.
+  - Two new settings keys reach existing tenants through the usual `getDefaultSettings()` merge:
+    `razorpayWebhookSecret` (redacted, write-only) and `publicUrl`. Both have Settings UI.
+  - **Verified:** `cd backend && npm test` → 83 billing + 6 integration + 27 route + 25 HTTP +
+    16 guard = **157 checks green**; `npm run test:e2e` → **16/16 green** across both viewports.
+    `backend/data/` untouched throughout (every suite uses a temp directory).
+  Detail in `docs/LEDGER.md`; manual steps in `docs/TESTING_CHECKLIST.md`.
+- **Next session should start with:** committing the Phase 0 and Phase 22 work above (branch
+  first — CLAUDE.md §6 — then `git add` only reviewed files; consider two commits, since the two
+  units are independent). After that the remaining Phase 0 items are
+  `npm ci` in the CI gates and converting manual UPI to a *manager*-reconciled claim (it is
+  already a pending claim, but any admin can approve it). `main` is also overdue its first push:
+  `origin/main` is 8 commits behind. Scheme phases 20.2–20.5 remain blocked on the seven product
+  decisions in `SCHEME_MODULE_PLAN.md` §7, and the deploy pipeline remains blocked on a domain
+  and VPS.
 
 ---
 

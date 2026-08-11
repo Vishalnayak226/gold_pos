@@ -919,6 +919,20 @@ body {
 
 /* ==========================================================================
    Print Styles for Invoices
+
+   Keyed off `.tab-panel.active` rather than a named tab. The previous rules
+   named `#tab-billing`, `.billing-container` and `.billing-form-col` — three
+   selectors that match nothing in the markup (the real names are `#sales-tab`,
+   `.billing-desk-grid` and `.billing-inputs-card`). The consequence was worse
+   than dead CSS: `.tab-panel:not(#tab-billing)` matched the billing panel too,
+   so PRINT INVOICE hid the very sheet it was meant to print and produced a
+   blank page.
+
+   Selecting the active panel instead means both the Billing Desk and the
+   Reprint Desk print correctly, and a tab added later needs no change here.
+   `.tab-panel` is absolutely positioned inside a clipped container for the
+   on-screen layout, which is why position/overflow are unwound below —
+   otherwise the sheet is cropped to one page height.
    ========================================================================== */
 @media print {
     body, html {
@@ -928,18 +942,32 @@ body {
         height: auto;
         overflow: visible !important;
     }
-    .sidebar, .billing-form-col, .tab-panel:not(#tab-billing), .topbar {
+
+    /* Everything that is screen chrome rather than invoice.
+       #advance-redeem-container is cashier-facing prompting ("You can redeem
+       this balance…"), not something to hand a customer. */
+    #sidebar, .topbar, #admin-login-view, #debug-drawer,
+    .tab-panel:not(.active), .panel-header,
+    .billing-inputs-card, .reprint-controls, .no-print,
+    #advance-redeem-container {
         display: none !important;
     }
-    #app-viewport, .billing-container, .billing-invoice-preview {
+
+    #app-viewport, #main-content, #tab-container,
+    .tab-panel.active, .panel-body,
+    .billing-desk-grid, .billing-invoice-preview {
         display: block !important;
         margin: 0 !important;
         padding: 0 !important;
         width: 100% !important;
         height: auto !important;
+        max-height: none !important;
         overflow: visible !important;
         position: static !important;
+        border: none !important;
+        background: #fff !important;
     }
+
     .invoice-sheet {
         box-shadow: none !important;
         border: none !important;
@@ -948,7 +976,9 @@ body {
         width: 100% !important;
         max-width: none !important;
     }
-    #generate-invoice-btn, #print-invoice-btn, .btn-primary {
+
+    /* Controls never belong on a customer's copy. */
+    #generate-invoice-btn, #print-invoice-btn, .btn, button {
         display: none !important;
     }
 }

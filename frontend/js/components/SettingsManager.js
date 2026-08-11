@@ -391,6 +391,29 @@ export class SettingsManager {
             <p class="text-muted-small">The demo pair <code>rzp_test_xxxxxx</code> / <code>rzp_test_xxxxxx_secret</code> auto-mocks checkout for local testing. Any other value is sent to the real Razorpay API.</p>
             <p class="text-muted-small">A saved Key Secret is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>
 
+            <div class="form-group-row" style="margin-top:16px;">
+                <div class="form-group">
+                    <label for="set-rzp-webhook-secret">Webhook Secret</label>
+                    <input type="password" id="set-rzp-webhook-secret" class="form-control" value="" placeholder="${s.razorpayWebhookSecretConfigured ? 'Configured — leave blank to keep' : 'Enter webhook secret'}">
+                </div>
+                <div class="form-group">
+                    <label for="set-public-url">Public URL</label>
+                    <input type="text" id="set-public-url" class="form-control" value="${s.publicUrl || ''}" placeholder="https://pos.yourstore.com">
+                </div>
+            </div>
+            <p class="text-muted-small">
+                Razorpay confirms payments server-to-server, which is what credits a customer whose
+                browser closed before the success screen. In the Razorpay dashboard add a webhook for
+                the <code>payment.captured</code> and <code>payment.failed</code> events pointing at
+                <code>${(s.publicUrl || 'https://your-public-url').replace(/\/+$/, '')}/api/payment/webhook</code>,
+                then paste the secret it gives you above.
+            </p>
+            <p class="text-muted-small">
+                Until a webhook secret is saved, that endpoint rejects every delivery — a callback that
+                cannot be verified is never allowed to credit a ledger. Online payments still work
+                without it; they just rely on the customer's browser completing the return trip.
+            </p>
+
             <h3 class="settings-section-title" style="margin-top:24px;">Manual UPI Fallback</h3>
             <div class="form-group" style="max-width:300px;">
                 <label for="set-upi-id">UPI ID (VPA)</label>
@@ -407,6 +430,10 @@ export class SettingsManager {
             const payload = {
                 razorpayKeyId: document.getElementById('set-rzp-key').value,
                 razorpayKeySecret: document.getElementById('set-rzp-secret').value || null,
+                // null, not '', so a blank field keeps the stored secret rather
+                // than wiping it — same write-only contract as the key secret.
+                razorpayWebhookSecret: document.getElementById('set-rzp-webhook-secret').value || null,
+                publicUrl: document.getElementById('set-public-url').value.trim(),
                 upiId: document.getElementById('set-upi-id').value
             };
             await this.saveSettings(payload, 'Payment settings saved!');
@@ -414,6 +441,35 @@ export class SettingsManager {
     }
 
     // ---------------------------------------------------------------- Backup
+    /**
+     * States, on the SMTP screen itself, whether customers can currently reset
+     * their own passwords.
+     *
+     * SMTP reads here as a reporting setting, so a store that never wanted the
+     * daily email leaves it blank and has no way to know it has also switched
+     * off every customer's self-service reset — the counter then absorbs every
+     * lockout without anyone connecting the two. The consequence belongs next
+     * to the cause.
+     *
+     * Mirrors the same three-field test as GET /api/settings/public's
+     * passwordResetAvailable, which is what the portal actually gates on;
+     * `pass` arrives here only as the write-only passConfigured flag.
+     */
+    renderResetAvailabilityNotice(smtp) {
+        const live = !!(smtp.host && smtp.user && smtp.passConfigured);
+        return live
+            ? `<p class="text-muted-small" style="color:#166534; background:#f0fdf4; border:1px solid #86efac; border-radius:6px; padding:10px 12px; margin:12px 0;">
+                   <strong>Customer password reset is live.</strong> Customers with an email saved on
+                   their account can reset their own password from the portal without coming in.
+               </p>`
+            : `<p class="text-muted-small" style="color:#92400e; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:10px 12px; margin:12px 0;">
+                   <strong>Customer password reset is off.</strong> Until SMTP host, username and
+                   password are all set, "Forgot password" in the customer portal cannot send a
+                   code — every locked-out customer has to be reset by hand under
+                   <strong>Customer Logins</strong>.
+               </p>`;
+    }
+
     renderBackupSection() {
         const s = this.settings;
         const smtp = s.smtp || {};
@@ -456,6 +512,7 @@ export class SettingsManager {
                 </div>
             </div>
             <p class="text-muted-small">A saved SMTP Password is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>
+            ${this.renderResetAvailabilityNotice(smtp)}
             <button type="button" id="save-backup-btn" class="btn btn-primary">Save Backup & Email Settings</button>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Manual Actions</h3>

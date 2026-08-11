@@ -265,8 +265,17 @@ export class BillingDesk {
                                 <span>Discount (<span id="sum-discount-percent">0</span>%)<span class="sum-net-note"></span>:</span>
                                 <span id="sum-discount-amount">-₹0.00</span>
                             </div>
+                            <!--
+                                Named, not just "Taxable Value". Under Indian
+                                GST a jewellery sale is a composite supply —
+                                one slab on the whole consideration, making
+                                charge included — and this is the line a
+                                customer questions at the counter. Saying what
+                                the base is on the slip answers it without the
+                                cashier having to.
+                            -->
                             <div class="summary-row summary-subtotal">
-                                <span>Taxable Value:</span>
+                                <span>Taxable Value (Metal + Making):</span>
                                 <span id="sum-taxable-amount">₹0.00</span>
                             </div>
                             <div class="summary-row">
@@ -613,31 +622,77 @@ export class BillingDesk {
         if (sumGrandTotal) sumGrandTotal.textContent = money(this.totalAmount);
     }
 
+    /**
+     * The customer number as it must be filed: read off the field itself
+     * rather than off this.customerPhone, because that property is only
+     * refreshed by the `input` event — a browser autofill, a paste handled by
+     * the OS, or a value restored on back-navigation never fires it, and the
+     * desk would then submit a phone the cashier cannot see on screen.
+     *
+     * Blank is legitimate (a walk-in cash sale has no number). Anything
+     * present must be all ten digits, matching the server's own rule at
+     * POST /api/sales — the same rule enforced in the same terms on both
+     * sides, so the desk never hands over a bill the ledger will reject.
+     *
+     * @returns {{phone: string, valid: boolean}}
+     */
+    readCustomerPhone() {
+        const phoneInput = document.getElementById('customer-phone');
+        const phone = String(phoneInput?.value || '').replace(/\D/g, '').slice(0, 10);
+        this.customerPhone = phone;
+        return { phone, valid: phone.length === 0 || phone.length === 10 };
+    }
+
     async submitSale() {
         const weightInput = document.getElementById('gold-weight');
         const weight = parseFloat(weightInput?.value) || 0;
-        
+
         if (weight <= 0) {
             alert('Please enter a valid gold weight.');
             return;
         }
 
+        // A partial number used to reach the server, come back as a 400, and
+        // surface as a generic "Failed to save invoice" — with the cashier
+        // given no clue which field was wrong. Caught here instead, on the
+        // field itself, before an invoice number is consumed.
+        const { phone, valid: phoneIsValid } = this.readCustomerPhone();
+        if (!phoneIsValid) {
+            const errorEl = document.getElementById('phone-validation-error');
+            if (errorEl) {
+                errorEl.textContent =
+                    `Customer phone must be exactly 10 digits — ${phone.length} entered. ` +
+                    `Clear the field for a cash sale.`;
+            }
+            const phoneInput = document.getElementById('customer-phone');
+            if (phoneInput) {
+                phoneInput.focus();
+                phoneInput.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+            return;
+        }
+
+        // Only what the server actually reads. It prices the invoice itself
+        // from its own active rate and tax settings, so sending a metal value,
+        // a tax figure or a timestamp here would just be sending numbers that
+        // get discarded — and a payload field the server ignores is one a
+        // future reader will assume is authoritative.
+        //
+        // goldPricePerGram and totalAmount are the exceptions, and they are
+        // sent to be CHECKED, not used: the server compares them against its
+        // own and answers with rateCorrected/totalCorrected so the desk finds
+        // out that the on-screen preview is stale.
         const salePayload = {
             customerName: this.customerName || 'Cash Sale',
             customerPhone: this.customerPhone || '',
             purity: this.selectedPurity === 'price24K' ? '24K' : this.selectedPurity === 'price22K' ? '22K' : '18K',
             weightGrams: weight,
             goldPricePerGram: this.goldRate[this.selectedPurity],
-            metalValue: this.metalValue,
             makingChargePercent: this.makingChargePercent,
             makingChargeAmount: this.makingChargeAmount,
-            taxPercent: this.taxSlab,
-            taxMode: this.taxMode,
             discountPercent: this.discountPercent,
-            discount: this.discountAmount,
             appliedAdvance: this.appliedAdvance,
-            totalAmount: this.totalAmount,
-            timestamp: Date.now()
+            totalAmount: this.totalAmount
         };
 
         try {
@@ -651,13 +706,17 @@ export class BillingDesk {
             if (response.ok) {
                 logTelemetry('SAVE_SALE_SUCCESS', Date.now() - startPost);
                 const result = await response.json();
-                if (result.totalCorrected && result.sale) {
-                    // The server recomputed a different total (almost always a
-                    // stale tab whose tax settings changed underneath it). Say
-                    // so rather than let the printed slip disagree with the ledger.
+                if ((result.totalCorrected || result.rateCorrected) && result.sale) {
+                    // The server priced it differently (almost always a stale
+                    // tab whose gold rate or tax settings changed underneath
+                    // it). Say so rather than let the printed slip disagree
+                    // with the ledger.
+                    const reason = result.rateCorrected
+                        ? `the current gold rate of ₹${result.sale.goldPricePerGram.toLocaleString('en-IN')}/g`
+                        : 'the current tax settings';
                     alert(
                         `Invoice ${result.invoiceId} saved, but the server recalculated the total to ` +
-                        `₹${result.sale.totalAmount.toLocaleString('en-IN')} using the current tax settings.\n\n` +
+                        `₹${result.sale.totalAmount.toLocaleString('en-IN')} using ${reason}.\n\n` +
                         `Please reprint the invoice — the preview on screen is out of date.`
                     );
                 } else {

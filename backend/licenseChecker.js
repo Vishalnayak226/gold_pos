@@ -197,6 +197,17 @@ export function checkLicenseGate(req, res, next) {
         return next();
     }
 
+    // Exempt the Razorpay webhook. The gateway has already taken the customer's
+    // money by the time it calls us; refusing the callback would not undo the
+    // charge, it would only lose our record of it — and Razorpay retries a
+    // non-2xx for hours before giving up permanently. A lapsed license must
+    // stop new selling, not silently discard money already collected. The
+    // endpoint is HMAC-signed (see /api/payment/webhook), so exempting it from
+    // the licence gate does not make it publicly writable.
+    if (req.path === '/api/payment/webhook') {
+        return next();
+    }
+
     if (!isLicenseValid()) {
         logTelemetry('LICENSE_GATE_BLOCKED', 0, `Blocked API request to: ${req.path}`);
         return res.status(402).json({

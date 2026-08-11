@@ -6,6 +6,12 @@ backend/backups/
 backend/data/
 backend/_rollback/
 backend/_staging/
+# Default output of `npm run seed` — a generated fixture database, regenerable
+# byte-for-byte from backend/seed.js, so there is nothing to track.
+backend/data-seed/
+# Playwright artefacts (traces, screenshots, HTML report)
+backend/test-results/
+backend/playwright-report/
 dist/
 gold_pos_release.zip
 backups/

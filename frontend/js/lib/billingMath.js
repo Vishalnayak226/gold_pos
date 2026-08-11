@@ -21,6 +21,54 @@ export function round2(value) {
 }
 
 /**
+ * Round to 3 decimal places — the milligram every weight figure settles on.
+ *
+ * Invoices already print grams to three places; returns made that precision
+ * load-bearing rather than cosmetic, because "how much of this invoice is
+ * still returnable" is a subtraction across several rows and an unrounded
+ * gram leaks a float tail into it.
+ */
+export function round3(value) {
+    return Math.round(num(value) * 1000) / 1000;
+}
+
+/**
+ * Rupees → integer paise.
+ *
+ * Payment gateways speak paise, and they speak it as an integer. Rupee floats
+ * cannot represent every payable amount exactly — 1234.35 is stored as
+ * 1234.3499999999999 — so comparing "what the gateway captured" against "what
+ * we asked for" in rupees is a comparison of two roundings. In paise both
+ * sides are integers and the comparison is exact, which is the entire point of
+ * confirming a capture.
+ *
+ * Lives here rather than in server.js because this module is where this
+ * project's money arithmetic is defined and tested; the payment routes are a
+ * caller, not an owner.
+ */
+export function toPaise(rupees) {
+    return Math.round(num(rupees) * 100);
+}
+
+/** Integer paise → rupees, for display and for the ledger's rupee columns. */
+export function fromPaise(paise) {
+    return round2(num(paise) / 100);
+}
+
+/**
+ * Metal value for a weight at a rate — the first number on every invoice, and
+ * the base every other figure is derived from.
+ *
+ * Rounded here, once, rather than left as a raw float for the tax and discount
+ * steps to inherit: an unrounded metal value propagates a sub-paisa error
+ * through the whole invoice, and the printed line item then fails to reconcile
+ * against the total by a paisa.
+ */
+export function computeMetalValue(weightGrams, ratePerGram) {
+    return round2(num(weightGrams) * num(ratePerGram));
+}
+
+/**
  * Canonicalise the configured tax mode to exactly 'Inclusive' or 'Exclusive'.
  *
  * Matching is case- and whitespace-insensitive: 'inclusive', ' Inclusive ' and
@@ -283,5 +331,168 @@ export function computeInvoiceTotals({
             grossMetalValue,
             grossMakingCharge
         }
+    };
+}
+
+/* ==========================================================================
+   Returns
+
+   A return is priced from the invoice it reverses, never from today. The gold
+   rate moves daily and the tax slab is editable in Settings, so re-pricing a
+   returned ornament against the current configuration would refund an amount
+   the store never charged — over-refunding after a rate rise, short-changing
+   the customer after a fall. Every input below therefore comes off the stored
+   sale record: its rate, its making charge, its discount, its slab, its mode.
+   ========================================================================== */
+
+/**
+ * What to refund for `returnWeightGrams` off a filed invoice.
+ *
+ * WHAT IS REFUNDED. The returned share of the invoice's TAXED value — that is
+ * `totalAmount + appliedAdvance`, not `totalAmount`. An advance redeemed on the
+ * original bill was the customer's own money being spent, so the value owed
+ * back on a return includes it; re-crediting the advance separately on top of
+ * that would pay the same rupees out twice. The refund mode (cash or gold
+ * credit) decides how that one figure is handed back, never how large it is.
+ *
+ * TWO PATHS, deliberately. Where the stored record still reconciles against
+ * its own line items, the refund is rebuilt through computeInvoiceTotals —
+ * the same pipeline that priced the sale — so the credit note can print a
+ * metal / making / discount / GST breakdown that adds up. Where it does not
+ * (an invoice filed before Phase 20 stored the tax split at all, or one whose
+ * stored figures disagree), the refund falls back to a straight pro-rata share
+ * of the filed gross and the breakdown is omitted rather than invented. A
+ * guessed GST figure on a credit note is a statement about a tax period this
+ * system never recorded.
+ *
+ * NO DRIFT ACROSS PARTIAL RETURNS. Three returns of a third each would each
+ * round independently and need not sum back to the invoice. So the return that
+ * closes out the last of the weight is trued up to exactly the unrefunded
+ * remainder, and every refund is capped at that remainder. The sum of all
+ * refunds against an invoice therefore equals its filed gross, to the paise,
+ * however it was split up.
+ *
+ * @param {object}  args.sale                  the stored sale record, as filed
+ * @param {number}  args.returnWeightGrams     grams coming back on this return
+ * @param {number} [args.alreadyReturnedGrams] grams already returned earlier
+ * @param {number} [args.alreadyRefundedAmount] rupees already refunded earlier
+ * @returns {{ok: true, ...}|{ok: false, error: string}}
+ */
+export function computeReturnRefund({
+    sale,
+    returnWeightGrams,
+    alreadyReturnedGrams = 0,
+    alreadyRefundedAmount = 0
+} = {}) {
+    if (!sale || typeof sale !== 'object') {
+        return { ok: false, error: 'A filed invoice is required to price a return.' };
+    }
+
+    const originalWeight = round3(sale.weightGrams);
+    if (!(originalWeight > 0)) {
+        return { ok: false, error: 'This invoice carries no gold weight, so nothing can be returned against it.' };
+    }
+
+    const returnedSoFar = round3(Math.max(0, alreadyReturnedGrams));
+    const remainingWeight = round3(originalWeight - returnedSoFar);
+    if (!(remainingWeight > 0)) {
+        return { ok: false, error: 'This invoice has already been returned in full.' };
+    }
+
+    const returnWeight = round3(returnWeightGrams);
+    if (!(returnWeight > 0)) {
+        return { ok: false, error: 'Enter the weight being returned.' };
+    }
+    if (returnWeight > remainingWeight) {
+        return {
+            ok: false,
+            error: `Only ${remainingWeight.toFixed(3)}g of this invoice is still returnable.`
+        };
+    }
+
+    // The gross the invoice actually charged, advance included — see above.
+    const filedGross = round2(num(sale.totalAmount) + num(sale.appliedAdvance));
+    const refundedSoFar = round2(Math.max(0, alreadyRefundedAmount));
+    const refundableRemaining = round2(Math.max(0, filedGross - refundedSoFar));
+
+    // Does the stored record still reconcile against its own line items? Same
+    // question ReprintDesk asks before it dares split a stored total into rows,
+    // asked here before we dare derive money from those same line items.
+    const storesTaxSplit = sale.taxableAmount !== undefined && sale.taxAmount !== undefined;
+    const wholeInvoice = computeInvoiceTotals({
+        metalValue: sale.metalValue,
+        makingChargeAmount: sale.makingChargeAmount,
+        discountPercent: sale.discountPercent,
+        taxSlab: sale.taxPercent,
+        taxMode: sale.taxMode
+    });
+    const itemisable = storesTaxSplit
+        && Math.abs(wholeInvoice.totalBeforeAdvance - filedGross) < 0.01;
+
+    const closesInvoice = returnWeight >= remainingWeight;
+    const fraction = returnWeight / originalWeight;
+
+    let refundAmount;
+    let components = null;
+
+    if (itemisable) {
+        // Metal is priced at the invoice's own rate and the returned weight,
+        // exactly as the sale was; the making charge — a flat rupee figure on
+        // the record — scales with the share of the weight going back.
+        const metalValue = computeMetalValue(returnWeight, sale.goldPricePerGram);
+        const makingChargeAmount = round2(num(sale.makingChargeAmount) * fraction);
+        const totals = computeInvoiceTotals({
+            metalValue,
+            makingChargeAmount,
+            discountPercent: sale.discountPercent,
+            taxSlab: sale.taxPercent,
+            taxMode: sale.taxMode
+        });
+        refundAmount = totals.totalBeforeAdvance;
+        components = {
+            metalValue: totals.components.metalValue,
+            makingChargeAmount: totals.components.makingChargeAmount,
+            discountAmount: totals.components.discountAmount,
+            taxableAmount: totals.taxableAmount,
+            taxAmount: totals.taxAmount
+        };
+    } else {
+        refundAmount = round2(filedGross * fraction);
+    }
+
+    // True-up and cap. The closing return takes the whole unrefunded
+    // remainder; any earlier one is capped by it.
+    if (closesInvoice) {
+        refundAmount = refundableRemaining;
+    } else {
+        refundAmount = round2(Math.min(refundAmount, refundableRemaining));
+    }
+
+    // A trued-up or capped figure no longer equals the sum of the rows above
+    // it, so the breakdown is dropped rather than printed alongside a total it
+    // disagrees with.
+    if (components && Math.abs(
+        round2(components.taxableAmount + components.taxAmount) - refundAmount
+    ) >= 0.01) {
+        components = null;
+    }
+
+    return {
+        ok: true,
+        weightGrams: returnWeight,
+        remainingWeightAfter: round3(remainingWeight - returnWeight),
+        fraction,
+        closesInvoice,
+        itemised: components !== null,
+        refundAmount,
+        components,
+        // Echoed from the invoice so the credit note can state the terms the
+        // refund was priced on without re-reading the sale record.
+        goldPricePerGram: round2(sale.goldPricePerGram),
+        purity: sale.purity || '',
+        makingChargePercent: num(sale.makingChargePercent),
+        discountPercent: num(sale.discountPercent),
+        taxPercent: num(sale.taxPercent),
+        taxMode: normalizeTaxMode(sale.taxMode)
     };
 }

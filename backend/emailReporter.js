@@ -39,7 +39,20 @@ function computeSummary(periodStart) {
         }
     });
     const periodSales = sales.filter(s => (s.timestamp || 0) >= periodStart);
-    const revenue = periodSales.reduce((sum, s) => sum + (parseFloat(s.totalAmount) || 0), 0);
+    const grossRevenue = periodSales.reduce((sum, s) => sum + (parseFloat(s.totalAmount) || 0), 0);
+
+    // Refunds are subtracted, not listed beside the takings. An owner reading
+    // "Revenue" on a summary mail reads it as money kept, so a period with
+    // returns in it has to report the net or the figure is simply wrong.
+    let returns = [];
+    files.forEach(f => {
+        if (f.startsWith('returns_') && f.endsWith('.json')) {
+            returns = returns.concat(readJSON(path.join(DATA_DIR, f), []));
+        }
+    });
+    const periodReturns = returns.filter(r => (r.timestamp || 0) >= periodStart);
+    const refundTotal = periodReturns.reduce((sum, r) => sum + (parseFloat(r.refundAmount) || 0), 0);
+    const revenue = grossRevenue - refundTotal;
 
     const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
     const periodDeposits = advances.filter(a => a.type === 'deposit' && (a.timestamp || 0) >= periodStart);
@@ -63,6 +76,9 @@ function computeSummary(periodStart) {
     return {
         invoiceCount: periodSales.length,
         revenue,
+        grossRevenue,
+        returnCount: periodReturns.length,
+        refundTotal,
         depositCount: periodDeposits.length,
         depositTotal,
         outstandingTotal,
@@ -77,7 +93,10 @@ function buildSummaryHtml(summary, periodLabel, companyName) {
             <h2 style="border-bottom:2px solid #0f172a; padding-bottom:10px;">${periodLabel} Business Summary — ${companyName || 'Gold POS'}</h2>
             <table style="width:100%; border-collapse:collapse; font-size:14px; margin-top:15px;">
                 <tr><td style="padding:8px 0; color:#64748b;">Invoices (${periodLabel.toLowerCase()})</td><td style="text-align:right; font-weight:bold;">${summary.invoiceCount}</td></tr>
-                <tr><td style="padding:8px 0; color:#64748b;">Revenue (${periodLabel.toLowerCase()})</td><td style="text-align:right; font-weight:bold;">${inr(summary.revenue)}</td></tr>
+                ${summary.returnCount > 0 ? `
+                <tr><td style="padding:8px 0; color:#64748b;">Gross sales (${periodLabel.toLowerCase()})</td><td style="text-align:right; font-weight:bold;">${inr(summary.grossRevenue)}</td></tr>
+                <tr><td style="padding:8px 0; color:#64748b;">Returns refunded (${periodLabel.toLowerCase()})</td><td style="text-align:right; font-weight:bold; color:#b91c1c;">${summary.returnCount} (-${inr(summary.refundTotal)})</td></tr>` : ''}
+                <tr><td style="padding:8px 0; color:#64748b;">${summary.returnCount > 0 ? 'Net revenue' : 'Revenue'} (${periodLabel.toLowerCase()})</td><td style="text-align:right; font-weight:bold;">${inr(summary.revenue)}</td></tr>
                 <tr><td style="padding:8px 0; color:#64748b;">Advance deposits (${periodLabel.toLowerCase()})</td><td style="text-align:right; font-weight:bold;">${summary.depositCount} (${inr(summary.depositTotal)})</td></tr>
                 <tr><td style="padding:8px 0; color:#64748b;">Total outstanding advances</td><td style="text-align:right; font-weight:bold;">${inr(summary.outstandingTotal)}</td></tr>
                 <tr><td style="padding:8px 0; color:#64748b;">Latest database backup</td><td style="text-align:right; font-weight:bold;">${summary.latestBackup}</td></tr>

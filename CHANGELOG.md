@@ -38,6 +38,34 @@ existing endpoints.
 
 ### Security
 
+- **Online payments are now confirmed with Razorpay before any credit is
+  given.** A valid checkout signature only proves that a payment id was issued
+  against an order — it carries no amount and no outcome, so a payment that was
+  authorised but never captured, one that later failed, one already refunded,
+  and one captured for the wrong amount all produced a signature that verified.
+  The server now asks the gateway what actually happened and credits only a
+  captured payment for the exact amount its order was created for.
+- **New Razorpay webhook (`POST /api/payment/webhook`).** Razorpay confirms
+  payments server-to-server, which is what credits a customer whose browser or
+  network dropped out between paying and returning to the portal — previously
+  that money was taken and never appeared in the ledger. Deliveries are
+  signature-verified against a **new Webhook Secret** in Settings → Payments;
+  until that secret is saved the endpoint accepts nothing, so upgrading changes
+  no behaviour until the webhook is deliberately configured.
+- **Production installs refuse to start when misconfigured.** A server started
+  with `NODE_ENV=production` now exits immediately, listing every problem, if it
+  is still carrying the demo Razorpay credentials, the default `1234` admin PIN,
+  the mock gold-price provider, no webhook secret, no https public URL, or a
+  contradictory environment name. Previously such an install started normally
+  and only failed at the moment a real customer tried to pay.
+- **Invoices are priced by the server, not the till.** The gold rate and metal
+  value on a saved invoice now always come from the store's own active rate for
+  the selected purity; the browser's figures are used only to detect that the
+  on-screen preview has gone stale, in which case the cashier is told to
+  reprint. Invoice dates are likewise taken from the server clock, so a
+  workstation with a wrong clock can no longer file a sale into the wrong year.
+- **Ledger identifiers are now cryptographically random** rather than derived
+  from `Math.random()`, which was both collision-prone at volume and guessable.
 - **The customer portal now requires a password.** Previously, typing *any*
   10-digit number into `customer.html` opened that customer's full advance
   ledger, balance and deposit history, and allowed depositing against their
@@ -88,6 +116,37 @@ existing endpoints.
 
 ### Added
 
+- **Returns & Refunds tab.** Refund part or all of a filed invoice and print a
+  **CREDIT NOTE** for it. The refund is priced from the invoice itself — the
+  gold rate, making charge, discount and GST it was sold under — never from
+  today's rate, so a return months later gives back exactly what was charged
+  rather than whatever the market has done since. Returns can be **partial by
+  weight**: an invoice can come back 6g today and the rest next week, the desk
+  always measures against what is left, and however an invoice is split up the
+  refunds add back to its billed total to the paise. Refund the customer in
+  **cash**, or as **gold credit** that lands in their account and is spendable
+  against their next bill immediately.
+
+  Only the store can issue a return — there is no way to raise one from the
+  customer portal — but customers **see** theirs on their phone the moment it
+  is filed, listed in their history against the invoice it came from. A gold
+  refund shows up as return credit in their balance and in the Money Worth in
+  Gold panel; a cash refund is listed without touching the balance, because it
+  was handed over the counter.
+
+  Filed invoices are never rewritten by a return, so reprints still reproduce
+  the original document exactly. Invoices from before this version recorded a
+  tax breakdown are refunded pro-rata with the itemisation marked *not
+  recorded* rather than invented. Summary report emails now show gross sales,
+  returns and net revenue whenever a period contains a refund.
+- **Reprint Invoice tab.** Find any filed invoice by its number, the customer's
+  phone, their name, or a date range, and print a second copy stamped
+  **DUPLICATE — REPRINT**. Every figure is the one written to the ledger when
+  the sale was saved — a reprint is never re-priced against the current gold
+  rate or tax settings, so a duplicate handed over months later still matches
+  the customer's original slip and the books. Invoices filed before this
+  version recorded a tax breakdown print their filed total with the tax line
+  marked *not recorded* rather than as ₹0.00.
 - `POST /api/customer/register` (self-service), `/login`, `/logout`,
   `GET|PATCH /api/customer/me`, `/password/change`, `/password/forgot`,
   `/password/reset`, `GET|POST /api/customer/advances`.
@@ -160,6 +219,26 @@ existing endpoints.
 
 ### Fixed
 
+- **"Print Invoice" printed a blank page.** The print stylesheet hid every tab
+  panel except one identified by a name that no longer existed, which meant it
+  hid the invoice it was supposed to print. Both the Billing Desk and the new
+  Reprint tab now print the invoice sheet, with the sidebar, the input column
+  and every button left off the customer's copy.
+- **A forgotten customer password no longer needs a trip to the store.**
+  "Forgot password?" used to refuse to open at all unless the store had set up
+  email, dismissing the customer with a message and no next step. It now always
+  opens and explains the situation in place. Self-service signup requires an
+  email address, since an account without one can never be reset by its owner,
+  and a customer whose account has no email on file is prompted to add one the
+  next time they sign in. Store owners see, on the SMTP settings screen itself,
+  whether customer password reset is currently working — it previously read as
+  a reporting-only setting, so a store that skipped it had no way to know it had
+  also switched off every customer's reset.
+- **A partial customer phone number no longer reaches the ledger as a failed
+  save.** Typing fewer than ten digits and pressing Save produced a generic
+  "Failed to save invoice" that named no field. The Billing Desk now flags the
+  phone box itself before sending anything, and no invoice number is consumed.
+  Leaving the field empty still files a cash sale as before.
 - **The Dashboard's "Outstanding Advances" tile, the Advances tab's
   per-customer balances, and the server's own ledger calculation each summed
   the advances file separately.** They now share one set of helpers in

@@ -16,10 +16,15 @@
 
 import {
     computeInvoiceTotals,
+    computeReturnRefund,
+    round3,
     makingChargeFromPercent,
     makingPercentFromAmount,
     normalizeTaxMode,
     round2,
+    toPaise,
+    fromPaise,
+    computeMetalValue,
     ADVANCE_STATUS,
     advanceEntryDelta,
     computeAdvanceBalance,
@@ -756,6 +761,517 @@ check('an empty or malformed ledger summarises to zeroes rather than NaN', () =>
 check('pending totals settle to paise', () => {
     const s = summarizeAdvanceLedger([deposit(1000.005, 'pending'), deposit(0.004, 'pending')]);
     if (!isPaiseExact(s.pendingTotal)) throw new Error(`pendingTotal ${s.pendingTotal}`);
+});
+
+/* ==========================================================================
+   Metal value — the server's authoritative first figure
+
+   /api/sales no longer accepts metalValue from the browser; it derives it from
+   the invoice weight and the store's own active rate through computeMetalValue.
+   Every other number on the invoice is a percentage of this one, so an error
+   here is an error everywhere.
+   ========================================================================== */
+group('9. Metal value (weight × server rate)');
+
+check('10 g at ₹6,875/g is ₹68,750', () => {
+    exact(computeMetalValue(10, 6875), 68750, 'metalValue');
+});
+
+check('a fractional weight settles on paise, not on a float tail', () => {
+    // 8.335 × 7500 = 62512.5 exactly; the risk is a 62512.499999999996 tail.
+    const value = computeMetalValue(8.335, 7500);
+    exact(value, 62512.5, 'metalValue');
+    if (!isPaiseExact(value)) throw new Error(`metalValue ${value} is not paise-exact`);
+});
+
+check('a three-decimal weight (milligram precision) still lands on paise', () => {
+    // 1.333 × 6875 = 9164.375 → half-up to 9164.38.
+    const value = computeMetalValue(1.333, 6875);
+    exact(value, 9164.38, 'metalValue');
+    if (!isPaiseExact(value)) throw new Error(`metalValue ${value} is not paise-exact`);
+});
+
+check('a rounded metal value flows through to a reconcilable invoice total', () => {
+    // The line item that prints must be the one the total was built from.
+    const metalValue = computeMetalValue(1.333, 6875); // 9164.38
+    const totals = computeInvoiceTotals({
+        metalValue,
+        makingChargeAmount: 0,
+        discountPercent: 0,
+        taxSlab: 3,
+        taxMode: 'Exclusive',
+        appliedAdvance: 0,
+        customerAdvanceBalance: 0
+    });
+    near(totals.taxableAmount, 9164.38, 'taxableAmount');
+    near(round2(totals.taxAmount), 274.93, 'taxAmount');   // 9164.38 × 0.03 = 274.9314
+    near(round2(totals.totalAmount), 9439.31, 'totalAmount');
+});
+
+check('garbage weight or rate yields zero rather than NaN', () => {
+    exact(computeMetalValue(undefined, 6875), 0, 'undefined weight');
+    exact(computeMetalValue(10, null), 0, 'null rate');
+    exact(computeMetalValue('abc', 'def'), 0, 'non-numeric');
+});
+
+/* ==========================================================================
+   Rupees ↔ paise
+
+   Payment gateways settle in integer paise. Every comparison between "what we
+   asked for" and "what was captured" happens in that integer domain, because
+   the rupee float for a payable amount is frequently not exact.
+   ========================================================================== */
+group('10. Rupee ↔ paise conversion');
+
+check('whole rupees convert exactly', () => {
+    exact(toPaise(2500), 250000, '₹2500');
+    exact(toPaise(1), 100, '₹1');
+    exact(toPaise(0), 0, '₹0');
+});
+
+check('the classic float-tail amounts convert to the right integer', () => {
+    // 1234.35 is stored as 1234.3499999999999; a bare *100 truncates to
+    // 123434 paise and the capture comparison then fails on a real payment.
+    exact(toPaise(1234.35), 123435, '₹1234.35');
+    exact(toPaise(0.07), 7, '₹0.07');
+    exact(toPaise(8.29), 829, '₹8.29');
+});
+
+check('a sub-paisa input rounds the same way round2 does', () => {
+    // 1.005 is not representable: the nearest double is 1.00499999999999989,
+    // so it rounds DOWN to 100 paise, not up to 101. That is the correct
+    // answer for the value actually held, and the property worth pinning is
+    // that both helpers agree on it — a ledger whose rupee column said 1.00
+    // while its paise column said 101 would never reconcile.
+    exact(toPaise(1.005), 100, '₹1.005');
+    exact(round2(1.005), 1, 'round2(1.005)');
+    for (const rupees of [1.005, 2.675, 8.615, 1234.355]) {
+        exact(toPaise(rupees), Math.round(round2(rupees) * 100), `toPaise/round2 agree on ₹${rupees}`);
+    }
+});
+
+check('every conversion is an integer — a gateway never accepts a fraction', () => {
+    for (const rupees of [0.01, 0.99, 5.555, 99.994, 12345.678, 1e6 + 0.33]) {
+        const paise = toPaise(rupees);
+        if (!Number.isInteger(paise)) throw new Error(`toPaise(${rupees}) = ${paise} is not an integer`);
+    }
+});
+
+check('paise round-trip back to the same rupee figure', () => {
+    for (const rupees of [100, 2500.5, 1234.35, 0.07, 99999.99]) {
+        exact(fromPaise(toPaise(rupees)), round2(rupees), `round-trip ₹${rupees}`);
+    }
+});
+
+check('fromPaise produces a paise-exact rupee amount', () => {
+    for (const paise of [1, 7, 250000, 123435, 999999999]) {
+        const rupees = fromPaise(paise);
+        if (!isPaiseExact(rupees)) throw new Error(`fromPaise(${paise}) = ${rupees} is not paise-exact`);
+    }
+});
+
+check('an amount and its capture compare equal in paise where they would not in rupees', () => {
+    // The actual production comparison: order amount vs. gateway-reported
+    // capture. In rupees these two expressions differ by a float epsilon.
+    const ordered = 1234.35;
+    const capturedFromGateway = 123435; // what Razorpay reports
+    exact(toPaise(ordered), capturedFromGateway, 'paise comparison');
+    if (ordered * 100 === capturedFromGateway) {
+        throw new Error('expected the naive rupee×100 comparison to be the unreliable one');
+    }
+});
+
+/* ==========================================================================
+   11. THE TAX BASE IS THE WHOLE BILL, NOT THE METAL
+
+   Groups 1 and 2 already price a bill that happens to carry a making charge,
+   so a regression to a metal-only tax base would fail them. These checks make
+   that property explicit and isolated, because "does GST apply to making
+   charges too?" is a question the store gets asked and must be able to answer
+   from the invoice — under Indian GST a jewellery sale is a composite supply,
+   taxed at one rate on the whole consideration.
+
+   Each check moves ONLY the making charge and asserts the tax moves with it.
+   A base that ignored making charges would hold the tax constant and fail.
+   ========================================================================== */
+group('11. Making charge sits inside the tax base (both modes)');
+
+// Same bill throughout: 10 g @ ₹7,500/g = ₹75,000 metal, 3% GST.
+const TAX_BASE_METAL = 75000;
+
+check('EXCLUSIVE: tax rises by slab × making charge, not slab × metal', () => {
+    const withoutMaking = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 0, taxSlab: 3, taxMode: 'Exclusive'
+    });
+    const withMaking = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 6000, taxSlab: 3, taxMode: 'Exclusive'
+    });
+    near(withoutMaking.taxAmount, 2250, 'tax on metal alone (3% of 75,000)');
+    near(withMaking.taxAmount, 2430, 'tax on metal + making (3% of 81,000)');
+    // The delta is exactly the slab applied to the making charge: 3% of 6,000.
+    near(withMaking.taxAmount - withoutMaking.taxAmount, 180, 'tax attributable to making');
+});
+
+check('EXCLUSIVE: the taxable value IS metal + making', () => {
+    const t = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 6000, taxSlab: 3, taxMode: 'Exclusive'
+    });
+    near(t.taxableAmount, 81000, 'taxableAmount');
+    if (Math.abs(t.taxableAmount - TAX_BASE_METAL) < 0.01) {
+        throw new Error('taxable value collapsed to the metal value — making charge fell out of the base');
+    }
+});
+
+check('INCLUSIVE: the carve-out runs on metal + making, not metal alone', () => {
+    const t = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 6000, taxSlab: 3, taxMode: 'Inclusive'
+    });
+    // 81,000 / 1.03 = 78,640.78 → tax 2,359.22. Carving out of the metal only
+    // would leave 75,000/1.03 = 72,815.53 and a tax of 2,184.47.
+    near(t.taxableAmount, 78640.78, 'taxableAmount');
+    near(t.taxAmount, 2359.22, 'taxAmount');
+    if (Math.abs(t.taxAmount - 2184.47) < 0.01) {
+        throw new Error('inclusive carve-out ran on the metal value alone');
+    }
+});
+
+check('INCLUSIVE: raising the making charge raises the tax carved out', () => {
+    const low = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 6000, taxSlab: 3, taxMode: 'Inclusive'
+    });
+    const high = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 12000, taxSlab: 3, taxMode: 'Inclusive'
+    });
+    if (!(high.taxAmount > low.taxAmount)) {
+        throw new Error(`making charge did not move the inclusive tax (₹${low.taxAmount} vs ₹${high.taxAmount})`);
+    }
+    // 87,000 / 1.03 = 84,466.02 → remainder 2,533.98.
+    near(high.taxAmount, 2533.98, 'taxAmount at ₹12,000 making');
+});
+
+check('a making-charge-only bill is still taxed', () => {
+    // Repairs and labour-only jobs: no metal sold, making charge alone. A
+    // metal-driven tax base would hand this customer a zero-GST invoice.
+    const excl = computeInvoiceTotals({
+        metalValue: 0, makingChargeAmount: 5000, taxSlab: 3, taxMode: 'Exclusive'
+    });
+    near(excl.taxableAmount, 5000, 'exclusive taxable');
+    near(excl.taxAmount, 150, 'exclusive tax');
+    near(excl.totalAmount, 5150, 'exclusive total');
+
+    const incl = computeInvoiceTotals({
+        metalValue: 0, makingChargeAmount: 5000, taxSlab: 3, taxMode: 'Inclusive'
+    });
+    near(incl.taxableAmount, 4854.37, 'inclusive taxable');   // 5,000 / 1.03
+    near(incl.taxAmount, 145.63, 'inclusive tax');
+    near(incl.totalAmount, 5000, 'inclusive total');
+});
+
+check('the discount also applies to metal + making before the slab does', () => {
+    // 10% off ₹81,000 = ₹8,100 (not ₹7,500, which is 10% of the metal alone).
+    const t = computeInvoiceTotals({
+        metalValue: TAX_BASE_METAL, makingChargeAmount: 6000,
+        discountPercent: 10, taxSlab: 3, taxMode: 'Exclusive'
+    });
+    near(t.discountAmount, 8100, 'discountAmount');
+    near(t.taxableAmount, 72900, 'taxableAmount after discount');
+    near(t.taxAmount, 2187, 'taxAmount (3% of 72,900)');
+    near(t.totalAmount, 75087, 'totalAmount');
+});
+
+check('the property holds at every slab, in both modes', () => {
+    for (const taxSlab of [0, 3, 5, 12, 18, 28]) {
+        const base = { metalValue: TAX_BASE_METAL, makingChargeAmount: 6000, taxSlab };
+
+        const excl = computeInvoiceTotals({ ...base, taxMode: 'Exclusive' });
+        near(excl.taxableAmount, 81000, `exclusive taxable at ${taxSlab}%`);
+        near(excl.taxAmount, round2(81000 * taxSlab / 100), `exclusive tax at ${taxSlab}%`);
+
+        const incl = computeInvoiceTotals({ ...base, taxMode: 'Inclusive' });
+        near(incl.taxableAmount, round2(81000 / (1 + taxSlab / 100)), `inclusive taxable at ${taxSlab}%`);
+        // Carved out of the gross, so the two always reconstruct the quote.
+        near(incl.taxableAmount + incl.taxAmount, 81000, `inclusive reconstruction at ${taxSlab}%`);
+    }
+});
+
+check('the printed rows still reconcile once making charge is in the base', () => {
+    // metal + making − discount === taxable value, so a customer adding the
+    // invoice rows up lands on the figure the tax line is computed from.
+    for (const taxMode of ['Exclusive', 'Inclusive']) {
+        for (const taxSlab of [0, 3, 5, 18]) {
+            for (const discountPercent of [0, 7.5]) {
+                const t = computeInvoiceTotals({
+                    metalValue: TAX_BASE_METAL, makingChargeAmount: 6000,
+                    discountPercent, taxSlab, taxMode
+                });
+                const c = t.components;
+                near(
+                    round2(c.metalValue + c.makingChargeAmount - c.discountAmount),
+                    t.taxableAmount,
+                    `${taxMode} ${taxSlab}% disc ${discountPercent}%: rows vs taxable`
+                );
+            }
+        }
+    }
+});
+
+/* ==========================================================================
+   RETURNS — refunding part or all of a filed invoice
+
+   Every expected figure below is worked out by hand from the invoice being
+   returned, never by re-running computeReturnRefund and writing down what it
+   said. The whole point of this block is that a change to the refund formula
+   fails here instead of quietly agreeing with itself.
+   ========================================================================== */
+group('11. Returns — full invoice');
+
+// 10 g @ ₹7,500/g = ₹75,000 metal; 8% making = ₹6,000; gross ₹81,000;
+// 3% exclusive GST = ₹2,430; nothing discounted, no advance. Total ₹83,430.
+const SALE_EXCL = {
+    id: 'GOLD-000001-26',
+    weightGrams: 10,
+    goldPricePerGram: 7500,
+    metalValue: 75000,
+    purity: '22K',
+    makingChargePercent: 8,
+    makingChargeAmount: 6000,
+    discountPercent: 0,
+    taxPercent: 3,
+    taxMode: 'Exclusive',
+    taxableAmount: 81000,
+    taxAmount: 2430,
+    appliedAdvance: 0,
+    totalAmount: 83430
+};
+
+check('returning the whole invoice refunds exactly what it charged (₹83,430)', () => {
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 10 });
+    exact(r.ok, true, 'ok');
+    near(r.refundAmount, 83430, 'refundAmount');
+});
+
+check('a full return closes the invoice and leaves nothing returnable', () => {
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 10 });
+    exact(r.closesInvoice, true, 'closesInvoice');
+    near(r.remainingWeightAfter, 0, 'remainingWeightAfter');
+});
+
+check('a full return itemises: ₹75,000 metal + ₹6,000 making + ₹2,430 GST', () => {
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 10 });
+    exact(r.itemised, true, 'itemised');
+    near(r.components.metalValue, 75000, 'metalValue');
+    near(r.components.makingChargeAmount, 6000, 'makingChargeAmount');
+    near(r.components.taxableAmount, 81000, 'taxableAmount');
+    near(r.components.taxAmount, 2430, 'taxAmount');
+});
+
+check('the refund is priced at the INVOICE rate, not at any current rate', () => {
+    // Nothing in the signature accepts a live rate — this asserts the echoed
+    // terms come off the sale record, which is what the credit note prints.
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 10 });
+    near(r.goldPricePerGram, 7500, 'goldPricePerGram');
+    exact(r.taxMode, 'Exclusive', 'taxMode');
+    near(r.taxPercent, 3, 'taxPercent');
+});
+
+group('12. Returns — partial by weight');
+
+check('4 g of a 10 g invoice refunds ₹33,372 (₹30,000 + ₹2,400 + 3%)', () => {
+    // 4 g @ 7,500 = 30,000 metal; making 6,000 × 0.4 = 2,400; gross 32,400;
+    // 3% of 32,400 = 972. Refund 33,372.
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 4 });
+    near(r.refundAmount, 33372, 'refundAmount');
+    near(r.components.metalValue, 30000, 'metalValue');
+    near(r.components.makingChargeAmount, 2400, 'makingChargeAmount');
+    near(r.components.taxAmount, 972, 'taxAmount');
+});
+
+check('a partial return does not close the invoice; 6 g stays returnable', () => {
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 4 });
+    exact(r.closesInvoice, false, 'closesInvoice');
+    near(r.remainingWeightAfter, 6, 'remainingWeightAfter');
+});
+
+check('the second return takes only the remaining 6 g and ₹50,058', () => {
+    const r = computeReturnRefund({
+        sale: SALE_EXCL,
+        returnWeightGrams: 6,
+        alreadyReturnedGrams: 4,
+        alreadyRefundedAmount: 33372
+    });
+    near(r.refundAmount, 50058, 'refundAmount');
+    exact(r.closesInvoice, true, 'closesInvoice');
+});
+
+check('two partial refunds sum to the invoice exactly', () => {
+    const first = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 4 });
+    const second = computeReturnRefund({
+        sale: SALE_EXCL,
+        returnWeightGrams: 6,
+        alreadyReturnedGrams: 4,
+        alreadyRefundedAmount: first.refundAmount
+    });
+    near(round2(first.refundAmount + second.refundAmount), 83430, 'sum of refunds');
+});
+
+check('three awkward thirds still sum to the invoice to the paise', () => {
+    // 3.333 + 3.333 + 3.334 g. Each leg rounds on its own, so only the
+    // closing true-up keeps the total honest — this is the drift guard.
+    const a = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 3.333 });
+    const b = computeReturnRefund({
+        sale: SALE_EXCL, returnWeightGrams: 3.333,
+        alreadyReturnedGrams: 3.333, alreadyRefundedAmount: a.refundAmount
+    });
+    const c = computeReturnRefund({
+        sale: SALE_EXCL, returnWeightGrams: 3.334,
+        alreadyReturnedGrams: round3(3.333 + 3.333),
+        alreadyRefundedAmount: round2(a.refundAmount + b.refundAmount)
+    });
+    exact(c.closesInvoice, true, 'the last leg closes the invoice');
+    near(round2(a.refundAmount + b.refundAmount + c.refundAmount), 83430, 'sum of three refunds');
+});
+
+group('13. Returns — the refunded gross includes any advance redeemed');
+
+// Same 10 g, but 10% discount, 3% INCLUSIVE GST, and ₹2,900 of the customer's
+// advance credit spent on it. preTax 81,000 − 8,100 discount = 72,900, which
+// already contains the tax; the customer paid 70,000 in money and 2,900 in
+// credit they had already deposited.
+const SALE_INCL_ADV = {
+    id: 'GOLD-000002-26',
+    weightGrams: 10,
+    goldPricePerGram: 7500,
+    metalValue: 75000,
+    purity: '22K',
+    makingChargePercent: 8,
+    makingChargeAmount: 6000,
+    discountPercent: 10,
+    taxPercent: 3,
+    taxMode: 'Inclusive',
+    taxableAmount: 70776.70,
+    taxAmount: 2123.30,
+    appliedAdvance: 2900,
+    totalAmount: 70000
+};
+
+check('a full return refunds ₹72,900 — the charge, not just the cash paid', () => {
+    // Refunding only totalAmount (70,000) would keep 2,900 of the customer's
+    // own deposited money against goods they no longer have.
+    const r = computeReturnRefund({ sale: SALE_INCL_ADV, returnWeightGrams: 10 });
+    near(r.refundAmount, 72900, 'refundAmount');
+});
+
+check('an inclusive-GST return carves the tax out rather than adding it', () => {
+    const r = computeReturnRefund({ sale: SALE_INCL_ADV, returnWeightGrams: 10 });
+    exact(r.itemised, true, 'itemised');
+    near(r.components.taxableAmount, 70776.70, 'taxableAmount');
+    near(r.components.taxAmount, 2123.30, 'taxAmount');
+    near(round2(r.components.taxableAmount + r.components.taxAmount), 72900, 'rows vs refund');
+});
+
+check('half that invoice refunds exactly half — ₹36,450', () => {
+    const r = computeReturnRefund({ sale: SALE_INCL_ADV, returnWeightGrams: 5 });
+    near(r.refundAmount, 36450, 'refundAmount');
+});
+
+check('the discount is reversed on a partial return, not pocketed', () => {
+    // 5 g: metal 37,500 + making 3,000 = 40,500; 10% discount = 4,050.
+    const r = computeReturnRefund({ sale: SALE_INCL_ADV, returnWeightGrams: 5 });
+    near(round2(r.components.taxableAmount + r.components.taxAmount), 36450, 'rows vs refund');
+});
+
+group('14. Returns — invoices whose breakdown was never stored');
+
+// Filed before the tax split was recorded against a sale (pre-Phase-20).
+const SALE_LEGACY = {
+    id: 'GOLD-000003-24',
+    weightGrams: 10,
+    goldPricePerGram: 5000,
+    metalValue: 50000,
+    purity: '22K',
+    makingChargeAmount: 4000,
+    discountPercent: 0,
+    appliedAdvance: 0,
+    totalAmount: 55620
+};
+
+check('a legacy invoice still refunds its filed total in full', () => {
+    const r = computeReturnRefund({ sale: SALE_LEGACY, returnWeightGrams: 10 });
+    exact(r.ok, true, 'ok');
+    near(r.refundAmount, 55620, 'refundAmount');
+});
+
+check('a legacy invoice refunds pro-rata on a partial return', () => {
+    const r = computeReturnRefund({ sale: SALE_LEGACY, returnWeightGrams: 2.5 });
+    near(r.refundAmount, 13905, 'refundAmount');
+});
+
+check('no GST breakdown is invented for an invoice that never carried one', () => {
+    const r = computeReturnRefund({ sale: SALE_LEGACY, returnWeightGrams: 2.5 });
+    exact(r.itemised, false, 'itemised');
+    exact(r.components, null, 'components');
+});
+
+check('stored figures that do not reconcile refuse to be itemised', () => {
+    // taxable + tax = 51,500, but the record claims a 99,999 total. The
+    // ledger's own total is refunded; the disagreeing rows are not printed.
+    const broken = {
+        weightGrams: 10, goldPricePerGram: 5000, metalValue: 50000,
+        makingChargeAmount: 0, discountPercent: 0,
+        taxPercent: 3, taxMode: 'Exclusive',
+        taxableAmount: 50000, taxAmount: 1500,
+        appliedAdvance: 0, totalAmount: 99999
+    };
+    const r = computeReturnRefund({ sale: broken, returnWeightGrams: 10 });
+    exact(r.itemised, false, 'itemised');
+    near(r.refundAmount, 99999, 'refundAmount');
+});
+
+group('15. Returns — what must be refused');
+
+check('a return larger than what is left is refused, naming what remains', () => {
+    const r = computeReturnRefund({
+        sale: SALE_EXCL, returnWeightGrams: 7, alreadyReturnedGrams: 4
+    });
+    exact(r.ok, false, 'ok');
+    exact(/6\.000g/.test(r.error), true, `error names the remaining weight: ${r.error}`);
+});
+
+check('a return larger than the whole invoice is refused', () => {
+    exact(computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 10.001 }).ok, false, 'ok');
+});
+
+check('a fully-returned invoice refuses any further return', () => {
+    const r = computeReturnRefund({
+        sale: SALE_EXCL, returnWeightGrams: 1,
+        alreadyReturnedGrams: 10, alreadyRefundedAmount: 83430
+    });
+    exact(r.ok, false, 'ok');
+});
+
+check('zero and negative weights are refused', () => {
+    exact(computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 0 }).ok, false, 'zero');
+    exact(computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: -5 }).ok, false, 'negative');
+    exact(computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 'abc' }).ok, false, 'garbage');
+});
+
+check('a missing or weightless invoice is refused rather than priced at zero', () => {
+    exact(computeReturnRefund({ returnWeightGrams: 1 }).ok, false, 'no sale');
+    exact(computeReturnRefund({ sale: null, returnWeightGrams: 1 }).ok, false, 'null sale');
+    exact(computeReturnRefund({
+        sale: { ...SALE_EXCL, weightGrams: 0 }, returnWeightGrams: 1
+    }).ok, false, 'zero-weight invoice');
+});
+
+check('a refund can never exceed what is left unrefunded on the invoice', () => {
+    // A ledger that somehow already refunded most of the invoice must not
+    // hand out a full pro-rata slice on top of it.
+    const r = computeReturnRefund({
+        sale: SALE_EXCL, returnWeightGrams: 4,
+        alreadyReturnedGrams: 1, alreadyRefundedAmount: 83000
+    });
+    exact(r.ok, true, 'ok');
+    exact(r.refundAmount <= 430, true, `refund capped at the remainder, got ${r.refundAmount}`);
 });
 
 /* ==========================================================================

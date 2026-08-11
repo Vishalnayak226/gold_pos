@@ -240,9 +240,17 @@
                     <label for="reg-phone">Mobile Number <span style="color:#b91c1c;">*</span></label>
                     <input type="tel" id="reg-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10">
                 </div>
+                <!--
+                    Required, not optional. An account with no email on file
+                    can never use "Forgot password" — the reset code has
+                    nowhere to go — and its owner has to come to the counter to
+                    get back in. Collecting it once here is what makes the
+                    reset self-service for the whole life of the account.
+                -->
                 <div class="form-group" style="margin-top: 12px;">
-                    <label for="reg-email">Email <span class="text-muted-small">(needed to reset a forgotten password)</span></label>
+                    <label for="reg-email">Email <span style="color:#b91c1c;">*</span></label>
                     <input type="email" id="reg-email" class="form-control" placeholder="you@example.com">
+                    <span class="text-muted-small">This is the only way to reset your own password if you forget it.</span>
                 </div>
                 <div class="form-group" style="margin-top: 12px;">
                     <label for="reg-password">Password</label>
@@ -261,7 +269,19 @@
                 <div id="forgot-step-1">
                     <p class="text-muted-small" style="margin-bottom: 15px;">
                         We'll email a single-use reset code to the address registered on your account.
+                        You can set a new password yourself — no need to visit the store.
                     </p>
+                    <!--
+                        Shown in place of a dismissed alert() when the store has
+                        no SMTP configured. The customer sees why nothing can be
+                        sent and what to do instead, on the same screen, rather
+                        than being bounced back to sign-in with no explanation.
+                    -->
+                    <div class="notice-box" id="forgot-unavailable-note" style="display: none; margin-bottom: 15px;">
+                        <strong>Reset emails are not switched on at this store yet.</strong><br>
+                        Ask the store to set up email in Settings → SMTP, and this page will send
+                        you a code. Until then a new password has to be issued at the counter.
+                    </div>
                     <div class="form-group">
                         <label for="forgot-phone">Mobile Number</label>
                         <input type="tel" id="forgot-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10">
@@ -271,6 +291,33 @@
                 </div>
                 <div id="forgot-step-2" style="display: none;">
                     <div class="notice-box" style="margin-bottom: 15px;" id="forgot-sent-note"></div>
+                    <!--
+                        The send response is deliberately identical whether or
+                        not the account exists, so this portal cannot be used to
+                        discover which mobile numbers belong to customers. That
+                        silence is what used to strand people: a code that never
+                        arrives looks the same as a code still in transit. Both
+                        reasons are named here up front, which leaks nothing
+                        (they are stated to every caller regardless) and turns a
+                        dead wait into something the customer can act on.
+                    -->
+                    <details style="margin-bottom: 15px;">
+                        <summary style="cursor: pointer; font-size: 13px; color: var(--color-text-muted, #64748b);">
+                            No code arrived?
+                        </summary>
+                        <div class="text-muted-small" style="margin-top: 8px; line-height: 1.6;">
+                            Check your spam folder first. If there is still nothing, it is one of two things:
+                            <ul style="margin: 8px 0 0 18px; padding: 0;">
+                                <li>this mobile number has no portal account yet — use <strong>Create account</strong>; or</li>
+                                <li>the account has no email address saved on it, so there is nowhere to send the code.</li>
+                            </ul>
+                            <p style="margin-top: 8px;">
+                                An account with no email on file can only be reset at the counter. Once you are
+                                back in, add your email under <strong>Account</strong> so you can do it yourself
+                                next time.
+                            </p>
+                        </div>
+                    </details>
                     <div class="form-group">
                         <label for="reset-code">Reset Code</label>
                         <input type="text" id="reset-code" class="form-control" placeholder="Code from your email" maxlength="12" style="font-family: var(--font-mono); letter-spacing: 2px;">
@@ -319,6 +366,29 @@
             <div style="flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 20px;">
                 <!-- TAB: PROFILE -->
                 <div id="tab-profile" style="display: block;">
+                    <!--
+                        The one screen every signed-in customer lands on, so it
+                        is the only place that reliably reaches the accounts
+                        that predate the required-email signup — counter-issued
+                        logins, and anyone who registered while email was
+                        optional. Without an address on file their "Forgot
+                        password" is a silent no-op forever; this converts them
+                        on their next visit, while they are still signed in and
+                        can save it in one tap.
+                    -->
+                    <div id="no-email-prompt"
+                         style="display: none; background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; border-radius: 12px; padding: 16px; margin-bottom: 20px;">
+                        <h3 style="font-size: 15px; margin: 0 0 6px; font-weight: 600;">Add your email address</h3>
+                        <p style="font-size: 13px; line-height: 1.5; margin: 0 0 12px;">
+                            There is no email saved on your account. Without one you cannot reset
+                            your own password if you forget it — you would have to come into the
+                            store. It takes a moment to add.
+                        </p>
+                        <button type="button" id="no-email-fix-btn" class="btn btn-primary" style="width: auto; padding: 8px 16px; font-size: 13px;">
+                            ADD MY EMAIL
+                        </button>
+                    </div>
+
                     <div class="balance-card" style="margin-bottom: 20px;">
                         <h2 style="font-size: 18px; margin-bottom: 15px; color: var(--color-text-main);">Welcome, <span id="greet-name"></span>!</h2>
                         <h3>Total Advance Credit Balance</h3>
@@ -387,7 +457,7 @@
                 <!-- TAB: HISTORY -->
                 <div id="tab-history" style="display: none;">
                     <div class="form-section">
-                        <h3>Payment History</h3>
+                        <h3>Payment &amp; Return History</h3>
                         <div class="table-wrapper">
                             <table class="invoice-table" style="margin: 0;">
                                 <thead>
@@ -585,6 +655,11 @@
             document.getElementById('acct-name').value = customerName;
             document.getElementById('acct-email').value = customer.email || '';
             document.getElementById('acct-notify-email').checked = customer.notifyEmail !== false;
+
+            // Re-evaluated on every profile load, so saving an email in the
+            // Account tab clears the prompt without a page reload.
+            const prompt = document.getElementById('no-email-prompt');
+            if (prompt) prompt.style.display = customer.email ? 'none' : 'block';
         }
 
         /** Restores an existing session on load, if one is still valid. */
@@ -606,13 +681,29 @@
 
         document.getElementById('auth-tab-login').addEventListener('click', () => switchAuthPane('login'));
         document.getElementById('auth-tab-register').addEventListener('click', () => switchAuthPane('register'));
+        /*
+         * The pane always opens. It used to refuse with an alert() whenever
+         * the store had no SMTP configured, which left the customer staring
+         * at a dismissed dialog on the sign-in screen with nothing to do —
+         * the exact dead-end that sent them to the counter. Now the reason is
+         * stated inside the pane, next to the field it applies to, and the
+         * send button is disabled rather than the whole flow being hidden.
+         */
         document.getElementById('show-forgot-btn').addEventListener('click', () => {
-            if (!merchantSettings.passwordResetAvailable) {
-                alert('This store has not enabled password reset emails. Please contact the store to have your password reset at the counter.');
-                return;
-            }
             switchAuthPane('forgot');
+            document.getElementById('forgot-step-1').style.display = 'block';
+            document.getElementById('forgot-step-2').style.display = 'none';
+            applyResetAvailability();
         });
+
+        /** Reflects whether this store can actually send a reset code. */
+        function applyResetAvailability() {
+            const available = !!merchantSettings.passwordResetAvailable;
+            const notice = document.getElementById('forgot-unavailable-note');
+            const btn = document.getElementById('forgot-submit-btn');
+            if (notice) notice.style.display = available ? 'none' : 'block';
+            if (btn) btn.disabled = !available;
+        }
         document.getElementById('back-to-login-btn').addEventListener('click', () => {
             document.getElementById('forgot-step-1').style.display = 'block';
             document.getElementById('forgot-step-2').style.display = 'none';
@@ -668,6 +759,14 @@
             errorEl.textContent = '';
             if (!name) { errorEl.textContent = 'Please enter your name.'; return; }
             if (phone.length !== 10) { errorEl.textContent = 'Please enter a valid 10-digit mobile number.'; return; }
+            // Enforced client-side only: the server accepts an email-less
+            // account because counter-issued logins legitimately start without
+            // one. What must not happen is a customer creating their own
+            // account with no way back into it, which is what this stops.
+            if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+                errorEl.textContent = 'Please enter a valid email address — it is how you reset your own password later.';
+                return;
+            }
             if (password.length < merchantSettings.passwordMinLength) {
                 errorEl.textContent = `Password must be at least ${merchantSettings.passwordMinLength} characters.`;
                 return;
@@ -833,6 +932,15 @@
             document.getElementById('nav-' + tabName).style.color = '#fff';
         };
 
+        // Takes the customer straight to the field the prompt is about, rather
+        // than telling them where to find it and leaving them to navigate.
+        document.getElementById('no-email-fix-btn').addEventListener('click', () => {
+            window.switchTab('account');
+            const emailInput = document.getElementById('acct-email');
+            emailInput.focus();
+            emailInput.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        });
+
         async function loadCustomerData() {
             try {
                 // Live 22K rate for the Gold Appreciation calculator
@@ -852,6 +960,33 @@
 
                 const data = await res.json();
                 balance = data.balance;
+
+                /* Returns the store has filed against this customer.
+
+                   Read-only here by design — a refund is issued at the counter,
+                   never from the phone (see GET /api/customer/returns). The
+                   portal's job is that the customer can SEE it the moment it
+                   happens instead of wondering whether the shop actually
+                   processed it.
+
+                   Only CASH refunds are merged into the table below. A gold
+                   refund already appears, because crediting it wrote a real
+                   deposit row into the ledger above — listing the return
+                   alongside its own credit row would show the same rupees
+                   twice and make the history disagree with the balance. */
+                let cashReturns = [];
+                try {
+                    const returnsRes = await customerFetch('/api/customer/returns');
+                    if (returnsRes.ok) {
+                        const returnsData = await returnsRes.json();
+                        cashReturns = (returnsData.returns || [])
+                            .filter(r => r.refundMode !== 'gold')
+                            .map(r => ({ ...r, type: 'return' }));
+                    }
+                } catch (e) {
+                    // History still renders the advance ledger without them.
+                }
+                data.history = data.history.concat(cashReturns);
 
                 document.getElementById('customer-balance-val').textContent = `₹${balance.toLocaleString('en-IN')}`;
                 document.getElementById('customer-profile-info').textContent =
@@ -881,24 +1016,34 @@
                     const cell = document.createElement('td');
                     cell.colSpan = 4;
                     cell.style.cssText = 'text-align: center; color: var(--color-text-light);';
-                    cell.textContent = 'No deposit history found.';
+                    cell.textContent = 'No deposit or return history found.';
                     empty.appendChild(cell);
                     tbody.appendChild(empty);
                 } else {
                     data.history.sort((a, b) => b.timestamp - a.timestamp);
                     data.history.forEach(item => {
                         const isDeposit = item.type === 'deposit';
+                        // A cash refund is money handed over the counter, not a
+                        // movement in this ledger — it never touches the balance
+                        // or the grams, it is listed so the customer has a record.
+                        const isReturn = item.type === 'return';
+                        // Gold refunds arrive here as ordinary approved deposits;
+                        // `source` is what distinguishes credit the store gave
+                        // back from money the customer paid in.
+                        const isReturnCredit = isDeposit && item.source === 'return';
                         const status = normalizeAdvanceStatus(item);
                         // A deposit awaiting the store's confirmation holds no
                         // credit, so it must not contribute grams to the Gold
                         // Appreciation figure either — that panel and the balance
                         // above it have to describe the same money.
                         const counts = advanceEntryDelta(item) !== 0;
-                        const typeColor = !counts
-                            ? 'color: var(--color-text-light); text-decoration: line-through;'
-                            : isDeposit
-                                ? 'color: var(--color-success); font-weight: 600;'
-                                : 'color: var(--color-danger);';
+                        const typeColor = isReturn
+                            ? 'color: #b45309; font-weight: 600;'
+                            : !counts
+                                ? 'color: var(--color-text-light); text-decoration: line-through;'
+                                : isDeposit
+                                    ? 'color: var(--color-success); font-weight: 600;'
+                                    : 'color: var(--color-danger);';
 
                         if (counts) {
                             const lockedRate = item.lockedGoldRate22K || currentLiveRate22K;
@@ -914,22 +1059,30 @@
                         // textContent throughout: referenceId is customer- and
                         // gateway-supplied, and this table renders it back out.
                         const row = document.createElement('tr');
-                        if (!counts) row.style.opacity = '0.7';
+                        if (!counts && !isReturn) row.style.opacity = '0.7';
                         const dateCell = document.createElement('td');
                         dateCell.textContent = new Date(item.timestamp).toLocaleDateString();
                         const idCell = document.createElement('td');
                         idCell.textContent = item.id;
                         const typeCell = document.createElement('td');
                         typeCell.style.cssText = typeColor;
-                        typeCell.textContent = isDeposit && status === ADVANCE_STATUS.PENDING
-                            ? 'AWAITING APPROVAL'
-                            : isDeposit && status === ADVANCE_STATUS.REJECTED
-                                ? 'NOT RECEIVED'
-                                : String(item.type || '').toUpperCase();
+                        // The invoice a refund came back from is named on the
+                        // row. Without it a credit the customer never paid in
+                        // reads as an unexplained deposit.
+                        typeCell.textContent = isReturn
+                            ? `RETURN — CASH REFUND (${item.originalInvoiceId || ''})`
+                            : isReturnCredit
+                                ? `RETURN CREDIT (${item.invoiceId || ''})`
+                                : isDeposit && status === ADVANCE_STATUS.PENDING
+                                    ? 'AWAITING APPROVAL'
+                                    : isDeposit && status === ADVANCE_STATUS.REJECTED
+                                        ? 'NOT RECEIVED'
+                                        : String(item.type || '').toUpperCase();
                         const amountCell = document.createElement('td');
                         amountCell.className = 'text-right';
                         amountCell.style.cssText = typeColor;
-                        amountCell.textContent = `₹${Number(item.amount).toLocaleString('en-IN')}`;
+                        amountCell.textContent =
+                            `₹${Number(isReturn ? item.refundAmount : item.amount).toLocaleString('en-IN')}`;
 
                         row.append(dateCell, idCell, typeCell, amountCell);
                         tbody.appendChild(row);

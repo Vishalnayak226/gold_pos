@@ -5,6 +5,8 @@
  */
 
 import { BillingDesk } from './components/BillingDesk.js';
+import { ReprintDesk } from './components/ReprintDesk.js';
+import { ReturnDesk } from './components/ReturnDesk.js';
 import { Dashboard } from './components/Dashboard.js';
 import { AdvancesManager } from './components/AdvancesManager.js';
 import { CustomerAccountsManager } from './components/CustomerAccountsManager.js';
@@ -17,12 +19,16 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initialize components before nav activates the default tab, so the
     // per-tab click handlers below can already reach window.dashboard etc.
     window.billingDesk = new BillingDesk();
+    window.reprintDesk = new ReprintDesk();
+    window.returnDesk = new ReturnDesk();
     window.dashboard = new Dashboard();
     window.advancesManager = new AdvancesManager();
     window.customerAccountsManager = new CustomerAccountsManager();
     window.settingsManager = new SettingsManager();
     if (sessionStorage.getItem('adminToken')) {
         window.dashboard.refresh();
+        window.reprintDesk.refresh();
+        window.returnDesk.refresh();
         window.advancesManager.refresh();
         window.customerAccountsManager.refresh();
         window.settingsManager.refresh();
@@ -49,6 +55,8 @@ async function loadFrontendExtension() {
         if (typeof init === 'function') {
             init({
                 billingDesk: window.billingDesk,
+                reprintDesk: window.reprintDesk,
+                returnDesk: window.returnDesk,
                 dashboard: window.dashboard,
                 advancesManager: window.advancesManager,
                 customerAccountsManager: window.customerAccountsManager,
@@ -123,6 +131,8 @@ function initAdminAuth() {
                 appViewport.style.display = 'grid';
                 pinInput.value = '';
                 if (window.dashboard) window.dashboard.refresh();
+                if (window.reprintDesk) window.reprintDesk.refresh();
+                if (window.returnDesk) window.returnDesk.refresh();
                 if (window.advancesManager) window.advancesManager.refresh();
                 if (window.customerAccountsManager) window.customerAccountsManager.refresh();
                 if (window.settingsManager) window.settingsManager.refresh();
@@ -179,6 +189,12 @@ function initNavigation() {
 
             if (targetId === 'dashboard-tab' && window.dashboard && sessionStorage.getItem('adminToken')) {
                 window.dashboard.refresh();
+            }
+            if (targetId === 'reprint-tab' && window.reprintDesk && sessionStorage.getItem('adminToken')) {
+                window.reprintDesk.refresh();
+            }
+            if (targetId === 'returns-tab' && window.returnDesk && sessionStorage.getItem('adminToken')) {
+                window.returnDesk.refresh();
             }
             if (targetId === 'advances-tab' && window.advancesManager && sessionStorage.getItem('adminToken')) {
                 window.advancesManager.refresh();

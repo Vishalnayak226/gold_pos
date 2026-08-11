@@ -15,24 +15,49 @@ cd backend
 npm test
 ```
 
-This runs two suites and exits non-zero on any failure:
+This runs five suites and exits non-zero on any failure (**216 checks** as of
+2026-08-11). None of them touch `backend/data/` — every one that needs a
+database makes its own temp directory — so all are safe to run with a dev
+server already up on :5000.
 
 | Suite | Covers |
 | --- | --- |
-| `npm run test:billing` | Invoice money math — discount ordering, GST inclusive/exclusive, advance capping, making-charge %/₹ conversion, NaN hardening, printed rows reconciling to the Grand Total, paise settlement, and advance-deposit status arithmetic (pending/rejected hold no balance; a missing status still counts, so existing ledgers keep their balances) (71 checks) |
-| `npm run test:integration` | Troy-ounce conversion, licensing grace periods, crypto envelopes, customer password hashing (scrypt round-trip, salt uniqueness, tampered-hash rejection), login-lockout escalation |
+| `npm run test:billing` | Invoice money math — discount ordering, GST inclusive/exclusive, advance capping, making-charge %/₹ conversion, NaN hardening, printed rows reconciling to the Grand Total, paise settlement, advance-deposit status arithmetic (pending/rejected hold no balance; a missing status still counts, so existing ledgers keep their balances), metal value from weight × server rate, rupee↔paise conversion, the tax base being metal **+** making charge in both modes, and the return-refund pipeline — full and partial-by-weight refunds, the refunded gross including any advance redeemed, no drift across split returns, legacy/non-reconciling invoices falling back to pro-rata, and every refusal (114 checks) |
+| `npm run test:integration` | Troy-ounce conversion, licensing grace periods, crypto envelopes, customer password hashing (scrypt round-trip, salt uniqueness, tampered-hash rejection), login-lockout escalation, and the password-reset code lifecycle (single use, expiry, guess budget, never stored in the clear) |
+| `npm run test:routes` | Real server over HTTP: public surface, admin auth boundary, credential redaction and the masked save round-trip, persistence failure, invoice-sequence guard, logout invalidation, brute-force lockout (27 checks) |
+| `npm run test:http` | The money paths over HTTP: server-authoritative rate and metal value, the client-field allowlist, refusal to price without a rate, Razorpay webhook signature/idempotency/amount-mismatch/unknown-order/failed-payment handling, transaction rollback, and the returns money path — admin gating, cash vs gold refund, the server pricing the refund rather than the client, cumulative over-return refusal, gold-refund rollback, and the session-scoped customer view (44 checks) |
+| `npm run test:guard` | Production startup guard — every fail-closed condition, plus booting a real server with demo settings under `NODE_ENV=production` and asserting it exits 1 (16 checks) |
+
+Separately, and **not** part of `npm test` because it needs a browser binary:
+
+```
+npm install && npx playwright install chromium   # one-off
+npm run test:e2e
+```
+
+43 end-to-end journeys (6 cashier, 12 customer × desktop and 390px mobile,
+6 reprint, 7 return), each booting its own server against its own seeded
+database.
+Generate a populated database to click through by hand with `npm run seed` — it
+prints the admin PIN and the customer logins, and refuses to overwrite
+`backend/data/`.
 
 Items below marked **[math automated]** have their *arithmetic* verified by
 `test:billing` — you are only confirming the UI is wired to it (right field,
 right row, updates live). If the numbers themselves are wrong, `npm test`
-should have caught it before you got here.
+should have caught it before you got here. **[e2e automated]** means a
+Playwright journey drives that exact click path; **[unit automated]** means the
+logic behind it is asserted in `npm test` but the screen is not.
 
 ---
 
 ## 0. Setup
 
-- [ ] `cd backend && npm test` is green. Three suites run in order: `test_billing_math.js` (pricing/rounding), `test_suite.js` (helper-level integration), then `test_routes.js` (HTTP routes + auth boundary). The third boots a real server on an ephemeral port against a temp data directory, so it is safe to run with a dev server already up on :5000.
-  Result: _____  Notes: ______________________________________________
+- [x] `cd backend && npm test` is green — **157 checks, verified 2026-08-09**. Five suites run in order: `test_billing_math.js` (pricing/rounding), `test_suite.js` (helper-level integration), `test_routes.js` (HTTP routes + auth boundary), `test_http.js` (money paths + webhook), `test_production_guard.js` (fail-closed startup). Each of the last three boots a real server on an ephemeral port against a temp data directory, so all are safe to run with a dev server already up on :5000.
+  Result: PASS  Notes: 83 billing + 6 integration + 27 route + 25 HTTP + 16 guard.
+
+- [x] `npm run test:e2e` is green — **16/16, verified 2026-08-09** (Desktop Chrome + 390px Pixel 7). Needs `npm install && npx playwright install chromium` first.
+  Result: PASS  Notes: cashier billing/redemption/stale-rate/over-redemption; customer balance/login/deposit/pending-UPI/duplicate-reference/logout.
 
 - [ ] Server starts cleanly (`Restart_Server.bat` or `node backend/server.js`), no red errors in console except the expected "Licensing sync connection failed" if licensing_server isn't running.
   Result: _____  Notes: ______________________________________________
@@ -118,16 +143,103 @@ should have caught it before you got here.
 - [ ] **[math automated]** Enter a phone that HAS an advance balance (create one first via Module 4, then come back) → "Customer Advance Available" box appears; click "Apply Advance" → total reduces by the advance (capped at the pre-advance total, so a large balance drives the total to ₹0 and never negative); click again to remove it. With the advance applied, lower the weight → the redeemed amount re-clamps down to the smaller bill.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Leave weight at 0 and click "SAVE INVOICE" → blocked with "Please enter a valid gold weight."
+- [ ] **[math automated]** **Tax base is the whole bill, including making charge.** With a 10 g @ ₹6,875/g sale and making charge set to a large figure (say 30%), note the GST amount. Drop making charge to 0% and watch the GST amount fall — the slab applies to Metal **+** Making, not to metal alone. The summary line names the base: `Taxable Value (Metal + Making)`. Repeat in `Inclusive` mode: the carved-out tax must move with the making charge there too.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Leave weight at 0 and click "SAVE INVOICE" → blocked with "Please enter a valid gold weight."
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** **Partial customer number is refused before it is sent.** Type a valid weight and a 5-digit customer phone, then click **SAVE INVOICE**. It must be blocked *on the field* — the red message reads "Customer phone must be exactly 10 digits — 5 entered", focus jumps to the phone box, and **no** alert appears. Check `backend/data/settings.json`: `invoiceSeqStart` must be unchanged (a refused sale never burns an invoice number). Complete the number to 10 digits → the sale files normally. Clear the field entirely → it also files, as a cash sale.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Fill a valid sale and click "SAVE INVOICE" → "Invoice Saved Successfully!", form resets, preview reverts to Cash Sale/blank.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Click "PRINT INVOICE" → browser print dialog opens showing just the invoice sheet (not the whole app chrome).
+- [ ] **[e2e automated]** Click "PRINT INVOICE" → browser print dialog opens showing **the invoice sheet, populated** (not the whole app chrome, and *not a blank page* — this printed blank until 2026-08-09). The left-hand input column, the sidebar, and every button must be absent from the preview.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Go back to Dashboard → new sale appears in Recent Transactions and today's revenue total.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 3a. Reprint Invoice tab
+
+*Added 2026-08-09. The rule this module exists to keep: a reprint shows what was **filed**, never
+what today's settings would price.*
+
+- [ ] Open **Reprint Invoice** and click **SEARCH INVOICES** with every field empty → refused with "Enter an invoice number, phone, or name…", and no results table. (An unfiltered search would dump the whole ledger.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Search by the invoice number of a sale you filed in §3 → exactly one row, showing the invoice number, when it was saved, customer, phone and total. Click **Open**.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** The sheet renders with a red **DUPLICATE — REPRINT** stamp in the header, the original invoice number and *original* date, and figures identical to the slip from §3 — Taxable Value, GST and Grand Total all matching to the paise.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** **A reprint is not re-priced.** After opening a duplicate, go to Settings, change the gold rate override and the GST slab, and flip tax mode. Come back, reload, search the *same* invoice and open it again — every figure must be unchanged. If any number moved, the module is re-pricing and is wrong.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Search by the customer's 10-digit phone, and by a fragment of their name → both find the invoice. Search a phone with no sales → "No filed invoice matches that", not an empty table.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Set a **From**/**To** date range around the sale's date → it appears. Narrow the range to exclude it → it does not. A `To` earlier than `From` is refused with a clear message.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Click **PRINT DUPLICATE** → the print preview shows the stamped sheet only. The search box, results table, and both buttons must be absent.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Pre-Phase-20 invoice (only if your `backend/data/sales_*.json` has one).** Open an invoice filed before `taxableAmount`/`taxAmount`/`taxMode` were stored. It must print its filed Grand Total with the tax row reading *"not recorded on this invoice"* and an amber notice above the sheet — **never** a ₹0.00 GST line, which would assert that no tax was charged.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 3b. Returns & Refunds tab
+
+*Added 2026-08-11. Three rules this module exists to keep: the refund is priced by the **original
+invoice** and never by today; **only the store** can issue one; and an invoice can never give back
+more than it took.*
+
+- [ ] Open **Returns & Refunds** and click **FIND INVOICE** with every field empty → refused with "Enter an invoice number, phone, or name…", no results table.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Search the invoice number of the sale you filed in §3 → one row showing weight, a `—` in the Returns column, the billed total, and a **Return** button. Click it. The form opens with the weight box defaulted to the full weight.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[math automated]** Enter a **partial** weight (say 4g of a 10g invoice). The preview itemises metal, making, discount (if any) and GST, and the REFUND line equals the sum. It states how much would remain returnable.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** With **Cash** selected, click **FILE RETURN & REFUND** and confirm → a **CREDIT NOTE** sheet appears, marked *RETURN & REFUND*, naming the credit-note number and the original invoice. The figure matches the preview exactly.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** **A cash refund is not store credit.** Check the customer's balance in the Advances tab before and after → unchanged. Then check the Reprint Invoice tab → the original invoice still reprints with its *original* total. Returns never rewrite an invoice.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Search the same invoice again → the row now reads "4.000 g returned", and reopening the form offers only the remaining 6g. Typing more than that is refused inline and the FILE button greys out.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Return the remaining weight → the note says the invoice is fully returned, and searching it again shows **Fully returned** with the button disabled. **The two refunds must sum to exactly the invoice's billed total** (add them up by hand; if they are a paisa out, the true-up is broken).
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** **Gold refund.** File a sale against a customer *with* a phone number, return it choosing **Gold**, then check that customer in the Advances tab → an approved deposit for the refund amount, described as a return credit against that invoice. Start a new bill for them → **Apply Advance** offers it immediately, with no approval step.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** **Walk-in with no phone.** Open a return against a cash sale filed without a customer number → the Gold option is disabled with an explanation, and Cash is preselected. There is no account to credit.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** **A return is not re-priced.** After filing a sale, change the gold rate override, the GST slab and the tax mode in Settings. Reload, open a return against that invoice → the preview must still quote the *original* rate and slab. If any figure moved, the module is re-pricing and is wrong.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **An invoice that redeemed an advance refunds the full charge.** Return a sale that used advance credit → the refund is `total + advance redeemed`, not the cash the customer handed over. (The advance was their money too.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Click **PRINT CREDIT NOTE** → the print preview shows the note only. Search box, results table, the Recent Returns list and both buttons must be absent.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** The **Recent Returns** list at the bottom shows every filed return with its mode (CASH / GOLD CREDIT), and **Note** reopens any credit note.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Pre-Phase-20 invoice (only if your `backend/data/sales_*.json` has one).** Return against one → the refund is a straight pro-rata share of the filed total and the note says the itemised breakdown was *not recorded on the original invoice*. Never an invented GST line.
   Result: _____  Notes: ______________________________________________
 
 ---
@@ -213,6 +325,12 @@ should have caught it before you got here.
 - [ ] Change only the UPI ID and Save → mock checkout still works, proving the untouched Key Secret was preserved rather than overwritten by the mask.
   Result: _____  Notes: ______________________________________________
 
+- [ ] **Webhook Secret and Public URL fields are present** under the Razorpay section. Type a Public URL (e.g. `https://pos.example.com`) and Save, then reopen Settings → the hint line below now shows the exact endpoint to register in the Razorpay dashboard: `https://pos.example.com/api/payment/webhook`.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Webhook Secret is write-only, like the Key Secret.** Save a secret, reload Settings → the field is blank with a "Configured — leave blank to keep" placeholder, and `GET /api/settings` in DevTools shows `razorpayWebhookSecret: null` with `razorpayWebhookSecretConfigured: true`. Save an unrelated field → the secret survives.
+  Result: _____  Notes: ______________________________________________
+
 ---
 
 ## 9. Settings → Backup & Email Reports
@@ -221,6 +339,9 @@ should have caught it before you got here.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Leave SMTP fields blank, click "Send Daily Report Now" → status shows a skip reason (not an error) since SMTP isn't configured.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Reset availability is stated here** *(added 2026-08-09)*. With SMTP blank, an amber notice under the SMTP fields reads "**Customer password reset is off**" and points at Customer Logins for manual resets. Fill host, username and password, Save, reload → it turns green and reads "**Customer password reset is live**". This exists because SMTP looks like a *reporting* setting: a store that never wanted the daily email had no way to know it had also switched off every customer's ability to reset their own password.
   Result: _____  Notes: ______________________________________________
 
 - [ ] (Optional, needs a real/test SMTP account e.g. Ethereal or Gmail App Password — see `docs/GO_LIVE_CHECKLIST.md` §"Email Reports") Fill SMTP host/port/user/pass, Save, then "Send Daily Report Now" again → status shows success and the report actually arrives at Report Email Address.
@@ -339,6 +460,23 @@ Playwright pass; you are confirming they hold in a real browser on your machine.
 - [ ] **Gold Appreciation Calculator:** note "Current Day Worth" on the Profile tab. In `backend/data/advances.json`, lower `lockedGoldRate22K` on one of this customer's deposits, save, reload → "Current Day Worth" and "Appreciation" recompute against your edited locked rate.
   Result: _____  Notes: ______________________________________________
 
+### 12c-i. Returns, as the customer sees them *(added 2026-08-11)*
+
+*The store issues refunds; the customer only ever sees them. Do this on a phone, or with the
+browser at 390px — a refund the customer cannot find is a refund they telephone the shop about.*
+
+- [ ] **[e2e automated]** After the store files a **cash** refund for this customer (§3b), open **History** → a row reading `RETURN — CASH REFUND (<invoice number>)` for the refund amount, and the **balance is unchanged**. Cash was handed over the counter; it is not credit.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** After a **gold** refund, History shows `RETURN CREDIT (<invoice number>)` — named against the invoice, so it does not read as a deposit the customer knows they never made — and the balance has gone **up** by the refund. It must appear **once**, not twice.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** With a gold refund on the account, the **Gold Appreciation** panel counts its grams (not 0.000 g). A refund credit is gold-backed like any other deposit.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] There is **no** button, form, or link anywhere in the portal for raising or cancelling a return. Returns are the store's to issue.
+  Result: _____  Notes: ______________________________________________
+
 ### 12d. Account, session, and password reset
 
 - [ ] **[auto]** Account tab shows your name and email; edit and Save → success, and the greeting on Profile updates.
@@ -353,10 +491,29 @@ Playwright pass; you are confirming they hold in a real browser on your machine.
 - [ ] Change your password from the Account tab → you are signed out of every device and must sign in again with the new one.
   Result: _____  Notes: ______________________________________________
 
-- [ ] With SMTP unconfigured (Module 9), click "Forgot password?" → a clear "contact the store" message, not an error.
+- [ ] **[e2e automated]** With SMTP unconfigured (Module 9), click "Forgot password?" → the reset **pane opens** (it must not fire an alert and bounce you back to Sign In — that dead-end was the whole reason customers had to come to the counter). Inside it, an amber notice explains reset emails are not switched on and the **SEND RESET CODE** button is disabled.
   Result: _____  Notes: ______________________________________________
 
-- [ ] With SMTP configured and an email saved on the account, request a reset → a 10-character code arrives by email; entering it sets a new password, and entering it a second time is refused.
+- [ ] **[unit automated]** With SMTP configured (Module 9) and an email saved on the account, request a reset → a 10-character code arrives by email; entering it sets a new password, and entering it a second time is refused. Also confirm the code never appears in `backend/data/customer_auth.json` — only its hash.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Request a reset for a number with no account, and for an account with no email.** Both must return the *same* wording as a successful send — the portal must never reveal which mobile numbers are customers. Expand **"No code arrived?"** on the next screen: it names both possibilities and what to do about each.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[unit automated]** Lock yourself out (5 wrong passwords), then complete a reset → the new password signs you in immediately. A lockout must not also block the way out of it.
+  Result: _____  Notes: ______________________________________________
+
+### 12d-i. Getting an email onto an account that has none *(added 2026-08-09)*
+
+*Every gate below exists so that a forgotten password never needs a trip to the store.*
+
+- [ ] **[e2e automated]** On **Create account**, fill everything except Email and submit → refused with "Please enter a valid email address — it is how you reset your own password later." Add a valid address → the account is created and carries it.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Issue a login at the counter (§13) **without** an email. The green handover panel must carry an amber warning that the account has no email and that "Forgot password" has nowhere to send a code.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **[e2e automated]** Sign in as that counter-issued customer and set a password. On the **Profile** tab an amber **"Add your email address"** prompt is visible. Click **ADD MY EMAIL** → it switches to the Account tab with the email field focused. Save an address → the prompt disappears without a reload, and the address is in `backend/data/customer_auth.json`.
   Result: _____  Notes: ______________________________________________
 
 ### 12e. Two windows, two customers (the isolation check)
@@ -452,6 +609,65 @@ These need a REST client (or the browser console) because the point is what happ
   Result: _____  Notes: ______________________________________________
 
 - [ ] Enter a customer name containing `<script>` or `"` characters in Billing Desk or the Advances deposit form → check it renders as literal text (escaped) in Dashboard/Advances lists, not executed — confirms the stored-XSS escaping holds.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 17. Razorpay webhook & capture confirmation (2026-08-09)
+
+The signature, idempotency, amount-mismatch and unknown-order paths are all
+covered by `npm run test:http`. What automation **cannot** prove is that a real
+Razorpay account, a real public URL and a real card all line up — that is what
+this section is for, and it needs a Razorpay **test-mode** account plus a
+tunnel (ngrok/Cloudflare) or a deployed instance.
+
+- [ ] In the Razorpay dashboard, add a webhook for `payment.captured` and `payment.failed` pointing at `<public URL>/api/payment/webhook`, and paste the generated secret into Settings → Payments. Use Razorpay's "Test webhook" button → the delivery shows **200** in their log, and `backend/data/payment_events.json` gains a row.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] With the secret **removed** from Settings, fire the test webhook again → Razorpay logs a **503** and no ledger row appears. (Fails closed: a callback that cannot be verified must never credit.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Make a real test-mode payment from the customer portal and let it complete normally → balance updates once. Check `payment_orders.json`: the order is `status: "paid"` with an `amountPaise` matching what was charged, and `advances.json` has exactly **one** deposit for that `razorpay_payment_id` even though both the browser and the webhook reported it.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **The tab-close case — this is the whole point of the webhook.** Start a test payment, complete it in the Razorpay window, then close the tab *before* it returns to the portal. Sign back in → the deposit is there anyway, credited by the webhook. Before this change that money was taken and never recorded.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Use a Razorpay test card that **fails** → no ledger row, and the order shows `status: "failed"`.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Temporarily point `razorpayKeySecret` at a wrong-but-well-formed value so the capture lookup fails, then pay → the portal says the payment could not be confirmed *and was not credited* (503, `pending: true`), rather than either crediting or claiming failure.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 18. Production startup guard (2026-08-09)
+
+Every condition is asserted by `npm run test:guard`, including a real process
+exiting 1. Confirm here only that it behaves sanely on a real machine.
+
+- [ ] Start the server with `NODE_ENV=production` against a stock demo `settings.json` → it prints a numbered list of blockers under "REFUSING TO START IN PRODUCTION" and exits; nothing is listening on :5000.
+  PowerShell: `$env:NODE_ENV="production"; node backend/server.js`
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Fix every listed item (real Razorpay keys, a webhook secret, an `https://` public URL, a non-`1234` PIN, provider `public`) and start again → it boots normally.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Start **without** `NODE_ENV=production` on the same demo settings → boots normally, mock checkout still works. (The guard must not make local development harder, or it will be worked around.)
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 19. Seeded data (2026-08-09)
+
+- [ ] `cd backend && npm run seed` → writes to `backend/data-seed/` and prints the admin PIN plus four customer logins. Run it a second time → the files are byte-identical (`git status` stays clean if you point it somewhere tracked).
+  Result: _____  Notes: ______________________________________________
+
+- [ ] `npm run seed -- --out backend/data` → **refuses**, naming the live database. (The one destructive thing this script could do.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Start the server against the seeded database and click through it: the dashboard shows six invoices across 2026 and 2027, the Advances tab shows one pending claim awaiting approval and one rejected claim holding no balance, and the four seeded logins all work at `/customer.html`.
+  PowerShell: `$env:GOLD_POS_DATA_DIR="<abs path>\backend\data-seed"; node backend/server.js`
   Result: _____  Notes: ______________________________________________
 
 ---

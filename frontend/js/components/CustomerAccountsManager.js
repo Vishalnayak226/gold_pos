@@ -266,6 +266,13 @@ export class CustomerAccountsManager {
                     <strong>It is shown only once.</strong>
                 </p>
                 <p style="font-family:var(--font-mono); font-size:22px; font-weight:700; letter-spacing:2px; background:#fff; border:1px dashed var(--color-border-dark); border-radius:6px; padding:12px; text-align:center; margin:0; user-select:all;">${escapeHtml(data.tempPassword)}</p>
+                ${data.hasEmail ? '' : `
+                <p style="font-size:13px; line-height:1.5; color:#92400e; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:10px 12px; margin:12px 0 0;">
+                    <strong>No email on this account.</strong> Tell the customer to add one under
+                    <strong>Account</strong> in the portal — without it, "Forgot password" has
+                    nowhere to send a code and they will have to come back to the counter every
+                    time they are locked out.
+                </p>`}
             </div>
         `;
     }

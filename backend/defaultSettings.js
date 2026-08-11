@@ -51,6 +51,13 @@ export const DEFAULT_SETTINGS = {
     // sent to the real Razorpay API instead of being intercepted.
     razorpayKeyId: "rzp_test_xxxxxx",
     razorpayKeySecret: "rzp_test_xxxxxx_secret",
+    // Signs the gateway's server-to-server callbacks. Razorpay generates this
+    // independently of the API key pair when the webhook endpoint is registered
+    // in their dashboard, so it is a THIRD credential, not a derivative of the
+    // other two. Blank means POST /api/payment/webhook rejects every delivery —
+    // deliberately fail-closed: an unverifiable callback that credits a ledger
+    // is worse than no callback at all.
+    razorpayWebhookSecret: "",
     upiId: "",
     adminPin: "1234",
     overrideGoldPrice: {
@@ -59,7 +66,13 @@ export const DEFAULT_SETTINGS = {
         price22K: 0.0,
         price18K: 0.0
     },
-    currency: "INR"
+    currency: "INR",
+    // Origin this install is reachable at from the public internet, e.g.
+    // "https://pos.example.com". Razorpay needs it to deliver webhooks, so a
+    // production process without it can take money it will never hear back
+    // about — assertProductionReady() (backend/productionGuard.js) refuses to
+    // boot in that state. Blank is correct for a local/offline counter install.
+    publicUrl: ""
 };
 
 /**
@@ -92,7 +105,7 @@ export function getDefaultSettings() {
    address nested objects (see NESTED_SETTINGS_KEYS).
    ========================================================================== */
 
-export const SECRET_SETTINGS_KEYS = ['razorpayKeySecret', 'adminPin', 'smtp.pass'];
+export const SECRET_SETTINGS_KEYS = ['razorpayKeySecret', 'razorpayWebhookSecret', 'adminPin', 'smtp.pass'];
 
 /**
  * What the browser sees in place of a real secret.

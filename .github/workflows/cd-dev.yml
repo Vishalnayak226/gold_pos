@@ -35,13 +35,13 @@ jobs:
           node-version: '20'
       - name: Install backend dependencies
         working-directory: backend
-        run: npm install --no-audit --no-fund
-      - name: Run integration test suite
+        run: npm ci --no-audit --no-fund
+      - name: Run all backend test suites
         working-directory: backend
-        run: node test_suite.js
+        run: npm test
       - name: Install licensing_server dependencies
         working-directory: licensing_server
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: Audit backend (high+ severity fails the build)
         working-directory: backend
         run: npm audit --audit-level=high

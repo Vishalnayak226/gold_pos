@@ -8,6 +8,7 @@
 
 import assert from 'assert';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -21,6 +22,25 @@ const ROU_DATA = {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/* --------------------------------------------------------------------------
+   Throwaway data directory, redirected BEFORE anything imports db.js.
+
+   db.js resolves DATA_DIR once, at import time, and ESM caches the module —
+   so setting these env vars inside a test function is far too late: the first
+   `await import('./customerAuth.js')` anywhere in this file has already
+   pinned the path. Getting that wrong writes fixture accounts into the
+   tenant's real backend/data/customer_auth.json, where they look exactly like
+   real customers (CLAUDE.md §8).
+
+   Every test here is pure math, crypto, or account machinery, so none of them
+   has any business reading the live database in the first place.
+   -------------------------------------------------------------------------- */
+const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-suite-'));
+process.env.GOLD_POS_DATA_DIR = path.join(TEST_ROOT, 'data');
+process.env.GOLD_POS_LOGS_DIR = path.join(TEST_ROOT, 'logs');
+fs.mkdirSync(process.env.GOLD_POS_DATA_DIR, { recursive: true });
+fs.mkdirSync(process.env.GOLD_POS_LOGS_DIR, { recursive: true });
 
 console.log('======================================================================');
 console.log('STARTING INTEGRATION VERIFICATION TESTS');
@@ -195,9 +215,9 @@ function testAsymmetricEnvelope() {
 /* ==========================================================================
    TEST 5: Customer password hashing (scrypt) round-trip
    Covers the pure half of backend/customerAuth.js — the half that decides
-   whether a stolen customer_auth.json is crackable. The stateful half
-   (sessions, lockout, reset codes) is proved against a live server instead,
-   because it writes to the tenant's real data directory.
+   whether a stolen customer_auth.json is crackable. Reset codes are covered
+   by Test 7 below; sessions and lockout are proved over HTTP in
+   test_routes.js against a live server on a throwaway data directory.
    ========================================================================== */
 async function testCustomerPasswordHashing() {
     console.log('Running Test 5: Customer password hashing & verification...');
@@ -272,6 +292,94 @@ function testLockoutEscalation() {
     console.log('✅ Test 6 Passed: Lockout escalation curve and cap validated.');
 }
 
+/* ==========================================================================
+   TEST 7: Password reset code lifecycle — the self-service path
+
+   This is the machinery a customer uses to get back into their account
+   WITHOUT the store: request a code, type it in, choose a new password. It
+   had no coverage at all, which is a poor place to have none — every branch
+   here either lets the wrong person in or strands the right one at the
+   counter, and Test 5's comment claiming it was "proved against a live
+   server" was not true of any suite.
+
+   Runs against the throwaway data directory set up at the top of this file,
+   so it never touches the tenant's customer_auth.json (CLAUDE.md §8).
+   ========================================================================== */
+async function testPasswordResetLifecycle() {
+    console.log('Running Test 7: Password reset code lifecycle...');
+
+    const dataDir = process.env.GOLD_POS_DATA_DIR;
+    const {
+        createCustomerAccount, issueResetToken, consumeResetToken,
+        loginCustomer, findAccount
+    } = await import('./customerAuth.js');
+
+    {
+        const phone = '9000000123';
+        const created = createCustomerAccount({
+            phone, password: 'OriginalPass!1', name: 'Reset Tester', email: 'reset@example.test'
+        });
+        assert.strictEqual(created.success, true, 'Test account should be created.');
+
+        // --- The happy path: request, use, sign in with the new password ---
+        const issued = issueResetToken(phone);
+        assert.ok(issued && issued.code, 'A reset code should be issued for a real account.');
+        assert.ok(issued.expiresAt > Date.now(), 'The code should carry a future expiry.');
+        assert.ok(issued.code.length >= 8, 'A short code would be brute-forceable inside its window.');
+
+        // The plaintext code must never be sitting in the account file — only
+        // its hash. A leaked customer_auth.json must not be a set of live
+        // account-takeover tokens.
+        const stored = findAccount(phone);
+        assert.ok(stored.resetTokenHash, 'The account should hold a reset token hash.');
+        assert.ok(!JSON.stringify(stored).includes(issued.code),
+            'The plaintext reset code must never be persisted.');
+
+        const used = consumeResetToken(phone, issued.code, 'BrandNewPass!2');
+        assert.strictEqual(used.success, true, 'A valid code should set the new password.');
+
+        const signedIn = loginCustomer(phone, 'BrandNewPass!2', '127.0.0.1');
+        assert.strictEqual(signedIn.success, true, 'The customer should sign in with the new password.');
+        const oldPassword = loginCustomer(phone, 'OriginalPass!1', '127.0.0.1');
+        assert.strictEqual(oldPassword.success, false, 'The old password must stop working.');
+
+        // --- Single use: the same code cannot be replayed ---
+        const replayed = consumeResetToken(phone, issued.code, 'ThirdPassword!3');
+        assert.strictEqual(replayed.success, false, 'A consumed code must not work twice.');
+
+        // --- A wrong code is refused, and burns the real one after 5 tries ---
+        const second = issueResetToken(phone);
+        for (let i = 0; i < 5; i++) {
+            const guess = consumeResetToken(phone, 'WRONGCODE1', 'GuessedPass!4');
+            assert.strictEqual(guess.success, false, `Wrong guess ${i + 1} must be refused.`);
+        }
+        const afterBruteForce = consumeResetToken(phone, second.code, 'GuessedPass!4');
+        assert.strictEqual(afterBruteForce.success, false,
+            'The real code must be invalidated once the guess budget is spent.');
+
+        // --- An expired code is refused ---
+        const third = issueResetToken(phone);
+        const accountsFile = path.join(dataDir, 'customer_auth.json');
+        const accounts = JSON.parse(fs.readFileSync(accountsFile, 'utf8'));
+        accounts.find(a => a.phone === phone).resetExpires = Date.now() - 1000;
+        fs.writeFileSync(accountsFile, JSON.stringify(accounts, null, 2));
+        const expired = consumeResetToken(phone, third.code, 'TooLate!5');
+        assert.strictEqual(expired.success, false, 'An expired code must be refused.');
+        assert.ok(/expired/i.test(expired.error), 'And must say so, so the customer requests another.');
+
+        // --- A weak new password is refused even with a valid code ---
+        const fourth = issueResetToken(phone);
+        const weak = consumeResetToken(phone, fourth.code, 'short');
+        assert.strictEqual(weak.success, false, 'A valid code must not waive the password rules.');
+
+        // --- No account, no code. Never throws, never reveals. ---
+        assert.strictEqual(issueResetToken('9999999999'), null,
+            'An unknown number must not produce a reset code.');
+
+        console.log('✅ Test 7 Passed: reset codes are single-use, expiring, guess-limited, and never stored in the clear.');
+    }
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -280,10 +388,16 @@ try {
     testAsymmetricEnvelope();
     await testCustomerPasswordHashing();
     testLockoutEscalation();
+    await testPasswordResetLifecycle();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');
 } catch (err) {
     console.error('❌ Test execution encountered failure:', err.message);
-    process.exit(1);
+    // exitCode rather than exit(), so the cleanup below still runs — exit()
+    // terminates immediately and would leave the temp tree behind on every
+    // failing run.
+    process.exitCode = 1;
+} finally {
+    fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 }
