@@ -324,10 +324,11 @@ export function createSale(input, deps) {
             }
 
             /* Other tenders are recorded only when the caller actually knows
-               them. The Billing Desk does not yet capture a cash/card/UPI split
-               — that is a Phase 5 screen — and writing a speculative "cash"
-               tender for the balance would be inventing a fact about how the
-               customer paid. An absent tender means unknown, not zero. */
+               them. The Billing Desk captures a cash/card/UPI split and always
+               sends one, but the argument stays optional: every invoice already
+               on disk predates tenders, and writing a speculative "cash" tender
+               for the balance would be inventing a fact about how the customer
+               paid. An absent tender means unknown, not zero. */
             recordSuppliedTenders(input.tenders, {
                 invoiceId, actorUserId, now,
                 payablePaise: toPaise(serverTotal)

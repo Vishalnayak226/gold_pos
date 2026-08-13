@@ -40,11 +40,14 @@ This document contains key architectural details, non-negotiable design guidelin
   - **Per-line sums equal the header** — asserted in `test_concurrency.js` ("every concurrently
     written invoice is complete, with its line") and structurally in `saleService`, which derives
     both from one `computeInvoiceTotals()` call.
-  - **Tender sum = total is enforced only when the caller supplies tenders.** A sale with no tender
-    split writes no speculative tender — the Billing Desk does not yet capture one, and inventing a
-    "cash" row for the balance would be recording a fact about how the customer paid that nobody
-    established. An absent tender means unknown, not zero. Pass a real split through as
-    `input.tenders` and the balance assertion fires.
+  - **Tender sum = total is enforced whenever the caller supplies tenders — and the Billing Desk
+    now always does** (landed 2026-08-12), so the assertion is live on every desk sale rather than
+    theoretical. The desk defaults to a single cash row tracking the total, sends it *without* an
+    amount so the server's own total wins over a stale browser one, and sends explicit amounts once
+    the cashier splits. Tenders stay **optional on the API** because every invoice already on disk
+    has none and must stay readable — an absent tender means unknown, not zero, and a speculative
+    "cash" row for the balance would record a fact about how the customer paid that nobody
+    established. Covered by `test_http.js` §"Tenders".
   - **Beyond the routes themselves**, the cut-over also needs `customerAuth.js`'s
     `readAccounts`/`writeAccounts` pair (a two-function change — `customerRepository.loadAccounts`
     / `saveAccounts` already speak the exact legacy account shape), plus retiring the ledger seeds
