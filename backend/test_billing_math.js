@@ -30,7 +30,11 @@ import {
     computeAdvanceBalance,
     isCountableAdvance,
     normalizeAdvanceStatus,
-    summarizeAdvanceLedger
+    summarizeAdvanceLedger,
+    summarizeAdvanceLiability,
+    saleLines,
+    saleTotalWeight,
+    describeSaleGoods
 } from '../frontend/js/lib/billingMath.js';
 
 /* ==========================================================================
@@ -420,14 +424,32 @@ check('percent → amount → percent round-trips', () => {
    ========================================================================== */
 group('7. Input hardening');
 
+/**
+ * Every numeric member of a computeInvoiceTotals() result, flattened —
+ * top-level figures, the printed `components`, and each entry of the per-line
+ * `lines` allocation. The two guards below both need the same reach, and both
+ * need it to keep reaching new fields automatically: a money figure that
+ * escapes this walk is a money figure nothing is asserting anything about.
+ */
+function everyMoneyField(t) {
+    const flat = {};
+    const collect = (obj, prefix) => {
+        for (const [key, value] of Object.entries(obj)) {
+            if (key === 'taxMode' || key === 'components' || key === 'lines') continue;
+            flat[`${prefix}${key}`] = value;
+        }
+    };
+    collect(t, '');
+    collect(t.components || {}, 'components.');
+    (t.lines || []).forEach((line, i) => collect(line, `lines[${i}].`));
+    return flat;
+}
+
 check('empty inputs produce a zero bill, not NaN', () => {
     const t = computeInvoiceTotals();
-    // Every money field — top level and the per-line components — must be a
-    // real number. taxMode is the one non-numeric member and is asserted below.
-    const moneyFields = { ...t, ...t.components };
-    delete moneyFields.taxMode;
-    delete moneyFields.components;
-    for (const [key, value] of Object.entries(moneyFields)) {
+    // Every money field — top level, printed components, and per-line — must be
+    // a real number. taxMode is the one non-numeric member, asserted below.
+    for (const [key, value] of Object.entries(everyMoneyField(t))) {
         if (!Number.isFinite(value)) throw new Error(`${key} is ${value}`);
     }
     near(t.totalAmount, 0, 'totalAmount');
@@ -601,10 +623,7 @@ check('no returned money field carries sub-paise precision', () => {
                     discountPercent, taxSlab, taxMode,
                     appliedAdvance: 1234.567, customerAdvanceBalance: 1234.567
                 });
-                const fields = { ...t, ...t.components };
-                delete fields.taxMode;
-                delete fields.components;
-                for (const [key, value] of Object.entries(fields)) {
+                for (const [key, value] of Object.entries(everyMoneyField(t))) {
                     if (!isPaiseExact(value)) {
                         throw new Error(
                             `${key} = ${value} (${taxMode}, ${taxSlab}%, ${discountPercent}% off)`
@@ -761,6 +780,65 @@ check('an empty or malformed ledger summarises to zeroes rather than NaN', () =>
 check('pending totals settle to paise', () => {
     const s = summarizeAdvanceLedger([deposit(1000.005, 'pending'), deposit(0.004, 'pending')]);
     if (!isPaiseExact(s.pendingTotal)) throw new Error(`pendingTotal ${s.pendingTotal}`);
+});
+
+/* --------------------------------------------------------------------------
+   The store's whole advance liability — the Dashboard tile, now computed
+   server-side so the browser no longer downloads the ledger to add it up.
+   -------------------------------------------------------------------------- */
+
+/** A ledger row for a named customer, so the per-customer split can be tested. */
+function row(phone, type, amount, status = 'approved') {
+    return { customerPhone: phone, type, amount, status, timestamp: 1 };
+}
+
+check('liability sums each customer’s spendable balance', () => {
+    const s = summarizeAdvanceLiability([
+        row('9000000001', 'deposit', 10000),
+        row('9000000001', 'redeem', 4000),
+        row('9000000002', 'deposit', 2500)
+    ]);
+    exact(s.outstandingTotal, 8500, 'outstandingTotal');
+    exact(s.outstandingCustomers, 2, 'outstandingCustomers');
+});
+
+check('a customer with nothing left is not counted as owed', () => {
+    const s = summarizeAdvanceLiability([
+        row('9000000001', 'deposit', 5000),
+        row('9000000001', 'redeem', 5000),
+        row('9000000002', 'deposit', 1000)
+    ]);
+    exact(s.outstandingTotal, 1000, 'outstandingTotal');
+    exact(s.outstandingCustomers, 1, 'outstandingCustomers');
+});
+
+check('one customer over-redeemed cannot cancel out another’s real credit', () => {
+    // The floor is applied PER CUSTOMER. Summing raw deltas would report ₹0
+    // owed here and understate what the store actually holds.
+    const s = summarizeAdvanceLiability([
+        row('9000000001', 'redeem', 3000),
+        row('9000000002', 'deposit', 3000)
+    ]);
+    exact(s.outstandingTotal, 3000, 'outstandingTotal');
+    exact(s.outstandingCustomers, 1, 'outstandingCustomers');
+});
+
+check('an unapproved claim is not a liability but is reported alongside it', () => {
+    const s = summarizeAdvanceLiability([
+        row('9000000001', 'deposit', 10000),
+        row('9000000002', 'deposit', 7000, 'pending')
+    ]);
+    exact(s.outstandingTotal, 10000, 'outstandingTotal excludes the pending claim');
+    exact(s.outstandingCustomers, 1, 'outstandingCustomers');
+    exact(s.pendingTotal, 7000, 'pendingTotal');
+    exact(s.pendingCount, 1, 'pendingCount');
+});
+
+check('an empty or malformed ledger has no liability rather than NaN', () => {
+    const s = summarizeAdvanceLiability([null, undefined, {}]);
+    exact(s.outstandingTotal, 0, 'outstandingTotal');
+    exact(s.outstandingCustomers, 0, 'outstandingCustomers');
+    exact(summarizeAdvanceLiability(null).outstandingTotal, 0, 'null ledger');
 });
 
 /* ==========================================================================
@@ -1272,6 +1350,275 @@ check('a refund can never exceed what is left unrefunded on the invoice', () => 
     });
     exact(r.ok, true, 'ok');
     exact(r.refundAmount <= 430, true, `refund capped at the remainder, got ${r.refundAmount}`);
+});
+
+/* ==========================================================================
+   16. MULTI-LINE INVOICES
+
+   One invoice, several items, each with its own purity, rate, making charge and
+   discount. Two properties matter more than any individual figure:
+
+     (a) A one-line invoice must price EXACTLY as it did before lines existed,
+         to the paise. Every check above this section is that assertion.
+     (b) The rows must sum to the header. A customer adding up a printed column
+         has to arrive at the total, at every slab, in both tax modes.
+
+   (b) is asserted as an identity over a spread of slabs and discounts rather
+   than against hand-worked figures, because it is the identity — not any one
+   number — that the allocation exists to guarantee.
+   ========================================================================== */
+group('16. Multi-line invoices');
+
+// Line 1: 10 g 22K @ ₹7,500 = ₹75,000 metal, 8% making = ₹6,000.
+// Line 2:  5 g 18K @ ₹6,000 = ₹30,000 metal, 10% making = ₹3,000.
+const TWO_LINES = [
+    { metalValue: 75000, makingChargeAmount: 6000, discountPercent: 0 },
+    { metalValue: 30000, makingChargeAmount: 3000, discountPercent: 0 }
+];
+
+check('a two-line invoice grosses the sum of its lines (₹1,14,000)', () => {
+    near(computeInvoiceTotals({ lines: TWO_LINES, taxSlab: 3, taxMode: 'Exclusive' }).preTaxTotal,
+        114000, 'preTaxTotal');
+});
+
+check('3% GST on ₹1,14,000 is ₹3,420, total ₹1,17,420', () => {
+    const t = computeInvoiceTotals({ lines: TWO_LINES, taxSlab: 3, taxMode: 'Exclusive' });
+    near(t.taxAmount, 3420, 'taxAmount');
+    near(t.totalAmount, 117420, 'totalAmount');
+});
+
+check('a two-line invoice equals the single-line invoice of its summed values', () => {
+    // The load-bearing compatibility claim: splitting a bill into lines must not
+    // move a paise of it.
+    const split = computeInvoiceTotals({ lines: TWO_LINES, taxSlab: 3, taxMode: 'Exclusive' });
+    const whole = computeInvoiceTotals({
+        metalValue: 105000, makingChargeAmount: 9000, taxSlab: 3, taxMode: 'Exclusive'
+    });
+    for (const key of ['preTaxTotal', 'discountAmount', 'taxableAmount', 'taxAmount', 'totalAmount']) {
+        near(split[key], whole[key], key);
+    }
+});
+
+check('one line in, one line out — and it equals the header', () => {
+    const t = computeInvoiceTotals(EXCL_BASE);
+    exact(t.lines.length, 1, 'line count');
+    near(t.lines[0].taxableAmount, t.taxableAmount, 'line taxable');
+    near(t.lines[0].taxAmount, t.taxAmount, 'line tax');
+    near(t.lines[0].lineTotal, t.totalBeforeAdvance, 'line total');
+});
+
+check('the rows sum to the header at every slab, in both modes, with any discount', () => {
+    const lines = [
+        { metalValue: 75000, makingChargeAmount: 6000, discountPercent: 0 },
+        { metalValue: 30000, makingChargeAmount: 3000, discountPercent: 7.5 },
+        { metalValue: 1234.56, makingChargeAmount: 99.99, discountPercent: 33.33 },
+        // A zero-value line (a fully discounted giveaway) must not break the
+        // weighting or steal a residual paise from a real line.
+        { metalValue: 0, makingChargeAmount: 0, discountPercent: 0 }
+    ];
+    for (const taxMode of ['Exclusive', 'Inclusive']) {
+        for (const taxSlab of [0, 3, 5, 12, 18, 28]) {
+            const t = computeInvoiceTotals({ lines, taxSlab, taxMode });
+            const where = `${taxMode} @ ${taxSlab}%`;
+            near(round2(t.lines.reduce((s, l) => s + l.taxableAmount, 0)), t.taxableAmount, `taxable sum, ${where}`);
+            near(round2(t.lines.reduce((s, l) => s + l.taxAmount, 0)), t.taxAmount, `tax sum, ${where}`);
+            near(round2(t.lines.reduce((s, l) => s + l.lineTotal, 0)), t.totalBeforeAdvance, `total sum, ${where}`);
+        }
+    }
+});
+
+check('a per-line discount applies to that line alone', () => {
+    // Line 2 is 25% off: ₹33,000 × 0.25 = ₹8,250 off, nothing off line 1.
+    const t = computeInvoiceTotals({
+        lines: [
+            { metalValue: 75000, makingChargeAmount: 6000, discountPercent: 0 },
+            { metalValue: 30000, makingChargeAmount: 3000, discountPercent: 25 }
+        ],
+        taxSlab: 0, taxMode: 'Exclusive'
+    });
+    near(t.discountAmount, 8250, 'invoice discount');
+    near(t.lines[0].discountAmount, 0, 'line 1 discount');
+    near(t.lines[1].discountAmount, 8250, 'line 2 discount');
+    near(t.totalAmount, 105750, 'totalAmount');
+});
+
+check('a line with no discount of its own inherits the invoice discount', () => {
+    const t = computeInvoiceTotals({
+        lines: [{ metalValue: 75000, makingChargeAmount: 6000 }, { metalValue: 30000, makingChargeAmount: 3000 }],
+        discountPercent: 10, taxSlab: 0, taxMode: 'Exclusive'
+    });
+    near(t.discountAmount, 11400, 'invoice discount (10% of ₹1,14,000)');
+});
+
+check('the advance still redeems against the invoice, not against a line', () => {
+    const t = computeInvoiceTotals({
+        lines: TWO_LINES, taxSlab: 3, taxMode: 'Exclusive',
+        appliedAdvance: 20000, customerAdvanceBalance: 20000
+    });
+    near(t.appliedAdvance, 20000, 'appliedAdvance');
+    near(t.totalAmount, 97420, 'totalAmount after advance');
+    // No line carries a share of it — a redemption settles the document.
+    near(round2(t.lines.reduce((s, l) => s + l.lineTotal, 0)), 117420, 'rows still gross');
+});
+
+/* ==========================================================================
+   17. READING A STORED SALE — old shape and new
+
+   saleLines() is the seam that lets a multi-line rollout keep every invoice
+   already on disk reprintable and returnable.
+   ========================================================================== */
+group('17. Reading a stored sale of either shape');
+
+const SALE_MULTI = {
+    id: 'GOLD-000009-26',
+    lines: [
+        {
+            lineNumber: 1, description: 'Bangles', purity: '22K', weightGrams: 10,
+            goldPricePerGram: 7500, grossMetalValue: 75000,
+            makingChargePercent: 8, grossMakingCharge: 6000, discountPercent: 0,
+            taxableAmount: 81000, taxAmount: 2430, lineTotal: 83430
+        },
+        {
+            lineNumber: 2, description: 'Chain', purity: '18K', weightGrams: 5,
+            goldPricePerGram: 6000, grossMetalValue: 30000,
+            makingChargePercent: 10, grossMakingCharge: 3000, discountPercent: 0,
+            taxableAmount: 33000, taxAmount: 990, lineTotal: 33990
+        }
+    ],
+    metalValue: 105000,
+    makingChargeAmount: 9000,
+    discountPercent: 0,
+    taxPercent: 3,
+    taxMode: 'Exclusive',
+    taxableAmount: 114000,
+    taxAmount: 3420,
+    appliedAdvance: 0,
+    totalAmount: 117420
+};
+
+check('a legacy scalar sale reads as exactly one line', () => {
+    const lines = saleLines(SALE_EXCL);
+    exact(lines.length, 1, 'line count');
+    exact(lines[0].purity, '22K', 'purity');
+    near(lines[0].weightGrams, 10, 'weightGrams');
+    near(lines[0].goldPricePerGram, 7500, 'rate');
+    near(lines[0].makingChargeAmount, 6000, 'making charge');
+});
+
+check('a multi-line sale reads back its own lines', () => {
+    const lines = saleLines(SALE_MULTI);
+    exact(lines.length, 2, 'line count');
+    exact(lines[1].purity, '18K', 'line 2 purity');
+    near(lines[1].goldPricePerGram, 6000, 'line 2 rate');
+});
+
+check('total weight sums across lines', () => {
+    near(saleTotalWeight(SALE_MULTI), 15, 'multi-line weight');
+    near(saleTotalWeight(SALE_EXCL), 10, 'legacy weight');
+});
+
+check('a sale is described in one phrase, whichever shape it is', () => {
+    exact(describeSaleGoods(SALE_EXCL), '22K · 10.000g', 'legacy');
+    exact(describeSaleGoods(SALE_MULTI), '2 items · 22K, 18K · 15.000g', 'multi-line');
+});
+
+/* ==========================================================================
+   18. RETURNING ONE LINE OF A MULTI-LINE INVOICE
+
+   A return has to name its line. A cart holding 22K bangles at ₹7,500 and an
+   18K chain at ₹6,000 has two rates on it, so "5 g came back" cannot be priced
+   until it is known which 5 g — pricing it against the wrong line would refund
+   money the store never charged.
+   ========================================================================== */
+group('18. Returning one line of a multi-line invoice');
+
+check('a multi-line invoice refuses a return that does not name a line', () => {
+    const r = computeReturnRefund({ sale: SALE_MULTI, returnWeightGrams: 5 });
+    exact(r.ok, false, 'refused');
+    exact(/several items/i.test(r.error), true, `error names the ambiguity, got: ${r.error}`);
+});
+
+check('a single-line invoice still needs no line number', () => {
+    const r = computeReturnRefund({ sale: SALE_EXCL, returnWeightGrams: 10 });
+    exact(r.ok, true, 'ok');
+    near(r.refundAmount, 83430, 'refundAmount');
+});
+
+check('an unknown line number is refused', () => {
+    exact(computeReturnRefund({ sale: SALE_MULTI, returnWeightGrams: 1, lineNumber: 7 }).ok,
+        false, 'refused');
+});
+
+check('returning line 2 in full refunds line 2 only (₹33,990)', () => {
+    const r = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 5, lineNumber: 2,
+        invoiceRemainingGrams: 15
+    });
+    exact(r.ok, true, 'ok');
+    // 5 g @ ₹6,000 = ₹30,000 metal + ₹3,000 making = ₹33,000 + 3% = ₹33,990.
+    near(r.refundAmount, 33990, 'refundAmount');
+    exact(r.purity, '18K', 'priced at line 2 purity');
+    near(r.goldPricePerGram, 6000, 'priced at line 2 rate');
+    exact(r.closesLine, true, 'closes the line');
+    exact(r.closesInvoice, false, 'does NOT close the invoice — line 1 is untouched');
+});
+
+check('returning line 1 is priced at line 1 rate, not line 2', () => {
+    const r = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 10, lineNumber: 1,
+        invoiceRemainingGrams: 15
+    });
+    exact(r.ok, true, 'ok');
+    near(r.refundAmount, 83430, 'refundAmount');
+    near(r.goldPricePerGram, 7500, 'priced at line 1 rate');
+});
+
+check('a partial return off one line is priced pro-rata within that line', () => {
+    // 2 of line 2's 5 g: ₹12,000 metal + ₹1,200 making = ₹13,200 + 3% = ₹13,596.
+    const r = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 2, lineNumber: 2,
+        invoiceRemainingGrams: 15
+    });
+    exact(r.ok, true, 'ok');
+    near(r.refundAmount, 13596, 'refundAmount');
+    near(r.remainingWeightAfter, 3, 'line remainder');
+});
+
+check("a line's remainder is its own, not the invoice's", () => {
+    // Line 2 is fully returned; a further gram off it is refused even though
+    // line 1 still has 10 g of returnable weight on the same invoice.
+    const r = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 1, lineNumber: 2,
+        alreadyReturnedGrams: 5, invoiceRemainingGrams: 10
+    });
+    exact(r.ok, false, 'refused');
+    exact(/line 2/i.test(r.error), true, `error names the line, got: ${r.error}`);
+});
+
+check('returning every line sums to exactly what the invoice charged', () => {
+    // Line 2 first, then line 1 closing the invoice — the second is trued up to
+    // the unrefunded remainder, so the two refunds must total ₹1,17,420 to the
+    // paise however the invoice was split up.
+    const first = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 5, lineNumber: 2, invoiceRemainingGrams: 15
+    });
+    const second = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 10, lineNumber: 1,
+        invoiceRemainingGrams: 10, alreadyRefundedAmount: first.refundAmount
+    });
+    exact(second.closesInvoice, true, 'the second return closes the invoice');
+    near(round2(first.refundAmount + second.refundAmount), 117420, 'refunds sum to the filed gross');
+});
+
+check('a multi-line refund still itemises into a printable breakdown', () => {
+    const r = computeReturnRefund({
+        sale: SALE_MULTI, returnWeightGrams: 5, lineNumber: 2, invoiceRemainingGrams: 15
+    });
+    exact(r.itemised, true, 'itemised');
+    near(round2(r.components.taxableAmount + r.components.taxAmount), r.refundAmount,
+        'the breakdown adds up to the refund');
+    near(r.components.taxableAmount, 33000, 'taxable');
+    near(r.components.taxAmount, 990, 'tax');
 });
 
 /* ==========================================================================

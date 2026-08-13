@@ -10,8 +10,44 @@ not every turn. This file is auto-loaded on every request, so it stays tight.
 
 ## 0. Stack posture — decided, then held
 
-- Language / runtime: **Node.js ≥18, ESM (`"type": "module"`) throughout. Express 4 only.**
-- Data store: **flat JSON files under `backend/data/`, written via `backend/db.js`. No SQL, no ORM, no DB server.**
+- Language / runtime: **Node.js ≥24, ESM (`"type": "module"`) throughout. Express 4 only.** The floor
+  is 24 (not 20) because `node:sqlite` is only stable and flag-free from 24 — see ADR-001.
+- Data store: **SQLite, via the stdlib `node:sqlite`, one database file per tenant. No ORM, no DB
+  server, and no new dependency — it is in the standard library.** All access goes through
+  `backend/repositories/`; **no SQL string appears above that seam**, because the seam is what keeps
+  the documented move to PostgreSQL a swap rather than a rewrite (ADR-001 §3).
+  - **Config stays JSON on purpose.** `settings.json` and `license.json` are configuration, not
+    ledger, and keep their existing mechanism — `defaultSettings.js` + `migrateSettings()`, the
+    additive migration path §1 already mandates. Do not move them into SQL.
+  - **NO CREDENTIAL MAY EVER SIT IN `DEFAULT_SETTINGS`.** `getDefaultSettings()` is merged over a
+    tenant's `settings.json` on *every* boot, so a secret in the template is re-added immediately
+    after anything deletes it — which is exactly how a plaintext `adminPin: "1234"` silently
+    resurrected itself beside the hash that had just replaced it. Credentials are **seeded**, not
+    merged: `migratePinsToHashes()` in `backend/adminAuth.js` owns `authSalt`, `adminPinHash` and
+    every `operators[].pinHash`, hashes any plaintext it finds, deletes it, and establishes the
+    documented default only when no hash exists at all. That function is the single writer.
+  - **PINs and TOTP secrets are scrypt-hashed, in the one shared `scrypt$N$r$p$<hex>` format**
+    `customerAuth.js` already uses. One tenant-wide `authSalt` is deliberate — a PIN-only login has
+    no username to look a per-user salt up by, so a per-operator salt would mean one scrypt call
+    per operator per attempt. The consequence (equal PINs hash equally) is safe *only because*
+    duplicate PINs are refused outright; do not relax that check.
+  - **Ledger JSON is legacy and mid-migration.** `advances`, `sales_*`, `customer_auth`,
+    `payment_orders` and `payment_events` still live in `backend/data/*.json` and `server.js` still
+    reads them — the SQLite schema exists but the routes have not been cut over yet. Add **no new**
+    JSON ledger document and **no new** `readJSON`/`writeJSON` caller: that path is being deleted,
+    and anything added to it now is work that has to be migrated twice.
+  - **A sale record is BOTH shapes at once, on purpose.** It carries `lines[]` (per item: purity,
+    weight, rate, making charge, discount, and that line's allocated share of the taxable value and
+    GST) *and* the flat scalar rollup it always had. The rollup is what keeps every pre-multi-line
+    reader working; `lines` is what the invoice actually is. Read it through `saleLines()` in
+    `frontend/js/lib/billingMath.js` — never branch on `Array.isArray(sale.lines)` at a call site.
+    Two invariants hold and are asserted in `test_billing_math.js` §16:
+    **the per-line figures always sum exactly to the header**, and **a one-line invoice prices to
+    the paise exactly as it did before lines existed.** Both are easy to break and neither is
+    visible without the tests.
+  - **`purity: 'MIXED'` and `goldPricePerGram: 0`** on the rollup mean "this invoice has more than
+    one of these". They are not sentinels to test for — they are what an honest answer looks like
+    when no single value exists. Do not "fix" them to line 1's value.
 - Frontend posture: **vanilla JS/CSS/HTML in `frontend/`, served statically off disk by `backend/server.js`. No framework.**
 - Build step: **none.** `frontend/package.json` exists only to mark `js/lib/` as ESM so Node tests can import it — it is never installed and never bundled.
 - Dependency budget: **the 7 runtime deps in `backend/package.json` (cors, dotenv, express, helmet, node-cron, nodemailer, qrcode) + the 3 in `licensing_server/`. That is the whole budget.** Adding another is a deliberate, announced decision.
@@ -35,8 +71,8 @@ Three separately-run Node processes, not one app: `backend/` (POS, :5000), `lice
   way that cannot be applied to a live `backend/data/` directory.
 - **Reuse the existing pattern; never introduce a parallel third way to do the same thing.**
   Before building a mechanism, find the one this codebase already has for that job and extend it
-  — the `frontend/js/lib/billingMath.js` helpers for any pricing/rounding math, `db.js`'s
-  read/write/log helpers for any persistence, the existing component pattern under
+  — the `frontend/js/lib/billingMath.js` helpers for any pricing/rounding math, the repository for
+  that domain under `backend/repositories/` for any persistence, the existing component pattern under
   `frontend/js/components/` for any new screen. Two ways to do a thing is a bug that compounds.
 - **Attach shared fixes at the single choke point every caller already runs through** — the one
   validator, the one error-response writer, the one client-side error handler — instead of
@@ -52,8 +88,13 @@ Three separately-run Node processes, not one app: `backend/` (POS, :5000), `lice
   user would**, rather than assuming they are accurate. If reality has drifted from the doc, fix
   the doc. If the doc exposes a real gap, fix the app.
 - The bar is: **the user should find minimal changes needed when they test it themselves.**
-- Money math is not "probably fine." Any change touching pricing, making charges, wastage, GST,
-  advances, or rounding must be covered by `backend/test_billing_math.js` before it is called done.
+- Money math is not "probably fine." Any change touching pricing, making charges, invoice lines,
+  tenders, GST, advances, returns, or rounding must be covered by `backend/test_billing_math.js`
+  before it is called done.
+  - **Wastage is not in this list because it does not exist.** There is no wastage field, helper,
+    setting or test anywhere in the tree; it was named here before it was ever built. It is a
+    planned SKU-catalogue attribute — see `docs/PRODUCTION_READINESS_ROADMAP.md` Phase 5 — and
+    stays out of this rule until somebody scopes it. Corrected 2026-08-12.
 
 ## 3. Third principle: take full control of routine execution
 
@@ -144,7 +185,7 @@ A knowledge graph of this tree lives in `graphify-out/` (gitignored). A `PreTool
 
 ### The brain
 
-`docs/brain/` is the **curated read of that graph** — every file in the tree filed into 18 regions
+`docs/brain/` is the **curated read of that graph** — every file in the tree filed into 19 regions
 across 5 lobes, as Markdown (`BRAIN.md`) and as an interactive page (`brain.html`). Use it to
 orient on *where something lives and what it touches* before grepping.
 
@@ -200,25 +241,47 @@ wrong answers.
 
 ## 8. Testing posture
 
-- `cd backend && npm test` runs five suites in order and exits non-zero on any failure:
-  `test_billing_math.js` (pricing/rounding) → `test_suite.js` (helper-level integration) →
-  `test_routes.js` (routes + auth boundary) → `test_http.js` (money paths, Razorpay webhook,
-  returns/refunds) → `test_production_guard.js` (fail-closed startup). **216 checks as of
-  2026-08-11.**
+- `cd backend && npm test` runs eight suites in order and exits non-zero on any failure:
+  `test_billing_math.js` (pricing/rounding) → `test_schema.js` (migrations + every SQL constraint,
+  asserted by attempting the violation) → `test_repositories.js` (the repository seam, the legacy
+  wire-shape projections, pagination, the JSON importer) → `test_concurrency.js` (real OS processes:
+  concurrent writers, crash injection, duplicate requests, migration drift) → `test_suite.js`
+  (helper-level integration) → `test_routes.js` (routes + auth boundary) → `test_http.js` (money
+  paths, Razorpay webhook, returns/refunds, multi-line invoices, tenders, actor identity, paged
+  ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
+  `test_production_guard.js` (fail-closed startup). **403 checks as of 2026-08-13**
+  (140 + 43 + 71 + 16 + 9 + 28 + 80 + 16, in run order — `test_suite.js` is counted by the nine
+  numbered tests it prints, not by an older tally that no longer matched anything).
+  - `test_concurrency.js` spawns child processes and is the slowest suite by far (~1–2 min). It is
+    in `npm test` anyway, because the properties it asserts — one balance cannot be spent twice, a
+    kill mid-sale leaves nothing behind — are not observable any other way.
 - **No suite touches `backend/data/`.** Each one that needs a database makes its own temp
   directory via `GOLD_POS_DATA_DIR`, so all of them are safe to run alongside a dev server on
   :5000. Keep it that way — fixture debris in a real ledger looks exactly like a real bug.
   **Set that env var at the TOP of a suite file, before anything imports `db.js`** — `db.js`
   resolves `DATA_DIR` once at import and ESM caches the module, so redirecting it inside a test
   function is too late and silently writes into the tenant's real ledger.
+  - **A STATIC IMPORT IS ALREADY TOO LATE.** ESM hoists every `import` above the
+    `process.env.GOLD_POS_DATA_DIR = …` line, so `import { x } from './adminAuth.js'` at the top of
+    a suite pins that whole suite to the real `backend/data`. This is not hypothetical: on
+    2026-08-13 exactly that import made `test_http.js` boot against the live tenant and migrate its
+    `settings.json` before the 401 gave it away. Pull anything that reaches `db.js` in with a
+    **dynamic `await import()`** placed after the env assignments — `test_http.js` and
+    `test_routes.js` both show the pattern, and `test_routes.js` additionally *unsets* the vars
+    afterwards because `GOLD_POS_DATA_DIR` outranks the `GOLDPOS_DATA_DIR` its child spawn passes.
+  - Only `defaultSettings.js` is safe to import statically from a suite; it is side-effect-free by
+    design and has no path to `db.js`. Keep it that way.
 - **`npm run test:e2e` (Playwright) is deliberately NOT in `npm test`.** It needs an installed
   browser binary, and `npm test` must keep running on a bare checkout with nothing installed.
   One-off setup: `npm install && npx playwright install chromium`. **43 journeys as of
-  2026-08-11** (cashier, customer portal at desktop + 390px mobile, reprint desk, return desk).
+  2026-08-12** (cashier, customer portal at desktop + 390px mobile, reprint desk, return desk).
+  - The Billing Desk's readiness signal for these specs is `#sales-tab[data-desk-ready="true"]`,
+    set at the end of `BillingDesk.init()`. Do not go back to inferring readiness from a rendered
+    figure — the invoice preview is a per-line table now and shows nothing until an item exists.
 - `npm run seed` builds a deterministic, synthetic database to click through by hand. It refuses
   to write into `backend/data/` without `--force`.
 - Money math changes still have to land in `test_billing_math.js` (§2) — including anything
-  touching `toPaise`/`fromPaise`/`computeMetalValue`/`computeReturnRefund`, which live in
+  touching `toPaise`/`fromPaise`/`computeMetalValue`/`computeReturnRefund`/`saleLines`, which live in
   `frontend/js/lib/billingMath.js` with the rest of it, not in `server.js`.
 - Record known-flaky, known-benign failures here by name with the reason. An unexplained red test
   trains everyone to ignore red tests.

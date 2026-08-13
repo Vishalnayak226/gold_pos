@@ -59,7 +59,22 @@ export const DEFAULT_SETTINGS = {
     // is worse than no callback at all.
     razorpayWebhookSecret: "",
     upiId: "",
-    adminPin: "1234",
+    /* THERE IS DELIBERATELY NO `adminPin` KEY HERE, and this is load-bearing.
+
+       It used to hold the plaintext default "1234". That could not stay, because
+       getDefaultSettings() is merged over a tenant's settings.json on every
+       boot: migratePinsToHashes() would hash the PIN and delete the plaintext,
+       and the very next boot would MERGE THE PLAINTEXT DEFAULT STRAIGHT BACK IN.
+       The hashing would appear to work and quietly undo itself, leaving a
+       resurrected "1234" on disk beside a hash of the real PIN.
+
+       So the master credential now exists only as `adminPinHash`, and it is
+       seeded — not merged — by migratePinsToHashes() in backend/adminAuth.js:
+       that function hashes any plaintext it finds (the upgrade path for an
+       existing tenant), and if no hash exists at all it establishes one from the
+       documented default so a fresh install still opens with 1234. `authSalt` is
+       likewise generated per tenant there and is absent here on purpose — a
+       shared default salt would defeat the point of having one. */
     overrideGoldPrice: {
         active: false,
         price24K: 0.0,
@@ -67,6 +82,42 @@ export const DEFAULT_SETTINGS = {
         price18K: 0.0
     },
     currency: "INR",
+    /* Named people who work the counter — the reason a financial record can say
+       WHO made it.
+
+       Empty by default, and an empty list is a fully working configuration: the
+       install falls back to `adminPin` above, which authenticates as the store
+       owner (see resolveActor in backend/adminAuth.js). A store that wants
+       per-cashier attribution — or the manager approval a manual-UPI deposit
+       needs — adds people here, each with their own PIN.
+
+       Shape: { id, name, role, pin, active }
+       Roles are exactly the four the SQL schema already defines
+       (backend/repositories/migrations/001_initial_schema.sql):
+         owner    — full access, may approve money claims
+         manager  — may approve money claims
+         cashier  — bills and returns, may NOT approve
+         auditor  — read-only
+       Each operator's PIN is stored only as a scrypt `pinHash`; the plaintext
+       `pin` an older build wrote is migrated away and deleted on the next boot.
+       An operator may additionally enrol an authenticator app, which adds
+       `mfaEnabled`, `totpSecret` and hashed `recoveryCodes` — none of which ever
+       reach a browser. */
+    operators: [],
+    /* Require a second factor to release money.
+       When true, approving or rejecting a customer's unverified deposit — and
+       authorising a refund at or above the threshold below — needs a session that
+       passed TOTP at sign-in, not merely an approving role. The shared master PIN
+       cannot satisfy it (there is no person to enrol), which is deliberate: it is
+       what moves a store onto named logins. Off by default so an existing install
+       keeps working untouched. */
+    requireMfaForApprovers: false,
+    /* Refund value at or above which an owner/manager must authorise the refund.
+       A cash refund is the one counter action that takes money out of the till on
+       a cashier's own say-so. 0 disables the control — which is the previous
+       behaviour, and therefore the default, so no existing store is surprised by
+       a refusal it did not ask for. */
+    refundApprovalThreshold: 0,
     // Origin this install is reachable at from the public internet, e.g.
     // "https://pos.example.com". Razorpay needs it to deliver webhooks, so a
     // production process without it can take money it will never hear back
@@ -105,7 +156,35 @@ export function getDefaultSettings() {
    address nested objects (see NESTED_SETTINGS_KEYS).
    ========================================================================== */
 
-export const SECRET_SETTINGS_KEYS = ['razorpayKeySecret', 'razorpayWebhookSecret', 'adminPin', 'smtp.pass'];
+export const SECRET_SETTINGS_KEYS = [
+    'razorpayKeySecret', 'razorpayWebhookSecret', 'smtp.pass',
+    // PINs are scrypt hashes now rather than plaintext, but a hash of a 4-digit
+    // PIN is still a crackable credential — a 10,000-value keyspace falls to an
+    // offline grind in minutes. So the hashes are masked out of the support
+    // export too, alongside the tenant salt that would make that grind cheaper
+    // still. `adminPin` stays listed because a settings.json restored from an old
+    // backup can still contain one until the boot migration converts it.
+    'adminPin', 'adminPinHash', 'authSalt',
+    // `*` matches every index of an array. Operator credentials sit in the same
+    // document as the company address and the Settings screen loads the whole
+    // document — so they mask through this one mechanism rather than a second,
+    // parallel rule that could be forgotten. `totpSecret` is the one that matters
+    // most: it is a bearer secret, and anyone holding it can generate valid codes
+    // forever.
+    'operators.*.pin', 'operators.*.pinHash', 'operators.*.totpSecret'
+];
+
+/** Roles an operator may hold — the four the SQL schema defines. */
+export const OPERATOR_ROLES = ['owner', 'manager', 'cashier', 'auditor'];
+
+/**
+ * Roles entitled to approve a money claim.
+ *
+ * Mirrors the `approvers` view in the SQL schema, which is the authority once
+ * the ledger moves to SQLite. Stated once here so a new role cannot quietly
+ * gain approval rights by being missed in a comparison somewhere.
+ */
+export const APPROVER_ROLES = ['owner', 'manager'];
 
 /**
  * What the browser sees in place of a real secret.
@@ -117,7 +196,34 @@ export const SECRET_SETTINGS_KEYS = ['razorpayKeySecret', 'razorpayWebhookSecret
  */
 export const REDACTED_SENTINEL = '••••••••';
 
+/**
+ * Every concrete path a (possibly wildcarded) secret path addresses in `obj`.
+ *
+ * `smtp.pass` resolves to itself. `operators.*.pin` resolves to
+ * `operators.0.pin`, `operators.1.pin`, … for however many operators the tenant
+ * has configured — so redaction covers a list whose length is not known until
+ * runtime, without either loop needing to know that an array is involved.
+ */
+function expandPath(obj, dotted) {
+    let paths = [[]];
+    for (const key of dotted.split('.')) {
+        const next = [];
+        for (const prefix of paths) {
+            if (key !== '*') {
+                next.push([...prefix, key]);
+                continue;
+            }
+            const node = getByPath(obj, prefix.join('.'));
+            if (!Array.isArray(node)) continue;
+            node.forEach((_, index) => next.push([...prefix, String(index)]));
+        }
+        paths = next;
+    }
+    return paths.map(parts => parts.join('.'));
+}
+
 function getByPath(obj, dotted) {
+    if (dotted === '') return obj;
     return dotted.split('.').reduce((node, key) => (node == null ? undefined : node[key]), obj);
 }
 
@@ -143,31 +249,24 @@ function setByPath(obj, dotted, value) {
  */
 export function redactSettings(settings) {
     const safe = JSON.parse(JSON.stringify(settings ?? {}));
-    for (const dotted of SECRET_SETTINGS_KEYS) {
-        const value = getByPath(safe, dotted);
-        if (value === undefined || value === null) continue;
-        setByPath(safe, dotted, String(value).length > 0 ? REDACTED_SENTINEL : '');
+    for (const pattern of SECRET_SETTINGS_KEYS) {
+        for (const dotted of expandPath(safe, pattern)) {
+            const value = getByPath(safe, dotted);
+            if (value === undefined || value === null) continue;
+            setByPath(safe, dotted, String(value).length > 0 ? REDACTED_SENTINEL : '');
+        }
     }
     return safe;
 }
 
-/**
- * The inverse, applied to an inbound settings payload before it is persisted.
+/*
+ * There is deliberately NO unredactSettings() here.
  *
- * The Settings screen is a read-modify-write form: it renders whatever GET
- * returned and posts the fields back. Without this, saving an unrelated
- * section (say the company address) would write the literal mask over the
- * tenant's real SMTP password and silently break report emails. Any secret
- * that comes back still equal to the mask is restored from `current`; a field
- * the admin genuinely retyped no longer matches, so it saves normally.
- *
- * Mutates and returns `incoming`.
+ * There used to be — a mirror of the above that swapped the mask back for the
+ * stored credential on the way in — and nothing ever called it. The live write
+ * path (POST /api/settings) masks with `null` + a `*Configured` flag and
+ * restores through preserveWriteOnlyValue() in server.js instead, so a second
+ * unredaction mechanism was one more way for the two to disagree about what a
+ * masked field means. redactSettings() above is used by the support export,
+ * which is one-way by definition: nothing is ever read back out of it.
  */
-export function unredactSettings(incoming, current) {
-    for (const dotted of SECRET_SETTINGS_KEYS) {
-        if (getByPath(incoming, dotted) !== REDACTED_SENTINEL) continue;
-        const stored = getByPath(current, dotted);
-        setByPath(incoming, dotted, stored === undefined || stored === null ? '' : stored);
-    }
-    return incoming;
-}

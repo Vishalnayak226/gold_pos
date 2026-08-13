@@ -1,19 +1,30 @@
-name: Daily Bug & Security Detection
+name: CI — tests & security audit
 
 # Detection only — this workflow never deploys or auto-patches anything.
 # It runs the integration test suite plus a dependency vulnerability audit
-# once a day and on every push, and fails loudly (visible here in the
-# Actions tab, and to anyone with notifications on for this repo) if either
-# finds something. Turning a finding into a shipped patch is still a human
-# decision: fix it, review it, then publish it through the licensing
-# server's release registry (see docs/ai_handover.md §7) — security-channel
-# releases auto-apply to tenants after that; nothing here does.
+# and fails loudly (visible here in the Actions tab, and to anyone with
+# notifications on for this repo) if either finds something. Turning a
+# finding into a shipped patch is still a human decision: fix it, review it,
+# then publish it through the licensing server's release registry (see
+# docs/ai_handover.md §7) — security-channel releases auto-apply to tenants
+# after that; nothing here does.
+#
+# This is the only gate that needs NO infrastructure: it runs entirely on a
+# GitHub runner, so it is green-able long before a VPS or domain exists. The
+# cd-*.yml workflows re-run the same two jobs before they deploy.
+#
+# Triggers deliberately include pull_request on every branch. Until
+# 2026-08-11 this fired only on push-to-main and the nightly cron, so on a
+# repo where all work happens on feature branches and main is only ever
+# fast-forwarded, the gate had never executed once.
 
 on:
   schedule:
     - cron: '0 3 * * *' # 03:00 UTC daily
   push:
-    branches: [main]
+    branches: [main, develop, staging]
+  pull_request:
+    branches: ['**']
   workflow_dispatch: {}
 
 jobs:
@@ -24,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Install backend dependencies
         working-directory: backend
         run: npm ci --no-audit --no-fund
@@ -42,7 +53,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Install ${{ matrix.module }} dependencies
         working-directory: ${{ matrix.module }}
         run: npm ci --no-audit --no-fund

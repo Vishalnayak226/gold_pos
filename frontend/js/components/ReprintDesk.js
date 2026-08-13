@@ -1,5 +1,5 @@
 import { adminFetch, logTelemetry } from '../app.js';
-import { computeInvoiceTotals, normalizeTaxMode } from '../lib/billingMath.js';
+import { computeInvoiceTotals, normalizeTaxMode, saleLines, describeSaleGoods } from '../lib/billingMath.js';
 
 /**
  * Money for the invoice, always to the paise. Same contract as BillingDesk's
@@ -207,6 +207,7 @@ export class ReprintDesk {
                 <td>${escapeHtml(formatWhen(sale.timestamp))}</td>
                 <td>${escapeHtml(sale.customerName || 'Cash Sale')}</td>
                 <td>${escapeHtml(sale.customerPhone || '—')}</td>
+                <td>${escapeHtml(describeSaleGoods(sale))}</td>
                 <td class="text-right">${money(sale.totalAmount)}</td>
                 <td class="text-right">
                     <button type="button" class="btn btn-secondary btn-sm reprint-open-btn"
@@ -227,6 +228,7 @@ export class ReprintDesk {
                         <th>Saved</th>
                         <th>Customer</th>
                         <th>Phone</th>
+                        <th>Goods</th>
                         <th class="text-right">Total</th>
                         <th class="text-right">Reprint</th>
                     </tr>
@@ -270,9 +272,17 @@ export class ReprintDesk {
     derivePrintedRows(sale) {
         const legacy = sale.taxableAmount === undefined || sale.taxAmount === undefined;
 
+        // Rebuilt from the invoice's OWN lines, whether it stored several or is
+        // a pre-multi-line record that saleLines() reads as one. Passing the
+        // rolled-up scalars instead would reconcile a mixed-purity invoice
+        // against an average rate it was never billed at.
+        const lines = saleLines(sale);
         const totals = computeInvoiceTotals({
-            metalValue: sale.metalValue,
-            makingChargeAmount: sale.makingChargeAmount,
+            lines: lines.map(l => ({
+                metalValue: l.metalValue,
+                makingChargeAmount: l.makingChargeAmount,
+                discountPercent: l.discountPercent
+            })),
             discountPercent: sale.discountPercent,
             taxSlab: sale.taxPercent,
             taxMode: sale.taxMode,
@@ -286,7 +296,7 @@ export class ReprintDesk {
             && Math.abs(totals.totalAmount - Number(sale.totalAmount)) < 0.01
             && Math.abs(totals.taxAmount - Number(sale.taxAmount)) < 0.01;
 
-        return { rows: totals.components, agrees, legacy };
+        return { rows: totals.components, lines, agrees, legacy };
     }
 
     renderInvoice(sale) {
@@ -294,7 +304,7 @@ export class ReprintDesk {
         const container = document.getElementById('reprint-sheet-container');
         if (!container) return;
 
-        const { rows, agrees, legacy } = this.derivePrintedRows(sale);
+        const { rows, lines, agrees, legacy } = this.derivePrintedRows(sale);
         const isInclusive = normalizeTaxMode(sale.taxMode) === 'Inclusive';
         // Only a trusted inclusive split restates its rows, so only that case
         // may claim to be net of GST.
@@ -317,7 +327,16 @@ export class ReprintDesk {
                 <button type="button" id="reprint-print-btn" class="btn btn-primary">PRINT DUPLICATE</button>
                 <button type="button" id="reprint-close-btn" class="btn btn-secondary">Close</button>
                 <span class="text-muted-small">
-                    Filed ${escapeHtml(formatWhen(sale.timestamp))}${sale.goldRateSource ? ` · rate source: ${escapeHtml(sale.goldRateSource)}` : ''}
+                    Filed ${escapeHtml(formatWhen(sale.timestamp))}${sale.goldRateSource ? ` · rate source: ${escapeHtml(sale.goldRateSource)}` : ''}${
+                        // Who billed it. Shown on the desk's control strip, not
+                        // on the customer's copy — it is an internal audit fact,
+                        // and the .reprint-controls class is excluded from print.
+                        sale.actor ? ` · billed by ${escapeHtml(sale.actor.name)} (${escapeHtml(sale.actor.role)})` : ''
+                    }${
+                        Array.isArray(sale.tenders) && sale.tenders.length > 0
+                            ? ` · paid ${escapeHtml(sale.tenders.map(t => `${t.method} ${money(t.amount)}`).join(' + '))}`
+                            : ''
+                    }
                 </span>
             </div>
 
@@ -367,13 +386,21 @@ export class ReprintDesk {
                                 <th class="text-right">Total (₹)</th>
                             </tr>
                         </thead>
+                        <!--
+                            One row per item AS FILED. A duplicate has to
+                            reproduce the original document, so a two-item
+                            invoice reprints two rows — collapsing them into one
+                            averaged line would hand the customer a "duplicate"
+                            that describes goods they did not buy.
+                        -->
                         <tbody>
+                            ${lines.map(l => `
                             <tr>
-                                <td>Gold Ornament (${escapeHtml(sale.purity || '')})</td>
-                                <td class="text-right">${Number(sale.weightGrams || 0).toFixed(3)} g</td>
-                                <td class="text-right">${money(sale.goldPricePerGram)}</td>
-                                <td class="text-right">${money(sale.metalValue)}</td>
-                            </tr>
+                                <td>${escapeHtml(l.description || 'Gold Ornament')} (${escapeHtml(l.purity || '')})</td>
+                                <td class="text-right">${Number(l.weightGrams || 0).toFixed(3)} g</td>
+                                <td class="text-right">${money(l.goldPricePerGram)}</td>
+                                <td class="text-right">${money(l.metalValue)}</td>
+                            </tr>`).join('')}
                         </tbody>
                     </table>
 

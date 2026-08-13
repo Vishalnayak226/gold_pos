@@ -1,7 +1,8 @@
-import { adminFetch, logTelemetry } from '../app.js';
-import {
-    ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus, summarizeAdvanceLedger
-} from '../lib/billingMath.js';
+import { adminFetch, logTelemetry, canApprove, getActor } from '../app.js';
+import { ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus } from '../lib/billingMath.js';
+
+/** Customers listed per page. The server clamps to 500 regardless. */
+const CUSTOMER_ROWS = 100;
 
 /**
  * Escapes HTML-significant characters. Advance records can contain
@@ -26,9 +27,12 @@ function escapeHtml(value) {
  */
 export class AdvancesManager {
     constructor() {
-        this.advances = [];
+        this.customers = [];
+        this.customerTotal = 0;
         this.pending = [];
         this.expandedPhone = null;
+        this.entriesByPhone = new Map();
+        this.searchTimer = null;
         this.render();
     }
 
@@ -86,10 +90,18 @@ export class AdvancesManager {
                 </thead>
                 <tbody id="advances-table-body"></tbody>
             </table>
+            <p id="advances-truncation" class="text-muted-small" style="margin-top:8px;"></p>
         `;
 
         document.getElementById('advances-refresh-btn').addEventListener('click', () => this.refresh());
-        document.getElementById('advances-search').addEventListener('input', () => this.renderTable());
+        // Search runs on the SERVER now — it has to, because the balance a row
+        // shows is rolled up from a customer's whole history and this screen
+        // only ever holds a page of customers. Debounced so a typed phone
+        // number is one request, not ten.
+        document.getElementById('advances-search').addEventListener('input', () => {
+            clearTimeout(this.searchTimer);
+            this.searchTimer = setTimeout(() => this.refresh(), 250);
+        });
         document.getElementById('advances-new-deposit-btn').addEventListener('click', () => {
             const form = document.getElementById('new-deposit-form');
             form.style.display = form.style.display === 'none' ? 'block' : 'none';
@@ -100,19 +112,54 @@ export class AdvancesManager {
         document.getElementById('submit-deposit-btn').addEventListener('click', () => this.submitManualDeposit());
     }
 
+    /**
+     * Loads a page of per-customer balances plus the approval queue.
+     *
+     * This screen no longer downloads the advances ledger. It asked for every
+     * deposit and redemption ever recorded and rolled them up here, which grew
+     * without bound and made paging impossible — a customer's spendable credit
+     * is their whole history, so a page of rows cannot produce it. The rollup
+     * now happens on the server (GET /api/advances/customers) and the
+     * per-customer drill-down fetches one customer's rows on demand.
+     */
     async refresh() {
+        const query = (document.getElementById('advances-search')?.value || '').trim();
+        // Approving a deposit or filing one changes a customer's rows, so the
+        // drill-down cache cannot survive a refresh.
+        this.entriesByPhone.clear();
         try {
-            const [ledgerRes, pendingRes] = await Promise.all([
-                adminFetch('/api/advances'),
+            const [customersRes, pendingRes] = await Promise.all([
+                adminFetch(`/api/advances/customers?limit=${CUSTOMER_ROWS}&q=${encodeURIComponent(query)}`),
                 adminFetch('/api/advances/pending')
             ]);
-            this.advances = ledgerRes.ok ? await ledgerRes.json() : [];
+            const page = customersRes.ok ? await customersRes.json() : null;
+            this.customers = page ? page.results : [];
+            this.customerTotal = page ? page.total : 0;
             this.pending = pendingRes.ok ? await pendingRes.json() : [];
+            // An open drill-down stays open across a refresh, so its rows are
+            // re-fetched rather than left showing the loading placeholder.
+            if (this.expandedPhone) await this.loadCustomerEntries(this.expandedPhone);
             this.renderPendingApprovals();
             this.renderTable();
             logTelemetry(`Advances ledger refreshed (${this.pending.length} awaiting approval).`);
         } catch (err) {
             console.error('Failed to load advances ledger:', err);
+        }
+    }
+
+    /**
+     * One customer's rows, fetched only when their drill-down is opened.
+     * Cached per phone so collapsing and re-expanding is free.
+     */
+    async loadCustomerEntries(phone) {
+        if (this.entriesByPhone.has(phone)) return;
+        try {
+            const res = await adminFetch(`/api/advances/lookup?phone=${encodeURIComponent(phone)}`);
+            if (!res.ok) return;
+            const ledger = await res.json();
+            this.entriesByPhone.set(phone, ledger.history || []);
+        } catch (err) {
+            console.error('Failed to load the customer ledger:', err);
         }
     }
 
@@ -146,6 +193,12 @@ export class AdvancesManager {
                     statement before approving — <strong>none of this money is in any customer's balance yet</strong>,
                     and approving is what credits it.
                 </p>
+                ${canApprove() ? '' : `
+                <p style="font-size:12px; color:var(--color-warning); margin:0 0 14px; max-width:80ch; font-weight:600;">
+                    Releasing one of these needs an Owner or a Manager. You are signed in as
+                    ${escapeHtml((getActor() && getActor().role) || 'cashier')}, so the queue is
+                    shown for visibility but the decision is not yours to make.
+                </p>`}
                 <div style="display:flex; flex-direction:column; gap:10px;">
                     ${this.pending.map(p => this.renderPendingRow(p)).join('')}
                 </div>
@@ -176,10 +229,11 @@ export class AdvancesManager {
                         ${escapeHtml(p.paymentMethod || 'UPI')} · Ref: <span style="font-family:var(--font-mono);">${escapeHtml(p.referenceId || '—')}</span> · submitted ${waited}
                     </div>
                 </div>
+                ${canApprove() ? `
                 <div style="display:flex; gap:8px; flex-shrink:0;">
                     <button type="button" class="btn btn-primary btn-sm approve-deposit-btn" data-id="${escapeHtml(p.id)}">Approve</button>
                     <button type="button" class="btn btn-danger btn-sm reject-deposit-btn" data-id="${escapeHtml(p.id)}">Reject</button>
-                </div>
+                </div>` : ''}
             </div>
         `;
     }
@@ -234,42 +288,19 @@ export class AdvancesManager {
     }
 
     /**
-     * Collapses the flat ledger into one running-balance row per customer.
-     * The customer's display name is taken from their most recent deposit
-     * (redemption records copy the name from the sale, which is fine too,
-     * but a deposit is the more authoritative "who this customer is" source).
+     * The customer list, straight from the server's rollup. Every balance here
+     * was computed over that customer's whole history — see refresh().
      */
-    getCustomerSummaries() {
-        const map = new Map();
-        this.advances.forEach(a => {
-            if (!map.has(a.customerPhone)) {
-                map.set(a.customerPhone, { phone: a.customerPhone, name: a.customerName, balance: 0, pendingTotal: 0, lastActivity: 0, entries: [] });
-            }
-            const c = map.get(a.customerPhone);
-            // Shared with the server's computeAdvanceLedger and the Dashboard
-            // tile: a pending deposit contributes 0 here, so an unverified claim
-            // can never appear as a balance a cashier might redeem against.
-            c.balance += advanceEntryDelta(a);
-            c.lastActivity = Math.max(c.lastActivity, a.timestamp || 0);
-            c.entries.push(a);
-            if (a.type === 'deposit' && a.customerName) c.name = a.customerName;
-        });
-        // Second pass so each row can show what is awaiting approval alongside
-        // the spendable figure, rather than the two being indistinguishable.
-        map.forEach(c => { c.pendingTotal = summarizeAdvanceLedger(c.entries).pendingTotal; });
-        return Array.from(map.values()).sort((a, b) => b.lastActivity - a.lastActivity);
-    }
-
     renderTable() {
         const tbody = document.getElementById('advances-table-body');
         if (!tbody) return;
 
-        const query = (document.getElementById('advances-search')?.value || '').trim().toLowerCase();
-        let customers = this.getCustomerSummaries();
-        if (query) {
-            customers = customers.filter(c =>
-                (c.phone || '').includes(query) || (c.name || '').toLowerCase().includes(query)
-            );
+        const customers = this.customers || [];
+        const note = document.getElementById('advances-truncation');
+        if (note) {
+            note.textContent = this.customerTotal > customers.length
+                ? `Showing ${customers.length} of ${this.customerTotal} customers. Narrow the search to find a specific one.`
+                : '';
         }
 
         if (customers.length === 0) {
@@ -292,16 +323,30 @@ export class AdvancesManager {
         `).join('');
 
         tbody.querySelectorAll('.expand-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
+            btn.addEventListener('click', async () => {
                 const phone = btn.getAttribute('data-phone');
-                this.expandedPhone = this.expandedPhone === phone ? null : phone;
+                if (this.expandedPhone === phone) {
+                    this.expandedPhone = null;
+                } else {
+                    this.expandedPhone = phone;
+                    // Fetched on open rather than held for every customer.
+                    btn.disabled = true;
+                    await this.loadCustomerEntries(phone);
+                }
                 this.renderTable();
             });
         });
     }
 
     renderDetailRow(customer) {
-        const entries = [...customer.entries].sort((a, b) => b.timestamp - a.timestamp);
+        const held = this.entriesByPhone.get(customer.phone);
+        if (!held) {
+            return `
+            <tr class="advances-detail-row">
+                <td colspan="5"><div class="ledger-drilldown"><p class="text-muted-small">Loading this customer's ledger…</p></div></td>
+            </tr>`;
+        }
+        const entries = [...held].sort((a, b) => b.timestamp - a.timestamp);
         return `
             <tr class="advances-detail-row">
                 <td colspan="5">

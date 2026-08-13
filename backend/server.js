@@ -6,7 +6,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { readJSON, writeJSON, writeJSONTransaction, logError, logTelemetry, newId, DATA_DIR } from './db.js';
-import { redactSettings } from './defaultSettings.js';
+import { redactSettings, OPERATOR_ROLES } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
 import https from 'https';
@@ -15,7 +15,13 @@ import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseCh
 import { initBackupScheduler, createBackup } from './backupEngine.js';
 import { assertProductionReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
-import { requireAdminSession, verifyAdminPin, createAdminSession, destroyAdminSession, loginRateLimiter, recordLoginResult } from './adminAuth.js';
+import {
+    requireAdminSession, requireApprover, verifyAdminPin, createAdminSession, destroyAdminSession,
+    loginRateLimiter, recordLoginResult, roleCanApprove, listOperators, SYSTEM_ACTOR, OWNER_ACTOR,
+    ensureAuthSalt, hashPin, migrateStoredPins,
+    generateTotpSecret, verifyTotp, totpEnrolmentUri, generateRecoveryCodes, consumeRecoveryCode,
+    listAdminSessions, revokeAdminSessionByHandle, revokeSessionsForActor, revokeSessionsForRosterChange
+} from './adminAuth.js';
 import {
     requireCustomerSession, requireEstablishedCustomer, customerLoginRateLimiter,
     loginCustomer, destroyCustomerSession, destroyAllCustomerSessions,
@@ -33,8 +39,8 @@ import { loadExtensions, fireHook } from './extensions/index.js';
 // updateEngine.js ship and replace backend/ and frontend/ as a pair.
 import {
     computeInvoiceTotals, normalizeTaxMode, round2, round3, toPaise, fromPaise, computeMetalValue,
-    computeReturnRefund,
-    ADVANCE_STATUS, normalizeAdvanceStatus, summarizeAdvanceLedger
+    computeReturnRefund, saleLines,
+    ADVANCE_STATUS, normalizeAdvanceStatus, summarizeAdvanceLedger, summarizeAdvanceLiability
 } from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
 
@@ -168,17 +174,305 @@ app.use(express.static(path.join(__dirname, '../frontend')));
  * Replaces the old client-only PIN check.
  */
 app.post('/api/admin/login', loginRateLimiter, (req, res) => {
-    const { pin } = req.body;
-    if (!verifyAdminPin(pin)) {
+    const { pin, totpCode, recoveryCode } = req.body || {};
+    // The PIN both authenticates AND names the person: each operator
+    // configured in Settings has their own, and the master PIN resolves to the
+    // store owner. See resolveActor() in adminAuth.js.
+    const resolved = verifyAdminPin(pin);
+    if (!resolved) {
         recordLoginResult(req, false);
         logTelemetry('ADMIN_LOGIN_FAILED', 0);
         return res.status(401).json({ error: 'Incorrect PIN' });
     }
+    const { actor, mfa } = resolved;
+
+    /* SECOND FACTOR. Only for an operator who has enrolled one — enrolment is
+       the switch, so turning it on for one manager does not disturb anyone else.
+
+       A wrong code counts as a FAILED LOGIN against the rate limiter. Otherwise a
+       correct PIN would buy unlimited guesses at a 6-digit code, and the second
+       factor would be weaker than the first. */
+    let mfaUsed = false;
+    if (mfa.enabled) {
+        const submittedTotp = String(totpCode || '').trim();
+        const submittedRecovery = String(recoveryCode || '').trim();
+
+        if (!submittedTotp && !submittedRecovery) {
+            // Deliberately NOT counted as a failed attempt: the PIN was right and
+            // the browser simply has not been asked for a code yet.
+            return res.status(401).json({
+                error: 'MFA_CODE_REQUIRED',
+                message: `${actor.name} has two-factor authentication enabled. Enter the 6-digit code from your authenticator app.`
+            });
+        }
+
+        if (submittedTotp && verifyTotp(submittedTotp, mfa.secret)) {
+            mfaUsed = true;
+        } else if (submittedRecovery) {
+            const settingsFile = path.join(DATA_DIR, 'settings.json');
+            const settings = readJSON(settingsFile, {});
+            const consumed = consumeRecoveryCode(submittedRecovery, settings.authSalt, mfa.recoveryCodes);
+            if (consumed.ok) {
+                // Single use: the surviving codes are written back before the
+                // session is issued, so a replay of the same code cannot work
+                // even if two attempts arrive together.
+                const row = (settings.operators || []).find(op => op && op.id === actor.id);
+                if (row) {
+                    row.recoveryCodes = consumed.remainingHashes;
+                    if (!writeJSON(settingsFile, settings)) {
+                        logError(`Could not record use of a recovery code for ${actor.name}; refusing the login rather than allowing a reusable code.`);
+                        return res.status(500).json({ error: 'Could not complete sign-in. Please retry.' });
+                    }
+                }
+                mfaUsed = true;
+                logTelemetry('ADMIN_LOGIN_RECOVERY_CODE', 0,
+                    `${actor.name} used a recovery code; ${consumed.remainingHashes.length} left`);
+            }
+        }
+
+        if (!mfaUsed) {
+            recordLoginResult(req, false);
+            logTelemetry('ADMIN_LOGIN_MFA_FAILED', 0, `${actor.name} (${actor.role})`);
+            return res.status(401).json({
+                error: 'MFA_CODE_INVALID',
+                message: 'That code is not valid. Check your authenticator app, or use a recovery code.'
+            });
+        }
+    }
+
     recordLoginResult(req, true);
-    const token = createAdminSession();
-    logTelemetry('ADMIN_LOGIN_SUCCESS', 0);
-    res.json({ success: true, token });
+    const token = createAdminSession(actor, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent'],
+        mfaUsed
+    });
+    logTelemetry('ADMIN_LOGIN_SUCCESS', 0, `${actor.name} (${actor.role})${mfaUsed ? ' +MFA' : ''}`);
+    // The desk shows who is signed in and hides controls their role cannot
+    // use, so the identity goes back with the token rather than the browser
+    // having to ask a second time.
+    res.json({
+        success: true,
+        token,
+        actor,
+        canApprove: roleCanApprove(actor.role),
+        mfaUsed
+    });
 });
+
+/**
+ * GET /api/admin/me
+ * Who the bearer token belongs to. The Billing Desk reads this on reload so a
+ * restored session still knows whose name goes on the next invoice.
+ */
+app.get('/api/admin/me', requireAdminSession, (req, res) => {
+    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    res.json({
+        actor: req.actor,
+        canApprove: roleCanApprove(req.actor.role),
+        mfaUsed: req.adminSession.mfaUsed === true,
+        // So the desk can explain a refusal before the cashier hits it.
+        requireMfaForApprovers: settings.requireMfaForApprovers === true,
+        refundApprovalThreshold: round2(settings.refundApprovalThreshold || 0)
+    });
+});
+
+/* ==========================================================================
+   API Routes: second factor and live sessions
+
+   Both are about the credential rather than the configuration, which is why
+   they are their own routes and not fields on POST /api/settings:
+
+   - Enrolment must PROVE the operator holds the secret before it is trusted,
+     which a settings form cannot do.
+   - A live session is not persisted configuration at all. It is in-memory state,
+     and writing it into settings.json to edit it would be nonsense.
+   ========================================================================== */
+
+/**
+ * POST /api/admin/mfa/begin
+ * Issues a fresh TOTP secret and the QR payload to scan. Nothing is enabled yet
+ * — the secret is returned and NOT stored, so an abandoned enrolment leaves no
+ * half-configured operator behind.
+ */
+app.post('/api/admin/mfa/begin', requireAdminSession, async (req, res) => {
+    try {
+        const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        const targetId = String((req.body || {}).operatorId || req.actor.id);
+
+        // Anyone may enrol THEMSELVES. Enrolling somebody else is an owner action:
+        // it would otherwise let a manager stand up a second factor on a
+        // colleague's account and hold the secret.
+        if (targetId !== req.actor.id && req.actor.role !== 'owner') {
+            return res.status(403).json({
+                error: 'OWNER_REQUIRED',
+                message: 'Only the owner can set up two-factor authentication for someone else.'
+            });
+        }
+        const operator = (settings.operators || []).find(op => op && op.id === targetId);
+        if (!operator) {
+            return res.status(400).json({
+                error: 'NOT_A_NAMED_OPERATOR',
+                message: 'Two-factor authentication belongs to a named person. The shared master PIN cannot carry one — add yourself to Settings → Staff & Roles first.'
+            });
+        }
+
+        const secret = generateTotpSecret();
+        const uri = totpEnrolmentUri(secret, operator.name, settings.companyName);
+        res.json({
+            success: true,
+            operatorId: targetId,
+            secret,
+            uri,
+            // Rendered server-side with the qrcode package already in the budget,
+            // so the browser needs no library and the secret is not put into an
+            // <img src> pointing at a third party.
+            qrDataUri: await QRCode.toDataURL(uri, { margin: 1, width: 220 })
+        });
+    } catch (err) {
+        logError('MFA enrolment could not be started: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not start two-factor setup.' });
+    }
+});
+
+/**
+ * POST /api/admin/mfa/enrol
+ * Confirms enrolment by requiring a live code from the secret just issued, then
+ * stores it and hands back ten single-use recovery codes.
+ *
+ * The code requirement is the point: it proves the authenticator app is actually
+ * configured. Storing a secret without it is how a store locks itself out.
+ */
+app.post('/api/admin/mfa/enrol', requireAdminSession, (req, res) => {
+    try {
+        const { operatorId, secret, code } = req.body || {};
+        const targetId = String(operatorId || req.actor.id);
+        if (targetId !== req.actor.id && req.actor.role !== 'owner') {
+            return res.status(403).json({ error: 'OWNER_REQUIRED', message: 'Only the owner can enrol someone else.' });
+        }
+        if (!secret || !verifyTotp(code, String(secret))) {
+            return res.status(400).json({
+                error: 'MFA_CODE_INVALID',
+                message: 'That code does not match. Check the app has finished adding the account, then enter the current 6-digit code.'
+            });
+        }
+
+        const settingsFile = path.join(DATA_DIR, 'settings.json');
+        const settings = readJSON(settingsFile, {});
+        const authSalt = ensureAuthSalt(settings);
+        const operator = (settings.operators || []).find(op => op && op.id === targetId);
+        if (!operator) {
+            return res.status(400).json({ error: 'NOT_A_NAMED_OPERATOR', message: 'That operator no longer exists.' });
+        }
+
+        const recovery = generateRecoveryCodes(authSalt);
+        operator.totpSecret = String(secret);
+        operator.mfaEnabled = true;
+        operator.recoveryCodes = recovery.hashes;
+
+        if (!writeJSON(settingsFile, settings)) {
+            return res.status(500).json({ error: 'Could not save the two-factor setup. Please retry.' });
+        }
+
+        logTelemetry('ADMIN_MFA_ENROLLED', 0, `${operator.name} (${operator.role})`);
+        res.json({
+            success: true,
+            operatorId: targetId,
+            // The ONLY time these are ever readable. They are stored as hashes,
+            // so this response cannot be reproduced later.
+            recoveryCodes: recovery.plain
+        });
+    } catch (err) {
+        logError('MFA enrolment failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not complete two-factor setup.' });
+    }
+});
+
+/**
+ * POST /api/admin/mfa/disable
+ * Removes an operator's second factor.
+ *
+ * Requires the CURRENT PIN of whoever is asking, because otherwise an unattended
+ * signed-in terminal is a one-click way to strip the very control that was meant
+ * to protect it.
+ */
+app.post('/api/admin/mfa/disable', requireAdminSession, (req, res) => {
+    try {
+        const { operatorId, pin } = req.body || {};
+        const targetId = String(operatorId || req.actor.id);
+        if (targetId !== req.actor.id && req.actor.role !== 'owner') {
+            return res.status(403).json({ error: 'OWNER_REQUIRED', message: 'Only the owner can turn off someone else\'s two-factor authentication.' });
+        }
+
+        const confirmed = verifyAdminPin(pin);
+        if (!confirmed || confirmed.actor.id !== req.actor.id) {
+            return res.status(401).json({
+                error: 'PIN_REQUIRED',
+                message: 'Enter your own PIN to confirm turning off two-factor authentication.'
+            });
+        }
+
+        const settingsFile = path.join(DATA_DIR, 'settings.json');
+        const settings = readJSON(settingsFile, {});
+        const operator = (settings.operators || []).find(op => op && op.id === targetId);
+        if (!operator) {
+            return res.status(400).json({ error: 'NOT_A_NAMED_OPERATOR', message: 'That operator no longer exists.' });
+        }
+
+        operator.mfaEnabled = false;
+        delete operator.totpSecret;
+        delete operator.recoveryCodes;
+        if (!writeJSON(settingsFile, settings)) {
+            return res.status(500).json({ error: 'Could not save the change. Please retry.' });
+        }
+
+        // The sessions that passed the old factor no longer represent what this
+        // store requires, so they end here.
+        const ended = revokeSessionsForActor(targetId, { exceptToken: req.adminToken });
+        logTelemetry('ADMIN_MFA_DISABLED', 0, `${operator.name}; ${ended} session(s) ended`);
+        res.json({ success: true, sessionsRevoked: ended });
+    } catch (err) {
+        logError('Disabling MFA failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Could not turn off two-factor authentication.' });
+    }
+});
+
+/**
+ * GET /api/admin/sessions
+ * Every live admin sign-in. Approver-gated — who is currently on the terminals is
+ * exactly the sort of thing a cashier should not be able to enumerate.
+ *
+ * Tokens are never included; each row carries an opaque handle instead.
+ */
+app.get('/api/admin/sessions', requireAdminSession, requireApprover, (req, res) => {
+    res.json({ results: listAdminSessions(), currentHandle: currentSessionHandle(req) });
+});
+
+/**
+ * POST /api/admin/sessions/revoke
+ * Ends one live session by its handle.
+ */
+app.post('/api/admin/sessions/revoke', requireAdminSession, requireApprover, (req, res) => {
+    const handle = String((req.body || {}).handle || '').trim();
+    if (!handle) return res.status(400).json({ error: 'A session handle is required.' });
+
+    // Ending your own session from this screen would just be a confusing logout.
+    if (handle === currentSessionHandle(req)) {
+        return res.status(400).json({
+            error: 'CANNOT_REVOKE_OWN_SESSION',
+            message: 'That is this browser\'s own sign-in. Use Logout instead.'
+        });
+    }
+    const ended = revokeAdminSessionByHandle(handle, { exceptToken: req.adminToken });
+    if (!ended) return res.status(404).json({ error: 'That sign-in is no longer active.' });
+
+    logTelemetry('ADMIN_SESSION_REVOKED', 0, `by ${req.actor.name} (${req.actor.role})`);
+    res.json({ success: true });
+});
+
+/** The handle of the caller's own session, so a screen can mark it "this one". */
+function currentSessionHandle(req) {
+    return crypto.createHash('sha256').update(req.adminToken || '').digest('hex').slice(0, 16);
+}
 
 /**
  * POST /api/admin/logout
@@ -621,7 +915,10 @@ function redactSettingsForBrowser(settings) {
     const safe = {
         ...settings,
         adminPin: null,
-        adminPinConfigured: !!settings.adminPin,
+        adminPinHash: null,
+        // The tenant PIN salt is credential material, not configuration.
+        authSalt: null,
+        adminPinConfigured: !!(settings.adminPinHash || settings.adminPin),
         razorpayKeySecret: null,
         razorpayKeySecretConfigured: !!settings.razorpayKeySecret,
         razorpayWebhookSecret: null,
@@ -630,7 +927,26 @@ function redactSettingsForBrowser(settings) {
             ...(settings.smtp || {}),
             pass: null,
             passConfigured: !!(settings.smtp && settings.smtp.pass)
-        }
+        },
+        /* An operator's credentials are write-only for exactly the same reason
+           adminPin is — the roster renders from this response, and one cashier
+           must never be handed another's PIN.
+
+           Field by field, NOT `...op` with a few keys nulled: that spread is how
+           a credential added later leaks by default. Anything not named here does
+           not reach the browser. `recoveryCodesRemaining` is a count rather than
+           the codes, because how many are left is what an owner needs to know and
+           the codes themselves are single-use secrets. */
+        operators: (Array.isArray(settings.operators) ? settings.operators : []).map(op => ({
+            id: op.id,
+            name: op.name,
+            role: op.role,
+            active: op.active !== false,
+            pin: null,
+            pinConfigured: !!(op && (op.pinHash || op.pin)),
+            mfaEnabled: op.mfaEnabled === true,
+            recoveryCodesRemaining: Array.isArray(op.recoveryCodes) ? op.recoveryCodes.length : 0
+        }))
     };
     return safe;
 }
@@ -638,6 +954,124 @@ function redactSettingsForBrowser(settings) {
 /** Null or an absent key means "leave this write-only value unchanged". */
 function preserveWriteOnlyValue(requested, current) {
     return requested === undefined || requested === null ? current : requested;
+}
+
+const OPERATOR_PIN_PATTERN = /^\d{4,8}$/;
+
+/**
+ * Validates an inbound operator roster and restores the PINs the browser was
+ * never given, returning `{ok: true, operators}` or `{ok: false, error}`.
+ *
+ * MATCHED BY `id`, NOT BY POSITION. The Settings screen can add, remove and
+ * reorder people in the same save that leaves everyone else's PIN masked, so
+ * index 2 on the way in is not necessarily index 2 on disk — restoring
+ * positionally would quietly move one cashier's PIN onto another cashier.
+ *
+ * PINS MUST BE UNIQUE, including against the legacy store `adminPin`. A PIN is
+ * how this system decides who is at the counter (see resolveActor), so two
+ * people sharing one does not merely weaken a credential, it makes the
+ * attribution on every invoice they file a coin toss — which is the exact
+ * problem the roster exists to remove.
+ */
+function mergeOperators(incoming, current, authSalt) {
+    if (incoming === undefined) return { ok: true, operators: current.operators || [] };
+    if (!Array.isArray(incoming)) {
+        return { ok: false, error: 'Operators must be a list.' };
+    }
+    if (incoming.length > 50) {
+        return { ok: false, error: 'A store may have at most 50 operators.' };
+    }
+
+    const storedById = new Map(
+        (Array.isArray(current.operators) ? current.operators : [])
+            .filter(op => op && op.id)
+            .map(op => [op.id, op])
+    );
+
+    // The master PIN's hash, so an operator reusing it can be caught. Comparing
+    // hashes works precisely because the tenant salt is shared — see the PIN
+    // HASHING note in adminAuth.js.
+    const masterHash = current.adminPinHash
+        || (current.adminPin ? hashPin(current.adminPin, authSalt) : '');
+
+    const operators = [];
+    const seenHashes = new Map();
+    const seenIds = new Set();
+
+    for (const raw of incoming) {
+        if (!raw || typeof raw !== 'object') {
+            return { ok: false, error: 'Each operator must be an object.' };
+        }
+
+        const name = String(raw.name || '').trim();
+        if (!name) return { ok: false, error: 'Every operator needs a name.' };
+        if (name.length > 60) return { ok: false, error: `Operator name "${name.slice(0, 20)}…" is too long (max 60 characters).` };
+
+        const role = String(raw.role || '').trim().toLowerCase();
+        if (!OPERATOR_ROLES.includes(role)) {
+            return { ok: false, error: `"${name}" has an unknown role. Use one of: ${OPERATOR_ROLES.join(', ')}.` };
+        }
+
+        const id = String(raw.id || '').trim() || newId('OP');
+        if (seenIds.has(id)) return { ok: false, error: 'Two operators cannot share an id.' };
+        seenIds.add(id);
+
+        const stored = storedById.get(id);
+
+        /* Absent or null PIN means "keep what is on disk" — the same contract as
+           every other write-only credential here. A supplied PIN is validated in
+           the clear and then immediately hashed; the plaintext never leaves this
+           function. A stored plaintext `pin` from an older build is hashed on the
+           way through, so a save is also a migration. */
+        let pinHash;
+        if (raw.pin === undefined || raw.pin === null || String(raw.pin).trim() === '') {
+            pinHash = (stored && stored.pinHash)
+                || (stored && stored.pin ? hashPin(stored.pin, authSalt) : '');
+            if (!pinHash) {
+                return { ok: false, error: `"${name}" needs a PIN — an operator with no PIN cannot sign in.` };
+            }
+        } else {
+            const pin = String(raw.pin).trim();
+            if (!OPERATOR_PIN_PATTERN.test(pin)) {
+                return { ok: false, error: `"${name}"'s PIN must be 4 to 8 digits.` };
+            }
+            pinHash = hashPin(pin, authSalt);
+        }
+
+        if (seenHashes.has(pinHash)) {
+            return {
+                ok: false,
+                error: `"${name}" and "${seenHashes.get(pinHash)}" have the same PIN. Each operator needs their own, or the ledger cannot say which of them billed a sale.`
+            };
+        }
+        if (masterHash && pinHash === masterHash) {
+            return {
+                ok: false,
+                error: `"${name}"'s PIN is the same as the store's master PIN. Give them their own so their sales are filed under their name.`
+            };
+        }
+        seenHashes.set(pinHash, name);
+
+        /* Second-factor enrolment is NOT editable through this form. It is
+           established by POST /api/admin/mfa/enrol (which proves the operator
+           holds the secret by making them submit a live code) and cleared by
+           POST /api/admin/mfa/disable. Carrying it across from disk here means a
+           roster edit — renaming someone, changing a role — cannot silently drop
+           the second factor, and a crafted settings payload cannot grant itself
+           one. */
+        operators.push({
+            id,
+            name,
+            role,
+            pinHash,
+            active: raw.active !== false,
+            mfaEnabled: !!(stored && stored.mfaEnabled),
+            ...(stored && stored.totpSecret ? { totpSecret: stored.totpSecret } : {}),
+            ...(stored && Array.isArray(stored.recoveryCodes) ? { recoveryCodes: stored.recoveryCodes } : {})
+        });
+    }
+
+    return { ok: true, operators };
 }
 
 /**
@@ -705,10 +1139,44 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
             }
         }
 
+        // Every PIN in this document is a scrypt hash, so the tenant salt has to
+        // exist before anything can be hashed against it.
+        const authSalt = ensureAuthSalt(currentSettings);
+
+        // The operator roster carries login credentials and decides who can
+        // approve money, so it is validated before anything is written rather
+        // than merged through and trusted.
+        const roster = mergeOperators(req.body.operators, currentSettings, authSalt);
+        if (!roster.ok) {
+            return res.status(400).json({ error: roster.error });
+        }
+
+        // A refund threshold and the MFA switch both gate money, so neither is
+        // taken on trust from the payload.
+        if (req.body.refundApprovalThreshold !== undefined) {
+            const threshold = Number(req.body.refundApprovalThreshold);
+            if (!Number.isFinite(threshold) || threshold < 0 || threshold > MAX_SANE_AMOUNT) {
+                return res.status(400).json({
+                    error: `The refund approval threshold must be between 0 and ${MAX_SANE_AMOUNT}. Use 0 to let any cashier refund any amount.`
+                });
+            }
+        }
+        if (req.body.requireMfaForApprovers !== undefined
+            && typeof req.body.requireMfaForApprovers !== 'boolean') {
+            return res.status(400).json({ error: 'requireMfaForApprovers must be true or false.' });
+        }
+
         const newSettings = {
             ...currentSettings,
             ...req.body,
-            adminPin: preserveWriteOnlyValue(req.body.adminPin, currentSettings.adminPin),
+            authSalt,
+            operators: roster.operators,
+            requireMfaForApprovers: req.body.requireMfaForApprovers === undefined
+                ? currentSettings.requireMfaForApprovers === true
+                : req.body.requireMfaForApprovers === true,
+            refundApprovalThreshold: req.body.refundApprovalThreshold === undefined
+                ? round2(currentSettings.refundApprovalThreshold || 0)
+                : round2(req.body.refundApprovalThreshold),
             razorpayKeySecret: preserveWriteOnlyValue(req.body.razorpayKeySecret, currentSettings.razorpayKeySecret),
             razorpayWebhookSecret: preserveWriteOnlyValue(req.body.razorpayWebhookSecret, currentSettings.razorpayWebhookSecret),
             smtp: req.body.smtp ? {
@@ -723,6 +1191,30 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         delete newSettings.razorpayKeySecretConfigured;
         delete newSettings.razorpayWebhookSecretConfigured;
         if (newSettings.smtp) delete newSettings.smtp.passConfigured;
+        // mergeOperators rebuilds each row field by field, so the response-only
+        // flags are already gone — asserted here so a future edit that loosens
+        // that merge cannot start persisting them.
+        newSettings.operators.forEach(op => {
+            delete op.pinConfigured;
+            delete op.recoveryCodesRemaining;
+        });
+
+        /* A master PIN supplied in the clear is hashed and the plaintext dropped.
+           `preserveWriteOnlyValue` is not enough on its own here: it would happily
+           persist a plaintext PIN, which is the thing being removed. */
+        if (req.body.adminPin !== undefined && req.body.adminPin !== null && String(req.body.adminPin).trim() !== '') {
+            const newPin = String(req.body.adminPin).trim();
+            if (!OPERATOR_PIN_PATTERN.test(newPin)) {
+                return res.status(400).json({ error: 'The store master PIN must be 4 to 8 digits.' });
+            }
+            newSettings.adminPinHash = hashPin(newPin, authSalt);
+        } else {
+            newSettings.adminPinHash = currentSettings.adminPinHash
+                || (currentSettings.adminPin ? hashPin(currentSettings.adminPin, authSalt) : '');
+        }
+        // Whatever the payload or the old document carried, no plaintext PIN is
+        // written back.
+        delete newSettings.adminPin;
 
         // Store the tax mode in canonical form. Billing tolerates any casing,
         // but settings.json stays the single tidy source of truth that the
@@ -741,10 +1233,31 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         if (!writeJSON(settingsFile, newSettings)) {
             return res.status(500).json({ error: 'Failed to persist settings. Please retry.' });
         }
+
+        /* Access follows the roster. Someone deactivated, removed, re-PINned or
+           demoted has their live sessions ended right here — otherwise the
+           credential would be gone while the access ran on for up to twelve
+           hours, which is the whole gap a revocation control exists to close.
+
+           The caller's own token is spared so an owner rotating their own PIN is
+           not signed out mid-task. Done AFTER the write: revoking sessions for a
+           roster change that failed to persist would lock people out on the
+           strength of an edit that did not happen. */
+        const revoked = revokeSessionsForRosterChange(
+            currentSettings.operators, newSettings.operators, { exceptToken: req.adminToken }
+        );
+
         // Extensions get the real document; the browser gets the masked one,
         // so the client's cached copy round-trips safely on the next save.
         fireHook('onSettingsUpdated', newSettings);
-        res.json({ success: true, settings: redactSettingsForBrowser(newSettings) });
+        res.json({
+            success: true,
+            settings: redactSettingsForBrowser(newSettings),
+            // Reported so the Settings screen can say "2 sessions were signed
+            // out" instead of the change looking like it did nothing.
+            sessionsRevoked: revoked.ended,
+            sessionsRevokedFor: revoked.reasons
+        });
     } catch (err) {
         logError('Error updating settings: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to save settings' });
@@ -816,43 +1329,177 @@ function readReturnRecords(years = null) {
  */
 function summarizeInvoiceReturns(invoiceId, returns = readReturnRecords()) {
     const rows = returns.filter(r => r && r.originalInvoiceId === invoiceId);
+
+    // Per line, because that is the level a return is priced and limited at. A
+    // return row filed before invoices had lines carries no lineNumber and
+    // belongs to line 1 — which is the only line such an invoice has.
+    const byLine = new Map();
+    for (const r of rows) {
+        const lineNumber = Number(r.lineNumber) || 1;
+        byLine.set(lineNumber, round3((byLine.get(lineNumber) || 0) + (Number(r.weightGrams) || 0)));
+    }
+
     return {
         count: rows.length,
         returnedWeightGrams: round3(rows.reduce((sum, r) => sum + (Number(r.weightGrams) || 0), 0)),
-        refundedAmount: round2(rows.reduce((sum, r) => sum + (Number(r.refundAmount) || 0), 0))
+        refundedAmount: round2(rows.reduce((sum, r) => sum + (Number(r.refundAmount) || 0), 0)),
+        returnedByLine: byLine
     };
 }
 
 /**
- * A sale, with what has been returned against it attached.
+ * A sale, with what has been returned against it attached — per line and in
+ * total.
  *
  * Both the Reprint Desk and the Return Desk need this pairing — one to stamp a
  * duplicate that is no longer fully payable, the other to decide what is still
  * returnable — so the join happens once, here, instead of each screen
  * re-deriving it from two endpoints and rounding differently.
+ *
+ * `lineReturnState` is what lets the Return Desk offer only the lines that still
+ * have weight on them. Without it a cashier picking from a multi-line invoice
+ * would have to guess, and would learn a line was exhausted only by being
+ * refused.
  */
 function withReturnState(sale, returns) {
     const summary = summarizeInvoiceReturns(sale.id, returns);
+    const lines = saleLines(sale);
+
+    const lineReturnState = lines.map(line => {
+        const returned = round3(summary.returnedByLine.get(line.lineNumber) || 0);
+        const returnable = round3(Math.max(0, round3(line.weightGrams) - returned));
+        return {
+            lineNumber: line.lineNumber,
+            description: line.description,
+            purity: line.purity,
+            weightGrams: line.weightGrams,
+            goldPricePerGram: line.goldPricePerGram,
+            makingChargePercent: line.makingChargePercent,
+            makingChargeAmount: line.makingChargeAmount,
+            discountPercent: line.discountPercent,
+            returnedWeightGrams: returned,
+            returnableWeightGrams: returnable,
+            fullyReturned: returnable <= 0
+        };
+    });
+
     const returnableWeightGrams = round3(
-        Math.max(0, round3(sale.weightGrams) - summary.returnedWeightGrams)
+        lineReturnState.reduce((total, l) => total + l.returnableWeightGrams, 0)
     );
+
     return {
         ...sale,
         returnedWeightGrams: summary.returnedWeightGrams,
         refundedAmount: summary.refundedAmount,
         returnCount: summary.count,
         returnableWeightGrams,
-        fullyReturned: summary.count > 0 && returnableWeightGrams <= 0
+        fullyReturned: summary.count > 0 && returnableWeightGrams <= 0,
+        lineReturnState
+    };
+}
+
+/* ==========================================================================
+   Ledger list responses — one clamp and one envelope for every ledger
+
+   GET /api/sales, /api/returns and GET /api/advances each used to return the
+   ENTIRE ledger as a bare array, and the screens that call them used to
+   download a store's whole trading history on every tab open to render five
+   rows and a revenue tile. On a store three years in, that is the largest
+   response the server sends, it grows without bound, and it gets slower every
+   day the business does well.
+
+   /api/sales/lookup already had the answer — a clamped limit and a `truncated`
+   flag — so this is that pattern lifted into one place and applied to all four.
+   Two rules make it safe to page a ledger a screen was aggregating:
+
+   1. AGGREGATES ARE COMPUTED SERVER-SIDE, OVER THE WHOLE MATCHED SET, and ride
+      along beside the page. A client that receives 100 of 4,000 rows can no
+      longer sum the page and call it this month's revenue — the figure it needs
+      is handed to it, correct, without the history.
+   2. THE ENVELOPE IS THE SAME EVERYWHERE: { results, total, truncated, limit }.
+      A caller that forgets to check `truncated` at least cannot mistake the
+      response for a complete array, which a bare (silently sliced) array
+      invites.
+   ========================================================================== */
+
+const LEDGER_PAGE_DEFAULT = 100;
+const LEDGER_PAGE_MAX = 500;
+
+/**
+ * Parses the `from` / `to` / `limit` triple every ledger list accepts.
+ *
+ * Returns `{ok: false, error}` on a malformed date rather than throwing, so
+ * each route answers 400 with the same wording, and `years` — the only year
+ * partitions a bounded range can touch — so a date-bounded query on a store
+ * with a decade of history reads one file instead of ten.
+ */
+function parseLedgerQuery(query = {}, { defaultLimit = LEDGER_PAGE_DEFAULT, maxLimit = LEDGER_PAGE_MAX } = {}) {
+    const limit = Math.min(maxLimit, Math.max(1, parseInt(query.limit, 10) || defaultLimit));
+
+    // Dates arrive as YYYY-MM-DD from a native date input. `to` covers the
+    // whole of its day: a cashier searching 1st–1st means that one day, not
+    // the single instant of midnight.
+    const from = query.from ? Date.parse(`${query.from}T00:00:00`) : null;
+    const to = query.to ? Date.parse(`${query.to}T23:59:59.999`) : null;
+    if ((from !== null && Number.isNaN(from)) || (to !== null && Number.isNaN(to))) {
+        return { ok: false, error: 'Dates must be in YYYY-MM-DD form.' };
+    }
+    if (from !== null && to !== null && from > to) {
+        return { ok: false, error: 'The "from" date cannot be after the "to" date.' };
+    }
+
+    let years = null;
+    if (from !== null || to !== null) {
+        const firstYear = new Date(from ?? to).getFullYear();
+        const lastYear = new Date(to ?? from).getFullYear();
+        years = [];
+        for (let y = firstYear; y <= lastYear; y++) years.push(y);
+    }
+
+    return { ok: true, from, to, years, limit };
+}
+
+/** Whether a row's timestamp falls inside a (possibly half-open) range. */
+function withinRange(row, from, to) {
+    const ts = (row && row.timestamp) || 0;
+    if (from !== null && ts < from) return false;
+    if (to !== null && ts > to) return false;
+    return true;
+}
+
+/** The standard page envelope. `extra` carries each ledger's own aggregates. */
+function pagedLedger(rows, limit, extra = {}) {
+    return {
+        results: rows.slice(0, limit),
+        total: rows.length,
+        truncated: rows.length > limit,
+        limit,
+        ...extra
     };
 }
 
 /**
- * GET /api/sales
- * Retrieves sales records combined across all partitioned files, sorted by date descending.
+ * GET /api/sales?from=&to=&limit=
+ * A page of the sales ledger, newest first, with the period's totals attached.
+ *
+ * `totals` covers every row the filter matched, not the page — it is what the
+ * Dashboard's revenue tiles read, and they must stay correct when the period
+ * holds more invoices than one page returns.
  */
 app.get('/api/sales', requireAdminSession, (req, res) => {
     try {
-        res.json(readSalesRecords());
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+
+        const matched = readSalesRecords(q.years).filter(s => withinRange(s, q.from, q.to));
+        res.json(pagedLedger(matched, q.limit, {
+            totals: {
+                count: matched.length,
+                totalAmount: round2(matched.reduce((sum, s) => sum + (Number(s.totalAmount) || 0), 0)),
+                appliedAdvance: round2(matched.reduce((sum, s) => sum + (Number(s.appliedAdvance) || 0), 0)),
+                weightGrams: round3(matched.reduce((sum, s) => sum + (Number(s.weightGrams) || 0), 0))
+            }
+        }));
     } catch (err) {
         logError('Error retrieving sales logs: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve sales' });
@@ -881,38 +1528,17 @@ const REPRINT_MAX_RESULTS = 200;
 
 app.get('/api/sales/lookup', requireAdminSession, (req, res) => {
     try {
+        const parsed = parseLedgerQuery(req.query, {
+            defaultLimit: 50,
+            maxLimit: REPRINT_MAX_RESULTS
+        });
+        if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+        const { from, to, years, limit } = parsed;
+
         const q = String(req.query.q || '').trim().toLowerCase();
-        const limit = Math.min(
-            REPRINT_MAX_RESULTS,
-            Math.max(1, parseInt(req.query.limit, 10) || 50)
-        );
-
-        // Dates arrive as YYYY-MM-DD from a native date input. `to` covers the
-        // whole of its day: a cashier searching 1st–1st means that one day, not
-        // the single instant of midnight.
-        const from = req.query.from ? Date.parse(`${req.query.from}T00:00:00`) : null;
-        const to = req.query.to ? Date.parse(`${req.query.to}T23:59:59.999`) : null;
-        if ((from !== null && Number.isNaN(from)) || (to !== null && Number.isNaN(to))) {
-            return res.status(400).json({ error: 'Dates must be in YYYY-MM-DD form.' });
-        }
-        if (from !== null && to !== null && from > to) {
-            return res.status(400).json({ error: 'The "from" date cannot be after the "to" date.' });
-        }
-
-        // Only the year partitions the range can touch.
-        let years = null;
-        if (from !== null || to !== null) {
-            const firstYear = new Date(from ?? to).getFullYear();
-            const lastYear = new Date(to ?? from).getFullYear();
-            years = [];
-            for (let y = firstYear; y <= lastYear; y++) years.push(y);
-        }
-
         const digitsOnly = q.replace(/\D/g, '');
         const results = readSalesRecords(years).filter(sale => {
-            const ts = sale.timestamp || 0;
-            if (from !== null && ts < from) return false;
-            if (to !== null && ts > to) return false;
+            if (!withinRange(sale, from, to)) return false;
             if (!q) return true;
             return String(sale.id || '').toLowerCase().includes(q)
                 || String(sale.customerName || '').toLowerCase().includes(q)
@@ -940,6 +1566,210 @@ app.get('/api/sales/lookup', requireAdminSession, (req, res) => {
     }
 });
 
+/* ==========================================================================
+   Sale line items
+
+   An invoice holds one or more items, each with its own purity, weight, rate,
+   making charge and discount. It used to hold exactly one, as scalars on the
+   record itself — which meant a customer buying bangles and a chain in one
+   visit needed two invoice numbers, two GST documents and two of everything
+   downstream, or a cashier averaged the two purities into one line and the
+   books stopped describing what was actually sold.
+
+   BOTH REQUEST SHAPES ARE ACCEPTED, permanently:
+     - `lines: [{purity, weightGrams, makingChargeAmount, ...}, ...]`
+     - the flat `purity` / `weightGrams` / `makingChargeAmount` fields, which
+       are normalised into a single line here.
+   The stored record carries `lines` AND the flat rollup fields, so every reader
+   that has not been taught about lines keeps working unchanged. See saleLines()
+   in frontend/js/lib/billingMath.js for the reading half of the same seam.
+   ========================================================================== */
+
+const VALID_PURITIES = ['24K', '22K', '18K'];
+const MAX_INVOICE_LINES = 50;
+
+/**
+ * Validates one requested line and prices its metal at the STORE's rate.
+ *
+ * The rate is never taken from the request — same rule as the single-line path
+ * it replaces, and for the same reason: recomputing tax and discount over a
+ * client-supplied metal value only derives correct percentages of a number the
+ * client chose. A tampered payload could bill 50 g of 22K at ₹1/g and the
+ * stored invoice would be internally consistent and completely wrong.
+ *
+ * @returns {{ok: true, line: object}|{ok: false, error: string, status?: number}}
+ */
+function validateSaleLine(raw, index, activeRates) {
+    const where = `Line ${index + 1}`;
+    if (!raw || typeof raw !== 'object') {
+        return { ok: false, error: `${where} is not a valid item.` };
+    }
+
+    const purity = raw.purity;
+    if (!VALID_PURITIES.includes(purity)) {
+        return { ok: false, error: `${where} needs a valid purity (24K, 22K, or 18K).` };
+    }
+
+    const weightGrams = Number(raw.weightGrams);
+    if (!Number.isFinite(weightGrams) || weightGrams <= 0) {
+        return { ok: false, error: `${where} needs a positive gold weight.` };
+    }
+    if (weightGrams > MAX_SANE_WEIGHT_GRAMS) {
+        return { ok: false, error: `${where} exceeds the ${MAX_SANE_WEIGHT_GRAMS}g limit.` };
+    }
+
+    const makingChargeAmount = raw.makingChargeAmount === undefined ? 0 : Number(raw.makingChargeAmount);
+    if (!Number.isFinite(makingChargeAmount) || makingChargeAmount < 0) {
+        return { ok: false, error: `${where} has an invalid making charge.` };
+    }
+
+    // Descriptive only — makingChargeAmount is what the money math uses — but it
+    // prints on the invoice, so it is validated rather than trusted through.
+    const makingChargePercent = raw.makingChargePercent === undefined ? 0 : Number(raw.makingChargePercent);
+    if (!Number.isFinite(makingChargePercent) || makingChargePercent < 0 || makingChargePercent > 100) {
+        return { ok: false, error: `${where} has an invalid making charge percent.` };
+    }
+
+    const discountPercent = raw.discountPercent === undefined ? 0 : Number(raw.discountPercent);
+    if (!Number.isFinite(discountPercent) || discountPercent < 0 || discountPercent > 100) {
+        return { ok: false, error: `${where} has a discount outside 0–100%.` };
+    }
+
+    const rateKey = PURITY_RATE_KEY[purity];
+    const ratePerGram = Number(activeRates[rateKey]);
+    if (!Number.isFinite(ratePerGram) || ratePerGram <= 0) {
+        logError(`Refusing to bill ${purity}: the active gold rate is unusable (${activeRates[rateKey]}).`);
+        return {
+            ok: false,
+            status: 503,
+            error: 'The current gold rate is unavailable, so this invoice cannot be priced. Check the gold rate in Settings and retry.'
+        };
+    }
+
+    return {
+        ok: true,
+        line: {
+            lineNumber: index + 1,
+            description: String(raw.description || '').trim().slice(0, 120),
+            purity,
+            weightGrams,
+            goldPricePerGram: ratePerGram,
+            // Provenance of the rate this line was priced at, so a later audit
+            // can tell a synced market rate from a counter override without
+            // having to guess from the number alone.
+            goldRateSource: activeRates.sources[rateKey],
+            metalValue: computeMetalValue(weightGrams, ratePerGram),
+            makingChargePercent,
+            makingChargeAmount: round2(makingChargeAmount),
+            discountPercent,
+            // What the cashier's screen quoted for this line, kept only to
+            // detect and log a disagreement — never persisted as money.
+            clientRate: Number(raw.goldPricePerGram)
+        }
+    };
+}
+
+/* ==========================================================================
+   Tenders — HOW the invoice was paid
+
+   A sale used to record no payment method at all. Not "no split tender": no
+   tender. Nothing on the record said whether a bill was settled in cash, on a
+   card, or by UPI, which meant a cash-drawer close, a shift variance and a card
+   settlement reconciliation were not features waiting to be built — they were
+   arithmetic with no data to perform it on.
+
+   Tenders are OPTIONAL on the request and additive on the record, because every
+   invoice already on disk has none and must stay readable. When they are
+   supplied they are checked hard: the posted tenders must sum to exactly the
+   amount payable, or the invoice is refused. A tender list that does not add up
+   to the bill is worse than no tender list, since it would reconcile against
+   nothing while looking authoritative.
+
+   Method vocabulary matches `tenders.method` in the SQL schema exactly, so the
+   cutover is a copy rather than a translation.
+   ========================================================================== */
+
+const TENDER_METHODS = ['cash', 'card', 'upi', 'razorpay', 'advance', 'bank_transfer', 'other'];
+const MAX_TENDERS = 10;
+
+/**
+ * Validates the tender list against the amount actually payable.
+ *
+ * `payable` is the total AFTER any advance redemption, because a redeemed
+ * advance is not tendered at the counter — it was tendered when the customer
+ * deposited it, and it appears on the record as `appliedAdvance`. Counting it
+ * twice is exactly the reconciliation error this validation exists to prevent.
+ */
+function validateTenders(raw, payable) {
+    if (raw === undefined || raw === null) return { ok: true, tenders: [] };
+    if (!Array.isArray(raw)) {
+        return { ok: false, error: 'Tenders must be a list.' };
+    }
+    if (raw.length === 0) return { ok: true, tenders: [] };
+    if (raw.length > MAX_TENDERS) {
+        return { ok: false, error: `An invoice may be split across at most ${MAX_TENDERS} tenders.` };
+    }
+    // Nothing left to pay — an invoice fully settled by a redeemed advance has
+    // no counter tender, and recording a ₹0 one would just be a row that means
+    // nothing.
+    if (round2(payable) <= 0) return { ok: true, tenders: [] };
+
+    const tenders = [];
+    for (const [i, entry] of raw.entries()) {
+        if (!entry || typeof entry !== 'object') {
+            return { ok: false, error: `Tender ${i + 1} is not a valid payment.` };
+        }
+        const method = String(entry.method || '').trim().toLowerCase();
+        if (!TENDER_METHODS.includes(method)) {
+            return { ok: false, error: `Tender ${i + 1} has an unknown method. Use one of: ${TENDER_METHODS.join(', ')}.` };
+        }
+
+        /* A LONE TENDER WITH NO AMOUNT means "the whole bill, by this method".
+           The desk sends that for the ordinary unsplit sale, and it matters
+           because the server may legitimately price the invoice differently
+           from the browser — a rate synced overnight, a tax slab edited
+           mid-shift. The cashier's intent there was "the customer is paying the
+           whole bill in cash", not "the customer is paying ₹4,532", so pinning
+           the amount to the browser's stale total would refuse a sale the store
+           genuinely wants to make.
+
+           A cashier who has actually split the payment sends explicit amounts,
+           and those must reconcile exactly — see the check below. */
+        const amountOmitted = raw.length === 1
+            && (entry.amount === undefined || entry.amount === null || entry.amount === '');
+        const amount = amountOmitted ? payable : Number(entry.amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return { ok: false, error: `Tender ${i + 1} needs a positive amount.` };
+        }
+        if (amount > MAX_SANE_AMOUNT) {
+            return { ok: false, error: `Tender ${i + 1} exceeds the per-payment limit.` };
+        }
+        tenders.push({
+            method,
+            amount: round2(amount),
+            // A card slip number, a UPI UTR, a cheque number — whatever the
+            // reconciliation will be done against. Free text by necessity;
+            // clamped, and never used as an identifier by this system.
+            reference: String(entry.reference || '').trim().slice(0, 100)
+        });
+    }
+
+    // Compared in integer paise, not rupees. Two rupee floats that both look
+    // like the same amount need not be equal, and this is precisely the
+    // comparison that must not be approximate.
+    const tenderedPaise = tenders.reduce((total, t) => total + toPaise(t.amount), 0);
+    const payablePaise = toPaise(payable);
+    if (tenderedPaise !== payablePaise) {
+        return {
+            ok: false,
+            error: `The payments recorded (₹${fromPaise(tenderedPaise)}) do not add up to the amount due (₹${fromPaise(payablePaise)}). `
+                + 'Adjust the split so the two match.'
+        };
+    }
+
+    return { ok: true, tenders };
+}
+
 /**
  * POST /api/sales
  * Saves a new Gold POS Sale, handles sequence numbering, and registers advance deductions if applied.
@@ -948,47 +1778,65 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
     try {
         // Validate the core billing fields before consuming a real,
         // sequential, legally-relevant invoice number on garbage/empty data.
-        const VALID_PURITIES = ['24K', '22K', '18K'];
-        const { purity, weightGrams, totalAmount, customerName, customerPhone, appliedAdvance } = req.body;
+        const { totalAmount, customerName, customerPhone, appliedAdvance } = req.body;
 
-        if (!VALID_PURITIES.includes(purity)) {
-            return res.status(400).json({ error: 'A valid purity (24K, 22K, or 18K) is required.' });
-        }
-        const numWeight = Number(weightGrams);
         const numTotal = Number(totalAmount);
         const numAppliedAdvance = appliedAdvance === undefined ? 0 : Number(appliedAdvance);
-        if (!Number.isFinite(numWeight) || numWeight <= 0) {
-            return res.status(400).json({ error: 'A valid positive gold weight is required.' });
-        }
-        if (numWeight > MAX_SANE_WEIGHT_GRAMS) {
-            return res.status(400).json({ error: `Gold weight exceeds the ${MAX_SANE_WEIGHT_GRAMS}g per-invoice limit.` });
-        }
         if (!Number.isFinite(numTotal) || numTotal < 0) {
             return res.status(400).json({ error: 'A valid non-negative total amount is required.' });
         }
         if (!Number.isFinite(numAppliedAdvance) || numAppliedAdvance < 0) {
             return res.status(400).json({ error: 'Applied advance must be a valid non-negative amount.' });
         }
-        const numMakingCharge = req.body.makingChargeAmount === undefined ? 0 : Number(req.body.makingChargeAmount);
-        if (!Number.isFinite(numMakingCharge) || numMakingCharge < 0) {
-            return res.status(400).json({ error: 'Making charge must be a valid non-negative amount.' });
-        }
         const numDiscountPercent = req.body.discountPercent === undefined ? 0 : Number(req.body.discountPercent);
         if (!Number.isFinite(numDiscountPercent) || numDiscountPercent < 0 || numDiscountPercent > 100) {
             return res.status(400).json({ error: 'Discount percent must be between 0 and 100.' });
-        }
-        // Descriptive only — makingChargeAmount above is what the money math
-        // uses — but it prints on the invoice, so it is validated rather than
-        // trusted through to the ledger unchecked.
-        const numMakingChargePercent = req.body.makingChargePercent === undefined ? 0 : Number(req.body.makingChargePercent);
-        if (!Number.isFinite(numMakingChargePercent) || numMakingChargePercent < 0 || numMakingChargePercent > 100) {
-            return res.status(400).json({ error: 'Making charge percent must be between 0 and 100.' });
         }
         if (customerPhone && !/^\d{10}$/.test(customerPhone)) {
             return res.status(400).json({ error: 'Customer phone must be exactly 10 digits if provided.' });
         }
         if (customerName && String(customerName).length > 200) {
             return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
+        }
+
+        /* The lines, priced at the store's rates.
+           The flat single-item form is normalised into a one-line cart so there
+           is exactly one code path below, whichever shape the request took. */
+        const requestedLines = Array.isArray(req.body.lines) && req.body.lines.length > 0
+            ? req.body.lines
+            : [{
+                purity: req.body.purity,
+                weightGrams: req.body.weightGrams,
+                goldPricePerGram: req.body.goldPricePerGram,
+                makingChargeAmount: req.body.makingChargeAmount,
+                makingChargePercent: req.body.makingChargePercent,
+                discountPercent: req.body.discountPercent,
+                description: req.body.description
+            }];
+
+        if (requestedLines.length > MAX_INVOICE_LINES) {
+            return res.status(400).json({ error: `An invoice may hold at most ${MAX_INVOICE_LINES} items.` });
+        }
+
+        /* The rate is the store's, not the browser's — see validateSaleLine.
+           Fetched once for the whole invoice so every line on one document is
+           priced against the same snapshot, rather than a midnight sync landing
+           between line 2 and line 3. */
+        const activeRates = getActiveGoldRates();
+        const saleLineItems = [];
+        for (const [i, raw] of requestedLines.entries()) {
+            const checked = validateSaleLine(raw, i, activeRates);
+            if (!checked.ok) {
+                return res.status(checked.status || 400).json({ error: checked.error });
+            }
+            saleLineItems.push(checked.line);
+        }
+
+        const totalWeight = round3(saleLineItems.reduce((total, l) => total + l.weightGrams, 0));
+        if (totalWeight > MAX_SANE_WEIGHT_GRAMS) {
+            return res.status(400).json({
+                error: `The invoice totals ${totalWeight}g, over the ${MAX_SANE_WEIGHT_GRAMS}g per-invoice limit.`
+            });
         }
 
         const settingsFile = path.join(DATA_DIR, 'settings.json');
@@ -1007,43 +1855,27 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         // the browser bills Inclusive.
         const taxMode = normalizeTaxMode(settings.taxMode);
 
-        /* The rate is the store's, not the browser's.
-
-           goldPricePerGram and metalValue used to be taken from the request
-           body and written to the ledger unchallenged, which made every other
-           server-side recomputation below decorative: recomputing tax and
-           discount over a client-supplied metal value just derives correct
-           percentages of a number the client chose. A tampered payload could
-           bill 50g of 22K at ₹1/g, and the stored invoice would be internally
-           consistent and completely wrong.
-
-           The rate now comes from the same getActiveGoldRates() the Billing
-           Desk fetched to draw its preview — which is also what makes the
-           manual override in Settings actually binding rather than advisory. */
-        const activeRates = getActiveGoldRates();
-        const rateKey = PURITY_RATE_KEY[purity];
-        const numRate = Number(activeRates[rateKey]);
-        if (!Number.isFinite(numRate) || numRate <= 0) {
-            logError(`Refusing to bill ${purity}: the active gold rate is unusable (${activeRates[rateKey]}).`);
-            return res.status(503).json({
-                error: 'The current gold rate is unavailable, so this invoice cannot be priced. Check the gold rate in Settings and retry.'
-            });
-        }
-        const numMetalValue = computeMetalValue(numWeight, numRate);
-
-        // The cashier quoted a rate on screen. If the rate moved between then
-        // and Save — an overnight sync, or an override edited mid-shift — the
-        // server's figure is what gets filed, and the desk is told so it can
-        // reprint rather than hand over a slip that disagrees with the ledger.
-        const clientRate = Number(req.body.goldPricePerGram);
-        const rateWasCorrected = Number.isFinite(clientRate) && Math.abs(clientRate - numRate) > 0.01;
+        // The cashier quoted a rate on screen, per line. If any of them moved
+        // between then and Save — an overnight sync, or an override edited
+        // mid-shift — the server's figure is what gets filed, and the desk is
+        // told so it can reprint rather than hand over a slip that disagrees
+        // with the ledger.
+        const rateWasCorrected = saleLineItems.some(l =>
+            Number.isFinite(l.clientRate) && Math.abs(l.clientRate - l.goldPricePerGram) > 0.01
+        );
         if (rateWasCorrected) {
-            logError(
-                `Sale rate mismatch — client billed ${purity} at ${clientRate}/g, server's active rate is ` +
-                `${numRate}/g (source: ${activeRates.sources[rateKey]}). Persisting the server rate.`
-            );
-            logTelemetry('SALE_RATE_MISMATCH', 0, `client: ${clientRate}, server: ${numRate}`);
+            for (const l of saleLineItems) {
+                if (!Number.isFinite(l.clientRate) || Math.abs(l.clientRate - l.goldPricePerGram) <= 0.01) continue;
+                logError(
+                    `Sale rate mismatch — client billed line ${l.lineNumber} (${l.purity}) at ${l.clientRate}/g, ` +
+                    `server's active rate is ${l.goldPricePerGram}/g (source: ${l.goldRateSource}). Persisting the server rate.`
+                );
+                logTelemetry('SALE_RATE_MISMATCH', 0, `client: ${l.clientRate}, server: ${l.goldPricePerGram}`);
+            }
         }
+        // `clientRate` was only ever needed for that comparison — it is not a
+        // money field and must not reach the ledger.
+        saleLineItems.forEach(l => { delete l.clientRate; });
 
         let advancesFile = null;
         let advances = null;
@@ -1063,8 +1895,11 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         }
 
         const totals = computeInvoiceTotals({
-            metalValue: numMetalValue,
-            makingChargeAmount: numMakingCharge,
+            lines: saleLineItems.map(l => ({
+                metalValue: l.metalValue,
+                makingChargeAmount: l.makingChargeAmount,
+                discountPercent: l.discountPercent
+            })),
             discountPercent: numDiscountPercent,
             taxSlab,
             taxMode,
@@ -1084,6 +1919,14 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
                 `(taxSlab ${taxSlab}%, taxMode ${taxMode}, discount ${numDiscountPercent}%). Persisting the server value.`
             );
             logTelemetry('SALE_TOTAL_MISMATCH', 0, `client: ${round2(numTotal)}, server: ${serverTotal}`);
+        }
+
+        // How the bill was settled, checked against what is actually payable.
+        // Validated BEFORE the invoice number is consumed — a tender split that
+        // does not add up must not burn a sequential, legally-relevant number.
+        const tendered = validateTenders(req.body.tenders, serverTotal);
+        if (!tendered.ok) {
+            return res.status(400).json({ error: tendered.error });
         }
 
         // 1. Generate Incrementing Serial Invoice ID
@@ -1119,16 +1962,45 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             timestamp: now,
             customerName: customerName ? String(customerName).slice(0, 200) : 'Cash Sale',
             customerPhone: customerPhone || '',
-            purity,
-            weightGrams: numWeight,
-            goldPricePerGram: numRate,
-            // Provenance of the rate this invoice was priced at, so a later
+
+            /* THE ITEMS. Each line's own purity, weight, rate, making charge and
+               discount, with its allocated share of the invoice's taxable value
+               and GST merged in from computeInvoiceTotals — so the rows on the
+               printed invoice sum exactly to the total at the bottom. */
+            lines: saleLineItems.map((l, i) => ({ ...l, ...totals.lines[i] })),
+
+            /* THE ROLLUP, kept deliberately.
+
+               These are the same scalar fields a single-line invoice has always
+               carried, now describing the whole document. They are redundant
+               with `lines` above and that is the point: every reader written
+               before lines existed — the dashboard tile, the email report, a
+               tenant's extension, an accountant's export — keeps working
+               untouched, and reads the right figures for a multi-line invoice
+               rather than the first line's.
+
+               `purity` is the invoice's only when every line agrees on it;
+               'MIXED' otherwise, because silently reporting line 1's purity for
+               a mixed cart would be a wrong answer rather than a missing one. */
+            purity: [...new Set(saleLineItems.map(l => l.purity))].length === 1
+                ? saleLineItems[0].purity
+                : 'MIXED',
+            weightGrams: totalWeight,
+            // A single-rate invoice states its rate; a mixed one has no single
+            // rate to state, and 0 is how every downstream reader already
+            // represents "not applicable" for this field.
+            goldPricePerGram: [...new Set(saleLineItems.map(l => l.goldPricePerGram))].length === 1
+                ? saleLineItems[0].goldPricePerGram
+                : 0,
+            // Provenance of the rates this invoice was priced at, so a later
             // audit can tell a synced market rate from a counter override
             // without having to guess from the number alone.
-            goldRateSource: activeRates.sources[rateKey],
-            metalValue: numMetalValue,
-            makingChargePercent: numMakingChargePercent,
-            makingChargeAmount: round2(numMakingCharge),
+            goldRateSource: [...new Set(saleLineItems.map(l => l.goldRateSource))].join('+'),
+            metalValue: round2(saleLineItems.reduce((t, l) => t + l.metalValue, 0)),
+            makingChargePercent: [...new Set(saleLineItems.map(l => l.makingChargePercent))].length === 1
+                ? saleLineItems[0].makingChargePercent
+                : 0,
+            makingChargeAmount: round2(saleLineItems.reduce((t, l) => t + l.makingChargeAmount, 0)),
             taxPercent: taxSlab,
             taxMode,
             taxableAmount: round2(totals.taxableAmount),
@@ -1136,7 +2008,25 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             discountPercent: numDiscountPercent,
             discount: round2(totals.discountAmount),
             appliedAdvance: round2(totals.appliedAdvance),
-            totalAmount: serverTotal
+            totalAmount: serverTotal,
+
+            /* HOW IT WAS PAID. Empty when the desk did not record a split, which
+               is what every invoice filed before tenders existed looks like —
+               so an empty list means "not recorded", never "paid nothing". When
+               non-empty it is guaranteed to sum to totalAmount (validateTenders
+               refuses the sale otherwise), which is what makes a cash-drawer
+               close and a card settlement reconcilable against it. */
+            tenders: tendered.tenders,
+            /* WHO BILLED THIS. Taken from the session, never from the body —
+               a client-supplied cashier name is worth nothing as an audit
+               trail, since the whole point is to bind the record to the
+               credential that was used.
+
+               Every invoice used to be filed anonymously: one shared PIN
+               gated the desk, so a discount, a counter rate override and the
+               sale itself named nobody. Maps to invoices.created_by_user_id +
+               the actor label in the SQL schema at cutover. */
+            actor: req.actor
         };
 
         // 3. Save to partitioned annual file (e.g. sales_2026.json)
@@ -1153,7 +2043,10 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
                 type: 'redeem',
                 amount: parseFloat(sale.appliedAdvance),
                 invoiceId: invoiceId,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                // Spending a customer's credit is a money movement, so it
+                // carries the same signature as the invoice that spent it.
+                actor: req.actor
             });
         }
 
@@ -1209,12 +2102,23 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
 const REFUND_MODES = ['cash', 'gold'];
 
 /**
- * GET /api/returns
- * The whole returns ledger, newest first. Admin-only.
+ * GET /api/returns?from=&to=&limit=
+ * A page of the returns ledger, newest first, with the period's refund total.
+ * Admin-only. Same envelope and same clamp as GET /api/sales — see above.
  */
 app.get('/api/returns', requireAdminSession, (req, res) => {
     try {
-        res.json(readReturnRecords());
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+
+        const matched = readReturnRecords(q.years).filter(r => withinRange(r, q.from, q.to));
+        res.json(pagedLedger(matched, q.limit, {
+            totals: {
+                count: matched.length,
+                refundAmount: round2(matched.reduce((sum, r) => sum + (Number(r.refundAmount) || 0), 0)),
+                weightGrams: round3(matched.reduce((sum, r) => sum + (Number(r.weightGrams) || 0), 0))
+            }
+        }));
     } catch (err) {
         logError('Error retrieving returns ledger: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve returns' });
@@ -1237,7 +2141,7 @@ app.get('/api/returns', requireAdminSession, (req, res) => {
  */
 app.post('/api/returns', requireAdminSession, (req, res) => {
     try {
-        const { invoiceId, weightGrams, refundMode, note } = req.body || {};
+        const { invoiceId, weightGrams, refundMode, note, lineNumber } = req.body || {};
 
         const cleanInvoiceId = String(invoiceId || '').trim();
         if (!cleanInvoiceId) {
@@ -1249,6 +2153,13 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
         const numWeight = Number(weightGrams);
         if (!Number.isFinite(numWeight) || numWeight <= 0) {
             return res.status(400).json({ error: 'A valid positive return weight is required.' });
+        }
+        // Which item on the invoice is coming back. Optional on a single-line
+        // invoice — computeReturnRefund resolves it — and required on a
+        // multi-line one, which it enforces rather than guessing.
+        const numLine = lineNumber === undefined || lineNumber === null ? null : Number(lineNumber);
+        if (numLine !== null && (!Number.isInteger(numLine) || numLine < 1)) {
+            return res.status(400).json({ error: 'Line number must be a positive whole number.' });
         }
 
         const sale = readSalesRecords().find(s => s && s.id === cleanInvoiceId);
@@ -1270,10 +2181,25 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
 
         const returns = readReturnRecords();
         const priorReturns = summarizeInvoiceReturns(cleanInvoiceId, returns);
+        const state = withReturnState(sale, returns);
+
+        // Prior returns are measured PER LINE — a line's remaining weight is its
+        // own, and exhausting line 2 must not consume line 1's returnable
+        // weight. `invoiceRemainingGrams` is the whole-invoice figure, which is
+        // what the money true-up on the closing return keys on.
+        const resolvedLine = numLine !== null
+            ? numLine
+            : (saleLines(sale).length === 1 ? 1 : null);
+        const priorOnLine = resolvedLine === null
+            ? 0
+            : round3(priorReturns.returnedByLine.get(resolvedLine) || 0);
+
         const refund = computeReturnRefund({
             sale,
             returnWeightGrams: numWeight,
-            alreadyReturnedGrams: priorReturns.returnedWeightGrams,
+            lineNumber: numLine,
+            alreadyReturnedGrams: priorOnLine,
+            invoiceRemainingGrams: state.returnableWeightGrams,
             alreadyRefundedAmount: priorReturns.refundedAmount
         });
         if (!refund.ok) {
@@ -1283,6 +2209,43 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
             return res.status(400).json({
                 error: 'This return prices to a zero refund, so there is nothing to pay back. Check the weight entered.'
             });
+        }
+
+        /* APPROVAL THRESHOLD. A refund is the one counter action that takes money
+           out of the till on the cashier's own say-so, and it was the obvious
+           remaining insider-fraud gap once roles existed.
+
+           Checked HERE, after the server has priced the refund, because the
+           amount that matters is the one about to be filed — not one the client
+           proposed. Zero disables the control, which is the previous behaviour
+           and therefore the default: no existing store is surprised by a refusal
+           it never configured.
+
+           The MFA condition is the same one requireApprover applies, restated
+           rather than shared because this is not a whole-route gate: a cashier
+           may file small refunds all day, and only crossing the threshold turns
+           this into an approver's decision. */
+        const refundSettings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        const threshold = round2(refundSettings.refundApprovalThreshold || 0);
+        if (threshold > 0 && refund.refundAmount >= threshold) {
+            if (!roleCanApprove(req.actor.role)) {
+                logTelemetry('REFUND_APPROVAL_DENIED', 0,
+                    `${req.actor.name} (${req.actor.role}) attempted ${refund.refundAmount} on ${sale.id}`);
+                return res.status(403).json({
+                    error: 'APPROVER_REQUIRED',
+                    message: `A refund of ₹${refund.refundAmount} needs a manager or the owner to authorise it `
+                        + `(this store's limit is ₹${threshold}). ${req.actor.name} is signed in as ${req.actor.role}.`
+                });
+            }
+            if (refundSettings.requireMfaForApprovers === true && req.adminSession && !req.adminSession.mfaUsed) {
+                logTelemetry('REFUND_APPROVAL_DENIED_NO_MFA', 0,
+                    `${req.actor.name} (${req.actor.role}) attempted ${refund.refundAmount} on ${sale.id}`);
+                return res.status(403).json({
+                    error: 'MFA_REQUIRED',
+                    message: `A refund of ₹${refund.refundAmount} is at or above this store's ₹${threshold} limit, `
+                        + 'and this store requires two-factor authentication to authorise one. Sign in with your authenticator code.'
+                });
+            }
         }
 
         const returnId = newId('RET');
@@ -1302,9 +2265,20 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
             originalTimestamp: sale.timestamp || null,
             customerName: sale.customerName || 'Cash Sale',
             customerPhone: sale.customerPhone || '',
+            // WHICH ITEM came back. Load-bearing on a multi-line invoice: it is
+            // what limits further returns against that line and what lets the
+            // refund be re-priced at the right rate. A row without it reads as
+            // line 1, which is correct for every invoice filed before lines.
+            lineNumber: refund.lineNumber,
+            description: refund.description,
             purity: refund.purity,
             weightGrams: refund.weightGrams,
-            originalWeightGrams: round3(sale.weightGrams),
+            // The weight of the LINE being returned, not of the whole invoice —
+            // it is what this return's share was computed against.
+            originalWeightGrams: round3(
+                (saleLines(sale).find(l => l.lineNumber === refund.lineNumber) || {}).weightGrams
+            ),
+            invoiceWeightGrams: round3(sale.weightGrams),
             // The rate the goods were SOLD at, restated on the credit note so
             // the customer can see the refund was not re-priced against today.
             goldPricePerGram: refund.goldPricePerGram,
@@ -1323,8 +2297,14 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
             itemised: refund.itemised,
             refundAmount: refund.refundAmount,
             refundMode,
+            closesLine: refund.closesLine,
             closesInvoice: refund.closesInvoice,
-            note: String(note || '').trim().slice(0, 300)
+            note: String(note || '').trim().slice(0, 300),
+            // WHO AUTHORISED THE REFUND. A cash refund moves money out of the
+            // till, which makes it the single most fraud-sensitive write in the
+            // system and the one that least tolerated being anonymous. From the
+            // session, never the body — see POST /api/sales.
+            actor: req.actor
         };
 
         const transactionWrites = [];
@@ -1344,7 +2324,10 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
                 status: ADVANCE_STATUS.APPROVED,
                 source: 'return',
                 invoiceId: sale.id,
-                returnId
+                returnId,
+                // The same person the return names — the credit and the refund
+                // that created it are one counter decision.
+                actor: req.actor
             });
             returnRecord.advanceCreditId = creditRow.id;
             returnRecord.lockedGoldRate22K = creditRow.lockedGoldRate22K;
@@ -1374,7 +2357,13 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
             returnId,
             return: returnRecord,
             advanceCredit: creditRow,
-            remainingWeightGrams: refund.remainingWeightAfter
+            // What is left on the LINE just returned against…
+            remainingWeightGrams: refund.remainingWeightAfter,
+            // …and on the invoice as a whole, which is what the desk needs to
+            // decide whether to offer another return against this bill at all.
+            invoiceRemainingWeightGrams: round3(
+                Math.max(0, state.returnableWeightGrams - refund.weightGrams)
+            )
         });
     } catch (err) {
         logError('Error filing return: ' + err.message, err.stack);
@@ -1386,20 +2375,122 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
    API Routes: Customer Advances Lookup
    ========================================================================== */
 
+const ADVANCE_ROW_TYPES = ['deposit', 'redeem'];
+
 /**
- * GET /api/advances
- * Returns the full advances ledger (deposits + redemptions), sorted by date
- * descending. Admin-only — powers the Dashboard and Advances report tabs.
+ * GET /api/advances?from=&to=&type=&limit=
+ * A page of the advances ledger (deposits + redemptions), newest first, plus
+ * the store's whole outstanding liability. Admin-only — powers the Dashboard
+ * tile and the Advances tab.
+ *
+ * `summary` is deliberately computed over the ENTIRE ledger and ignores every
+ * filter, because an advance balance is a lifetime running figure: what the
+ * store owes a customer today is every deposit they ever made minus every
+ * redemption, and a month's slice of that is not a balance. Only `totals`
+ * describes the filtered period.
  */
 app.get('/api/advances', requireAdminSession, (req, res) => {
     try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+
+        // `type` narrows the page server-side. Without it, a screen wanting the
+        // five most recent DEPOSITS had to over-fetch and filter, and could
+        // still come back empty on a run of redemptions.
+        const type = String(req.query.type || '').trim().toLowerCase();
+        if (type && !ADVANCE_ROW_TYPES.includes(type)) {
+            return res.status(400).json({ error: `Type must be one of: ${ADVANCE_ROW_TYPES.join(', ')}.` });
+        }
+
         const advancesFile = path.join(DATA_DIR, 'advances.json');
         const advances = readJSON(advancesFile, []);
         advances.sort((a, b) => b.timestamp - a.timestamp);
-        res.json(advances);
+
+        const matched = advances.filter(a =>
+            withinRange(a, q.from, q.to) && (!type || (a && a.type === type))
+        );
+        res.json(pagedLedger(matched, q.limit, {
+            summary: summarizeAdvanceLiability(advances),
+            totals: {
+                count: matched.length,
+                depositAmount: round2(matched
+                    .filter(a => a && a.type === 'deposit')
+                    .reduce((sum, a) => sum + Math.abs(Number(a.amount) || 0), 0)),
+                redeemedAmount: round2(matched
+                    .filter(a => a && a.type === 'redeem')
+                    .reduce((sum, a) => sum + Math.abs(Number(a.amount) || 0), 0))
+            }
+        }));
     } catch (err) {
         logError('Error retrieving advances ledger: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve advances ledger' });
+    }
+});
+
+/**
+ * GET /api/advances/customers?q=&limit=
+ * One running-balance row per customer who has ever had an advance, newest
+ * activity first. Admin-only — this is what the Advances tab lists.
+ *
+ * THE ROLLUP HAPPENS HERE, not in the browser. The Advances tab used to
+ * download the entire ledger and collapse it per customer on the client, which
+ * meant the tab could not be paged without silently reporting wrong balances:
+ * a customer's spendable credit is every row they have ever had, so a page of
+ * recent rows is not enough to compute it. Rolled up server-side, the browser
+ * receives a bounded list of correct balances instead of unbounded history.
+ *
+ * Search is applied AFTER the rollup, so a cashier searching a phone number
+ * matches on the customer, not on whichever of their rows happened to be in
+ * the page.
+ */
+app.get('/api/advances/customers', requireAdminSession, (req, res) => {
+    try {
+        const limit = Math.min(LEDGER_PAGE_MAX, Math.max(1, parseInt(req.query.limit, 10) || LEDGER_PAGE_DEFAULT));
+        const q = String(req.query.q || '').trim().toLowerCase();
+
+        const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
+        const byPhone = new Map();
+        for (const row of advances) {
+            if (!row) continue;
+            const phone = row.customerPhone || '';
+            if (!byPhone.has(phone)) byPhone.set(phone, { phone, name: '', lastActivity: 0, entries: [] });
+            const c = byPhone.get(phone);
+            c.lastActivity = Math.max(c.lastActivity, row.timestamp || 0);
+            c.entries.push(row);
+            // A deposit is the more authoritative "who this customer is" source
+            // than a redemption, which copies the name off the sale.
+            if (row.type === 'deposit' && row.customerName) c.name = row.customerName;
+            else if (!c.name && row.customerName) c.name = row.customerName;
+        }
+
+        let customers = Array.from(byPhone.values()).map(c => {
+            // The same summariser the tile, the portal and the redemption
+            // lookup use — one rule for what counts as spendable credit.
+            const summary = summarizeAdvanceLedger(c.entries);
+            return {
+                phone: c.phone,
+                name: c.name,
+                balance: summary.balance,
+                pendingTotal: summary.pendingTotal,
+                pendingCount: summary.pendingCount,
+                entryCount: c.entries.length,
+                lastActivity: c.lastActivity
+            };
+        });
+
+        if (q) {
+            const digits = q.replace(/\D/g, '');
+            customers = customers.filter(c =>
+                (digits.length > 0 && String(c.phone).includes(digits))
+                || String(c.name || '').toLowerCase().includes(q)
+            );
+        }
+        customers.sort((a, b) => b.lastActivity - a.lastActivity);
+
+        res.json(pagedLedger(customers, limit, { summary: summarizeAdvanceLiability(advances) }));
+    } catch (err) {
+        logError('Error rolling up advance customers: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to retrieve advance customers' });
     }
 });
 
@@ -1460,7 +2551,8 @@ function computeAdvanceLedger(phone, advances = readJSON(path.join(DATA_DIR, 'ad
  */
 function buildAdvanceDepositRow({
     customerPhone, customerName, amount, paymentMethod, referenceId,
-    status = ADVANCE_STATUS.APPROVED, source = 'counter', invoiceId = '', returnId = ''
+    status = ADVANCE_STATUS.APPROVED, source = 'counter', invoiceId = '', returnId = '',
+    actor = SYSTEM_ACTOR
 }) {
     return {
         id: newId('ADV'),
@@ -1482,13 +2574,25 @@ function buildAdvanceDepositRow({
         // that moment is the one they are owed. A rate move during the approval
         // wait is the store's timing, not the customer's.
         lockedGoldRate22K: getActiveGoldRates().price22K,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        /* WHO CREATED THIS ROW. Not who the money belongs to — who put it in the
+           ledger. Defaults to SYSTEM_ACTOR because most callers are machinery: a
+           signature-verified Razorpay capture, the webhook, a return credit
+           filed by the store itself. A cashier keying a counter deposit passes
+           their own session actor, so "the shop says this cash arrived" and
+           "the gateway proved this transfer arrived" are distinguishable
+           afterwards, which is the distinction the approval queue rests on.
+
+           A CUSTOMER's own unverified UPI claim is neither: it is recorded with
+           the system actor and status 'pending', and gains an `approvedBy` only
+           when a manager releases it. */
+        actor: { id: actor.id, name: actor.name, role: actor.role }
     };
 }
 
 function recordAdvanceDeposit({
     customerPhone, customerName, amount, paymentMethod, referenceId,
-    status = ADVANCE_STATUS.APPROVED
+    status = ADVANCE_STATUS.APPROVED, actor = SYSTEM_ACTOR
 }) {
     if (!isValidPhone(customerPhone)) {
         return { success: false, error: 'Valid 10-digit customer phone number required' };
@@ -1528,7 +2632,7 @@ function recordAdvanceDeposit({
 
     const deposit = buildAdvanceDepositRow({
         customerPhone, customerName, amount: numAmount,
-        paymentMethod, referenceId: cleanReference, status
+        paymentMethod, referenceId: cleanReference, status, actor
     });
     const resolvedStatus = deposit.status;
 
@@ -1552,9 +2656,15 @@ function recordAdvanceDeposit({
 /**
  * Moves a pending deposit to approved or rejected, in one read-modify-write so
  * a double-tapped Approve button cannot credit the same claim twice.
+ *
+ * `approver` is stamped onto the row and is the point of the whole pending
+ * state: an unverified customer claim becomes spendable credit only when a named
+ * person with an approving role says the transfer landed. Without a name on it,
+ * "reconciled by a manager" was an aspiration rather than a record.
+ *
  * @returns {{success: boolean, error?: string, status?: number, deposit?: object}}
  */
-function reviewPendingDeposit(depositId, decision, note) {
+function reviewPendingDeposit(depositId, decision, note, approver = SYSTEM_ACTOR) {
     const advancesFile = path.join(DATA_DIR, 'advances.json');
     const advances = readJSON(advancesFile, []);
     const index = advances.findIndex(a => a.id === depositId && a.type === 'deposit');
@@ -1576,14 +2686,21 @@ function reviewPendingDeposit(depositId, decision, note) {
         ...current,
         status: decision,
         reviewedAt: Date.now(),
-        reviewNote: String(note || '').trim().slice(0, 300)
+        reviewNote: String(note || '').trim().slice(0, 300),
+        // Maps to advance_entries.approved_by_user_id, which the SQL schema
+        // guards with CHECK (status <> 'posted' OR approved_by_user_id IS NOT
+        // NULL) — no money claim may be posted anonymously.
+        reviewedBy: { id: approver.id, name: approver.name, role: approver.role }
     };
     advances[index] = reviewed;
     if (!writeJSONTransaction([{ filepath: advancesFile, data: advances }])) {
         return { success: false, status: 500, error: 'Failed to save the review. Please retry.' };
     }
 
-    logTelemetry('REVIEW_ADVANCE_DEPOSIT', 0, `Deposit: ${depositId}, Decision: ${decision}, Amount: ${reviewed.amount}`);
+    logTelemetry(
+        'REVIEW_ADVANCE_DEPOSIT', 0,
+        `Deposit: ${depositId}, Decision: ${decision}, Amount: ${reviewed.amount}, By: ${approver.name} (${approver.role})`
+    );
     // The hook deliberately fires here, on approval, rather than at submission:
     // this is the moment the credit becomes real for the customer.
     if (decision === ADVANCE_STATUS.APPROVED) fireHook('onAdvanceDeposit', reviewed);
@@ -1622,8 +2739,14 @@ app.post('/api/advances', requireAdminSession, (req, res) => {
     try {
         // A cashier at the counter has seen the money, so a counter entry is
         // approved on arrival. `status` is pinned here rather than read from the
-        // body so this route can never be used to inject a pending row.
-        const result = recordAdvanceDeposit({ ...(req.body || {}), status: ADVANCE_STATUS.APPROVED });
+        // body so this route can never be used to inject a pending row — and
+        // `actor` likewise, so the row names whoever's PIN opened this session
+        // rather than whatever the payload claimed.
+        const result = recordAdvanceDeposit({
+            ...(req.body || {}),
+            status: ADVANCE_STATUS.APPROVED,
+            actor: req.actor
+        });
         if (!result.success) {
             const status = result.code === 'DUPLICATE_REFERENCE' ? 409
                 : result.error.startsWith('Failed to persist') ? 500 : 400;
@@ -1657,12 +2780,20 @@ app.get('/api/advances/pending', requireAdminSession, (req, res) => {
 
 /**
  * POST /api/advances/:id/approve
- * Credits a pending deposit once the cashier has confirmed the transfer landed
- * in the store's account. This is the point the money becomes spendable.
+ * Credits a pending deposit once a manager has confirmed the transfer landed in
+ * the store's account. This is the point the money becomes spendable.
+ *
+ * requireApprover, not just requireAdminSession: releasing an unverified
+ * customer claim into a spendable balance is the one counter action a cashier
+ * must not be able to take alone. That control is only meaningful now that a
+ * session has a role at all — before, "manager approval" named a person who did
+ * not exist in the system.
  */
-app.post('/api/advances/:id/approve', requireAdminSession, (req, res) => {
+app.post('/api/advances/:id/approve', requireAdminSession, requireApprover, (req, res) => {
     try {
-        const result = reviewPendingDeposit(req.params.id, ADVANCE_STATUS.APPROVED, (req.body || {}).note);
+        const result = reviewPendingDeposit(
+            req.params.id, ADVANCE_STATUS.APPROVED, (req.body || {}).note, req.actor
+        );
         if (!result.success) return res.status(result.status).json({ error: result.error });
         res.json({ success: true, deposit: result.deposit });
     } catch (err) {
@@ -1676,14 +2807,18 @@ app.post('/api/advances/:id/approve', requireAdminSession, (req, res) => {
  * Marks a claimed transfer as not received. The row is kept rather than deleted
  * — a rejected claim is exactly the history worth being able to look back on,
  * and a reason is required so the customer can be told something specific.
+ *
+ * Approver-gated for the same reason as approve: refusing a customer's claim
+ * that they paid is as consequential a call as accepting it, and both belong to
+ * whoever carries the reconciliation.
  */
-app.post('/api/advances/:id/reject', requireAdminSession, (req, res) => {
+app.post('/api/advances/:id/reject', requireAdminSession, requireApprover, (req, res) => {
     try {
         const note = String((req.body || {}).note || '').trim();
         if (!note) {
             return res.status(400).json({ error: 'A reason is required when rejecting a deposit claim.' });
         }
-        const result = reviewPendingDeposit(req.params.id, ADVANCE_STATUS.REJECTED, note);
+        const result = reviewPendingDeposit(req.params.id, ADVANCE_STATUS.REJECTED, note, req.actor);
         if (!result.success) return res.status(result.status).json({ error: result.error });
         res.json({ success: true, deposit: result.deposit });
     } catch (err) {
@@ -2704,7 +3839,14 @@ export function startServer(port = PORT, host = '127.0.0.1') {
 }
 
 function bootstrapServer() {
-    // FIRST, before any scheduler starts, any backup is written, or the port
+    /* Before the guard, because the guard asks "is the master PIN still the
+       default?" and can only answer that against the canonical stored form. This
+       is also the moment a tenant upgrading from a build that kept PINs in
+       plaintext has them hashed and the plaintext deleted — once, on the first
+       boot after the upgrade, with nobody having to retype anything. */
+    migrateStoredPins();
+
+    // Then, before any scheduler starts, any backup is written, or the port
     // is bound: refuse to run a production process that is configured to take
     // money it cannot honour. Inert outside NODE_ENV=production.
     assertProductionReady();

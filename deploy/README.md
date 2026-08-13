@@ -143,7 +143,8 @@ costs and click paths.
 
 What it does, i.e. what to do by hand if you'd rather:
 
-1. §1 once (Node 20, PM2, Nginx, Certbot) + `ufw` allowing only OpenSSH and
+1. §1 once (Node 24 — the floor since ADR-001, `node:sqlite` needs it — PM2,
+   Nginx, Certbot) + `ufw` allowing only OpenSSH and
    Nginx — all 5 Node processes bind `127.0.0.1`, so their ports must never
    be publicly reachable.
 2. DNS: 5 A records (table above) → the VPS IP.

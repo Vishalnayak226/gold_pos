@@ -42,18 +42,29 @@
       "id": "persistence",
       "lobe": "pos",
       "name": "Persistence & Settings",
-      "role": "Atomic JSON file writers, the error/telemetry logs, and the settings default-merge-and-retire mechanism that stands in for schema migrations. Every tenant's live data passes through here. seed.js generates the deterministic synthetic fixture database the E2E suite and manual QA run against.",
+      "role": "The SQLite datastore and the JSON layer it replaces. backend/repositories/ is the ADR-001 seam: connection/PRAGMAs, the migration runner, the numbered migrations, and one repository per domain — no SQL string exists above this directory, which is what keeps the documented move to PostgreSQL a swap rather than a rewrite. importLegacyJson.js carries a live tenant across from the JSON ledger with a dry run, a reconciliation report and a rollback. db.js/defaultSettings.js are the legacy JSON writers plus the settings default-merge-and-retire mechanism; settings and licence stay JSON on purpose. seed.js generates the deterministic synthetic fixture database.",
       "match": [
         "backend/db.js",
         "backend/defaultSettings.js",
-        "backend/seed.js"
+        "backend/seed.js",
+        "backend/repositories/**",
+        "backend/importLegacyJson.js"
+      ]
+    },
+    {
+      "id": "domain-services",
+      "lobe": "pos",
+      "name": "Domain Services",
+      "role": "The money rules, sitting between the routes and the repositories. A sale is one ACID transaction here — number allocation, header, lines, tenders, advance redemption and audit commit together or not at all — and the advance-balance check runs inside it, which is what stops two tills spending one balance. Services own the pricing decision and the persistence; routes own only HTTP parsing and status codes.",
+      "match": [
+        "backend/services/**"
       ]
     },
     {
       "id": "pricing",
       "lobe": "pos",
       "name": "Pricing & Billing Math",
-      "role": "Gold rate sync, rate overrides, and the DOM-free billing helpers shared by the browser and the Node test suite. Making charges, wastage, GST, and bi-directional rounding live here.",
+      "role": "Gold rate sync, rate overrides, and the DOM-free billing helpers shared by the browser and the Node test suite. Making charges, GST, bi-directional rounding, the per-line allocation that makes a multi-line invoice's rows sum to its total, the saleLines() seam that reads a stored sale of either shape, and the return-refund pipeline all live here. Wastage does NOT — it exists nowhere in the tree; see the roadmap Phase 5 note.",
       "match": [
         "backend/priceEngine.js",
         "frontend/js/lib/*.js"
@@ -115,7 +126,7 @@
       "id": "security",
       "lobe": "platform",
       "name": "Crypto, Auth & Black Box",
-      "role": "Admin authentication and lockout, the RSA-4096/AES-256-GCM diagnostics envelope, black-box incident logging, and every key material path. Nothing private here is ever committed.",
+      "role": "Admin identity and every credential the terminal verifies. adminAuth.js owns the lot: scrypt-hashed PINs (one tenant-wide authSalt, because a PIN-only login has no username to look a per-user salt up by), the migration that converts a tenant's plaintext PINs on boot and deletes them, the named-operator roster and its four roles, session issue/expiry/revocation, the approver and privileged-MFA gates, and RFC 6238 TOTP with single-use hashed recovery codes — all on node:crypto, no dependency. Also the RSA-4096/AES-256-GCM diagnostics envelope, black-box incident logging, the fail-closed production guard, and every key material path. Nothing private here is ever committed, and no credential may live in DEFAULT_SETTINGS — see CLAUDE.md §0.",
       "match": [
         "backend/adminAuth.js",
         "backend/cryptoHelper.js",
@@ -214,7 +225,8 @@
         "docs/BRD.md",
         "docs/credentials.md",
         "**README.md",
-        "docs/archive/**"
+        "docs/archive/**",
+        "docs/adr/**"
       ]
     },
     {

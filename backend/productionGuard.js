@@ -23,6 +23,7 @@
 
 import path from 'path';
 import { readJSON, logError, DATA_DIR } from './db.js';
+import { verifyPinHash } from './adminAuth.js';
 
 // The shipped placeholders. Matching these exactly is what identifies an
 // install that was deployed without anyone opening Settings.
@@ -67,10 +68,22 @@ export function findProductionBlockers(settings = {}, env = process.env) {
         blockers.push(`The configured public URL "${publicUrl}" is not an https:// origin. Payment callbacks and customer sessions must not traverse plaintext HTTP.`);
     }
 
-    // --- Credentials -------------------------------------------------------
-    if (!settings.adminPin) {
+    /* --- Credentials -------------------------------------------------------
+
+       The master PIN is stored as a scrypt hash, so "is it still 1234?" is
+       answered by hashing 1234 against this tenant's salt and comparing — not by
+       a string equality that would silently stop finding anything the moment
+       hashing shipped. A settings.json restored from an older backup can still
+       hold a plaintext `adminPin`, which is checked directly for the same reason
+       the migration still looks for it. */
+    const storedHash = settings.adminPinHash;
+    const storedPlain = settings.adminPin;
+    if (!storedHash && !storedPlain) {
         blockers.push('No admin PIN is set, so the admin terminal would fall back to the shipped default.');
-    } else if (String(settings.adminPin) === DEFAULT_ADMIN_PIN) {
+    } else if (storedPlain && String(storedPlain) === DEFAULT_ADMIN_PIN) {
+        blockers.push('The admin PIN is still the shipped default (1234). Anyone who can reach this install can open the admin terminal.');
+    } else if (storedHash && settings.authSalt
+        && verifyPinHash(DEFAULT_ADMIN_PIN, settings.authSalt, storedHash)) {
         blockers.push('The admin PIN is still the shipped default (1234). Anyone who can reach this install can open the admin terminal.');
     }
 

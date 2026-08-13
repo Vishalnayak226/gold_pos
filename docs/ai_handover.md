@@ -12,17 +12,73 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `818b401` — "Secure settings and add HTTP money-path tests" (2026-08-08).
-  `main` contains Phases 1–21 plus 20.2. The earlier divergence between `main` and
-  `phase-20.1-customer-auth` is **resolved**: `f04f138` (payments/atomic-sales hardening) and
-  `7bf4df3` (Phase 20.2) are both in `main`, and the two branch tips now hold the same tree.
-- **⚠️ UNCOMMITTED WORK IS IN THE TREE RIGHT NOW (2026-08-11).** THREE units of work are sitting
-  uncommitted, all finished and fully tested: the Phase 0 remediation, Phase 22 on top of it, and
-  Phase 23 (Returns & Refunds) on top of that. `git status` shows ~30 modified files and 8 new
-  paths (`backend/productionGuard.js`, `backend/seed.js`, `backend/test_production_guard.js`,
-  `backend/playwright.config.js`, `backend/tests/`, `frontend/js/components/ReprintDesk.js`,
-  `frontend/js/components/ReturnDesk.js`, `backend/tests/e2e/return-desk.spec.js`). Review and
+- **Latest commit:** `3198072` — "Verify payments with Razorpay and fail closed in production"
+  (2026-08-11), on branch **`phase-21-payment-verification-and-production-guard`**. The Phase 22 /
+  23 / Phase-0-remediation work that this section previously described as uncommitted **has since
+  been committed** across `f04f138`, `7bf4df3`, `818b401` and `3198072`.
+- **⚠️ UNCOMMITTED WORK IS IN THE TREE RIGHT NOW (2026-08-12) — TWO SEPARATE UNITS.** Review and
   commit before starting anything else, or a concurrent session will trip over it.
+  - **Phase 24** — ADR-001 plus the transactional-schema foundation. Finished and fully tested.
+    New paths: `docs/adr/`, `backend/repositories/` (`connection.js`, `migrate.js`,
+    `migrations/001_initial_schema.sql`), `backend/test_schema.js`. Modified: `CLAUDE.md`,
+    `backend/package.json`, all four workflows, `deploy/README.md`.
+  - **Phase 27** — the four security gaps Phase 25 left open (see "Last unit of work" below).
+    Finished, fully tested, verified against a running server. Modified: `backend/adminAuth.js`,
+    `backend/server.js`, `backend/defaultSettings.js`, `backend/productionGuard.js`,
+    `frontend/index.html`, `frontend/js/app.js`,
+    `frontend/js/components/SettingsManager.js`, `backend/test_suite.js`, `backend/test_http.js`,
+    `backend/test_routes.js`, plus the usual docs. **No new files, no new dependency.**
+  - **Phase 25** — the four audit gaps. Finished, fully tested, and
+    verified against a running server. Modified: `backend/server.js`, `backend/adminAuth.js`,
+    `backend/defaultSettings.js`, `frontend/js/lib/billingMath.js`, `frontend/js/app.js`,
+    `frontend/index.html`, five components under `frontend/js/components/`,
+    `backend/test_billing_math.js`, `backend/test_http.js`, three specs under
+    `backend/tests/e2e/`, `CLAUDE.md`, `docs/LEDGER.md`,
+    `docs/PRODUCTION_READINESS_ROADMAP.md`, `docs/TESTING_CHECKLIST.md`, this file.
+  - **Phase 26 — the SQLite seam below the routes.** A THIRD unit, from a separate concurrent
+    session, finished 2026-08-13. **Everything below `server.js` is done and green; no route is cut
+    over and `server.js` imports none of it**, so this unit changes no runtime behaviour yet — it is
+    additive and safe to commit on its own. New paths: `backend/services/`
+    (`saleService.js`, `returnService.js`, `advanceService.js`, `paymentService.js`),
+    `backend/importLegacyJson.js`, `backend/test_repositories.js`, `backend/test_concurrency.js`,
+    and under `backend/repositories/`: `index.js`, `calendar.js`, `invoiceRepository.js`,
+    `creditNoteRepository.js`, `advanceRepository.js`, `paymentRepository.js`,
+    `customerRepository.js`, `userRepository.js`, `rateRepository.js`, `sequenceRepository.js`,
+    `organisationRepository.js`, `auditRepository.js`, `migrations/002_credit_note_projection.sql`,
+    `migrations/003_reference_reuse_after_rejection.sql`. Modified: `repositories/connection.js`
+    (PRAGMA order + `checkpointAndCopy`), `backend/package.json` (two suites added to `npm test`),
+    `docs/LEDGER.md`, `docs/PRODUCTION_READINESS_ROADMAP.md`, this file. **Not filed in the brain
+    map yet.**
+  - **⚠️ THESE UNITS OVERLAP AND WILL NEED RECONCILING — but less than it looks.** Phase 25 extended
+    the **JSON** sale and return paths in `server.js`; Phase 26 built the **SQLite** service layer
+    that replaces them, and deliberately stopped short of `server.js` precisely so the two would not
+    collide mid-write. Phase 25 was built to the SQL schema's own vocabulary, so the mapping is
+    one-for-one rather than a redesign: `actor` → `invoices.created_by_user_id`, `reviewedBy` →
+    `advance_entries.approved_by_user_id`, `lines[]` → `invoice_lines`, `tenders[]` → `tenders`.
+    - **The two checks Phase 25 asked the merger to make have been answered.** Per-line sums equal
+      the header: asserted in `test_concurrency.js` ("every concurrently written invoice is complete,
+      with its line") and structurally in `saleService`, which derives both from one
+      `computeInvoiceTotals()` call. Tender sum = total inside the same transaction: **enforced only
+      when the caller supplies tenders.** A sale with no tender split writes no speculative tender —
+      the Billing Desk does not yet capture one, and inventing a "cash" row for the balance would be
+      recording a fact about how the customer paid that nobody established. An absent tender means
+      unknown, not zero. If Phase 25's `tenders[]` now carries a real split, pass it through as
+      `input.tenders` and the balance assertion fires.
+    - **The remaining merge work is the route cut-over itself**, plus `customerAuth.js`'s
+      `readAccounts`/`writeAccounts` pair (a two-function change — `customerRepository.loadAccounts`
+      / `saveAccounts` already speak the exact legacy account shape), plus retiring the ledger seeds
+      in `db.js#initDatabaseFiles`.
+- **Two owner decisions were taken on 2026-08-11 and are now binding:** ADR-001 accepted as the
+  **SQLite bridge** (not PostgreSQL — `docs/adr/ADR-001-transactional-datastore.md` has the
+  argument and the four revisit triggers), and the manual-UPI approver is a **distinct named
+  role**, with the identity slice pulled forward into Phase 1. Also: **there is no SKU concept** —
+  roadmap §4's whole Catalogue domain is struck.
+- **The data store is mid-migration.** The SQLite schema and migration runner exist and are
+  tested, but **no route has been cut over yet** — `server.js` still reads and writes
+  `backend/data/*.json` for every domain. Do not add a new JSON ledger document or a new
+  `readJSON`/`writeJSON` caller; see CLAUDE.md §0. `settings.json` and `license.json` are
+  configuration, not ledger, and stay JSON deliberately.
+- **Node floor is now 24**, not 20 — `node:sqlite` is only stable and flag-free from 24.
 - **`backend/data/` is clean.** An early run of the new `test_suite.js` Test 7 wrote a synthetic
   `9000000123 / Reset Tester` account into `customer_auth.json` before the data-directory
   redirect was fixed; the row was removed on 2026-08-09 with the user's confirmation (CLAUDE.md
@@ -32,13 +88,81 @@ This document contains key architectural details, non-negotiable design guidelin
   nodemailer `^9.0.5` / node-cron `^4.6.0` bumps, and the new `@playwright/test` **devDependency**.
   Runtime deps are unchanged. Playwright additionally needs `npx playwright install chromium`
   (one-off, ~130 MB) before `npm run test:e2e` will run; `npm test` does not need it.
-- **Branches:** `develop`, `staging`, `origin/main`, `origin/develop` and `origin/staging` are ALL
-  still at `e4999bc` (Phase 19). Local `main` is **8 commits ahead of `origin/main`** and nothing
-  has ever been pushed past Phase 19.
-- **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060).
-- **Concurrent-session risk:** high — see the uncommitted work above. Run `git status`/`git diff`
-  and stage only files you reviewed — never `git add -A`.
-- **Last unit of work:** **Phase 23 — Returns & Refunds** (2026-08-11, uncommitted, on top of
+- **Branches:** `origin/main`, `origin/develop` and `origin/staging` are ALL still at `e4999bc`
+  (Phase 19). The local branch is **9 commits ahead** and nothing has ever been pushed past
+  Phase 19. **This is why the CI gate has never executed** — not the missing deploy target. The
+  trigger was fixed on 2026-08-11 (`daily-checks.yml` now also runs on `pull_request` against any
+  branch), but a green run still needs the branch pushed and a PR opened.
+- **Servers:** not running (start with `Restart_Server.bat` → :5000; licensing server → :6060). The
+  Phase 25 verification used a throwaway tenant on :5099 via `GOLD_POS_DATA_DIR`; it was stopped and
+  its directory deleted. Note `GOLD_POS_DISABLE_BOOTSTRAP=1` suppresses the listener entirely — set
+  it only for suites that own their own listener.
+- **Concurrent-session risk:** high — two units of uncommitted work plus another session's
+  `backend/services/` and `backend/importLegacyJson.js` in the tree. Run `git status`/`git diff` and
+  stage only files you reviewed — never `git add -A`.
+- **Last unit of work:** **Phase 27 — the four security gaps Phase 25 left open** (2026-08-13,
+  uncommitted). Full detail in `docs/LEDGER.md`; the four in one line each:
+  1. **PINs are scrypt hashes**, master and per-operator, in the same format `customerAuth.js` uses
+     for customer passwords. An existing tenant migrates on its next boot with nobody retyping
+     anything. **One tenant-wide `authSalt`** because a PIN-only login has no username to look a
+     per-user salt up by; that makes duplicate-PIN detection exact, and duplicates were already
+     forbidden. Salt and hashes are masked from `GET /api/settings` and the support export.
+  2. **Session revocation.** Deactivate, remove, re-PIN or demote an operator and their live
+     sessions end in the same request. An owner/manager can list every live sign-in and end one;
+     the listing carries opaque handles, never tokens.
+  3. **Privileged MFA.** Per-operator TOTP (RFC 6238, `node:crypto`, no new dependency) with ten
+     single-use hashed recovery codes. Enrolment requires a live code. `requireMfaForApprovers`
+     makes releasing money need a session that passed the factor — which the shared master PIN
+     cannot do, by design.
+  4. **Refund approval threshold.** `refundApprovalThreshold` refuses a refund at or above it
+     unless an owner/manager authorises, checked against the server's own priced amount. 0 = off,
+     the default.
+  - **⚠️ RULE THAT CAME OUT OF A REAL MISTAKE:** a **static** `import` of anything reaching `db.js`
+    at the top of a test suite pins that suite to the real `backend/data`, because ESM hoists
+    imports above the `process.env.GOLD_POS_DATA_DIR = …` lines. It happened here — `test_http.js`
+    booted against the live tenant and migrated its `settings.json`. The file was repaired (snapshot
+    in the session scratchpad; it now differs from `backups/backup_2026-08-10` only by three
+    additive defaults) and both HTTP suites now use a dynamic `await import()` after the env is set.
+    `test_routes.js` also unsets the vars afterwards, because `GOLD_POS_DATA_DIR` outranks the
+    `GOLDPOS_DATA_DIR` its child spawn passes. A full `npm test` is verified byte-for-byte not to
+    touch `backend/data`. See CLAUDE.md §8.
+  - **Also fixed:** `DEFAULT_SETTINGS` must never hold a credential. It held `adminPin: "1234"`,
+    and because that template is merged over a tenant's settings on every boot, the plaintext was
+    re-added right after the migration deleted it. Defaults are now *seeded* by
+    `migratePinsToHashes()`, never merged.
+  - **Tests: 403 checks** (140 + 43 + 71 + 16 + 9 + 28 + 80 + 16) and 43 Playwright journeys, all
+    green. New: `test_suite.js` Test 8 (PIN hashing/migration) and Test 9 (**TOTP against the
+    published RFC 6238 vectors** — the only check that proves a real authenticator app will work).
+  - **Still open here:** a 4-digit PIN keyspace does not survive file theft whatever the KDF (the UI
+    allows 8; the copy asks for 6+); Razorpay/SMTP secrets are still plaintext on disk because those
+    must be *presented* to a third party, not verified; there is no append-only audit trail yet
+    (`audit_events` exists and `server.js` does not write it); and there is no dual control — one
+    manager can still both authorise and take a large refund.
+
+- **Previous unit of work:** **Phase 25 — the four audit gaps** (2026-08-12, uncommitted). Full detail
+  in `docs/LEDGER.md`; the four in one line each:
+  1. **Actor identity.** Named operators with per-person PINs and the four schema roles live in
+     Settings → Staff & Roles. The PIN identifies as well as authenticates; `requireAdminSession`
+     attaches `req.actor` at the single choke point, and the sale, refund, advance redemption,
+     counter deposit and deposit approval all name a person. `requireApprover` gates deposit
+     approve/reject to owner/manager. A store with no operators still works on the master PIN,
+     resolving to the `owner` bootstrap identity.
+  2. **Multi-line invoices.** `lines[]` on the request and the record, with per-line figures
+     **allocated** out of the header in integer paise — so a one-line invoice prices to the identical
+     paise as before and the printed rows always sum to the total. Read every stored sale through
+     `saleLines()`; the flat rollup is retained so pre-multi-line readers keep working.
+  3. **Tenders.** `tenders[]` on the sale, validated in paise to sum exactly to the amount payable
+     after any advance. Empty means "not recorded", never "paid nothing".
+  4. **Bounded ledger reads.** `/api/sales`, `/api/returns`, `/api/advances` now page, with the
+     aggregates the screens were summing moved server-side. New `/api/advances/customers` rolls
+     balances up per customer.
+  - **Next obvious steps:** the SQL cutover can now map `actor` → `created_by_user_id`,
+    `reviewedBy` → `approved_by_user_id`, `lines[]` → `invoice_lines` and `tenders[]` → `tenders`
+    one-for-one, since all four were built to the schema's own vocabulary.
+  - The three security items this phase deferred (hashed PINs, session revocation, MFA) and the
+    refund threshold it named as the obvious next control were all done in **Phase 27** above.
+
+- **Previous unit of work:** **Phase 23 — Returns & Refunds** (2026-08-11, uncommitted, on top of
   Phase 22 below).
   - **New Return Desk tab** (`frontend/js/components/ReturnDesk.js`) and a new year-partitioned
     ledger `returns_YYYY.json`, filed under the year the **refund** happened, not the invoice's

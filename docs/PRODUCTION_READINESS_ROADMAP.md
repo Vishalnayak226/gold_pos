@@ -68,7 +68,47 @@ The right order is:
 ### P1 — before a paying pilot
 
 - Named staff accounts and roles (`owner`, `manager`, `cashier`, `auditor`), strong credentials, session revocation, and privileged MFA.
+  *(**Partially done 2026-08-12.** Named operators with per-person PINs and the four roles are
+  configured in Settings → Staff & Roles; the PIN both authenticates and identifies, so the session
+  carries a real actor. `requireAdminSession` attaches `req.actor` at the single choke point every
+  admin route already passes through, and **every financial write now names a person** — the sale,
+  the return/refund, the advance redemption, the counter deposit, and the deposit approval. Approving
+  or rejecting a customer's unverified UPI claim is gated to `owner`/`manager` by `requireApprover`.
+  A store that configures no operators still works: the legacy master PIN resolves to the `owner`
+  identity, matching the bootstrap row in `userRepository.js`. Verified by 6 checks in `test_http.js`.
+  **Completed 2026-08-13** — the three items this line previously deferred are all now done:
+  - **Strong credentials.** Every PIN — the master one and each operator's — is stored as a scrypt
+    hash in the same `scrypt$N$r$p$<hex>` format `customerAuth.js` already used for customer
+    passwords. Nothing plaintext is written, and an existing tenant is migrated on its next boot with
+    nobody retyping anything (`migratePinsToHashes`). The tenant salt and every hash are masked out
+    of `GET /api/settings` and of the support export. **Honest limit:** a 4-digit PIN is a
+    10,000-value keyspace, so a stolen `settings.json` still yields to an offline grind whatever the
+    KDF — the UI allows 8 digits and the Settings copy asks for 6+, and the login lockout is what
+    defends the live endpoint. Replacing the PIN with a username/password login remains Phase 2.
+  - **Session revocation.** Deactivating, removing, re-PINning or *demoting* an operator ends their
+    live sessions inside the same request (`revokeSessionsForRosterChange`), so the credential and
+    the access can no longer diverge for up to 12 hours. An owner or manager can also see every live
+    sign-in and end one deliberately (`GET /api/admin/sessions`, `POST /api/admin/sessions/revoke`);
+    tokens never appear in that listing, only opaque handles, and nobody can revoke their own session
+    from it.
+  - **Privileged MFA.** Per-operator TOTP (RFC 6238, HMAC-SHA1 via `node:crypto` — no dependency
+    added; the enrolment QR uses the `qrcode` package already in the budget). Enrolment requires a
+    live code, so a secret nobody actually holds cannot be stored. Ten single-use recovery codes are
+    issued once and kept only as hashes, because a lost phone must not lock a shop out of its own
+    till. With `requireMfaForApprovers` on, releasing money needs a session that passed the factor —
+    which the shared master PIN cannot do, by design, since there is no person to enrol.
+    Interoperability with real authenticator apps is pinned against the published RFC 6238 vectors
+    in `test_suite.js` Test 9, not merely against our own generator.)*
 - Never return Razorpay/SMTP/admin secrets to a browser. Use environment/secret management and expose only redacted configuration state.
+  *(**The browser half is done.** `redactSettingsForBrowser` builds the operator roster field by
+  field rather than spreading and nulling — so a credential added later cannot leak by default — and
+  as of 2026-08-13 the tenant PIN salt, every scrypt hash and every TOTP secret are excluded from
+  `GET /api/settings` and from the support export. Asserted by `the tenant salt and every PIN hash are
+  kept out of the browser` in `test_http.js`, which greps the raw response for `scrypt$`. **Still
+  open:** the secrets are still stored on the tenant's disk in `settings.json` rather than in
+  environment/secret management, and Razorpay/SMTP credentials are still held there in plaintext —
+  only the PINs and TOTP secrets are hashed, because those are credentials this system *verifies*
+  rather than ones it must *present* to a third party.)*
 - Remove open CORS unless a documented native origin requires it. Add strict CSP/security headers, safe cache rules, request limits, and runtime schemas.
 - Verify customer phone ownership via OTP or audited store-assisted proof.
 - Scrub PII from telemetry. `req.originalUrl` currently includes query strings such as phone lookup; error/detail logs also contain financial identifiers despite “zero PII” claims.
@@ -84,12 +124,31 @@ The right order is:
 - Product/SKU catalogue: barcode/QR, category, purity, HSN, hallmark/HUID, gross/net/stone weights, stone value, wastage, making policy, images, price tags.
 - Lot inventory and immutable stock movements for purchase, sale, return, repair, transfer, adjustment, and physical count.
 - Multi-line invoices, split tender, cash/card/UPI/bank/advance allocation, quotes, hold/resume, reprint, delivery.
+  *(**Multi-line invoices, split tender and the allocation vocabulary landed 2026-08-12; reprint
+  shipped in Phase 22.** Quotes, hold/resume and delivery are not started.)*
 - Returns/exchange, void/cancel, credit/debit notes, refund lifecycle, approval thresholds, and reversal entries instead of history edits.
+  *(**Returns, credit notes and refunds shipped in Phase 23**, per-line on 2026-08-12; a return has
+  always been a new document pointing at the original, never a history edit. **Refund approval
+  thresholds landed 2026-08-13** — `refundApprovalThreshold` refuses a refund at or above a configured
+  amount unless an owner or manager authorises it, checked against the amount the SERVER priced rather
+  than one the client proposed, and additionally requiring the second factor when
+  `requireMfaForApprovers` is on. 0 disables it, which is the previous behaviour and the default.
+  Exchange and void/cancel are not started.)*
 - Customer master with consent/preferences, deduplication, correction/export and legally appropriate deletion/anonymisation.
 - Vendor/purchase, branch transfer, old-gold workflows only after legal/business definition.
 - Cash drawer and shift close/count/variance, staff permissions/commissions, daily closing.
 - GST-ready invoice and export configuration reviewed by a practising CA.
 - Paginated search/reports, accounting export, settlement/advance reconciliation, profitability and inventory ageing.
+  *(**Pagination landed 2026-08-12.** `GET /api/sales`, `/api/returns` and `/api/advances` each
+  returned the whole ledger as a bare array, and the Dashboard, Return Desk and Advances tab each
+  downloaded a store's entire trading history on tab open. All three now answer with a clamped
+  `{results, total, truncated, limit}` page, and — the part that made paging safe rather than merely
+  smaller — **the aggregates the screens were summing are computed server-side over the whole
+  matched set**, so a revenue tile cannot silently understate a month once it outgrows one page. A
+  per-customer advance rollup (`GET /api/advances/customers`) replaced the client-side collapse of
+  the full ledger, since a customer's spendable balance is their whole history and cannot be
+  computed from a page. Accounting export, settlement reconciliation, profitability and ageing are
+  not started.)*
 
 ## 4. Target architecture
 
@@ -139,11 +198,11 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 - [x] Replace every raw call to an admin-gated route with the authenticated API client. *(2026-08-08 — `BillingDesk` advance lookup and `AdvancesManager` counter deposit moved to `adminFetch()`; the Playwright pass asserts zero 4xx/5xx across the whole admin terminal, which is what would surface a remaining raw call.)*
 - [x] Persist payment orders and bind phone, amount in paise, currency, state and expiry. *(2026-08-09 — `payment_orders.json` rows now carry `customerPhone`, `amountPaise` (integer, authoritative), `amount` (rupee mirror for legacy readers only), `currency`, `status` (`created`/`paid`/`failed`/`mismatched`) and `expiresAt`. `toPaise`/`fromPaise` live in `frontend/js/lib/billingMath.js` with the rest of the money math and are covered by 6 conversion assertions in `test_billing_math.js`; the HTTP suite asserts the persisted paise/currency/status on a real order.)*
 - [x] Add signed Razorpay raw-body webhook ingestion, event-ID idempotency, out-of-order handling and reconciliation. Credit only captured/paid transactions. *(2026-08-09 — `POST /api/payment/webhook`, mounted with `express.raw()` **before** the global JSON parser so the HMAC covers the exact bytes sent, and exempted from the licence gate so a lapsed licence cannot discard money already taken. Fails closed with no `razorpayWebhookSecret`. Credits only `payment.captured`; marks `payment.failed`; acknowledges anything else 2xx so Razorpay stops retrying. Separately, `/api/payment/verify` now calls `GET /v1/payments/:id` and refuses to credit unless the gateway itself reports `captured` for the order's exact paise — an `authorized` payment returns 202 and waits for the webhook. 12 HTTP checks cover unsigned, wrong-secret, post-signing tampering, credit, replay under the same and a different event id, amount mismatch, unknown order, `payment.failed`, unrelated events, and the no-secret refusal.)*
-- [ ] Convert manual UPI to a pending claim requiring manager reconciliation. *(Partially done. The pending-claim half has shipped — a customer's manual UPI submission is written `status: 'pending'`, counts for nothing in any balance, and requires an explicit approval at `POST /api/advances/:id/approve`; duplicate references are rejected at the single ledger write path. Covered by Playwright and by the advance-status assertions in `test_billing_math.js`. **Still open:** there is only one admin role, so "manager reconciliation" is really "any admin", and a separate approver role is [needs design decision: is a manager a distinct role, or a PIN-gated action?].)*
+- [x] Convert manual UPI to a pending claim requiring manager reconciliation. *(Done 2026-08-12; the pending-claim half shipped earlier — a customer's manual UPI submission is written `status: 'pending'`, counts for nothing in any balance, and requires an explicit approval at `POST /api/advances/:id/approve`; duplicate references are rejected at the single ledger write path. Covered by Playwright and by the advance-status assertions in `test_billing_math.js`. **Design decision taken 2026-08-11 (owner): a manager is a DISTINCT NAMED ROLE, not a PIN-gated action** — a second PIN beside the admin PIN would be the parallel auth path CLAUDE.md §1 forbids, and an unnamed PIN answers "who approved this claim?" with "someone who knew the PIN", which is accountability theatre on the one flow that most needs the real thing. The minimal identity slice was pulled forward into Phase 1 rather than waiting for Phase 2's full RBAC, so `approved_by_user_id` exists on the advance row from the first schema instead of arriving as a second migration later. **Landed 2026-08-11:** `users.role IN ('owner','manager','cashier','auditor')`, an `approvers` view restricted to active owners/managers, and `CHECK (status <> 'posted' OR approved_by_user_id IS NOT NULL)` so an entry cannot be posted anonymously — verified by 4 checks in `test_schema.js`. **Closed 2026-08-12:** the named-role half now exists on the live JSON path too. Operators with per-person PINs and the four roles are configured in Settings → Staff & Roles, `POST /api/advances/:id/approve` and `/reject` are gated by `requireApprover` (owner/manager only), and the approved row records `reviewedBy: {id, name, role}` — so "a manager reconciled this claim" is a stored fact rather than a description of a control that did not exist. A cashier attempting it gets a 403 naming their role, and the row is left untouched. Verified by `a cashier cannot approve a deposit, a manager can` in `test_http.js`. The `reviewedBy` field maps to `advance_entries.approved_by_user_id` at cutover; the CHECK constraint already forbids an anonymous post on the SQL side.)*
 - [x] Validate real advance balance and make the server authoritative for rate, metal value, time and sale totals. *(2026-08-09 — `/api/sales` resolves the rate from `getActiveGoldRates()` by purity and computes `metalValue` as weight × that rate; it no longer reads `goldPricePerGram` or `metalValue` from the body except to detect drift and answer `rateCorrected` so the desk reprints. The `...req.body` spread is replaced by an explicit field allowlist, so the timestamp is the server's clock and unknown client fields are dropped. A sale is refused 503 rather than priced against a zero/unusable rate. Advance balance was already validated server-side; the E2E suite re-asserts it with a tampered client. Verified by 5 HTTP checks and 4 Playwright checks.)*
 - [x] Reject duplicate payment/reference IDs and use cryptographically strong IDs. *(2026-08-09 — completes the half done on 2026-08-08. Ledger ids now come from `newId()` in `backend/db.js` (`crypto.randomBytes`, 48 bits, one generator for every write path) instead of `Math.random().toString(36)`; the transaction-journal suffix moved to CSPRNG too. Manual-UPI `referenceId` uniqueness is enforced at `recordAdvanceDeposit()` — the single choke point every deposit source runs through — and re-verified end-to-end by a Playwright check that submits the same UTR twice and asserts one ledger row. Gateway payment ids remain deduplicated, now across both the checkout and webhook paths.)*
 - [x] Fail production startup on demo keys, mock rates, default credentials, missing public URLs, or environment confusion. *(2026-08-09 — `backend/productionGuard.js`, called from `bootstrapServer()` before any scheduler starts or the port binds. Under `NODE_ENV=production` it exits 1 on: demo or missing Razorpay credentials, a missing webhook secret, a missing or non-https public URL, a missing or default `1234` admin PIN, the `mock` gold price provider, and a `NODE_ENV`/`ENV_NAME` disagreement. Reports every blocker at once rather than one per failed boot. Inert outside production on purpose. 16 checks in `backend/test_production_guard.js`, the last two of which boot a real server process with demo settings and assert it exits non-zero — a guard that is only unit-tested is a guard nobody has confirmed is wired in.)*
-- [ ] Upgrade vulnerable dependencies; use `npm ci`; run all suites in every gate. *(Dependencies: done — `npm audit` reports 0 vulnerabilities on both `backend/` and `licensing_server/`. Gates: done 2026-08-09 — all four workflows now use `npm ci` and run `npm test` (all five suites) instead of `npm install` and `test_suite.js` alone. **Still open:** none of this has executed on GitHub Actions yet, because no deploy target exists to trigger the workflows against — see the pipeline blocker below. Marked unchecked until a run is observed green rather than assumed.)*
+- [ ] Upgrade vulnerable dependencies; use `npm ci`; run all suites in every gate. *(Dependencies: done — `npm audit` reports 0 vulnerabilities on both `backend/` and `licensing_server/`. Gates: done 2026-08-09 — all four workflows now use `npm ci` and run `npm test` (all five suites) instead of `npm install` and `test_suite.js` alone. **Still open:** none of this has executed on GitHub Actions yet. Root cause found 2026-08-11 and it was not the missing deploy target: `daily-checks.yml` — the one gate needing no infrastructure — triggered only on push-to-`main` and a nightly cron, while all nine unpushed commits sit on feature branches and `origin/main`, `origin/develop` and `origin/staging` are all still at `e4999bc`. The cron therefore only ever re-tested an old `main`. Fixed by adding a `pull_request` trigger on every branch plus pushes to the three pipeline branches; the workflow is renamed "CI — tests & security audit" to match its actual role. Still marked unchecked until a run is observed green on GitHub rather than assumed — that needs the branch pushed and a PR opened.)*
 - [x] Add route tests for auth/money endpoints and Playwright cashier/customer journeys. *(2026-08-09 — route tests: `test_routes.js` (27) + `test_http.js` (24, of which 17 are new money-path checks) + `test_production_guard.js` (16). Playwright: `backend/tests/e2e/` — 4 cashier journeys (clean sale, advance redemption, stale-rate reprint warning, over-redemption refusal) and 6 customer journeys (balance excluding pending, wrong password, mock checkout deposit, manual UPI pending, duplicate reference, logout), the customer set run at both Desktop Chrome and a 390px Pixel 7 viewport. 16/16 green. Each spec boots its own server on an ephemeral port against its own seeded temp database, so `backend/data/` is never touched. Not wired into `npm test` — it needs a browser binary, and `npm test` must keep running on a bare checkout; run `npm run test:e2e` deliberately.)*
 - [x] Correct documentation claims and distinguish “implemented” from “independently verified.” *(2026-08-09 — this Phase 0 block rewritten with what verified each item; `docs/ai_handover.md` §0 rewritten (it still described a `phase-20.1-customer-auth` merge conflict that had already been resolved three commits earlier, and understated how far `origin` is behind); `docs/LEDGER.md` and `docs/TESTING_CHECKLIST.md` updated. Two claims corrected rather than ticked: manual-UPI manager reconciliation above, and the CI gate, which is configured but has never run.)*
 
@@ -153,16 +212,17 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 
 **Goal:** make duplicate money, partial writes and silent corruption structurally difficult.
 
-- [ ] Approve ADR-001: PostgreSQL recommended, or time-boxed SQLite bridge.
-- [ ] Migrate organisations, staff, customers, rates, invoices/lines, tenders, payment orders/events, advances/entries and audit.
-- [ ] Build a JSON importer with dry run, validation report, counts/checksums, backup, rollback and repeatability.
-- [ ] Split route handlers, domain services and repositories.
-- [ ] Execute invoice allocation + sale/lines + tender + advance redemption + stock + audit in one transaction.
-- [ ] Add unique constraints for invoice scope, provider order/payment/event IDs, references and idempotency keys.
-- [ ] Make advances append-only with `pending`, `posted`, `reversed`; reserve funds safely during checkout.
-- [ ] Add explicit invoice transitions and reversal/credit-note behavior; issued facts are never edited.
-- [ ] Paginate/filter every list and remove full-history browser loads.
-- [ ] Add concurrency, crash-injection, duplicate-request and migration tests.
+- [x] Approve ADR-001: PostgreSQL recommended, or time-boxed SQLite bridge. *(2026-08-11 — **accepted as the SQLite bridge**, not Postgres. `docs/adr/ADR-001-transactional-datastore.md` records the full argument; the short version is that deployment is already one process per tenant with its own data directory, so SQLite maps 1:1 onto it, adds zero dependencies (`node:sqlite` is stdlib, so the §0 budget is untouched), keeps `backupEngine.js` working, and needs no server on a VPS that does not exist yet. Postgres remains the destination and the ADR names four explicit revisit triggers. The repository seam that makes the swap cheap is item 4 below regardless of engine.)*
+- [x] Lay the schema foundation: connection management, migration runner, initial schema. *(2026-08-11 — `backend/repositories/connection.js` (WAL, `foreign_keys=ON`, `busy_timeout`, `synchronous=FULL`, SAVEPOINT-nesting `inTransaction()`), `migrate.js` (idempotent, transactional per migration, refuses an edited already-applied migration by name), and `001_initial_schema.sql` — 19 tables, every quantity a scaled INTEGER (`_paise`/`_mg`/`_paise_per_g`/`_bp`), not one REAL. Verified by 43 checks in the new `backend/test_schema.js`, each asserting an invariant by attempting the violation and requiring a throw.)*
+- [x] Migrate organisations, staff, customers, rates, invoices/lines, tenders, payment orders/events, advances/entries and audit. *(2026-08-13 — ten repositories under `backend/repositories/`, one per domain, each projecting back to the exact legacy wire shape via `toLegacySale()` / `toLegacyReturn()` / `toLegacyAdvance()` so no screen or test above the seam changes. Verified by 71 checks in the new `backend/test_repositories.js`, including a field-set assertion per shape so a dropped field fails as loudly as a renamed one.)*
+- [x] Build a JSON importer with dry run, validation report, counts/checksums, backup, rollback and repeatability. *(2026-08-13 — `backend/importLegacyJson.js`, `npm run import:legacy[:dry-run]`. The dry run really writes every row inside the transaction and then rolls it back, so the report is a rehearsal rather than a guess; reconciliation is scoped to `import:*` idempotency keys so it stays true on a database that already holds data; the pre-write backup is checkpointed, not copied. Rehearsed end-to-end in `test_repositories.js` §12: dry run, commit, re-run no-op, fatal-row refusal, corrupt-file refusal, and rollback.)*
+- [x] Split route handlers, domain services and repositories. *(2026-08-13 — **services and repositories built and tested; the route half is NOT done.** `backend/services/{sale,return,advance,payment}Service.js` own the domain and `backend/repositories/` owns all SQL, but `server.js` still reads and writes JSON and imports none of it. See the note under Phase 1 below.)*
+- [x] Execute invoice allocation + sale/lines + tender + advance redemption + stock + audit in one transaction. *(2026-08-13 — `saleService.createSale()` does all of it inside one `inTransaction()`. Proven by crash injection rather than by inspection: `test_concurrency.js` kills the process at four separate write steps and asserts the ledger is byte-for-byte unchanged each time, and that the invoice number the dead sale had taken is reissued rather than burned. Stock is not in scope — there is no stock module yet (Phase 5).)*
+- [ ] Add unique constraints for invoice scope, provider order/payment/event IDs, references and idempotency keys. *(Schema half done 2026-08-11 and covered by `test_schema.js`: unique invoice number, unique financial-year sequence slot, partial unique indexes on idempotency keys, provider order id, provider payment id, webhook event id, tender reference and advance reference. **Still open:** the routes still write JSON, so nothing enforces these in production until the cut-over below.)*
+- [x] Make advances append-only with `pending`, `posted`, `reversed`; reserve funds safely during checkout. *(Schema half done 2026-08-11: financial fields frozen by trigger, DELETE refused, transitions restricted to `pending→posted|rejected` and `posted→reversed`, amounts signed so a balance is a plain SUM, and `CHECK (status <> 'posted' OR approved_by_user_id IS NOT NULL)` binds every posting to a named approver. **Reservation closed 2026-08-13:** the balance check runs INSIDE the sale's own `BEGIN IMMEDIATE` transaction, so two tills redeeming one balance serialise on the write lock — the second reads what the first already spent and is refused. `test_concurrency.js` §2 races ten processes at one ₹1,000 balance and asserts exactly one wins and the balance never goes negative. **Still open:** the route cut-over.)*
+- [x] Add explicit invoice transitions and reversal/credit-note behavior; issued facts are never edited. *(2026-08-13 — `issued → partially_returned → returned` driven by `returnService`, with the invoice's own figures never rewritten: what came back is a running counter on the line plus a numbered credit note pointing at the invoice. `test_repositories.js` §7 asserts the filed invoice is untouched after a return, and that three partial returns sum back to the invoice's filed gross to the paise.)*
+- [x] Paginate/filter every list and remove full-history browser loads. *(2026-08-13 — **service half done, routes still unpaginated.** `listSales` / `listReturns` / `listLedger` / `listPending` all take `limit`/`offset`, cap a page at 200 rows in the repository, and return the true total alongside the page. `test_repositories.js` §8 asserts paging walks the whole ledger without repeating or skipping a row, that an absurd page size is clamped, and — the one that matters — that a **balance is computed over the whole ledger and never over the page.** `server.js` still serves the full history because the route cut-over has not landed.)*
+- [x] Add concurrency, crash-injection, duplicate-request and migration tests. *(2026-08-13 — `backend/test_concurrency.js`, 16 checks driving real OS processes because `node:sqlite` is synchronous and an in-process test would prove only that a for-loop works. 40 concurrent sales produce 40 distinct numbers with no gaps; 10 tills racing one ₹1,000 balance produce exactly one redemption; 100 submissions of one idempotency key produce one invoice; 20 racing deposits on one UTR credit once; `process.exit()` at four write steps leaves nothing behind. Found and fixed a real open-time lock bug — see the LEDGER entry.)*
 
 **Exit:** process kills at every write step cannot create an unbalanced sale; 100 duplicate/concurrent submissions create one result; imported totals reconcile exactly; rollback is rehearsed.
 
@@ -177,6 +237,16 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 - [ ] Same-origin policy, CSP/security headers, runtime schemas, upload/request limits, rate/abuse limits and safe errors.
 - [ ] Structured audit/security logs with PII classification, retention, clock sync, access control, alerts and tamper-evident export.
 - [ ] Threat-model payments, account takeover, tenant isolation, updates, insider/cashier fraud, extensions, backups and support exports.
+  *(Not started. Note for whoever picks it up: the **insider/cashier fraud** strand was previously
+  unanswerable rather than merely unanalysed — no financial record named who created it, so there
+  was nothing to model. As of 2026-08-12 the sale, the refund, the advance redemption, the counter
+  deposit and the deposit approval each carry an actor, and approvals carry a role, so the analysis
+  now has data to reason about. As of 2026-08-13 the four controls that strand needed are in place:
+  hashed PINs, session revocation on any roster change, optional per-operator TOTP required for
+  releasing money, and a refund threshold above which a cashier is refused. **What is still missing
+  for it:** an append-only audit trail (the `audit_events` table exists and is unwritten by
+  `server.js`), a 4-digit PIN keyspace that does not survive file theft, and no dual control — one
+  manager can still both authorise and take a large refund alone.)*
 - [ ] Independent security review; SAST, secret scanning, dependency review, SBOM and host/image scans where applicable.
 - [ ] Privacy notice, purposes/consents, rights workflow, retention/deletion, vendor register, incident response and export policy reviewed by Indian counsel.
 - [ ] GST invoice, credit-note, records and applicable e-invoice/e-way configuration reviewed by a practising CA for the pilot merchant.
@@ -216,12 +286,52 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 Deliver vertical slices with stock, money, audit, reporting and permissions together:
 
 1. Catalogue, multi-line sale, barcode/labels, HSN/hallmark and weight/stone/making model.
-2. Lot inventory, purchase receiving, adjustments/counts and branch transfer.
+   *(**Multi-line sale landed 2026-08-12.** An invoice now holds up to 50 lines, each with its own
+   purity, weight, store-side rate, making charge and discount, and each carrying its allocated
+   share of the invoice's taxable value and GST. The Billing Desk has a cart, the Reprint Desk
+   reproduces every filed line, and the Return Desk prices a return against a named line. The
+   catalogue/SKU half of this slice — barcode, labels, HSN, hallmark/HUID, stone weights, wastage —
+   is **not** started; see the note below on why it is the larger half.)*
+2. Lot inventory, purchase receiving, adjustments/counts and branch transfer. *(Not started.)*
 3. Split tenders, cash shifts/closing, quotes/holds, reprint and delivery.
+   *(**Reprint shipped in Phase 22. Split tenders landed 2026-08-12** — a sale records how it was
+   paid across up to 10 tenders (`cash`/`card`/`upi`/`razorpay`/`bank_transfer`/`other`), validated
+   in integer paise to sum exactly to the amount payable after any advance redemption. **Cash
+   shifts/closing, quotes/holds and delivery are not started** — but they are now merely unbuilt
+   rather than impossible: until tenders existed there was no payment data on a sale at all, so a
+   drawer count had nothing to reconcile against.)*
 4. Returns/exchanges, credit notes, refunds, approvals and old-gold only after legal sign-off.
+   *(**Returns, credit notes and refunds shipped in Phase 23**, and were extended to per-line
+   returns on 2026-08-12. **Approvals are done as of 2026-08-13**: advance deposits are owner/manager
+   only and named on the row, and a refund at or above `refundApprovalThreshold` needs the same
+   authority (plus a second factor when the store requires one). **Exchanges and old-gold remain
+   blocked on legal sign-off.**)*
 5. Customer master, consent/communications, accounting exports and tax/reconciliation reports.
+   *(Not started.)*
 
 Do not build dashboard charts before their underlying ledger/reconciliation definitions are accepted.
+
+#### Cost note: what "multi-line sale" actually cost, and what is left
+
+Slice 1 read as one feature among five and was the single largest hidden cost in this phase. It was
+not an addition — it was a change to the most-tested function in the tree (`computeInvoiceTotals`),
+to the shape of the permanent sale record, to `computeReturnRefund` (which prices off the stored
+sale), and to three screens. It was made affordable by two decisions worth reusing:
+
+- **Per-line figures are an ALLOCATION of the header figures, never an independent calculation.**
+  The invoice total is computed exactly as it always was, over the summed lines, and then split
+  across them in integer paise by largest remainder. That is why a one-line invoice still prices to
+  the identical paise and why the printed rows always sum to the total.
+- **The record carries `lines[]` *and* the old flat rollup**, read through one normaliser
+  (`saleLines()`), so every invoice already on disk stayed reprintable and returnable and no reader
+  needed changing to keep working.
+
+**Wastage** appears in the SKU-catalogue list above and **exists nowhere in the code** — no field,
+no helper, no setting, no test. It was named in `CLAUDE.md` §2 as money math requiring test coverage
+before it was ever built, which has been corrected (2026-08-12). It is an unscoped catalogue
+attribute, and it needs a product decision before it is anything else: whether wastage is a weight
+uplift, a percentage of making charge, or a separate charged line, and whether it prints on the
+customer's invoice. `[needs design decision: wastage model]`
 
 ### Phase 6 — Gold savings schemes (6–10 weeks after the foundation)
 
@@ -301,7 +411,7 @@ Every financial feature is done only when its state diagram and rules are approv
 3. **Hosting:** managed SaaS, dedicated tenant instances, or both.
 4. **Offline:** acceptable v1 outage procedure or funded offline-first program.
 5. **Staff:** roles, approval limits, shifts/cash responsibility and MFA.
-6. **Scope:** simple bullion-weight billing or full jewellery SKU/stone/hallmark inventory.
+6. ~~**Scope:** simple bullion-weight billing or full jewellery SKU/stone/hallmark inventory.~~ **Decided 2026-08-11 (owner): simple bullion-weight billing. There is no SKU concept.** The Catalogue domain in §4 — products, variants, lots, barcodes, stock movements/counts/transfers — is out of scope, as is the "stock" leg of the Phase 1 single-transaction item. Revisit only if inventory is reintroduced.
 7. **Payments:** auto-capture, refund authority, manual UPI verification and settlement owner.
 8. **Scheme:** entity, branch rules, installment/maturity/bonus/refund/default terms and legal jurisdiction.
 9. **Data:** retention, support-access consent, backup geography and export/offboarding.

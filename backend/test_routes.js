@@ -23,7 +23,50 @@ import net from 'net';
 import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+// defaultSettings.js is deliberately side-effect-free, so this import is safe.
+// Anything that reaches db.js is NOT — see the scrypt note below.
 import { getDefaultSettings } from './defaultSettings.js';
+
+/* This suite drives the server as a CHILD process, so its own process should
+ * never touch a data directory at all. But db.js resolves DATA_DIR and seeds and
+ * migrates files at IMPORT, and every static import is hoisted above any
+ * assignment here — so importing adminAuth.js (which imports db.js) at the top of
+ * this file would silently point this process at the real backend/data and
+ * migrate the live tenant's settings on the way past. It did exactly that once.
+ *
+ * The PIN verifier is therefore loaded lazily, after a throwaway directory has
+ * been named. See CLAUDE.md §8.
+ */
+let verifyPinHash = null;
+
+async function loadPinVerifier(tempDir) {
+    if (verifyPinHash) return;
+    // Point db.js at a scratch directory for the duration of the import, then
+    // UNSET both names again. The server runs as a child that inherits this
+    // process's env, and GOLD_POS_DATA_DIR outranks the GOLDPOS_DATA_DIR the
+    // spawn passes — so leaving it set silently redirects the server under test
+    // to an empty directory with no licence in it.
+    process.env.GOLD_POS_DATA_DIR = path.join(tempDir, 'verifier-data');
+    process.env.GOLD_POS_LOGS_DIR = path.join(tempDir, 'verifier-logs');
+    try {
+        ({ verifyPinHash } = await import('./adminAuth.js'));
+    } finally {
+        delete process.env.GOLD_POS_DATA_DIR;
+        delete process.env.GOLD_POS_LOGS_DIR;
+    }
+}
+
+/**
+ * Whether the stored (hashed) master PIN still verifies the given plaintext.
+ *
+ * PINs are scrypt hashes on disk, so "did the save clobber the credential?" can
+ * no longer be a string comparison — and should not be: the assertion that
+ * matters is that the PIN still WORKS and that its plaintext is nowhere on disk.
+ */
+function diskPinVerifies(disk, pin) {
+    return Boolean(disk.adminPinHash) && Boolean(disk.authSalt)
+        && verifyPinHash(pin, disk.authSalt, disk.adminPinHash);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -87,6 +130,10 @@ async function startServer() {
     const logsDir = path.join(tempRoot, 'logs');
     seedDataDir(dataDir);
     fs.mkdirSync(logsDir, { recursive: true });
+
+    // Load the scrypt verifier now that there is a throwaway directory to point
+    // its db.js import at — never at module top. See loadPinVerifier().
+    await loadPinVerifier(tempRoot);
 
     BASE = `http://127.0.0.1:${port}`;
 
@@ -301,8 +348,20 @@ try {
         const disk = readDiskSettings(dataDir);
         assert.strictEqual(disk.companyName, 'Renamed Jewellers', 'the edit should have applied');
         assert.strictEqual(disk.razorpayKeySecret, REAL.razorpaySecret, 'razorpayKeySecret was overwritten by the mask!');
-        assert.strictEqual(disk.adminPin, REAL.adminPin, 'adminPin was overwritten by the mask!');
         assert.strictEqual(disk.smtp.pass, REAL.smtpPass, 'smtp.pass was overwritten by the mask!');
+        // The PIN is a hash now. Two things must hold: it still verifies the real
+        // PIN, and the plaintext is gone from disk entirely.
+        assert.ok(diskPinVerifies(disk, REAL.adminPin), 'adminPin was overwritten by the mask!');
+        assert.strictEqual(disk.adminPin, undefined, 'a plaintext adminPin must never be written back');
+    });
+
+    check('The master PIN is stored hashed, never in the clear', () => {
+        const raw = fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8');
+        assert.ok(!raw.includes(REAL.adminPin), 'the plaintext PIN is still somewhere in settings.json');
+        const disk = readDiskSettings(dataDir);
+        assert.match(disk.adminPinHash, /^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]+$/,
+            'the stored hash should be in the shared self-describing format');
+        assert.ok(!diskPinVerifies(disk, '1234'), 'the hash must not verify some other PIN');
     });
 
     const reLogin = await call('POST', '/api/admin/login', { body: { pin: REAL.adminPin } });
@@ -353,7 +412,7 @@ try {
         const disk = readDiskSettings(dataDir);
         assert.notStrictEqual(disk.companyName, 'Should Not Persist',
             'a write reported as failed must not have partially applied');
-        assert.strictEqual(disk.adminPin, REAL.adminPin, 'credentials must survive a failed write');
+        assert.ok(diskPinVerifies(disk, REAL.adminPin), 'credentials must survive a failed write');
     });
 
     const stillUp = await call('GET', '/api/health');

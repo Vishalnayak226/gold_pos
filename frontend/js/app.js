@@ -70,6 +70,61 @@ async function loadFrontendExtension() {
     }
 }
 
+/* ==========================================================================
+   Who is signed in
+
+   The desk needs the logged-in person for two different reasons: to show whose
+   name is going on the next invoice, and to hide the controls their role cannot
+   use. Held here, in the module every component already imports adminFetch
+   from, so there is one answer to "who is at the counter" rather than each
+   screen keeping its own.
+
+   NOT a security boundary. Hiding the Approve button is a courtesy so a cashier
+   is not offered an action that will be refused; the actual refusal is
+   requireApprover on the server, which is the only place it counts.
+   ========================================================================== */
+
+let currentActor = null;
+let currentCanApprove = false;
+
+/** The signed-in person, or null before login. */
+export function getActor() {
+    return currentActor;
+}
+
+/** Whether the signed-in person may approve a money claim. */
+export function canApprove() {
+    return currentCanApprove;
+}
+
+function setActor(actor, approver) {
+    currentActor = actor || null;
+    currentCanApprove = Boolean(approver);
+    const label = document.getElementById('signed-in-as');
+    if (label) {
+        label.textContent = currentActor
+            ? `Signed in: ${currentActor.name} (${currentActor.role})`
+            : '';
+    }
+}
+
+/**
+ * Re-establishes the identity behind a session token restored from
+ * sessionStorage on reload. The token is the authority, not anything cached in
+ * the browser, so the name is asked for rather than remembered.
+ */
+async function loadActor() {
+    try {
+        const res = await adminFetch('/api/admin/me');
+        if (!res.ok) return;
+        const data = await res.json();
+        setActor(data.actor, data.canApprove);
+    } catch (err) {
+        // Offline or mid-restart — the next gated call bounces to the lock
+        // screen, which is where a missing identity gets resolved.
+    }
+}
+
 /**
  * Wraps fetch() with the admin bearer session token. Use for any endpoint
  * that requires requireAdminSession server-side (settings, sales, etc).
@@ -84,6 +139,7 @@ export async function adminFetch(url, options = {}) {
     if (res.status === 401) {
         sessionStorage.removeItem('adminToken');
         sessionStorage.removeItem('adminAuthenticated');
+        setActor(null, false);
         const loginView = document.getElementById('admin-login-view');
         const appViewport = document.getElementById('app-viewport');
         if (loginView && appViewport) {
@@ -112,24 +168,82 @@ function initAdminAuth() {
     if (sessionStorage.getItem('adminToken')) {
         loginView.style.display = 'none';
         appViewport.style.display = 'grid';
+        loadActor();
     }
+
+    const mfaBlock = document.getElementById('admin-mfa-block');
+    const totpInput = document.getElementById('admin-totp-input');
+    const recoveryToggle = document.getElementById('admin-recovery-toggle');
+    const recoveryInput = document.getElementById('admin-recovery-input');
+    const loginError = document.getElementById('admin-login-error');
+
+    if (recoveryToggle && recoveryInput) {
+        recoveryToggle.addEventListener('click', () => {
+            const showing = recoveryInput.style.display !== 'none';
+            recoveryInput.style.display = showing ? 'none' : 'block';
+            recoveryToggle.textContent = showing
+                ? 'Lost your phone? Use a recovery code'
+                : 'Use my authenticator code instead';
+            (showing ? totpInput : recoveryInput).focus();
+        });
+    }
+
+    const showLoginError = (message) => {
+        if (loginError) loginError.textContent = message || '';
+    };
 
     loginBtn.addEventListener('click', async () => {
         const pin = pinInput.value;
         loginBtn.disabled = true;
+        showLoginError('');
         try {
             const res = await fetch('/api/admin/login', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ pin })
+                body: JSON.stringify({
+                    pin,
+                    totpCode: totpInput ? totpInput.value : '',
+                    recoveryCode: recoveryInput ? recoveryInput.value : ''
+                })
             });
+
+            /* A correct PIN belonging to somebody with a second factor comes back
+               as MFA_CODE_REQUIRED rather than a plain 401. The PIN box keeps its
+               value: the cashier has typed it correctly and should not have to
+               retype it just because a code is now being asked for. */
+            if (res.status === 401) {
+                const err = await res.json().catch(() => ({}));
+                if (err.error === 'MFA_CODE_REQUIRED') {
+                    if (mfaBlock) mfaBlock.style.display = 'block';
+                    if (totpInput) totpInput.focus();
+                    showLoginError(err.message || 'Enter your authenticator code.');
+                    return;
+                }
+                if (err.error === 'MFA_CODE_INVALID') {
+                    if (mfaBlock) mfaBlock.style.display = 'block';
+                    if (totpInput) { totpInput.value = ''; totpInput.focus(); }
+                    if (recoveryInput) recoveryInput.value = '';
+                    showLoginError(err.message || 'That code is not valid.');
+                    return;
+                }
+                showLoginError('Incorrect PIN.');
+                return;
+            }
 
             if (res.ok) {
                 const data = await res.json();
                 sessionStorage.setItem('adminToken', data.token);
+                // The PIN identified a person, not just "authenticated" — see
+                // resolveActor() in backend/adminAuth.js.
+                setActor(data.actor, data.canApprove);
+                // Clear the credential fields so they are not left in the DOM of
+                // an unlocked terminal.
+                pinInput.value = '';
+                if (totpInput) totpInput.value = '';
+                if (recoveryInput) recoveryInput.value = '';
+                if (mfaBlock) mfaBlock.style.display = 'none';
                 loginView.style.display = 'none';
                 appViewport.style.display = 'grid';
-                pinInput.value = '';
                 if (window.dashboard) window.dashboard.refresh();
                 if (window.reprintDesk) window.reprintDesk.refresh();
                 if (window.returnDesk) window.returnDesk.refresh();
@@ -138,19 +252,36 @@ function initAdminAuth() {
                 if (window.settingsManager) window.settingsManager.refresh();
                 if (window.billingDesk) window.billingDesk.fetchSettings();
             } else {
-                alert('Incorrect Admin PIN.');
+                const err = await res.json().catch(() => ({}));
+                showLoginError(err.message || err.error || 'Could not sign in.');
             }
         } catch (err) {
-            alert('Could not reach the server to log in. Please check your connection.');
+            showLoginError('Could not reach the server to log in. Check your connection.');
         } finally {
             loginBtn.disabled = false;
         }
+    });
+
+    // Enter submits from any of the three fields — a counter terminal is used by
+    // touch-typists who never reach for the mouse.
+    [pinInput, totpInput, recoveryInput].forEach(field => {
+        if (!field) return;
+        field.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') loginBtn.click();
+        });
     });
 
     if (logoutBtn) {
         logoutBtn.addEventListener('click', async () => {
             const token = sessionStorage.getItem('adminToken');
             sessionStorage.removeItem('adminToken');
+            setActor(null, false);
+            // Back to the plain PIN prompt — the next person at this terminal may
+            // not be the one who just signed out.
+            if (mfaBlock) mfaBlock.style.display = 'none';
+            if (recoveryInput) { recoveryInput.value = ''; recoveryInput.style.display = 'none'; }
+            if (totpInput) totpInput.value = '';
+            showLoginError('');
             appViewport.style.display = 'none';
             loginView.style.display = 'flex';
             try {

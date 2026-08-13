@@ -10,6 +10,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+/* NOTHING that reaches db.js may be imported here.
+ *
+ * db.js resolves DATA_DIR once, at import, and ESM hoists every static import
+ * above the process.env assignments below — so a static `import ... from
+ * './adminAuth.js'` at the top of this file silently pins the whole suite to the
+ * real backend/data directory instead of its temp one. That is not a theoretical
+ * hazard: it happened, and the suite migrated the live tenant's settings.json
+ * before anyone noticed the 401 it caused. See CLAUDE.md §8.
+ *
+ * Auth helpers are pulled in with a dynamic import() further down, after
+ * GOLD_POS_DATA_DIR is set. */
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-http-'));
 const dataDir = path.join(tempRoot, 'data');
@@ -89,6 +100,26 @@ function readData(filename) {
     return JSON.parse(fs.readFileSync(path.join(dataDir, filename), 'utf8'));
 }
 
+/**
+ * Whether the master PIN stored on disk verifies this plaintext.
+ *
+ * PINs are scrypt hashes, so a save can no longer be checked by string equality
+ * — and should not be. What matters is that the credential still works.
+ */
+function storedPinVerifies(pin) {
+    const stored = readData('settings.json');
+    return Boolean(stored.adminPinHash) && Boolean(stored.authSalt)
+        && verifyPinHash(pin, stored.authSalt, stored.adminPinHash);
+}
+
+/** Whether an operator's stored PIN hash verifies this plaintext. */
+function operatorPinVerifies(operatorId, pin) {
+    const stored = readData('settings.json');
+    const op = (stored.operators || []).find(o => o && o.id === operatorId);
+    return Boolean(op && op.pinHash) && Boolean(stored.authSalt)
+        && verifyPinHash(pin, stored.authSalt, op.pinHash);
+}
+
 function salePayload(appliedAdvance) {
     return {
         purity: '22K',
@@ -108,6 +139,25 @@ function salePayload(appliedAdvance) {
 console.log('======================================================================');
 console.log('HTTP ROUTE SECURITY & TRANSACTION VERIFICATION');
 console.log('======================================================================');
+
+// Safe now: GOLD_POS_DATA_DIR is set, so db.js resolves to the temp directory.
+const { verifyPinHash, currentTotpCode } = await import('./adminAuth.js');
+
+/**
+ * The code an authenticator app would be showing now.
+ *
+ * Uses the production generator rather than a copy of it: a test that
+ * reimplements what it is testing agrees with its own bugs. The generator itself
+ * is pinned against the published RFC 6238 vectors in test_suite.js.
+ */
+function currentTotp(secret) {
+    return currentTotpCode(secret);
+}
+
+// Populated by the enrolment check and used by the ones that follow it.
+let mfaSecret = '';
+let mfaRecoveryCodes = [];
+let mfaManagerToken = '';
 
 try {
     const { startServer } = await import('./server.js');
@@ -177,7 +227,11 @@ try {
 
         const stored = readData('settings.json');
         assert.equal(stored.companyName, 'Updated HTTP Store');
-        assert.equal(stored.adminPin, '2468');
+        // The PIN is hashed on disk, so the assertion is that it still VERIFIES
+        // and that no plaintext survives — a stronger claim than the string
+        // comparison this replaced.
+        assert.equal(storedPinVerifies('2468'), true, 'the master PIN was clobbered by the mask');
+        assert.equal(stored.adminPin, undefined, 'a plaintext PIN must never be written back');
         assert.equal(stored.razorpayKeySecret, 'razorpay-secret-value');
         assert.equal(stored.smtp.pass, 'smtp-secret-value');
         assert.equal(stored.smtp.host, 'smtp2.example.test');
@@ -190,7 +244,7 @@ try {
         });
         assert.equal(omitted.status, 200);
         const afterOmitted = readData('settings.json');
-        assert.equal(afterOmitted.adminPin, '2468');
+        assert.equal(storedPinVerifies('2468'), true);
         assert.equal(afterOmitted.razorpayKeySecret, 'razorpay-secret-value');
         assert.equal(afterOmitted.smtp.pass, 'smtp-secret-value');
     });
@@ -208,7 +262,9 @@ try {
         assert.equal(response.status, 200);
         assert.doesNotMatch(JSON.stringify(await response.json()), /8642|rotated-razorpay-secret|rotated-smtp-secret/);
         const stored = readData('settings.json');
-        assert.equal(stored.adminPin, '8642');
+        assert.equal(storedPinVerifies('8642'), true, 'the rotated PIN should now be the one that works');
+        assert.equal(storedPinVerifies('2468'), false, 'the old PIN must stop working');
+        assert.equal(stored.adminPin, undefined);
         assert.equal(stored.razorpayKeySecret, 'rotated-razorpay-secret');
         assert.equal(stored.smtp.pass, 'rotated-smtp-secret');
     });
@@ -968,6 +1024,924 @@ try {
             assert.equal(fs.readFileSync(path.join(dataDir, name), 'utf8'), before[name], `${name} changed after rollback`);
         }
         assert.equal(fs.existsSync(path.join(dataDir, '.json-transaction.json')), false);
+    });
+
+    /* ==================================================================
+       Multi-line invoices over HTTP
+       ================================================================== */
+
+    await check('a multi-line sale stores a line per item and a correct rollup', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerName: 'Multi Line Customer',
+                customerPhone: phone,
+                lines: [
+                    { description: 'Bangles', purity: '22K', weightGrams: 2, makingChargeAmount: 100, makingChargePercent: 5 },
+                    { description: 'Chain', purity: '18K', weightGrams: 1, makingChargeAmount: 50, makingChargePercent: 6 }
+                ],
+                totalAmount: 0
+            })
+        });
+        assert.equal(response.status, 200);
+        const { sale } = await response.json();
+
+        assert.equal(sale.lines.length, 2);
+        assert.equal(sale.lines[0].lineNumber, 1);
+        assert.equal(sale.lines[1].purity, '18K');
+        // Each line priced at ITS OWN purity's store rate, never the request's.
+        assert.equal(sale.lines[0].goldPricePerGram, FIXTURE_RATE);
+        assert.equal(sale.lines[1].goldPricePerGram, FIXTURE_RATE * 18 / 22);
+
+        // The rollup describes the whole document, not line 1.
+        assert.equal(sale.purity, 'MIXED');
+        assert.equal(sale.weightGrams, 3);
+        assert.equal(sale.goldPricePerGram, 0, 'a mixed-rate invoice states no single rate');
+        assert.equal(sale.makingChargeAmount, 150);
+
+        // The rows sum to the header, to the paise — the identity the whole
+        // per-line allocation exists to guarantee.
+        const taxableSum = sale.lines.reduce((t, l) => t + l.taxableAmount, 0);
+        const taxSum = sale.lines.reduce((t, l) => t + l.taxAmount, 0);
+        assert.equal(Math.round(taxableSum * 100), Math.round(sale.taxableAmount * 100));
+        assert.equal(Math.round(taxSum * 100), Math.round(sale.taxAmount * 100));
+    });
+
+    await check('a single-line request still stores one line and the same scalars', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        });
+        assert.equal(response.status, 200);
+        const { sale } = await response.json();
+        assert.equal(sale.lines.length, 1);
+        assert.equal(sale.purity, '22K', 'a single-purity invoice states its purity, not MIXED');
+        assert.equal(sale.weightGrams, 1);
+        assert.equal(sale.goldPricePerGram, FIXTURE_RATE);
+        assert.equal(sale.totalAmount, 1030);
+    });
+
+    await check('one bad line refuses the whole invoice and names which line', async () => {
+        const before = readData('settings.json').invoiceSeqStart;
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                lines: [
+                    { purity: '22K', weightGrams: 1 },
+                    { purity: '99K', weightGrams: 1 }
+                ],
+                totalAmount: 0
+            })
+        });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /Line 2/);
+        // No invoice number burned on a rejected payload.
+        assert.equal(readData('settings.json').invoiceSeqStart, before);
+    });
+
+    await check('returning one line of a multi-line invoice prices it at that line’s rate', async () => {
+        const sale = (await (await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerName: 'Line Return Customer',
+                customerPhone: phone,
+                lines: [
+                    { description: 'Ring', purity: '22K', weightGrams: 4, makingChargeAmount: 0 },
+                    { description: 'Pendant', purity: '24K', weightGrams: 2, makingChargeAmount: 0 }
+                ],
+                totalAmount: 0
+            })
+        })).json()).sale;
+
+        // Line 2 in full: 2 g @ the 24K rate, plus 3% GST.
+        const expected = Math.round(2 * (FIXTURE_RATE * 24 / 22) * 1.03 * 100) / 100;
+        const filed = await request('/api/returns', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, lineNumber: 2, weightGrams: 2, refundMode: 'cash' })
+        });
+        assert.equal(filed.status, 200);
+        const body = await filed.json();
+        assert.equal(body.return.lineNumber, 2);
+        assert.equal(body.return.purity, '24K');
+        assert.equal(Math.abs(body.return.refundAmount - expected) < 0.02, true,
+            `expected about ${expected}, got ${body.return.refundAmount}`);
+        // Line 2 is closed; the invoice is not, because line 1 is untouched.
+        assert.equal(body.return.closesLine, true);
+        assert.equal(body.return.closesInvoice, false);
+        assert.equal(body.invoiceRemainingWeightGrams, 4);
+
+        // A second return against the SAME line is refused even though the
+        // invoice still has returnable weight on line 1.
+        const again = await request('/api/returns', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, lineNumber: 2, weightGrams: 1, refundMode: 'cash' })
+        });
+        assert.equal(again.status, 400);
+        assert.match((await again.json()).error, /line 2/i);
+
+        // Line 1 is still returnable, and closing it closes the invoice.
+        const closing = await request('/api/returns', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, lineNumber: 1, weightGrams: 4, refundMode: 'cash' })
+        });
+        assert.equal(closing.status, 200);
+        const closed = await closing.json();
+        assert.equal(closed.return.closesInvoice, true);
+        // The two refunds together equal exactly what the invoice charged.
+        const filedGross = Math.round((sale.totalAmount + sale.appliedAdvance) * 100);
+        const refunded = Math.round((body.return.refundAmount + closed.return.refundAmount) * 100);
+        assert.equal(refunded, filedGross, 'refunds must sum to the filed gross');
+    });
+
+    await check('a multi-line invoice refuses a return that does not name a line', async () => {
+        const sale = (await (await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerPhone: phone,
+                lines: [
+                    { purity: '22K', weightGrams: 1, makingChargeAmount: 0 },
+                    { purity: '18K', weightGrams: 1, makingChargeAmount: 0 }
+                ],
+                totalAmount: 0
+            })
+        })).json()).sale;
+
+        const response = await request('/api/returns', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
+        });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /several items/i);
+    });
+
+    /* ==================================================================
+       Tenders — how the invoice was paid
+       ================================================================== */
+
+    await check('a tender split that adds up is stored on the invoice', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                tenders: [
+                    { method: 'cash', amount: 30 },
+                    { method: 'card', amount: 1000, reference: 'SLIP-42' }
+                ]
+            })
+        });
+        assert.equal(response.status, 200);
+        const { sale } = await response.json();
+        assert.equal(sale.totalAmount, 1030);
+        assert.equal(sale.tenders.length, 2);
+        assert.equal(sale.tenders[1].method, 'card');
+        assert.equal(sale.tenders[1].reference, 'SLIP-42');
+    });
+
+    await check('a tender split that does not add up refuses the sale', async () => {
+        const before = readData('settings.json').invoiceSeqStart;
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                tenders: [{ method: 'cash', amount: 500 }]
+            })
+        });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /do not add up/i);
+        // Refused BEFORE the invoice number is consumed.
+        assert.equal(readData('settings.json').invoiceSeqStart, before);
+    });
+
+    await check('an unknown tender method is refused', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                tenders: [{ method: 'crypto', amount: 1030 }]
+            })
+        });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /unknown method/i);
+    });
+
+    await check('a tender must cover the total AFTER an advance is redeemed', async () => {
+        // A DEDICATED customer with a balance of exactly ₹100. Redeeming an
+        // advance is all-or-nothing (computeInvoiceTotals redeems as much as the
+        // balance allows), so the shared fixture customer — whose balance the
+        // checks above legitimately spend and refund — cannot give a
+        // deterministic total to tender against.
+        const tenderPhone = '9000000123';
+        const topUp = await request('/api/advances', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerPhone: tenderPhone,
+                customerName: 'Tender Advance Customer',
+                amount: 100,
+                paymentMethod: 'Cash',
+                referenceId: 'TENDER-ADVANCE-TOPUP'
+            })
+        });
+        assert.equal(topUp.status, 200);
+
+        // A redeemed advance was tendered when it was deposited. Requiring the
+        // tenders to cover the pre-advance gross would double-count it.
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(100),
+                customerPhone: tenderPhone,
+                tenders: [{ method: 'cash', amount: 930 }]
+            })
+        });
+        assert.equal(response.status, 200);
+        const { sale } = await response.json();
+        assert.equal(sale.appliedAdvance, 100);
+        assert.equal(sale.totalAmount, 930);
+        assert.equal(sale.tenders[0].amount, 930);
+    });
+
+    await check('a lone tender with no amount records the server’s own total', async () => {
+        // The desk sends this for an ordinary unsplit sale. It is what keeps a
+        // legitimately repriced invoice (rate synced overnight, slab edited
+        // mid-shift) from being refused for disagreeing with the browser's
+        // stale figure — the cashier's intent was "the whole bill, in cash".
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                // Deliberately disagrees with the server's 1030.
+                totalAmount: 1,
+                tenders: [{ method: 'cash' }]
+            })
+        });
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.totalCorrected, true, 'the desk is still told it was repriced');
+        assert.equal(body.sale.totalAmount, 1030);
+        assert.equal(body.sale.tenders.length, 1);
+        assert.equal(body.sale.tenders[0].amount, 1030, 'the tender follows the server total');
+    });
+
+    await check('an amountless tender is NOT accepted inside a split', async () => {
+        // Two rows mean the cashier deliberately allocated amounts, so every
+        // row must carry one — otherwise "the rest" would be guessed.
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                tenders: [{ method: 'cash', amount: 30 }, { method: 'card' }]
+            })
+        });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /positive amount/i);
+    });
+
+    await check('an invoice fully settled by an advance records no counter tender', async () => {
+        const freePhone = '9000000456';
+        await request('/api/advances', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerPhone: freePhone,
+                customerName: 'Fully Advance Customer',
+                amount: 2000,
+                paymentMethod: 'Cash',
+                referenceId: 'FULLY-ADVANCE-TOPUP'
+            })
+        });
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                customerPhone: freePhone,
+                appliedAdvance: 2000,
+                tenders: [{ method: 'cash' }]
+            })
+        });
+        assert.equal(response.status, 200);
+        const { sale } = await response.json();
+        assert.equal(sale.totalAmount, 0, 'the advance covered the whole bill');
+        assert.deepEqual(sale.tenders, [], 'nothing was tendered at the counter');
+    });
+
+    await check('an invoice with no tenders recorded is still accepted', async () => {
+        // Every invoice filed before tenders existed has none, and the desk may
+        // legitimately not record one — absent must never mean "paid nothing".
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        });
+        assert.equal(response.status, 200);
+        assert.deepEqual((await response.json()).sale.tenders, []);
+    });
+
+    /* ==================================================================
+       Actor identity — who filed the record
+       ================================================================== */
+
+    await check('the master PIN signs in as the store owner and is named on the sale', async () => {
+        const me = await request('/api/admin/me', { headers: adminHeaders });
+        assert.equal(me.status, 200);
+        const identity = await me.json();
+        assert.equal(identity.actor.id, 'owner');
+        assert.equal(identity.actor.role, 'owner');
+        assert.equal(identity.canApprove, true);
+
+        const sale = (await (await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        })).json()).sale;
+        assert.equal(sale.actor.id, 'owner');
+        assert.equal(sale.actor.role, 'owner');
+    });
+
+    await check('a named cashier’s PIN identifies them, and their sales carry their name', async () => {
+        const saved = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                operators: [
+                    { name: 'Cashier One', role: 'cashier', pin: '4321', active: true },
+                    { name: 'Manager Two', role: 'manager', pin: '5678', active: true }
+                ]
+            })
+        });
+        assert.equal(saved.status, 200);
+        // The roster comes back without any PIN in it.
+        const body = await saved.json();
+        assert.doesNotMatch(JSON.stringify(body.settings.operators), /4321|5678/);
+        assert.equal(body.settings.operators[0].pinConfigured, true);
+
+        const cashierLogin = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '4321' })
+        });
+        assert.equal(cashierLogin.status, 200);
+        const cashier = await cashierLogin.json();
+        assert.equal(cashier.actor.name, 'Cashier One');
+        assert.equal(cashier.actor.role, 'cashier');
+        assert.equal(cashier.canApprove, false);
+
+        const sale = (await (await request('/api/sales', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${cashier.token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        })).json()).sale;
+        assert.equal(sale.actor.name, 'Cashier One');
+        assert.equal(sale.actor.role, 'cashier');
+
+        // …and their refunds do too.
+        const refund = await request('/api/returns', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${cashier.token}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
+        });
+        assert.equal(refund.status, 200);
+        assert.equal((await refund.json()).return.actor.name, 'Cashier One');
+    });
+
+    await check('two operators cannot share a PIN', async () => {
+        const response = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                operators: [
+                    { name: 'A', role: 'cashier', pin: '1111' },
+                    { name: 'B', role: 'cashier', pin: '1111' }
+                ]
+            })
+        });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /same PIN/i);
+    });
+
+    await check('an operator with no PIN, a bad PIN or an unknown role is refused', async () => {
+        const cases = [
+            [{ name: 'No Pin', role: 'cashier' }, /needs a PIN/i],
+            [{ name: 'Short', role: 'cashier', pin: '12' }, /4 to 8 digits/i],
+            [{ name: 'Bad Role', role: 'wizard', pin: '9876' }, /unknown role/i],
+            [{ role: 'cashier', pin: '9876' }, /needs a name/i]
+        ];
+        for (const [operator, pattern] of cases) {
+            const response = await request('/api/settings', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ operators: [operator] })
+            });
+            assert.equal(response.status, 400, JSON.stringify(operator));
+            assert.match((await response.json()).error, pattern);
+        }
+    });
+
+    await check('a cashier cannot approve a deposit, a manager can', async () => {
+        // A customer's unverified claim, sitting pending.
+        const advances = readData('advances.json');
+        advances.push({
+            id: 'ADV-PENDING-ROLE',
+            customerPhone: phone,
+            customerName: 'HTTP Customer',
+            type: 'deposit',
+            status: 'pending',
+            amount: 250,
+            referenceId: 'UTR-ROLE-TEST',
+            timestamp: Date.now()
+        });
+        fs.writeFileSync(path.join(dataDir, 'advances.json'), JSON.stringify(advances, null, 2));
+
+        const asCashier = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '4321' })
+        });
+        const cashierToken = (await asCashier.json()).token;
+
+        const refused = await request('/api/advances/ADV-PENDING-ROLE/approve', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        assert.equal(refused.status, 403);
+        assert.equal((await refused.json()).error, 'APPROVER_REQUIRED');
+        // Still pending — the refusal changed nothing.
+        assert.equal(
+            readData('advances.json').find(a => a.id === 'ADV-PENDING-ROLE').status,
+            'pending'
+        );
+
+        const asManager = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '5678' })
+        });
+        const managerToken = (await asManager.json()).token;
+
+        const allowed = await request('/api/advances/ADV-PENDING-ROLE/approve', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${managerToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note: 'seen on the bank statement' })
+        });
+        assert.equal(allowed.status, 200);
+        const stored = readData('advances.json').find(a => a.id === 'ADV-PENDING-ROLE');
+        assert.equal(stored.status, 'approved');
+        // The approval names the person who gave it — the whole point of the
+        // pending state.
+        assert.equal(stored.reviewedBy.name, 'Manager Two');
+        assert.equal(stored.reviewedBy.role, 'manager');
+    });
+
+    await check('a rejected PIN is still rejected once operators exist', async () => {
+        const response = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '0000' })
+        });
+        assert.equal(response.status, 401);
+    });
+
+    /* ==================================================================
+       PIN hashing, session revocation, MFA, refund threshold
+       ================================================================== */
+
+    await check('operator PINs are stored hashed, never in the clear', async () => {
+        const raw = fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8');
+        // '4321' and '5678' were configured as operator PINs above.
+        assert.doesNotMatch(raw, /"pin"\s*:\s*"4321"/);
+        assert.doesNotMatch(raw, /"pin"\s*:\s*"5678"/);
+        const stored = readData('settings.json');
+        const cashier = stored.operators.find(op => op.name === 'Cashier One');
+        assert.equal(cashier.pin, undefined, 'no plaintext pin key should survive');
+        assert.match(cashier.pinHash, /^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]+$/);
+        assert.equal(operatorPinVerifies(cashier.id, '4321'), true, 'the hash must verify the real PIN');
+        assert.equal(operatorPinVerifies(cashier.id, '0000'), false, 'and reject another');
+    });
+
+    await check('the tenant salt and every PIN hash are kept out of the browser', async () => {
+        const response = await request('/api/settings', { headers: adminHeaders });
+        const body = await response.text();
+        assert.doesNotMatch(body, /authSalt"\s*:\s*"[0-9a-f]{8}/, 'the salt must not be sent');
+        assert.doesNotMatch(body, /scrypt\$/, 'no PIN hash may be sent to a browser');
+        const settings = JSON.parse(body);
+        assert.equal(settings.adminPinHash, null);
+        assert.equal(settings.authSalt, null);
+        assert.equal(settings.operators[0].pinHash, undefined);
+        assert.equal(settings.operators[0].pinConfigured, true);
+    });
+
+    await check('changing an operator’s PIN ends their live sessions', async () => {
+        const before = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '4321' })
+        });
+        const cashierToken = (await before.json()).token;
+        // The session works…
+        assert.equal((await request('/api/admin/me', {
+            headers: { Authorization: `Bearer ${cashierToken}` }
+        })).status, 200);
+
+        const roster = readData('settings.json').operators.map(op => ({
+            id: op.id, name: op.name, role: op.role, active: op.active,
+            ...(op.name === 'Cashier One' ? { pin: '43219' } : {})
+        }));
+        const saved = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operators: roster })
+        });
+        assert.equal(saved.status, 200);
+        assert.equal((await saved.json()).sessionsRevoked >= 1, true, 'the save should report the revocation');
+
+        // …and no longer does. The credential changed, so the access ends with it.
+        assert.equal((await request('/api/admin/me', {
+            headers: { Authorization: `Bearer ${cashierToken}` }
+        })).status, 401);
+        // The new PIN works; the old one does not.
+        assert.equal((await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        })).status, 200);
+        assert.equal((await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '4321' })
+        })).status, 401);
+    });
+
+    await check('deactivating an operator ends their sessions and their login', async () => {
+        const login = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        });
+        const token = (await login.json()).token;
+
+        const roster = readData('settings.json').operators.map(op => ({
+            id: op.id, name: op.name, role: op.role,
+            active: op.name === 'Cashier One' ? false : op.active
+        }));
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operators: roster })
+        });
+
+        assert.equal((await request('/api/admin/me', { headers: { Authorization: `Bearer ${token}` } })).status, 401);
+        assert.equal((await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        })).status, 401, 'an inactive operator cannot sign in');
+
+        // Reactivate for the checks that follow.
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                operators: readData('settings.json').operators.map(op => ({
+                    id: op.id, name: op.name, role: op.role, active: true
+                }))
+            })
+        });
+    });
+
+    await check('a live session can be listed and signed out by an approver', async () => {
+        const login = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        });
+        const cashierToken = (await login.json()).token;
+
+        // A cashier may not enumerate who is signed in.
+        assert.equal((await request('/api/admin/sessions', {
+            headers: { Authorization: `Bearer ${cashierToken}` }
+        })).status, 403);
+
+        const list = await request('/api/admin/sessions', { headers: adminHeaders });
+        assert.equal(list.status, 200);
+        const page = await list.json();
+        const theirs = page.results.find(r => r.actor.name === 'Cashier One');
+        assert.equal(Boolean(theirs), true, 'the cashier session should be listed');
+        // No token may appear in the listing — that would be handing out a
+        // credential from a read-only screen.
+        assert.doesNotMatch(JSON.stringify(page), new RegExp(cashierToken));
+
+        const revoked = await request('/api/admin/sessions/revoke', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ handle: theirs.handle })
+        });
+        assert.equal(revoked.status, 200);
+        assert.equal((await request('/api/admin/me', {
+            headers: { Authorization: `Bearer ${cashierToken}` }
+        })).status, 401);
+
+        // And an approver cannot revoke their own session from that screen.
+        const self = await request('/api/admin/sessions', { headers: adminHeaders });
+        const selfHandle = (await self.json()).currentHandle;
+        const refused = await request('/api/admin/sessions/revoke', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ handle: selfHandle })
+        });
+        assert.equal(refused.status, 400);
+        assert.equal((await refused.json()).error, 'CANNOT_REVOKE_OWN_SESSION');
+    });
+
+    await check('TOTP enrolment requires a live code, then issues recovery codes', async () => {
+        const manager = readData('settings.json').operators.find(op => op.name === 'Manager Two');
+
+        const begin = await request('/api/admin/mfa/begin', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operatorId: manager.id })
+        });
+        assert.equal(begin.status, 200);
+        const setup = await begin.json();
+        assert.match(setup.uri, /^otpauth:\/\/totp\//);
+        assert.match(setup.qrDataUri, /^data:image\/png;base64,/);
+        // Nothing is stored until the code is proven: no secret, not enabled.
+        const beforeEnrol = readData('settings.json').operators.find(op => op.id === manager.id);
+        assert.equal(Boolean(beforeEnrol.mfaEnabled), false);
+        assert.equal(beforeEnrol.totpSecret, undefined, 'the secret must not be stored before it is proven');
+
+        // A wrong code is refused.
+        const bad = await request('/api/admin/mfa/enrol', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operatorId: manager.id, secret: setup.secret, code: '000000' })
+        });
+        assert.equal(bad.status, 400);
+
+        // The real code enrols and returns the codes exactly once.
+        const good = await request('/api/admin/mfa/enrol', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ operatorId: manager.id, secret: setup.secret, code: currentTotp(setup.secret) })
+        });
+        assert.equal(good.status, 200);
+        const enrolled = await good.json();
+        assert.equal(enrolled.recoveryCodes.length, 10);
+
+        const stored = readData('settings.json').operators.find(op => op.id === manager.id);
+        assert.equal(stored.mfaEnabled, true);
+        assert.equal(stored.recoveryCodes.length, 10);
+        // Stored as hashes, never as the codes themselves.
+        assert.doesNotMatch(JSON.stringify(stored.recoveryCodes), new RegExp(enrolled.recoveryCodes[0]));
+        mfaSecret = setup.secret;
+        mfaRecoveryCodes = enrolled.recoveryCodes;
+    });
+
+    await check('an enrolled operator must supply a code to sign in', async () => {
+        const noCode = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '5678' })
+        });
+        assert.equal(noCode.status, 401);
+        assert.equal((await noCode.json()).error, 'MFA_CODE_REQUIRED');
+
+        const wrongCode = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '5678', totpCode: '000000' })
+        });
+        assert.equal(wrongCode.status, 401);
+        assert.equal((await wrongCode.json()).error, 'MFA_CODE_INVALID');
+
+        const ok = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '5678', totpCode: currentTotp(mfaSecret) })
+        });
+        assert.equal(ok.status, 200);
+        const session = await ok.json();
+        assert.equal(session.mfaUsed, true);
+        mfaManagerToken = session.token;
+    });
+
+    await check('a recovery code works once and only once', async () => {
+        const code = mfaRecoveryCodes[0];
+        const first = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '5678', recoveryCode: code })
+        });
+        assert.equal(first.status, 200);
+        assert.equal((await first.json()).mfaUsed, true);
+        assert.equal(
+            readData('settings.json').operators.find(op => op.name === 'Manager Two').recoveryCodes.length,
+            9, 'the used code must be consumed'
+        );
+
+        const replay = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '5678', recoveryCode: code })
+        });
+        assert.equal(replay.status, 401, 'a recovery code must not work twice');
+    });
+
+    await check('requireMfaForApprovers blocks an approval from a session without a factor', async () => {
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requireMfaForApprovers: true })
+        });
+
+        const advances = readData('advances.json');
+        advances.push({
+            id: 'ADV-MFA-GATE', customerPhone: phone, customerName: 'HTTP Customer',
+            type: 'deposit', status: 'pending', amount: 300,
+            referenceId: 'UTR-MFA-GATE', timestamp: Date.now()
+        });
+        fs.writeFileSync(path.join(dataDir, 'advances.json'), JSON.stringify(advances, null, 2));
+
+        // The master PIN is an owner, but it carries no second factor — and
+        // cannot, since there is no person to enrol. That refusal is the point.
+        const refused = await request('/api/advances/ADV-MFA-GATE/approve', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
+        });
+        assert.equal(refused.status, 403);
+        assert.equal((await refused.json()).error, 'MFA_REQUIRED');
+        assert.equal(readData('advances.json').find(a => a.id === 'ADV-MFA-GATE').status, 'pending');
+
+        // The manager who signed in WITH a code may approve.
+        const allowed = await request('/api/advances/ADV-MFA-GATE/approve', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${mfaManagerToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note: 'verified' })
+        });
+        assert.equal(allowed.status, 200);
+        assert.equal(readData('advances.json').find(a => a.id === 'ADV-MFA-GATE').reviewedBy.name, 'Manager Two');
+
+        // Put it back so the remaining checks are not all MFA-gated.
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ requireMfaForApprovers: false })
+        });
+    });
+
+    await check('a refund at or above the threshold needs an approver', async () => {
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refundApprovalThreshold: 500 })
+        });
+
+        // A sale worth refunding ~1030, comfortably over the 500 limit.
+        const sale = (await (await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        })).json()).sale;
+
+        const cashier = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        });
+        const cashierToken = (await cashier.json()).token;
+
+        const refused = await request('/api/returns', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
+        });
+        assert.equal(refused.status, 403);
+        const body = await refused.json();
+        assert.equal(body.error, 'APPROVER_REQUIRED');
+        assert.match(body.message, /500/, 'the message should name the store limit');
+        // Nothing was filed.
+        assert.equal(
+            readData('returns_' + new Date().getFullYear() + '.json')
+                .filter(r => r.originalInvoiceId === sale.id).length,
+            0, 'a refused refund must not be written'
+        );
+
+        // The owner may.
+        const allowed = await request('/api/returns', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
+        });
+        assert.equal(allowed.status, 200);
+    });
+
+    await check('a refund below the threshold is still a cashier’s to make', async () => {
+        // Threshold well above the refund this produces.
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refundApprovalThreshold: 100000 })
+        });
+        const sale = (await (await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        })).json()).sale;
+
+        const cashier = await request('/api/admin/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        });
+        const cashierToken = (await cashier.json()).token;
+
+        const filed = await request('/api/returns', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
+        });
+        assert.equal(filed.status, 200);
+        assert.equal((await filed.json()).return.actor.name, 'Cashier One');
+
+        // Back to unlimited so later checks behave as before.
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refundApprovalThreshold: 0 })
+        });
+    });
+
+    await check('the refund threshold itself is validated', async () => {
+        for (const bad of [-1, 'abc', 10 ** 12]) {
+            const response = await request('/api/settings', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refundApprovalThreshold: bad })
+            });
+            assert.equal(response.status, 400, `threshold ${bad} should be refused`);
+        }
+    });
+
+    /* ==================================================================
+       Paged ledger reads
+       ================================================================== */
+
+    await check('GET /api/sales returns a clamped page with period totals', async () => {
+        const response = await request('/api/sales?limit=2', { headers: adminHeaders });
+        assert.equal(response.status, 200);
+        const page = await response.json();
+        assert.equal(Array.isArray(page.results), true);
+        assert.equal(page.results.length <= 2, true);
+        assert.equal(page.limit, 2);
+        assert.equal(page.truncated, page.total > 2);
+        // `totals` covers every matched row, not the page — the Dashboard's
+        // revenue tiles read it and must stay correct beyond one page.
+        assert.equal(page.totals.count, page.total);
+        assert.equal(typeof page.totals.totalAmount, 'number');
+        assert.equal(page.total > 2, true, 'fixture should have filed more than two sales by now');
+    });
+
+    await check('GET /api/returns and /api/advances use the same envelope', async () => {
+        for (const route of ['/api/returns', '/api/advances']) {
+            const page = await (await request(`${route}?limit=1`, { headers: adminHeaders })).json();
+            assert.equal(Array.isArray(page.results), true, route);
+            assert.equal(page.limit, 1, route);
+            assert.equal(typeof page.total, 'number', route);
+            assert.equal(typeof page.truncated, 'boolean', route);
+        }
+    });
+
+    await check('the advance liability summary ignores the date filter', async () => {
+        // A balance is a lifetime running figure; a month's slice of it is not a
+        // balance. Only `totals` describes the filtered period.
+        const page = await (await request('/api/advances?from=1990-01-01&to=1990-01-02', { headers: adminHeaders })).json();
+        assert.equal(page.totals.count, 0, 'no rows in 1990');
+        assert.equal(page.summary.outstandingTotal > 0, true, 'the liability is still reported');
+    });
+
+    await check('a malformed date is refused rather than silently ignored', async () => {
+        const response = await request('/api/sales?from=not-a-date', { headers: adminHeaders });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /YYYY-MM-DD/);
+    });
+
+    await check('GET /api/advances/customers rolls balances up per customer', async () => {
+        const page = await (await request('/api/advances/customers', { headers: adminHeaders })).json();
+        assert.equal(Array.isArray(page.results), true);
+        const row = page.results.find(c => c.phone === phone);
+        assert.equal(Boolean(row), true, 'the fixture customer should be listed');
+        assert.equal(typeof row.balance, 'number');
+        assert.equal(row.entryCount > 0, true);
+        // Searching matches the CUSTOMER, after the rollup.
+        const searched = await (await request(
+            `/api/advances/customers?q=${phone}`, { headers: adminHeaders }
+        )).json();
+        assert.equal(searched.results.length, 1);
+        assert.equal(searched.results[0].phone, phone);
     });
 
     console.log('======================================================================');

@@ -1,5 +1,5 @@
 import { adminFetch, logTelemetry } from '../app.js';
-import { computeReturnRefund, round3 } from '../lib/billingMath.js';
+import { computeReturnRefund, round2, round3, describeSaleGoods } from '../lib/billingMath.js';
 
 /**
  * Money for the credit note, always to the paise. Same contract as the copies
@@ -33,6 +33,9 @@ function formatDate(ts) {
 function formatWhen(ts) {
     return ts ? new Date(ts).toLocaleString() : '—';
 }
+
+/** Rows the recent-returns list shows — and therefore rows it asks for. */
+const RECENT_RETURNS = 25;
 
 function grams(value) {
     return `${Number(value || 0).toFixed(3)} g`;
@@ -71,6 +74,7 @@ export class ReturnDesk {
         this.results = [];
         this.selected = null;
         this.recent = [];
+        this.recentTotal = 0;
         this.company = { name: '', logo: '' };
         this.filedReturn = null;
         this.render();
@@ -82,7 +86,9 @@ export class ReturnDesk {
         try {
             const [settingsRes, returnsRes] = await Promise.all([
                 adminFetch('/api/settings'),
-                adminFetch('/api/returns')
+                // Only the rows the list below actually draws. This used to ask
+                // for the entire returns ledger to show the last handful.
+                adminFetch(`/api/returns?limit=${RECENT_RETURNS}`)
             ]);
             if (settingsRes.ok) {
                 const s = await settingsRes.json();
@@ -94,7 +100,9 @@ export class ReturnDesk {
                 };
             }
             if (returnsRes.ok) {
-                this.recent = await returnsRes.json();
+                const page = await returnsRes.json();
+                this.recent = page.results || [];
+                this.recentTotal = page.total || this.recent.length;
                 this.renderRecent();
             }
         } catch (err) {
@@ -236,7 +244,6 @@ export class ReturnDesk {
         }
 
         const rows = this.results.map(sale => {
-            const left = Number(sale.returnableWeightGrams ?? sale.weightGrams) || 0;
             const done = Number(sale.returnedWeightGrams) || 0;
             const state = sale.fullyReturned
                 ? '<span style="color:var(--color-danger); font-weight:600;">Fully returned</span>'
@@ -248,7 +255,7 @@ export class ReturnDesk {
                 <td style="font-family:var(--font-mono);">${escapeHtml(sale.id)}</td>
                 <td>${escapeHtml(formatWhen(sale.timestamp))}</td>
                 <td>${escapeHtml(sale.customerName || 'Cash Sale')}</td>
-                <td class="text-right">${grams(sale.weightGrams)}</td>
+                <td>${escapeHtml(describeSaleGoods(sale))}</td>
                 <td>${state}</td>
                 <td class="text-right">${money(sale.totalAmount)}</td>
                 <td class="text-right">
@@ -271,7 +278,7 @@ export class ReturnDesk {
                         <th>Invoice</th>
                         <th>Sold</th>
                         <th>Customer</th>
-                        <th class="text-right">Weight</th>
+                        <th>Goods</th>
                         <th>Returns</th>
                         <th class="text-right">Billed</th>
                         <th class="text-right">Action</th>
@@ -294,6 +301,36 @@ export class ReturnDesk {
         return (Number(sale.totalAmount) || 0) + (Number(sale.appliedAdvance) || 0);
     }
 
+    /**
+     * Every item on the invoice with weight still on it, and how much.
+     *
+     * The server computes this (withReturnState) because "what is still
+     * returnable" is a question about the returns ledger, not about the sale.
+     * `lineReturnState` is absent only on a response from an older server, in
+     * which case the invoice is treated as the single line it must have been.
+     */
+    returnableLines(sale) {
+        if (Array.isArray(sale.lineReturnState) && sale.lineReturnState.length > 0) {
+            return sale.lineReturnState;
+        }
+        return [{
+            lineNumber: 1,
+            description: '',
+            purity: sale.purity || '',
+            weightGrams: round3(sale.weightGrams),
+            goldPricePerGram: round2(sale.goldPricePerGram),
+            returnedWeightGrams: round3(sale.returnedWeightGrams || 0),
+            returnableWeightGrams: round3(Number(sale.returnableWeightGrams ?? sale.weightGrams) || 0),
+            fullyReturned: false
+        }];
+    }
+
+    /** The line the cashier has picked, or the only one there is. */
+    activeLine() {
+        const lines = this.returnableLines(this.selected);
+        return lines.find(l => l.lineNumber === this.selectedLineNumber) || lines[0];
+    }
+
     openReturnForm(sale) {
         this.selected = sale;
         this.filedReturn = null;
@@ -302,9 +339,15 @@ export class ReturnDesk {
         const container = document.getElementById('return-form-container');
         if (!container) return;
 
-        const returnable = round3(Number(sale.returnableWeightGrams ?? sale.weightGrams) || 0);
+        const allLines = this.returnableLines(sale);
+        const openLines = allLines.filter(l => l.returnableWeightGrams > 0);
+        // Default to the first line with weight left on it — the one a cashier
+        // almost always wants, and never a line that would only refuse them.
+        this.selectedLineNumber = (openLines[0] || allLines[0]).lineNumber;
+
         const done = Number(sale.returnedWeightGrams) || 0;
         const hasPhone = /^\d{10}$/.test(String(sale.customerPhone || ''));
+        const multiLine = allLines.length > 1;
 
         container.style.display = 'block';
         container.innerHTML = `
@@ -314,8 +357,7 @@ export class ReturnDesk {
                     ${escapeHtml(sale.customerName || 'Cash Sale')}
                     ${sale.customerPhone ? ` · ${escapeHtml(sale.customerPhone)}` : ''}
                     · sold ${escapeHtml(formatDate(sale.timestamp))}
-                    · ${escapeHtml(sale.purity || '')} ${grams(sale.weightGrams)}
-                    @ ${money(sale.goldPricePerGram)}/g
+                    · ${escapeHtml(describeSaleGoods(sale))}
                     · billed ${money(this.filedGross(sale))}
                 </p>
 
@@ -323,14 +365,39 @@ export class ReturnDesk {
                 <p class="text-muted-small" style="color:#92400e; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:8px 12px; margin-bottom:14px;">
                     ${grams(done)} has already come back on this invoice
                     (${money(sale.refundedAmount)} refunded across ${sale.returnCount} return${sale.returnCount === 1 ? '' : 's'}).
-                    <strong>${grams(returnable)} remains returnable.</strong>
+                    <strong>${grams(sale.returnableWeightGrams)} remains returnable.</strong>
                 </p>` : ''}
+
+                ${multiLine ? `
+                <!--
+                    Which item is coming back. Not a convenience: the lines on a
+                    mixed invoice carry different rates and different making
+                    charges, so a refund cannot be priced until the line is
+                    known. An exhausted line stays listed but disabled, so a
+                    cashier can see it was returned rather than wonder where it
+                    went.
+                -->
+                <div class="form-group">
+                    <label for="return-line">Which item is being returned</label>
+                    <select id="return-line" class="form-control">
+                        ${allLines.map(l => `
+                            <option value="${l.lineNumber}"${l.lineNumber === this.selectedLineNumber ? ' selected' : ''}
+                                    ${l.returnableWeightGrams > 0 ? '' : 'disabled'}>
+                                ${l.lineNumber}. ${escapeHtml(l.description || 'Gold ornament')}
+                                — ${escapeHtml(l.purity)} ${grams(l.weightGrams)} @ ${money(l.goldPricePerGram)}/g
+                                ${l.returnableWeightGrams > 0
+                                    ? `(${grams(l.returnableWeightGrams)} returnable)`
+                                    : '(fully returned)'}
+                            </option>
+                        `).join('')}
+                    </select>
+                </div>` : ''}
 
                 <div class="form-group-row">
                     <div class="form-group">
-                        <label for="return-weight">Weight being returned (max ${returnable.toFixed(3)} g)</label>
+                        <label for="return-weight">Weight being returned <span id="return-weight-max"></span></label>
                         <input type="number" id="return-weight" class="form-control"
-                               step="0.001" min="0.001" max="${returnable}" value="${returnable.toFixed(3)}">
+                               step="0.001" min="0.001">
                     </div>
                     <div class="form-group">
                         <label for="return-note">Reason / note (optional)</label>
@@ -371,14 +438,44 @@ export class ReturnDesk {
         container.querySelectorAll('input[name="return-mode"]').forEach(radio => {
             radio.addEventListener('change', () => this.renderPreview());
         });
+
+        const lineSelect = document.getElementById('return-line');
+        if (lineSelect) {
+            lineSelect.addEventListener('change', () => {
+                this.selectedLineNumber = Number(lineSelect.value);
+                this.resetWeightToLineMax();
+                this.renderPreview();
+            });
+        }
+
         document.getElementById('return-file-btn').addEventListener('click', () => this.fileReturn());
         document.getElementById('return-cancel-btn').addEventListener('click', () => {
             this.selected = null;
             container.style.display = 'none';
         });
 
+        this.resetWeightToLineMax();
         this.renderPreview();
         container.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+
+    /**
+     * Pre-fills the weight box with everything still returnable on the SELECTED
+     * line, and re-labels the cap.
+     *
+     * Switching line has to move both. Leaving line 1's 10 g in the box after
+     * picking a 5 g line 2 would offer a return the server is bound to refuse.
+     */
+    resetWeightToLineMax() {
+        const line = this.activeLine();
+        const max = round3(line.returnableWeightGrams);
+        const input = document.getElementById('return-weight');
+        const label = document.getElementById('return-weight-max');
+        if (input) {
+            input.max = max;
+            input.value = max.toFixed(3);
+        }
+        if (label) label.textContent = `(max ${max.toFixed(3)} g)`;
     }
 
     /** Whichever refund mode the cashier currently has selected. */
@@ -397,10 +494,17 @@ export class ReturnDesk {
         const sale = this.selected;
         if (!previewEl || !sale) return;
 
+        // Priced against the SELECTED line, with that line's own prior returns
+        // as the limit and the invoice's remaining weight deciding whether this
+        // return closes the bill. Same arguments the server passes, so the
+        // preview and the ledger cannot disagree.
+        const line = this.activeLine();
         const refund = computeReturnRefund({
             sale,
             returnWeightGrams: document.getElementById('return-weight').value,
-            alreadyReturnedGrams: sale.returnedWeightGrams,
+            lineNumber: line.lineNumber,
+            alreadyReturnedGrams: line.returnedWeightGrams,
+            invoiceRemainingGrams: sale.returnableWeightGrams,
             alreadyRefundedAmount: sale.refundedAmount
         });
 
@@ -461,9 +565,16 @@ export class ReturnDesk {
                     ${isGold
                         ? 'Credited to the customer\'s advance account and visible on their phone immediately. It can be redeemed against a future bill.'
                         : 'Pay this out from the till. Nothing is credited to the customer\'s account.'}
-                    ${refund.closesInvoice
+                    ${/* The item is named only on an invoice that HAS several —
+                          on a single-item bill "item 1" is noise, and the
+                          sentence should read exactly as it always has. */
+                      refund.closesInvoice
                         ? ' This closes the invoice — nothing further can be returned against it.'
-                        : ` ${grams(refund.remainingWeightAfter)} would remain returnable afterwards.`}
+                        : refund.closesLine
+                            ? ` This closes item ${refund.lineNumber}; other items on this invoice remain returnable.`
+                            : this.returnableLines(sale).length > 1
+                                ? ` ${grams(refund.remainingWeightAfter)} of item ${refund.lineNumber} would remain returnable afterwards.`
+                                : ` ${grams(refund.remainingWeightAfter)} would remain returnable afterwards.`}
                 </p>
             </div>
         `;
@@ -480,19 +591,25 @@ export class ReturnDesk {
         // A refund moves money out of the till and cannot be undone from this
         // screen, so it gets an explicit confirmation rather than firing on a
         // single click of a button the cashier may have been tabbing past.
+        const line = this.activeLine();
         const preview = computeReturnRefund({
             sale,
             returnWeightGrams: weight,
-            alreadyReturnedGrams: sale.returnedWeightGrams,
+            lineNumber: line.lineNumber,
+            alreadyReturnedGrams: line.returnedWeightGrams,
+            invoiceRemainingGrams: sale.returnableWeightGrams,
             alreadyRefundedAmount: sale.refundedAmount
         });
         if (!preview.ok) {
             alert(preview.error);
             return;
         }
+        const itemLabel = this.returnableLines(sale).length > 1
+            ? ` (item ${line.lineNumber}: ${line.description || line.purity})`
+            : '';
         const confirmed = window.confirm(
             `Refund ${money(preview.refundAmount)} as ${mode === 'gold' ? 'GOLD CREDIT' : 'CASH'} ` +
-            `for ${grams(preview.weightGrams)} returned against ${sale.id}?\n\n` +
+            `for ${grams(preview.weightGrams)} returned against ${sale.id}${itemLabel}?\n\n` +
             `This is filed to the ledger and cannot be undone from this screen.`
         );
         if (!confirmed) return;
@@ -505,6 +622,7 @@ export class ReturnDesk {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     invoiceId: sale.id,
+                    lineNumber: line.lineNumber,
                     weightGrams: Number(weight),
                     refundMode: mode,
                     note
@@ -579,7 +697,14 @@ export class ReturnDesk {
                         </thead>
                         <tbody>
                             <tr>
-                                <td>Gold Ornament returned (${escapeHtml(record.purity || '')})</td>
+                                <td>${escapeHtml(record.description || 'Gold Ornament')} returned (${escapeHtml(record.purity || '')})${
+                                    // Named only when the original invoice had
+                                    // several items — otherwise "item 1 of 1" is
+                                    // noise on a customer's document.
+                                    record.lineNumber > 1 || record.invoiceWeightGrams > record.originalWeightGrams
+                                        ? ` <span style="font-size:11px; opacity:0.75;">— item ${escapeHtml(String(record.lineNumber || 1))} of invoice</span>`
+                                        : ''
+                                }</td>
                                 <td class="text-right">${grams(record.weightGrams)}</td>
                                 <td class="text-right">${money(record.goldPricePerGram)}</td>
                                 <td class="text-right">${record.itemised ? money(record.metalValue) : '—'}</td>
@@ -667,12 +792,13 @@ export class ReturnDesk {
             return;
         }
 
-        const rows = this.recent.slice(0, 25).map(r => `
+        const rows = this.recent.map(r => `
             <tr>
                 <td style="font-family:var(--font-mono);">${escapeHtml(r.id)}</td>
                 <td>${escapeHtml(formatWhen(r.timestamp))}</td>
                 <td style="font-family:var(--font-mono);">${escapeHtml(r.originalInvoiceId)}</td>
                 <td>${escapeHtml(r.customerName || 'Cash Sale')}</td>
+                <td>${escapeHtml(r.actor ? r.actor.name : '—')}</td>
                 <td class="text-right">${grams(r.weightGrams)}</td>
                 <td>${r.refundMode === 'gold'
                     ? '<span style="color:#b45309; font-weight:600;">GOLD CREDIT</span>'
@@ -693,6 +819,9 @@ export class ReturnDesk {
                         <th>Filed</th>
                         <th>Invoice</th>
                         <th>Customer</th>
+                        <!-- Who authorised the refund. A cash refund moves money
+                             out of the till; the ledger names the person now. -->
+                        <th>Refunded by</th>
                         <th class="text-right">Weight</th>
                         <th>Mode</th>
                         <th class="text-right">Refunded</th>
@@ -701,6 +830,11 @@ export class ReturnDesk {
                 </thead>
                 <tbody>${rows}</tbody>
             </table>
+            ${this.recentTotal > this.recent.length
+                ? `<p class="text-muted-small" style="margin-top:8px;">Showing the
+                     ${this.recent.length} most recent of ${this.recentTotal} credit notes.
+                     Search an invoice above to find an older one.</p>`
+                : ''}
         `;
 
         el.querySelectorAll('.return-reprint-btn').forEach(btn => {

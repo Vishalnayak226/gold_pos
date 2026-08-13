@@ -6,8 +6,15 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_billing_math.js && node test_suite.js && node test_routes.js && node test_http.js && node test_production_guard.js",
+    "test": "node test_billing_math.js && node test_schema.js && node test_repositories.js && node test_concurrency.js && node test_suite.js && node test_routes.js && node test_http.js && node test_production_guard.js",
     "test:billing": "node test_billing_math.js",
+    "test:schema": "node test_schema.js",
+    "test:repositories": "node test_repositories.js",
+    "test:concurrency": "node test_concurrency.js",
+    "migrate": "node repositories/migrate.js",
+    "migrate:status": "node repositories/migrate.js --status",
+    "import:legacy": "node importLegacyJson.js",
+    "import:legacy:dry-run": "node importLegacyJson.js --dry-run",
     "test:integration": "node test_suite.js",
     "test:routes": "node test_routes.js",
     "test:http": "node test_http.js",
@@ -28,6 +35,6 @@
     "@playwright/test": "^1.50.0"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   }
 }

@@ -1,10 +1,8 @@
 import { logTelemetry, adminFetch } from '../app.js';
-import {
-    ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus, summarizeAdvanceLedger
-} from '../lib/billingMath.js';
+import { ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus } from '../lib/billingMath.js';
 
-const PURITY_LABELS = { '24K': '24K Gold', '22K': '22K Gold', '18K': '18K Gold' };
-const PURITY_SWATCH_CLASS = { '24K': 'swatch-24k', '22K': 'swatch-22k', '18K': 'swatch-18k' };
+/** Rows each "recent" list shows — and therefore rows each list asks for. */
+const RECENT_ROWS = 5;
 
 /**
  * Escapes HTML-significant characters. Sales/advances records can contain
@@ -87,9 +85,18 @@ export class Dashboard {
     }
 
     /**
-     * Fetches sales, advances, and the active gold rate, then recomputes and
-     * repaints every data region. Safe to call repeatedly (e.g. each time the
-     * Dashboard tab is opened) — all API reads are already-admin-gated GETs.
+     * Fetches the figures the tiles state and the handful of rows the lists
+     * show, then repaints every data region. Safe to call repeatedly (e.g. each
+     * time the Dashboard tab is opened) — all API reads are already-admin-gated
+     * GETs.
+     *
+     * THIS SCREEN DOES NOT DOWNLOAD THE LEDGER. It used to ask for every sale
+     * and every advance row ever filed and add them up here, which meant the
+     * response grew with the store's whole trading history to render two
+     * revenue tiles and five list rows. The revenue figures now come from the
+     * server's own `totals` over the matched period, the liability figure from
+     * its `summary` over the whole advance ledger, and the lists ask for
+     * exactly the rows they display.
      */
     async refresh() {
         const refreshBtn = document.getElementById('dashboard-refresh-btn');
@@ -99,20 +106,34 @@ export class Dashboard {
         }
 
         try {
-            const [salesRes, advancesRes, rateRes] = await Promise.all([
-                adminFetch('/api/sales'),
-                adminFetch('/api/advances'),
+            const now = new Date();
+            const day = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+            const today = day(now);
+            const monthStart = day(new Date(now.getFullYear(), now.getMonth(), 1));
+
+            // Four small reads instead of two unbounded ones. The two tile
+            // calls ask for a single row each because only their `totals` is
+            // wanted; the two list calls ask for exactly the rows they draw.
+            // The recent-invoice list is deliberately NOT date-bounded — a
+            // store with a quiet month still has a last invoice, and it should
+            // still be shown.
+            const [todayRes, mtdRes, recentRes, advancesRes, rateRes] = await Promise.all([
+                adminFetch(`/api/sales?from=${today}&to=${today}&limit=1`),
+                adminFetch(`/api/sales?from=${monthStart}&to=${today}&limit=1`),
+                adminFetch(`/api/sales?limit=${RECENT_ROWS}`),
+                adminFetch(`/api/advances?type=deposit&limit=${RECENT_ROWS}`),
                 fetch('/api/gold-price')
             ]);
 
-            const sales = salesRes.ok ? await salesRes.json() : [];
-            const advances = advancesRes.ok ? await advancesRes.json() : [];
+            const todayPage = todayRes.ok ? await todayRes.json() : null;
+            const mtdPage = mtdRes.ok ? await mtdRes.json() : null;
+            const recentPage = recentRes.ok ? await recentRes.json() : null;
+            const advancesPage = advancesRes.ok ? await advancesRes.json() : null;
             const rate = rateRes.ok ? await rateRes.json() : null;
 
-            this.renderStatTiles(sales, advances, rate);
-            // this.renderPurityMix(sales); // Removed as per user request
-            this.renderRecentTransactions(sales);
-            this.renderRecentAdvances(advances);
+            this.renderStatTiles(todayPage, mtdPage, advancesPage, rate);
+            this.renderRecentTransactions(recentPage ? recentPage.results : []);
+            this.renderRecentAdvances(advancesPage ? advancesPage.results : []);
 
             const updatedAt = document.getElementById('dashboard-updated-at');
             if (updatedAt) {
@@ -131,48 +152,44 @@ export class Dashboard {
         }
     }
 
-    renderStatTiles(sales, advances, rate) {
-        const now = new Date();
-        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    /**
+     * The four tiles, every figure taken from a server-computed aggregate.
+     *
+     * Nothing here sums a page of rows. A tile that says "this month's revenue"
+     * has to be the whole month's revenue, and the rows this screen holds are
+     * only ever the handful the lists below display — so summing them locally
+     * would have quietly understated the business the day the ledger outgrew
+     * one page.
+     */
+    renderStatTiles(todayPage, mtdPage, advancesPage, rate) {
+        const period = (page) => (page && page.totals) || { count: 0, totalAmount: 0 };
+        const tile = (revenueId, countId, page) => {
+            const t = period(page);
+            this.setText(revenueId, `₹${(t.totalAmount || 0).toLocaleString('en-IN')}`);
+            this.setText(countId, `${t.count} invoice${t.count === 1 ? '' : 's'}`);
+        };
 
-        const todaySales = sales.filter(s => s.timestamp >= todayStart);
-        const mtdSales = sales.filter(s => s.timestamp >= monthStart);
-
-        const sum = (arr) => arr.reduce((total, s) => total + (parseFloat(s.totalAmount) || 0), 0);
-
-        this.setText('stat-today-revenue', `₹${sum(todaySales).toLocaleString('en-IN')}`);
-        this.setText('stat-today-count', `${todaySales.length} invoice${todaySales.length === 1 ? '' : 's'}`);
-        this.setText('stat-mtd-revenue', `₹${sum(mtdSales).toLocaleString('en-IN')}`);
-        this.setText('stat-mtd-count', `${mtdSales.length} invoice${mtdSales.length === 1 ? '' : 's'}`);
+        tile('stat-today-revenue', 'stat-today-count', todayPage);
+        tile('stat-mtd-revenue', 'stat-mtd-count', mtdPage);
 
         // Outstanding advance balance per customer: deposits minus redemptions,
-        // floored at 0. advanceEntryDelta() is the shared rule — it returns 0 for
-        // a deposit still awaiting counter approval, so an unverified customer
-        // claim cannot inflate the store's liability figure on this tile.
-        const balances = new Map();
-        advances.forEach(a => {
-            balances.set(a.customerPhone, (balances.get(a.customerPhone) || 0) + advanceEntryDelta(a));
-        });
-        let outstandingTotal = 0;
-        let outstandingCustomers = 0;
-        balances.forEach(balance => {
-            if (balance > 0) {
-                outstandingTotal += balance;
-                outstandingCustomers += 1;
-            }
-        });
-        this.setText('stat-outstanding-advances', `₹${outstandingTotal.toLocaleString('en-IN')}`);
-        this.setText('stat-outstanding-customers', `${outstandingCustomers} customer${outstandingCustomers === 1 ? '' : 's'}`);
+        // floored per customer at 0. summarizeAdvanceLiability() is the shared
+        // rule and it runs on the server here — it excludes a deposit still
+        // awaiting counter approval, so an unverified customer claim cannot
+        // inflate the store's liability figure on this tile.
+        const liability = (advancesPage && advancesPage.summary) || {
+            outstandingTotal: 0, outstandingCustomers: 0, pendingTotal: 0, pendingCount: 0
+        };
+        this.setText('stat-outstanding-advances', `₹${liability.outstandingTotal.toLocaleString('en-IN')}`);
+        this.setText('stat-outstanding-customers', `${liability.outstandingCustomers} customer${liability.outstandingCustomers === 1 ? '' : 's'}`);
 
         // Awaiting-approval callout: money customers say they have sent that no
         // one has confirmed yet. Deliberately NOT added to the tile above — the
         // point of the pending state is that it is not yet a liability.
-        const pendingSummary = summarizeAdvanceLedger(advances);
         const pendingNote = document.getElementById('stat-pending-advances');
         if (pendingNote) {
-            pendingNote.textContent = pendingSummary.pendingCount > 0
-                ? `₹${pendingSummary.pendingTotal.toLocaleString('en-IN')} awaiting approval (${pendingSummary.pendingCount})`
+            pendingNote.textContent = liability.pendingCount > 0
+                ? `₹${liability.pendingTotal.toLocaleString('en-IN')} awaiting approval (${liability.pendingCount})`
                 : '';
         }
 
@@ -185,63 +202,21 @@ export class Dashboard {
         }
     }
 
-    renderPurityMix(sales) {
-        const bar = document.getElementById('purity-mix-bar');
-        const legend = document.getElementById('purity-mix-legend');
-        if (!bar || !legend) return;
-
-        const totals = { '24K': 0, '22K': 0, '18K': 0 };
-        sales.forEach(s => {
-            if (totals[s.purity] !== undefined) {
-                totals[s.purity] += parseFloat(s.totalAmount) || 0;
-            }
-        });
-        const grandTotal = totals['24K'] + totals['22K'] + totals['18K'];
-
-        if (grandTotal <= 0) {
-            bar.innerHTML = '<div class="purity-mix-empty">No sales recorded yet</div>';
-            legend.innerHTML = '';
-            return;
-        }
-
-        const purities = ['24K', '22K', '18K'];
-        bar.innerHTML = purities
-            .filter(p => totals[p] > 0)
-            .map(p => {
-                const pct = (totals[p] / grandTotal) * 100;
-                return `<div class="purity-mix-segment ${PURITY_SWATCH_CLASS[p]}" style="width:${pct}%" title="${PURITY_LABELS[p]}: ${pct.toFixed(1)}%"></div>`;
-            })
-            .join('');
-
-        legend.innerHTML = purities
-            .filter(p => totals[p] > 0)
-            .map(p => {
-                const pct = (totals[p] / grandTotal) * 100;
-                return `
-                    <div class="legend-item">
-                        <span class="legend-swatch ${PURITY_SWATCH_CLASS[p]}"></span>
-                        <span>${PURITY_LABELS[p]} — ₹${totals[p].toLocaleString('en-IN')} (${pct.toFixed(1)}%)</span>
-                    </div>
-                `;
-            })
-            .join('');
-    }
-
+    /** The newest invoices, already ordered and already clamped by the server. */
     renderRecentTransactions(sales) {
         const list = document.getElementById('recent-transactions-list');
         if (!list) return;
 
-        const recent = [...sales].sort((a, b) => b.timestamp - a.timestamp).slice(0, 5);
-        if (recent.length === 0) {
+        if (sales.length === 0) {
             list.innerHTML = '<div class="recent-list-empty">No transactions yet.</div>';
             return;
         }
 
-        list.innerHTML = recent.map(s => `
+        list.innerHTML = sales.map(s => `
             <div class="recent-list-item">
                 <div>
                     <strong>${escapeHtml(s.id || 'N/A')}</strong>
-                    <div class="text-muted-small">${escapeHtml(s.customerName || 'Cash Sale')} · ${escapeHtml(s.purity || '')} · ${(parseFloat(s.weightGrams) || 0).toFixed(3)}g</div>
+                    <div class="text-muted-small">${escapeHtml(s.customerName || 'Cash Sale')} · ${escapeHtml(describeSaleGoods(s))}</div>
                 </div>
                 <div class="text-right">
                     <strong>₹${(parseFloat(s.totalAmount) || 0).toLocaleString('en-IN')}</strong>
@@ -251,14 +226,12 @@ export class Dashboard {
         `).join('');
     }
 
+    /** The newest deposits — the server filtered to `type=deposit` and clamped. */
     renderRecentAdvances(advances) {
         const list = document.getElementById('recent-advances-list');
         if (!list) return;
 
-        const recentDeposits = advances
-            .filter(a => a.type === 'deposit')
-            .sort((a, b) => b.timestamp - a.timestamp)
-            .slice(0, 5);
+        const recentDeposits = advances;
 
         if (recentDeposits.length === 0) {
             list.innerHTML = '<div class="recent-list-empty">No advance deposits yet.</div>';

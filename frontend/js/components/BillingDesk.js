@@ -1,10 +1,11 @@
-import { logTelemetry, adminFetch } from '../app.js';
+import { logTelemetry, adminFetch, getActor } from '../app.js';
 import {
     computeInvoiceTotals,
     makingChargeFromPercent,
     makingPercentFromAmount,
     normalizeTaxMode,
-    round2
+    round2,
+    toPaise
 } from '../lib/billingMath.js';
 
 /**
@@ -20,6 +21,32 @@ function money(value) {
         maximumFractionDigits: 2
     })}`;
 }
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[ch]));
+}
+
+/** The three purities, and the key each one reads its rate from. */
+const PURITY_BY_KEY = { price24K: '24K', price22K: '22K', price18K: '18K' };
+
+/**
+ * How a bill can be settled. Matches TENDER_METHODS on the server, which
+ * matches `tenders.method` in the SQL schema — one vocabulary, three layers.
+ *
+ * 'advance' is deliberately absent: a redeemed advance is not tendered at the
+ * counter, it was tendered when the customer deposited it, and it appears on the
+ * invoice as `appliedAdvance`. Offering it here would let a cashier record the
+ * same money twice.
+ */
+const TENDER_METHODS = [
+    { value: 'cash', label: 'Cash' },
+    { value: 'card', label: 'Card' },
+    { value: 'upi', label: 'UPI' },
+    { value: 'bank_transfer', label: 'Bank transfer' },
+    { value: 'other', label: 'Other' }
+];
 
 export class BillingDesk {
     constructor() {
@@ -38,7 +65,22 @@ export class BillingDesk {
         this.customerAdvanceBalance = 0;
         this.customerPhone = '';
         this.customerName = '';
-        
+
+        /* THE CART. Items already added to this invoice, in order.
+           Empty for the common single-item sale: the entry form's own contents
+           count as a line, so "type a weight and press Save" bills one item with
+           no extra clicks. "Add Item" moves the entry into the cart and clears
+           the form for the next one. */
+        this.cart = [];
+
+        /* HOW THE BILL IS BEING PAID. One cash tender by default, its amount
+           tracking the total, so an ordinary sale records its tender without the
+           cashier doing anything — which is the point: a sale used to record no
+           payment method at all, making a drawer count impossible to reconcile.
+           `amountEdited` flips once the cashier types an amount, after which the
+           row stops auto-tracking and the remainder is theirs to allocate. */
+        this.tenders = [{ method: 'cash', amount: 0, reference: '', amountEdited: false }];
+
         this.init();
     }
 
@@ -50,6 +92,17 @@ export class BillingDesk {
         }
         this.setupEventListeners();
         this.recalculate();
+
+        /* The desk is now live: rates and settings have landed and the event
+           listeners are wired.
+
+           Stated explicitly because until this attribute existed, the only way
+           to know was to watch for the gold rate appearing in the invoice
+           preview — and the preview no longer shows a rate until an item is
+           entered, so that signal was both indirect and gone. Filling the form
+           before this point types into a live-looking form whose Save button
+           does nothing. */
+        document.getElementById('sales-tab')?.setAttribute('data-desk-ready', 'true');
     }
 
     async fetchGoldRate() {
@@ -154,6 +207,20 @@ export class BillingDesk {
                                     <input type="number" id="gold-weight" class="form-control" placeholder="0.00" step="0.001" min="0" required>
                                 </div>
                             </div>
+                            <div class="form-group">
+                                <label for="item-description">Item (optional)</label>
+                                <input type="text" id="item-description" class="form-control" placeholder="e.g. Bangles, chain" maxlength="120">
+                            </div>
+                            <!--
+                                One invoice can hold several items, each with its
+                                own purity, rate and making charge. A single-item
+                                sale needs no click here: the entry above counts
+                                as the line. "Add Item" banks it and clears the
+                                form so a second, differently-priced item can go
+                                on the same bill and the same GST document.
+                            -->
+                            <div id="cart-list"></div>
+                            <button type="button" id="add-item-btn" class="btn btn-secondary" style="margin-top:10px;">+ Add Item to Invoice</button>
                         </div>
 
                         <div class="form-section">
@@ -206,6 +273,24 @@ export class BillingDesk {
                                 </div>
                             </div>
                         </div>
+
+                        <!--
+                            HOW THE BILL IS PAID. A sale used to record no payment
+                            method whatsoever, which is why a cash-drawer close,
+                            a shift variance and a card settlement could not be
+                            reconciled against the ledger — the data to reconcile
+                            simply was not there. One cash row is filled in
+                            automatically so an ordinary sale costs no extra
+                            keystrokes; splitting is a click.
+                        -->
+                        <div class="form-section">
+                            <h3>4. Payment</h3>
+                            <div id="tender-rows"></div>
+                            <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:10px;">
+                                <button type="button" id="add-tender-btn" class="btn btn-secondary btn-small">+ Split payment</button>
+                                <span id="tender-remaining" class="text-muted-small"></span>
+                            </div>
+                        </div>
                     </form>
                 </div>
 
@@ -233,14 +318,14 @@ export class BillingDesk {
                                     <th class="text-right">Total (₹)</th>
                                 </tr>
                             </thead>
-                            <tbody>
-                                <tr>
-                                    <td>Gold Ornament (<span id="preview-purity">22K</span>)</td>
-                                    <td class="text-right" id="preview-weight">0.000 g</td>
-                                    <td class="text-right" id="preview-rate">₹0.00</td>
-                                    <td class="text-right" id="preview-metal-val">₹0.00</td>
-                                </tr>
-                            </tbody>
+                            <!--
+                                One row per item on the invoice, rendered from the
+                                cart. Each quotes its own purity, weight and rate,
+                                because on a mixed bill those genuinely differ per
+                                line and a single averaged row would misdescribe
+                                what was sold.
+                            -->
+                            <tbody id="preview-line-rows"></tbody>
                         </table>
                         
                         <!--
@@ -469,6 +554,42 @@ export class BillingDesk {
             }
         });
 
+        // Cart: bank the entry form as a line and clear it for the next item.
+        const addItemBtn = document.getElementById('add-item-btn');
+        if (addItemBtn) addItemBtn.addEventListener('click', () => this.addEntryToCart());
+
+        // The item description is descriptive only, but the preview row shows
+        // it, so the preview has to follow it as it is typed.
+        const descInput = document.getElementById('item-description');
+        if (descInput) descInput.addEventListener('input', () => this.recalculateSummaryOnly());
+
+        // Payment: add a split row, pre-filled with whatever is unallocated so
+        // the common "₹5,000 cash, rest on card" split is one click and no
+        // arithmetic.
+        const addTenderBtn = document.getElementById('add-tender-btn');
+        if (addTenderBtn) {
+            addTenderBtn.addEventListener('click', () => {
+                if (this.tenders.length >= 10) {
+                    alert('An invoice can be split across at most 10 payments.');
+                    return;
+                }
+                // The first row stops auto-tracking the total the moment a
+                // second one exists, otherwise the two would fight over it.
+                this.tenders.forEach(t => { t.amountEdited = true; });
+                const remaining = this.remainingToAllocate();
+                this.tenders.push({
+                    method: 'card',
+                    amount: remaining > 0 ? remaining : 0,
+                    reference: '',
+                    amountEdited: true
+                });
+                this.renderTenderRows();
+            });
+        }
+
+        this.renderCart();
+        this.renderTenderRows();
+
         // Submit Invoice
         submitBtn.addEventListener('click', () => this.submitSale());
     }
@@ -518,7 +639,11 @@ export class BillingDesk {
         const weight = parseFloat(weightInput?.value) || 0;
         const rateVal = this.goldRate[this.selectedPurity] || 0;
 
-        // 1. Metal Value calculation
+        // 1. Metal value of the line being ENTERED. The making-charge percentage
+        //    boxes are bi-directional against this one line, not against the
+        //    whole cart — each item carries its own making charge, and rebasing
+        //    the percentage on the cart total would silently rewrite the charge
+        //    on items already added.
         this.metalValue = weight * rateVal;
 
         // 2. Making Charges recalculation based on percent
@@ -531,15 +656,228 @@ export class BillingDesk {
         this.recalculateSummaryOnly();
     }
 
-    recalculateSummaryOnly() {
-        const weightInput = document.getElementById('gold-weight');
-        const weight = parseFloat(weightInput?.value) || 0;
-        const rateVal = this.goldRate[this.selectedPurity] || 0;
+    /* ------------------------------------------------------------------ Cart
 
-        // All money math lives in lib/billingMath.js (discount → tax → advance).
+       An invoice is a list of lines. The entry form holds the line being typed;
+       the cart holds the ones already banked. `activeLines()` is the union, and
+       it is the ONE thing the preview, the totals and the submitted payload are
+       all derived from — so what the cashier sees on screen and what reaches the
+       ledger cannot describe different carts.
+       ------------------------------------------------------------------ */
+
+    /** The line currently in the entry form, or null if nothing is entered. */
+    readEntryLine() {
+        const weight = parseFloat(document.getElementById('gold-weight')?.value) || 0;
+        if (weight <= 0) return null;
+        const rate = this.goldRate[this.selectedPurity] || 0;
+        return {
+            purityKey: this.selectedPurity,
+            purity: PURITY_BY_KEY[this.selectedPurity],
+            description: String(document.getElementById('item-description')?.value || '').trim(),
+            weightGrams: weight,
+            goldPricePerGram: rate,
+            metalValue: round2(weight * rate),
+            makingChargePercent: this.makingChargePercent,
+            makingChargeAmount: round2(this.makingChargeAmount)
+        };
+    }
+
+    /**
+     * Every line on the invoice as it stands: the banked cart, plus whatever is
+     * in the entry form. That last part is what keeps a one-item sale a
+     * two-keystroke job — the cashier never has to "add" a single item before
+     * saving it.
+     */
+    activeLines() {
+        const entry = this.readEntryLine();
+        return entry ? [...this.cart, entry] : [...this.cart];
+    }
+
+    /** Banks the entry form as a cart line and clears it for the next item. */
+    addEntryToCart() {
+        const entry = this.readEntryLine();
+        if (!entry) {
+            alert('Enter a weight for this item before adding it to the invoice.');
+            return;
+        }
+        this.cart.push(entry);
+
+        const weightInput = document.getElementById('gold-weight');
+        const descInput = document.getElementById('item-description');
+        if (weightInput) weightInput.value = '';
+        if (descInput) descInput.value = '';
+        if (weightInput) weightInput.focus();
+
+        this.renderCart();
+        this.recalculate();
+    }
+
+    renderCart() {
+        const host = document.getElementById('cart-list');
+        if (!host) return;
+
+        if (this.cart.length === 0) {
+            host.innerHTML = '';
+            return;
+        }
+
+        host.innerHTML = `
+            <table class="advances-table" style="margin-top:12px;">
+                <thead>
+                    <tr>
+                        <th>#</th><th>Item</th><th class="text-right">Weight</th>
+                        <th class="text-right">Rate/g</th><th class="text-right">Making</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${this.cart.map((line, i) => `
+                        <tr>
+                            <td>${i + 1}</td>
+                            <td>${escapeHtml(line.description || `Gold ornament (${line.purity})`)}
+                                <div class="text-muted-small">${escapeHtml(line.purity)}</div></td>
+                            <td class="text-right">${line.weightGrams.toFixed(3)} g</td>
+                            <td class="text-right">${money(line.goldPricePerGram)}</td>
+                            <td class="text-right">${money(line.makingChargeAmount)}</td>
+                            <td class="text-right">
+                                <button type="button" class="btn btn-secondary btn-sm cart-remove-btn" data-index="${i}">Remove</button>
+                            </td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        `;
+
+        host.querySelectorAll('.cart-remove-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this.cart.splice(Number(btn.dataset.index), 1);
+                this.renderCart();
+                this.recalculate();
+            });
+        });
+    }
+
+    /* --------------------------------------------------------------- Tenders */
+
+    /** Rupees still unallocated across the tender rows — negative if over. */
+    remainingToAllocate() {
+        const allocated = this.tenders.reduce((total, t) => total + toPaise(t.amount), 0);
+        return round2((toPaise(this.totalAmount) - allocated) / 100);
+    }
+
+    renderTenderRows() {
+        const host = document.getElementById('tender-rows');
+        if (!host) return;
+
+        host.innerHTML = this.tenders.map((t, i) => `
+            <div class="form-group-row" style="align-items:flex-end;">
+                <div class="form-group">
+                    ${i === 0 ? '<label>Method</label>' : ''}
+                    <select class="form-control tender-method" data-index="${i}">
+                        ${TENDER_METHODS.map(m => `<option value="${m.value}"${m.value === t.method ? ' selected' : ''}>${m.label}</option>`).join('')}
+                    </select>
+                </div>
+                <div class="form-group">
+                    ${i === 0 ? '<label>Amount (₹)</label>' : ''}
+                    <input type="number" class="form-control tender-amount" data-index="${i}"
+                           min="0" step="0.01" value="${t.amount || ''}">
+                </div>
+                <div class="form-group">
+                    ${i === 0 ? '<label>Reference (optional)</label>' : ''}
+                    <input type="text" class="form-control tender-reference" data-index="${i}"
+                           maxlength="100" placeholder="Card slip / UTR" value="${escapeHtml(t.reference)}">
+                </div>
+                ${this.tenders.length > 1 ? `
+                <div class="form-group" style="flex:0 0 auto;">
+                    <button type="button" class="btn btn-secondary btn-sm tender-remove-btn" data-index="${i}">✕</button>
+                </div>` : ''}
+            </div>
+        `).join('');
+
+        host.querySelectorAll('.tender-method').forEach(el => {
+            el.addEventListener('change', () => {
+                this.tenders[Number(el.dataset.index)].method = el.value;
+            });
+        });
+        host.querySelectorAll('.tender-amount').forEach(el => {
+            el.addEventListener('input', () => {
+                const t = this.tenders[Number(el.dataset.index)];
+                t.amount = parseFloat(el.value) || 0;
+                // Once a cashier types an amount, stop auto-filling this row —
+                // otherwise the next recalculation would overwrite what they
+                // deliberately entered.
+                t.amountEdited = true;
+                this.updateTenderRemaining();
+            });
+        });
+        host.querySelectorAll('.tender-reference').forEach(el => {
+            el.addEventListener('input', () => {
+                this.tenders[Number(el.dataset.index)].reference = el.value;
+            });
+        });
+        host.querySelectorAll('.tender-remove-btn').forEach(el => {
+            el.addEventListener('click', () => {
+                this.tenders.splice(Number(el.dataset.index), 1);
+                if (this.tenders.length === 1) this.tenders[0].amountEdited = false;
+                this.syncTenders();
+            });
+        });
+
+        this.updateTenderRemaining();
+    }
+
+    /**
+     * Keeps the tender rows consistent with the bill.
+     *
+     * The single untouched row simply mirrors the total, so the ordinary case
+     * needs no attention at all. Once the cashier has split the payment, their
+     * figures are left exactly as typed and only the shortfall is reported —
+     * silently "correcting" a split would hide the very mismatch they need to
+     * see.
+     */
+    syncTenders() {
+        const autoRow = this.tenders.length === 1 && !this.tenders[0].amountEdited
+            ? this.tenders[0]
+            : null;
+
+        if (autoRow && autoRow.amount !== this.totalAmount) {
+            autoRow.amount = this.totalAmount;
+            // Update the field in place rather than rebuilding the rows. This
+            // runs on every keystroke in the weight box, and re-rendering the
+            // payment section that often would throw away a half-typed
+            // reference number.
+            const input = document.querySelector('.tender-amount[data-index="0"]');
+            if (input) input.value = autoRow.amount || '';
+        }
+        this.updateTenderRemaining();
+    }
+
+    updateTenderRemaining() {
+        const el = document.getElementById('tender-remaining');
+        if (!el) return;
+        const remaining = this.remainingToAllocate();
+        if (Math.abs(remaining) < 0.005) {
+            el.textContent = 'Payment matches the total.';
+            el.style.color = 'var(--color-text-muted)';
+        } else if (remaining > 0) {
+            el.textContent = `${money(remaining)} still to allocate`;
+            el.style.color = 'var(--color-warning)';
+        } else {
+            el.textContent = `${money(-remaining)} over the total`;
+            el.style.color = 'var(--color-danger)';
+        }
+    }
+
+    recalculateSummaryOnly() {
+        const lines = this.activeLines();
+
+        // All money math lives in lib/billingMath.js (discount → tax → advance),
+        // now over the whole cart. A one-line cart prices identically to the way
+        // this desk always did — the arithmetic below is the same call.
         const totals = computeInvoiceTotals({
-            metalValue: this.metalValue,
-            makingChargeAmount: this.makingChargeAmount,
+            lines: lines.map(l => ({
+                metalValue: l.metalValue,
+                makingChargeAmount: l.makingChargeAmount
+            })),
             discountPercent: this.discountPercent,
             taxSlab: this.taxSlab,
             taxMode: this.taxMode,
@@ -554,25 +892,32 @@ export class BillingDesk {
         this.taxAmount = totals.taxAmount;
         const taxAmount = totals.taxAmount;
 
-        // Line items as they must PRINT: net of the GST shown below them. In
-        // exclusive mode these are the gross figures unchanged; in inclusive
-        // mode the embedded tax has been carved out so the rows sum correctly.
-        const lines = totals.components;
+        // Invoice-level components as they must PRINT: net of the GST shown
+        // below them. In exclusive mode these are the gross figures unchanged;
+        // in inclusive mode the embedded tax has been carved out so the rows sum
+        // correctly.
+        const components = totals.components;
         const isInclusive = totals.taxMode === 'Inclusive';
 
-        // Update previews
-        const previewWeight = document.getElementById('preview-weight');
-        const previewRate = document.getElementById('preview-rate');
-        const previewMetalVal = document.getElementById('preview-metal-val');
-        const previewPurity = document.getElementById('preview-purity');
-
-        // The item table quotes the catalogue price the cashier actually keyed
-        // in, which in inclusive mode is the tax-bearing figure — the carving
+        // The item rows quote the catalogue prices the cashier actually keyed
+        // in, which in inclusive mode are the tax-bearing figures — the carving
         // happens in the summary rows below, not here.
-        if (previewWeight) previewWeight.textContent = `${weight.toFixed(3)} g`;
-        if (previewRate) previewRate.textContent = money(rateVal);
-        if (previewMetalVal) previewMetalVal.textContent = money(lines.grossMetalValue);
-        if (previewPurity) previewPurity.textContent = this.selectedPurity === 'price24K' ? '24K' : this.selectedPurity === 'price22K' ? '22K' : '18K';
+        const rowHost = document.getElementById('preview-line-rows');
+        if (rowHost) {
+            rowHost.innerHTML = lines.length === 0
+                ? `<tr><td colspan="4" style="text-align:center; font-style:italic; opacity:0.6;">No items yet</td></tr>`
+                // `data-line` / `data-cell` are the stable hook for the
+                // Playwright journeys. Positional element ids cannot address a
+                // list whose length is not known until the cashier builds it.
+                : lines.map((l, i) => `
+                    <tr data-line="${i + 1}">
+                        <td data-cell="description">${escapeHtml(l.description || 'Gold Ornament')} (${escapeHtml(l.purity)})</td>
+                        <td class="text-right" data-cell="weight">${l.weightGrams.toFixed(3)} g</td>
+                        <td class="text-right" data-cell="rate">${money(l.goldPricePerGram)}</td>
+                        <td class="text-right" data-cell="amount">${money(l.metalValue)}</td>
+                    </tr>
+                `).join('');
+        }
 
         // Update invoice summary fields
         const sumMetal = document.getElementById('sum-metal-value');
@@ -589,9 +934,16 @@ export class BillingDesk {
         const sumAdvanceAmt = document.getElementById('sum-advance-amount');
         const sumGrandTotal = document.getElementById('sum-grand-total');
 
-        if (sumMetal) sumMetal.textContent = money(lines.metalValue);
-        if (sumMakingPct) sumMakingPct.textContent = this.makingChargePercent;
-        if (sumMakingAmt) sumMakingAmt.textContent = money(lines.makingChargeAmount);
+        if (sumMetal) sumMetal.textContent = money(components.metalValue);
+        // The percentage is stated only when every line shares it. On a mixed
+        // cart there is no single making-charge percentage, and printing one
+        // line's rate beside the summed rupees of several would be a wrong
+        // statement rather than a missing one.
+        if (sumMakingPct) {
+            const percents = [...new Set(lines.map(l => l.makingChargePercent))];
+            sumMakingPct.textContent = percents.length === 1 ? percents[0] : '—';
+        }
+        if (sumMakingAmt) sumMakingAmt.textContent = money(components.makingChargeAmount);
 
         // Only inclusive pricing restates its lines, so only inclusive pricing
         // needs to say so on the invoice.
@@ -606,7 +958,7 @@ export class BillingDesk {
 
         if (this.discountPercent > 0 && sumDiscountRow && sumDiscountAmt) {
             if (sumDiscountPercent) sumDiscountPercent.textContent = this.discountPercent;
-            sumDiscountAmt.textContent = `-${money(lines.discountAmount)}`;
+            sumDiscountAmt.textContent = `-${money(components.discountAmount)}`;
             sumDiscountRow.style.display = 'flex';
         } else if (sumDiscountRow) {
             sumDiscountRow.style.display = 'none';
@@ -620,6 +972,9 @@ export class BillingDesk {
         }
 
         if (sumGrandTotal) sumGrandTotal.textContent = money(this.totalAmount);
+
+        // The bill moved, so the payment rows have to follow it.
+        this.syncTenders();
     }
 
     /**
@@ -644,11 +999,9 @@ export class BillingDesk {
     }
 
     async submitSale() {
-        const weightInput = document.getElementById('gold-weight');
-        const weight = parseFloat(weightInput?.value) || 0;
-
-        if (weight <= 0) {
-            alert('Please enter a valid gold weight.');
+        const lines = this.activeLines();
+        if (lines.length === 0) {
+            alert('Add at least one item to the invoice — enter a weight for the current item, or add items to the cart.');
             return;
         }
 
@@ -672,6 +1025,23 @@ export class BillingDesk {
             return;
         }
 
+        // The payment split has to add up before an invoice number is consumed.
+        // The server refuses a mismatched split too — this check exists so the
+        // cashier is told at the counter, with the figure named, rather than by
+        // a rejected save.
+        const unallocated = this.remainingToAllocate();
+        if (Math.abs(unallocated) >= 0.005) {
+            alert(
+                unallocated > 0
+                    ? `${money(unallocated)} of this bill has not been allocated to a payment method.\n\n`
+                        + `Adjust the Payment section so the amounts add up to ${money(this.totalAmount)}.`
+                    : `The payments recorded exceed the bill by ${money(-unallocated)}.\n\n`
+                        + `Adjust the Payment section so the amounts add up to ${money(this.totalAmount)}.`
+            );
+            document.getElementById('tender-rows')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            return;
+        }
+
         // Only what the server actually reads. It prices the invoice itself
         // from its own active rate and tax settings, so sending a metal value,
         // a tax figure or a timestamp here would just be sending numbers that
@@ -685,13 +1055,34 @@ export class BillingDesk {
         const salePayload = {
             customerName: this.customerName || 'Cash Sale',
             customerPhone: this.customerPhone || '',
-            purity: this.selectedPurity === 'price24K' ? '24K' : this.selectedPurity === 'price22K' ? '22K' : '18K',
-            weightGrams: weight,
-            goldPricePerGram: this.goldRate[this.selectedPurity],
-            makingChargePercent: this.makingChargePercent,
-            makingChargeAmount: this.makingChargeAmount,
+            lines: lines.map(l => ({
+                description: l.description,
+                purity: l.purity,
+                weightGrams: l.weightGrams,
+                goldPricePerGram: l.goldPricePerGram,
+                makingChargePercent: l.makingChargePercent,
+                makingChargeAmount: l.makingChargeAmount
+            })),
             discountPercent: this.discountPercent,
             appliedAdvance: this.appliedAdvance,
+            /* HOW IT WAS PAID.
+
+               A single row the cashier never edited is sent as a METHOD WITH NO
+               AMOUNT, meaning "the whole bill, this way". The server fills in
+               its own total, so an invoice it legitimately reprices — an
+               overnight rate sync, a tax slab changed mid-shift — still records
+               the payment the cashier intended instead of being refused for
+               disagreeing with a stale figure on this screen.
+
+               An actual split sends explicit amounts, which the server requires
+               to reconcile exactly. A zero-value row is dropped rather than
+               sent: an empty split row the cashier added and thought better of
+               should not block a sale that is otherwise correct. */
+            tenders: this.tenders.length === 1 && !this.tenders[0].amountEdited
+                ? [{ method: this.tenders[0].method, reference: this.tenders[0].reference }]
+                : this.tenders
+                    .filter(t => Number(t.amount) > 0)
+                    .map(t => ({ method: t.method, amount: round2(t.amount), reference: t.reference })),
             totalAmount: this.totalAmount
         };
 
@@ -738,6 +1129,12 @@ export class BillingDesk {
         if (form) form.reset();
         this.customerName = '';
         this.customerPhone = '';
+        // A filed invoice takes its items and its payment split with it — the
+        // next customer must not inherit either.
+        this.cart = [];
+        this.tenders = [{ method: 'cash', amount: 0, reference: '', amountEdited: false }];
+        this.renderCart();
+        this.renderTenderRows();
         this.discountPercent = this.defaultDiscountConfig;
         const discountInput = document.getElementById('manual-discount');
         if (discountInput) discountInput.value = this.discountPercent;

@@ -15,6 +15,46 @@ function num(value) {
     return Number.isFinite(n) ? n : 0;
 }
 
+/** Total of a list of numbers, blanks and junk counted as zero. */
+function sum(values) {
+    return (values || []).reduce((total, value) => total + num(value), 0);
+}
+
+/**
+ * Splits `totalPaise` across `weights` so the parts sum to it EXACTLY.
+ *
+ * Largest-remainder: each part takes its floor share, then the leftover paise go
+ * one each to the lines with the largest discarded fractions. This is the whole
+ * reason a multi-line invoice reconciles — rounding each line independently
+ * leaves the rows short or over by a paise or two, and a customer adding up the
+ * column on a printed invoice finds it does not match the total. Allocating a
+ * figure that is already correct cannot drift from it.
+ *
+ * A zero total, or weights that are all zero, splits to all zeros — which is the
+ * right answer for a fully-discounted or zero-rated invoice rather than a
+ * division by zero.
+ */
+function allocatePaise(totalPaise, weights) {
+    const total = Math.round(num(totalPaise));
+    const w = (weights || []).map(x => Math.max(0, num(x)));
+    const weightTotal = sum(w);
+    if (w.length === 0) return [];
+    if (weightTotal <= 0 || total === 0) return w.map(() => 0);
+
+    const exact = w.map(x => (total * x) / weightTotal);
+    const parts = exact.map(Math.floor);
+    let remainder = total - sum(parts);
+
+    // Hand the leftover paise to the largest fractional parts first.
+    const order = exact
+        .map((value, index) => ({ index, frac: value - Math.floor(value) }))
+        .sort((a, b) => b.frac - a.frac);
+    for (let i = 0; remainder > 0 && i < order.length; i++, remainder--) {
+        parts[order[i].index] += 1;
+    }
+    return parts;
+}
+
 /** Round to 2 decimal places — the paise every money figure settles on. */
 export function round2(value) {
     return Math.round(num(value) * 100) / 100;
@@ -208,6 +248,48 @@ export function summarizeAdvanceLedger(entries) {
 }
 
 /**
+ * The store's whole advance liability, split by customer — what the Dashboard
+ * tile states and what an auditor would ask for.
+ *
+ * Per-customer balances are floored individually before being summed, for the
+ * same reason computeAdvanceBalance() floors: one customer's reconciliation
+ * error going negative must not quietly cancel out another customer's real
+ * credit and understate what the store owes.
+ *
+ * Lives here rather than in Dashboard.js because the figure is now computed
+ * server-side (GET /api/advances returns it, so the browser no longer downloads
+ * the entire ledger to add it up) and the browser still renders it — two
+ * callers, therefore one rule, in the module that owns money arithmetic.
+ */
+export function summarizeAdvanceLiability(entries) {
+    const rows = entries || [];
+    const balances = new Map();
+    for (const entry of rows) {
+        if (!entry) continue;
+        const phone = entry.customerPhone || '';
+        balances.set(phone, (balances.get(phone) || 0) + advanceEntryDelta(entry));
+    }
+
+    let outstandingTotal = 0;
+    let outstandingCustomers = 0;
+    for (const balance of balances.values()) {
+        const owed = round2(balance);
+        if (owed > 0) {
+            outstandingTotal += owed;
+            outstandingCustomers += 1;
+        }
+    }
+
+    const pending = summarizeAdvanceLedger(rows);
+    return {
+        outstandingTotal: round2(outstandingTotal),
+        outstandingCustomers,
+        pendingTotal: pending.pendingTotal,
+        pendingCount: pending.pendingCount
+    };
+}
+
+/**
  * The invoice pipeline, in the order the numbers must be applied:
  *
  *   1. preTaxTotal   = metal value + making charges
@@ -250,15 +332,54 @@ export function computeInvoiceTotals({
     taxSlab = 0,
     taxMode = 'Exclusive',
     appliedAdvance = 0,
-    customerAdvanceBalance = 0
+    customerAdvanceBalance = 0,
+    lines = null
 } = {}) {
     const mode = normalizeTaxMode(taxMode);
     const slab = Math.max(0, num(taxSlab));
 
-    const grossMetalValue = round2(metalValue);
-    const grossMakingCharge = round2(makingChargeAmount);
+    /* ONE INVOICE, ONE OR MANY LINES.
+     *
+     * `lines` is the multi-item form: each entry contributes its own metal value
+     * and making charge, and may carry its own discount. The scalar
+     * metalValue / makingChargeAmount arguments are the single-line form, which
+     * every stored invoice filed before this used and which a one-item sale
+     * still uses — they are normalised into a single line here so there is
+     * exactly ONE arithmetic path below rather than a second one bolted on.
+     *
+     * The header figures are then computed over the SUMS, precisely as they
+     * always were, which is what keeps a one-line invoice's total identical to
+     * the paise before and after this change. Per-line taxable/tax/total
+     * figures are an ALLOCATION of those header figures (see allocateLines
+     * below), never an independent calculation — so the rows on a printed
+     * invoice always add up to the total at the bottom, at any slab, with any
+     * number of lines. */
+    const inputLines = Array.isArray(lines) && lines.length > 0
+        ? lines
+        : [{ metalValue, makingChargeAmount, discountPercent }];
+
+    const normalizedLines = inputLines.map(line => {
+        const lineMetal = round2((line && line.metalValue) ?? 0);
+        const lineMaking = round2((line && line.makingChargeAmount) ?? 0);
+        // A line without its own discount inherits the invoice's, so passing a
+        // bare list of items behaves exactly like the single-line form did.
+        const linePct = Math.min(100, Math.max(0,
+            num((line && line.discountPercent) ?? discountPercent)
+        ));
+        const linePreTax = round2(lineMetal + lineMaking);
+        return {
+            metalValue: lineMetal,
+            makingChargeAmount: lineMaking,
+            discountPercent: linePct,
+            preTaxTotal: linePreTax,
+            discountAmount: round2(linePreTax * (linePct / 100))
+        };
+    });
+
+    const grossMetalValue = round2(sum(normalizedLines.map(l => l.metalValue)));
+    const grossMakingCharge = round2(sum(normalizedLines.map(l => l.makingChargeAmount)));
     const preTaxTotal = round2(grossMetalValue + grossMakingCharge);
-    const discountAmount = round2(preTaxTotal * (num(discountPercent) / 100));
+    const discountAmount = round2(sum(normalizedLines.map(l => l.discountAmount)));
     const afterDiscount = round2(preTaxTotal - discountAmount);
 
     let taxableAmount;
@@ -330,8 +451,140 @@ export function computeInvoiceTotals({
             // the UI which must keep showing what the cashier actually typed.
             grossMetalValue,
             grossMakingCharge
-        }
+        },
+        // Per-line breakdown, allocated out of the header figures above so the
+        // rows always sum back to them. A single-line invoice gets a one-entry
+        // array whose values equal the header — which is what makes the printed
+        // layout identical whether the sale had one item or six.
+        lines: allocateLines(normalizedLines, { taxableAmount, taxAmount, divisor })
     };
+}
+
+/**
+ * Turns the invoice's own taxable and tax figures into per-line shares.
+ *
+ * Weighted by each line's post-discount value, because that is the base the tax
+ * was charged on. Everything is allocated in integer paise and every line's
+ * `lineTotal` is its taxable plus its tax, so:
+ *
+ *   sum(line.taxableAmount) === invoice.taxableAmount
+ *   sum(line.taxAmount)     === invoice.taxAmount
+ *   sum(line.lineTotal)     === invoice.totalBeforeAdvance
+ *
+ * exactly, at every slab and in both tax modes. Those three identities are what
+ * the printed invoice, the credit note and the returns arithmetic all rely on.
+ *
+ * NOTE the advance is deliberately absent: redeeming a customer's credit settles
+ * the invoice as a whole and is not a property of any one item on it.
+ */
+function allocateLines(normalizedLines, { taxableAmount, taxAmount, divisor }) {
+    const weights = normalizedLines.map(l => Math.max(0, round2(l.preTaxTotal - l.discountAmount)));
+    const taxableParts = allocatePaise(toPaise(taxableAmount), weights);
+    const taxParts = allocatePaise(toPaise(taxAmount), weights);
+
+    return normalizedLines.map((line, i) => {
+        const lineTaxable = fromPaise(taxableParts[i]);
+        const lineTax = fromPaise(taxParts[i]);
+        // Net-of-tax restatements, on the same rule the header uses: in
+        // inclusive mode the quoted metal and making figures contain the tax, so
+        // they are carved down by the same divisor and metal absorbs the
+        // residual, keeping metal + making − discount === taxable per line.
+        const netMaking = round2(line.makingChargeAmount / divisor);
+        const netDiscount = round2(line.discountAmount / divisor);
+        return {
+            lineNumber: i + 1,
+            // As quoted by the cashier — what the cart showed and what a
+            // per-line return is re-priced from.
+            grossMetalValue: line.metalValue,
+            grossMakingCharge: line.makingChargeAmount,
+            discountPercent: line.discountPercent,
+            preTaxTotal: line.preTaxTotal,
+            // Net of tax, for printing beside a tax line.
+            metalValue: round2(lineTaxable - netMaking + netDiscount),
+            makingChargeAmount: netMaking,
+            discountAmount: netDiscount,
+            taxableAmount: lineTaxable,
+            taxAmount: lineTax,
+            lineTotal: round2(lineTaxable + lineTax)
+        };
+    });
+}
+
+/* ==========================================================================
+   Reading a stored sale
+
+   An invoice on disk is one of two shapes and both must keep working forever:
+
+     - MULTI-LINE (this version onward): a `lines` array, each entry a distinct
+       item with its own purity, weight, rate, making charge and discount.
+     - SINGLE-LINE (every invoice filed before it): the scalar purity /
+       weightGrams / goldPricePerGram / makingChargeAmount fields on the record
+       itself.
+
+   Everything downstream — the reprint, the return, the dashboard row — reads
+   through saleLines() and therefore never has to know which it is looking at.
+   That is the point: a Phase 5 multi-line rollout that made a 2026 invoice
+   unreprintable or unreturnable would be worse than no rollout.
+   ========================================================================== */
+
+/**
+ * The items on a stored sale, oldest shape or newest, always as a list.
+ *
+ * A legacy record becomes exactly one line carrying its scalar fields, so
+ * "line 1 of a one-item invoice" and "a pre-multi-line invoice" are the same
+ * thing to every caller.
+ */
+export function saleLines(sale) {
+    if (!sale || typeof sale !== 'object') return [];
+
+    if (Array.isArray(sale.lines) && sale.lines.length > 0) {
+        return sale.lines.map((line, i) => ({
+            lineNumber: num(line.lineNumber) || i + 1,
+            description: String(line.description || ''),
+            purity: line.purity || sale.purity || '',
+            weightGrams: round3(line.weightGrams),
+            goldPricePerGram: round2(line.goldPricePerGram),
+            metalValue: round2(line.grossMetalValue ?? line.metalValue),
+            makingChargePercent: num(line.makingChargePercent),
+            makingChargeAmount: round2(line.grossMakingCharge ?? line.makingChargeAmount),
+            discountPercent: num(line.discountPercent ?? sale.discountPercent),
+            lineTotal: round2(line.lineTotal)
+        }));
+    }
+
+    return [{
+        lineNumber: 1,
+        description: '',
+        purity: sale.purity || '',
+        weightGrams: round3(sale.weightGrams),
+        goldPricePerGram: round2(sale.goldPricePerGram),
+        metalValue: round2(sale.metalValue),
+        makingChargePercent: num(sale.makingChargePercent),
+        makingChargeAmount: round2(sale.makingChargeAmount),
+        discountPercent: num(sale.discountPercent),
+        lineTotal: round2(num(sale.totalAmount) + num(sale.appliedAdvance))
+    }];
+}
+
+/** Total weight on a sale, whichever shape it is stored in. */
+export function saleTotalWeight(sale) {
+    return round3(sum(saleLines(sale).map(l => l.weightGrams)));
+}
+
+/**
+ * A one-line description of what was sold — "22K · 10.500g" for a single item,
+ * "3 items · 22K, 18K · 25.400g" for a cart. Used by the dashboard row and the
+ * reprint search result, which have room for a phrase and not a table.
+ */
+export function describeSaleGoods(sale) {
+    const lines = saleLines(sale);
+    if (lines.length === 0) return '';
+    const weight = saleTotalWeight(sale).toFixed(3);
+    if (lines.length === 1) {
+        return `${lines[0].purity} · ${weight}g`;
+    }
+    const purities = [...new Set(lines.map(l => l.purity).filter(Boolean))];
+    return `${lines.length} items · ${purities.join(', ')} · ${weight}g`;
 }
 
 /* ==========================================================================
@@ -343,6 +596,13 @@ export function computeInvoiceTotals({
    the store never charged — over-refunding after a rate rise, short-changing
    the customer after a fall. Every input below therefore comes off the stored
    sale record: its rate, its making charge, its discount, its slab, its mode.
+
+   A return is against ONE LINE of an invoice, because that is the only level at
+   which it can be priced: a cart holding 22K bangles and an 18K chain has two
+   rates and two making charges on it, and "5g came back" is not a answerable
+   question until you know which of the two it was. A single-line invoice has
+   exactly one line, so the caller may leave `lineNumber` out and get the old
+   behaviour unchanged.
    ========================================================================== */
 
 /**
@@ -374,21 +634,52 @@ export function computeInvoiceTotals({
  *
  * @param {object}  args.sale                  the stored sale record, as filed
  * @param {number}  args.returnWeightGrams     grams coming back on this return
- * @param {number} [args.alreadyReturnedGrams] grams already returned earlier
+ * @param {number} [args.lineNumber]           which line — required only when the
+ *                                             invoice has more than one
+ * @param {number} [args.alreadyReturnedGrams] grams already returned off THAT LINE
+ * @param {number} [args.invoiceRemainingGrams] grams still returnable across the
+ *                                             whole invoice; defaults to the
+ *                                             line's own remainder, which is the
+ *                                             correct value for a one-line sale
  * @param {number} [args.alreadyRefundedAmount] rupees already refunded earlier
  * @returns {{ok: true, ...}|{ok: false, error: string}}
  */
 export function computeReturnRefund({
     sale,
     returnWeightGrams,
+    lineNumber = null,
     alreadyReturnedGrams = 0,
+    invoiceRemainingGrams = null,
     alreadyRefundedAmount = 0
 } = {}) {
     if (!sale || typeof sale !== 'object') {
         return { ok: false, error: 'A filed invoice is required to price a return.' };
     }
 
-    const originalWeight = round3(sale.weightGrams);
+    const lines = saleLines(sale);
+    if (lines.length === 0) {
+        return { ok: false, error: 'This invoice has no items on it, so nothing can be returned against it.' };
+    }
+
+    // One line means the caller need not name it. More than one and they must:
+    // guessing would price a 22K return at an 18K rate.
+    let line;
+    if (lineNumber === null || lineNumber === undefined) {
+        if (lines.length > 1) {
+            return {
+                ok: false,
+                error: 'This invoice has several items on it. Choose which line is being returned.'
+            };
+        }
+        line = lines[0];
+    } else {
+        line = lines.find(l => l.lineNumber === num(lineNumber));
+        if (!line) {
+            return { ok: false, error: `This invoice has no line ${lineNumber}.` };
+        }
+    }
+
+    const originalWeight = round3(line.weightGrams);
     if (!(originalWeight > 0)) {
         return { ok: false, error: 'This invoice carries no gold weight, so nothing can be returned against it.' };
     }
@@ -396,7 +687,12 @@ export function computeReturnRefund({
     const returnedSoFar = round3(Math.max(0, alreadyReturnedGrams));
     const remainingWeight = round3(originalWeight - returnedSoFar);
     if (!(remainingWeight > 0)) {
-        return { ok: false, error: 'This invoice has already been returned in full.' };
+        return {
+            ok: false,
+            error: lines.length > 1
+                ? `Line ${line.lineNumber} of this invoice has already been returned in full.`
+                : 'This invoice has already been returned in full.'
+        };
     }
 
     const returnWeight = round3(returnWeightGrams);
@@ -406,7 +702,9 @@ export function computeReturnRefund({
     if (returnWeight > remainingWeight) {
         return {
             ok: false,
-            error: `Only ${remainingWeight.toFixed(3)}g of this invoice is still returnable.`
+            error: lines.length > 1
+                ? `Only ${remainingWeight.toFixed(3)}g of line ${line.lineNumber} is still returnable.`
+                : `Only ${remainingWeight.toFixed(3)}g of this invoice is still returnable.`
         };
     }
 
@@ -417,11 +715,15 @@ export function computeReturnRefund({
 
     // Does the stored record still reconcile against its own line items? Same
     // question ReprintDesk asks before it dares split a stored total into rows,
-    // asked here before we dare derive money from those same line items.
+    // asked here before we dare derive money from those same line items. Rebuilt
+    // from ALL the lines, so a multi-line invoice is checked as a whole.
     const storesTaxSplit = sale.taxableAmount !== undefined && sale.taxAmount !== undefined;
     const wholeInvoice = computeInvoiceTotals({
-        metalValue: sale.metalValue,
-        makingChargeAmount: sale.makingChargeAmount,
+        lines: lines.map(l => ({
+            metalValue: l.metalValue,
+            makingChargeAmount: l.makingChargeAmount,
+            discountPercent: l.discountPercent
+        })),
         discountPercent: sale.discountPercent,
         taxSlab: sale.taxPercent,
         taxMode: sale.taxMode
@@ -429,22 +731,32 @@ export function computeReturnRefund({
     const itemisable = storesTaxSplit
         && Math.abs(wholeInvoice.totalBeforeAdvance - filedGross) < 0.01;
 
-    const closesInvoice = returnWeight >= remainingWeight;
+    const closesLine = returnWeight >= remainingWeight;
+    // Whether this is the LAST weight on the whole invoice — which is what the
+    // true-up below keys on, because the remainder being trued up is the
+    // invoice's unrefunded gross, not the line's.
+    const invoiceRemaining = invoiceRemainingGrams === null || invoiceRemainingGrams === undefined
+        ? remainingWeight
+        : round3(Math.max(0, invoiceRemainingGrams));
+    const closesInvoice = closesLine && round3(invoiceRemaining - returnWeight) <= 0;
+
     const fraction = returnWeight / originalWeight;
 
     let refundAmount;
     let components = null;
 
     if (itemisable) {
-        // Metal is priced at the invoice's own rate and the returned weight,
+        // Metal is priced at the LINE's own rate and the returned weight,
         // exactly as the sale was; the making charge — a flat rupee figure on
-        // the record — scales with the share of the weight going back.
-        const metalValue = computeMetalValue(returnWeight, sale.goldPricePerGram);
-        const makingChargeAmount = round2(num(sale.makingChargeAmount) * fraction);
+        // the line — scales with the share of that line's weight going back.
+        // The discount is the line's, and the tax slab and mode are the
+        // invoice's, because GST is levied on the document.
+        const metalValue = computeMetalValue(returnWeight, line.goldPricePerGram);
+        const makingChargeAmount = round2(line.makingChargeAmount * fraction);
         const totals = computeInvoiceTotals({
             metalValue,
             makingChargeAmount,
-            discountPercent: sale.discountPercent,
+            discountPercent: line.discountPercent,
             taxSlab: sale.taxPercent,
             taxMode: sale.taxMode
         });
@@ -457,11 +769,17 @@ export function computeReturnRefund({
             taxAmount: totals.taxAmount
         };
     } else {
-        refundAmount = round2(filedGross * fraction);
+        // No trustworthy per-line split. Pro-rate the filed gross by this
+        // return's share of the invoice's TOTAL weight, not the line's — the
+        // line's share of the money is exactly what is not knowable here.
+        const invoiceWeight = round3(sum(lines.map(l => l.weightGrams)));
+        refundAmount = invoiceWeight > 0
+            ? round2(filedGross * (returnWeight / invoiceWeight))
+            : 0;
     }
 
-    // True-up and cap. The closing return takes the whole unrefunded
-    // remainder; any earlier one is capped by it.
+    // True-up and cap. The return that closes the last of the invoice's weight
+    // takes the whole unrefunded remainder; any earlier one is capped by it.
     if (closesInvoice) {
         refundAmount = refundableRemaining;
     } else {
@@ -479,19 +797,23 @@ export function computeReturnRefund({
 
     return {
         ok: true,
+        lineNumber: line.lineNumber,
         weightGrams: returnWeight,
         remainingWeightAfter: round3(remainingWeight - returnWeight),
         fraction,
+        closesLine,
         closesInvoice,
         itemised: components !== null,
         refundAmount,
         components,
-        // Echoed from the invoice so the credit note can state the terms the
-        // refund was priced on without re-reading the sale record.
-        goldPricePerGram: round2(sale.goldPricePerGram),
-        purity: sale.purity || '',
-        makingChargePercent: num(sale.makingChargePercent),
-        discountPercent: num(sale.discountPercent),
+        // Echoed from the LINE (rate, purity, making, discount) and the invoice
+        // (slab, mode), so the credit note can state the terms the refund was
+        // priced on without re-reading the sale record.
+        goldPricePerGram: round2(line.goldPricePerGram),
+        purity: line.purity || '',
+        description: line.description || '',
+        makingChargePercent: num(line.makingChargePercent),
+        discountPercent: num(line.discountPercent),
         taxPercent: num(sale.taxPercent),
         taxMode: normalizeTaxMode(sale.taxMode)
     };

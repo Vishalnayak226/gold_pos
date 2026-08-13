@@ -23,7 +23,10 @@ import { test, expect, loginAsAdmin, readAlert } from './fixtures.js';
 async function openBillingDesk(page) {
     await page.click('button[data-target="sales-tab"]');
     await expect(page.locator('#sales-tab')).toHaveClass(/active/);
-    await expect(page.locator('#preview-rate')).toContainText('6,875');
+    // The desk sets this once /api/gold-price and /api/settings have landed and
+    // its listeners are wired. Filling the form before that types into a
+    // live-looking form whose Save button does nothing.
+    await expect(page.locator('#sales-tab')).toHaveAttribute('data-desk-ready', 'true');
 }
 
 test.describe('Cashier billing journey', () => {

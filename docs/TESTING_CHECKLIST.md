@@ -15,17 +15,18 @@ cd backend
 npm test
 ```
 
-This runs five suites and exits non-zero on any failure (**216 checks** as of
-2026-08-11). None of them touch `backend/data/` — every one that needs a
+This runs eight suites and exits non-zero on any failure (**403 checks** as of
+2026-08-13). None of them touch `backend/data/` — every one that needs a
 database makes its own temp directory — so all are safe to run with a dev
 server already up on :5000.
 
 | Suite | Covers |
 | --- | --- |
-| `npm run test:billing` | Invoice money math — discount ordering, GST inclusive/exclusive, advance capping, making-charge %/₹ conversion, NaN hardening, printed rows reconciling to the Grand Total, paise settlement, advance-deposit status arithmetic (pending/rejected hold no balance; a missing status still counts, so existing ledgers keep their balances), metal value from weight × server rate, rupee↔paise conversion, the tax base being metal **+** making charge in both modes, and the return-refund pipeline — full and partial-by-weight refunds, the refunded gross including any advance redeemed, no drift across split returns, legacy/non-reconciling invoices falling back to pro-rata, and every refusal (114 checks) |
-| `npm run test:integration` | Troy-ounce conversion, licensing grace periods, crypto envelopes, customer password hashing (scrypt round-trip, salt uniqueness, tampered-hash rejection), login-lockout escalation, and the password-reset code lifecycle (single use, expiry, guess budget, never stored in the clear) |
+| `npm run test:billing` | Invoice money math — discount ordering, GST inclusive/exclusive, advance capping, making-charge %/₹ conversion, NaN hardening, printed rows reconciling to the Grand Total, paise settlement, advance-deposit status arithmetic (pending/rejected hold no balance; a missing status still counts, so existing ledgers keep their balances), metal value from weight × server rate, rupee↔paise conversion, the tax base being metal **+** making charge in both modes, and the return-refund pipeline — full and partial-by-weight refunds, the refunded gross including any advance redeemed, no drift across split returns, legacy/non-reconciling invoices falling back to pro-rata, and every refusal. Plus, since 2026-08-12: multi-line invoices — the per-line allocation summing exactly to the header at every slab in both tax modes, a two-line invoice equalling the single-line invoice of its summed values, per-line discounts, `saleLines()` reading both the new and the legacy record shape, per-line returns priced at the right line's rate, and the store's advance-liability rollup (140 checks) |
+| `npm run test:schema` | Every SQLite migration and every SQL constraint, each asserted by attempting the violation (43 checks) |
+| `npm run test:integration` | Troy-ounce conversion, licensing grace periods, crypto envelopes, customer password hashing (scrypt round-trip, salt uniqueness, tampered-hash rejection), login-lockout escalation, and the password-reset code lifecycle (single use, expiry, guess budget, never stored in the clear). Plus, since 2026-08-13: admin PIN hashing (the plaintext migration, its idempotence, fresh-install seeding, refusal when no salt exists, recovery-code single use) and **TOTP against the published RFC 6238 vectors** — the one check that proves a real authenticator app will interoperate, since every other MFA test presents a code from our own generator (9 tests) |
 | `npm run test:routes` | Real server over HTTP: public surface, admin auth boundary, credential redaction and the masked save round-trip, persistence failure, invoice-sequence guard, logout invalidation, brute-force lockout (27 checks) |
-| `npm run test:http` | The money paths over HTTP: server-authoritative rate and metal value, the client-field allowlist, refusal to price without a rate, Razorpay webhook signature/idempotency/amount-mismatch/unknown-order/failed-payment handling, transaction rollback, and the returns money path — admin gating, cash vs gold refund, the server pricing the refund rather than the client, cumulative over-return refusal, gold-refund rollback, and the session-scoped customer view (44 checks) |
+| `npm run test:http` | The money paths over HTTP: server-authoritative rate and metal value, the client-field allowlist, refusal to price without a rate, Razorpay webhook signature/idempotency/amount-mismatch/unknown-order/failed-payment handling, transaction rollback, and the returns money path — admin gating, cash vs gold refund, the server pricing the refund rather than the client, cumulative over-return refusal, gold-refund rollback, and the session-scoped customer view. Plus, since 2026-08-12: multi-line sales and their rollup, one bad line refusing the whole invoice without burning an invoice number, per-line returns, tender validation in paise (including the amountless "whole bill" form and the advance-settled zero case), actor identity on the sale and the refund, the owner/manager approver gate, operator PIN rules and redaction, and the paged ledger envelopes. Plus, since 2026-08-13: no PIN hash or tenant salt reaching a browser, session revocation on a PIN change and on deactivation, the session list and who may read it, TOTP enrolment requiring a live code, recovery-code replay refusal, the MFA gate on an approval, and the refund threshold either side of the line (80 checks) |
 | `npm run test:guard` | Production startup guard — every fail-closed condition, plus booting a real server with demo settings under `NODE_ENV=production` and asserting it exits 1 (16 checks) |
 
 Separately, and **not** part of `npm test` because it needs a browser binary:
@@ -668,6 +669,243 @@ exiting 1. Confirm here only that it behaves sanely on a real machine.
 
 - [ ] Start the server against the seeded database and click through it: the dashboard shows six invoices across 2026 and 2027, the Advances tab shows one pending claim awaiting approval and one rejected claim holding no balance, and the four seeded logins all work at `/customer.html`.
   PowerShell: `$env:GOLD_POS_DATA_DIR="<abs path>\backend\data-seed"; node backend/server.js`
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 20. Staff & Roles, multi-line invoices, tenders, per-line returns *(added 2026-08-12)*
+
+The automated suites cover the arithmetic and the API. These are the things only a
+person clicking through can confirm.
+
+### 20a. Named staff
+
+- [ ] **Settings → Staff & Roles** with an empty roster → the table says so, and the master PIN
+  from Settings → Billing & Invoice still unlocks the terminal. The sidebar reads
+  `Signed in: Store Owner (owner)`.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Add two people — one **Cashier** with PIN `4321`, one **Manager** with PIN `8765` — and Save.
+  The PIN boxes go blank and their placeholders change to `unchanged`; the two names persist on a
+  page reload.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Save again **without retyping either PIN** → both still work at the lock screen. (This is the
+  write-only round-trip: a save that masked the PINs must not blank them.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Give both people the **same PIN** and Save → refused, with a message naming both. Give one the
+  **master PIN** → refused. Leave a new person's PIN **blank** → refused, naming them.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Log out, sign in with `4321` → sidebar reads `Signed in: <name> (cashier)`. Bill a sale, then
+  open **Reprint Invoice** and find it → the control strip above the sheet says `billed by <name>
+  (cashier)`. Print it → that line does **not** appear on the paper.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Still signed in as the cashier, open **Customer Advances** with a pending claim in the queue →
+  the Approve/Reject buttons are absent and a note says an Owner or Manager is needed. Sign in as
+  the manager → the buttons are there, approving works, and the drill-down row for that deposit
+  shows the manager's note.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Untick **Active** on the cashier and Save → their PIN no longer unlocks the terminal, but the
+  invoice they filed earlier still shows their name in the Reprint Desk.
+  Result: _____  Notes: ______________________________________________
+
+### 20b. A multi-item invoice
+
+- [ ] Billing Desk: enter 22K / 10 g / 8% making, type `Bangles` in the item box, press
+  **+ Add Item to Invoice** → the row appears in the cart table and the weight box clears.
+  The invoice preview on the right shows one row.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Add a second item: 18K / 5 g / 10% making, `Chain`. Do **not** press Add — leave it in the
+  form. The preview now shows **two** rows, each at its own rate.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Add up the printed rows by hand.** Metal Value + Making Charges − Discount must equal the
+  Taxable Value, and Taxable + GST must equal the Grand Total, to the paise. Then switch Settings →
+  Billing & Invoice to **Inclusive** and do it again — the rows are restated `(net of GST)` and must
+  still add up.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Press **Save Invoice**, then reprint it → the duplicate shows **both** rows, each with its own
+  purity, weight and rate. The Reprint Desk's Goods column reads `2 items · 22K, 18K · 15.000g`.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Remove a cart line with **Remove** → the totals and the preview both drop it immediately.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] File a **single-item** sale exactly as before (type a weight, press Save, no Add Item) → it
+  works with no extra clicks, and the invoice shows its purity rather than `MIXED`.
+  Result: _____  Notes: ______________________________________________
+
+### 20c. How the bill was paid
+
+- [ ] With a bill on screen, the **Payment** section shows one Cash row whose amount tracks the
+  total as you type a weight, and the note reads `Payment matches the total.`
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Press **+ Split payment** → a Card row appears pre-filled with the unallocated remainder.
+  Change the cash amount to less than the bill → the note turns amber and names what is still to
+  allocate. Try to Save → refused at the counter, naming the figure.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Fix the split so it adds up, add a reference on the card row, Save, then reprint → the control
+  strip reads `paid cash ₹… + card ₹…`.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Bill a customer whose advance covers the **whole** bill → the total is ₹0 and no tender is
+  recorded (nothing was handed over the counter).
+  Result: _____  Notes: ______________________________________________
+
+### 20d. Returning one item of several
+
+- [ ] Returns & Refunds → search the two-item invoice → the form shows a **Which item is being
+  returned** dropdown listing both, each with its returnable weight.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Pick item 2 → the weight box resets to that item's returnable weight and its max label
+  follows. The refund preview quotes **item 2's** purity and rate, not item 1's.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] File it in full → the note says it closes that item and that other items remain returnable.
+  Search the invoice again → item 2 is listed as `(fully returned)` and disabled; item 1 is still
+  selectable.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Return item 1 in full too → the note says it closes the invoice, and **the two refunds added
+  together equal exactly what the invoice charged.**
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Do the same on a **single-item** invoice → no dropdown appears, and the wording is exactly as
+  it was before (`… would remain returnable afterwards`, no "item 1").
+  Result: _____  Notes: ______________________________________________
+
+### 20e. Screens no longer download the whole ledger
+
+- [ ] Open DevTools → Network, then open the **Dashboard** → the `/api/sales` calls carry
+  `limit=` and `from=`/`to=`, and no response contains the full history. The Today and This Month
+  revenue tiles are still correct (cross-check against the Reprint Desk search for that range).
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Customer Advances** → the balances are correct, and typing in the search box issues a
+  request rather than filtering locally. Open a customer's drill-down → their rows are fetched at
+  that moment.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] **Returns & Refunds** → the recent-credit-notes list appears, and if there are more than 25 a
+  line beneath says so.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Approve a pending deposit → the Advances tab **and** the Dashboard's outstanding-advances tile
+  both move.
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 21. Hashed PINs, session revocation, two-factor, refund limits *(added 2026-08-13)*
+
+### 21a. The PIN upgrade is invisible to the user
+
+- [ ] Before starting the server, open `backend/data/settings.json` and note the `adminPin` value.
+  Start the server, then look again: `adminPin` is **gone**, replaced by `adminPinHash` and
+  `authSalt`. **The old PIN still unlocks the terminal.** (This is the upgrade path every existing
+  install takes; nobody retypes anything.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Search that file for any operator's PIN as plain digits → not found. (A 4-digit sequence may
+  appear by chance inside a hex hash; check it is inside a `pinHash` value, not a `pin` key.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Restart the server twice more → `settings.json` does not change on either boot. (The migration
+  is idempotent; a boot loop must not rehash a hash.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] DevTools → Network → open Settings → the `/api/settings` response contains **no** `scrypt$`
+  string, no `authSalt`, and each operator shows `pinConfigured: true` with `pin: null`.
+  Result: _____  Notes: ______________________________________________
+
+### 21b. Sessions end when access should
+
+- [ ] Sign in as a cashier in one browser. In another (as the owner), change that cashier's PIN and
+  Save → the save reports how many sign-ins were ended. Back in the first browser, click any tab →
+  it drops to the lock screen. The old PIN no longer works; the new one does.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Repeat, but **untick Active** instead of changing the PIN → same result, and their PIN is now
+  refused at the lock screen entirely.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Repeat, but change their **role** from Cashier to Manager → their session also ends. (A demoted
+  manager's open session must not keep its approving role for the rest of the day.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Change **your own** PIN as the owner → you stay signed in. (Otherwise nobody would use this.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Settings → Staff & Roles → **Who is signed in right now** lists every live sign-in, marks your
+  own "(this browser)", shows whether each passed two-factor, and offers **Sign out** on the others
+  but not on yours. Ending one drops that browser to the lock screen on its next action.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Sign in as a Cashier and open Settings → the session table says only an Owner or Manager can
+  see it.
+  Result: _____  Notes: ______________________________________________
+
+### 21c. Two-factor for the people who release money
+
+- [ ] Staff & Roles → **Set up** in a manager's Two-factor column → a QR appears with a typed key
+  beside it. Scan it with any authenticator app (Google Authenticator, Authy, …). **This is the check
+  that matters most — a real app must accept it.**
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Enter a **wrong** code → refused, and nothing is saved (the column still says "Set up").
+  Then enter the real code → enabled, and **ten recovery codes are shown once**. Print or copy them.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Reload Settings → the codes are **not** shown again, and the column reports "10 recovery codes
+  left".
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Log out. Enter that manager's PIN alone → the screen asks for a 6-digit code and **keeps the
+  PIN you typed**. Enter the code from the app → signed in.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Log out, enter the PIN, then click **"Lost your phone? Use a recovery code"** and use one →
+  signed in, and Settings now says 9 left. Try the *same* code again → refused.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Set **Require two-factor to release money** to Yes and Save. Sign in with the **master PIN**
+  and try to approve a pending deposit → refused, with a message explaining the shared PIN cannot
+  carry a second factor. Sign in as the enrolled manager with a code → approval works.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] With nobody enrolled, try to set that switch to Yes → refused in the browser, before saving.
+  (Otherwise a store locks itself out of its own approvals.)
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Turn two-factor off for someone → you are asked for **your own** PIN first, and their sessions
+  end.
+  Result: _____  Notes: ______________________________________________
+
+### 21d. A limit on refunds
+
+- [ ] Settings → Staff & Roles → set **Refund needing an Owner/Manager** to ₹5,000 and Save.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] As a **Cashier**, file a return worth more than ₹5,000 → refused, naming the amount, the
+  store's limit and the cashier's role. Check the Returns list: **nothing was filed**.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] The same return as the Owner or a Manager → filed normally, with their name on the credit note.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] As the Cashier, file a return worth **less** than ₹5,000 → allowed, with their name on it.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Set the limit back to 0 → a cashier can refund any amount again (the original behaviour).
   Result: _____  Notes: ______________________________________________
 
 ---

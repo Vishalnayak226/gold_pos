@@ -9,11 +9,20 @@ function escapeHtmlAttr(value) {
 
 const SECTIONS = [
     { id: 'profile', label: 'Store Profile' },
+    { id: 'staff', label: 'Staff & Roles' },
     { id: 'pricing', label: 'Gold Pricing & Overrides' },
     { id: 'billing', label: 'Billing & Invoice' },
     { id: 'payment', label: 'Payment Gateway' },
     { id: 'backup', label: 'Backup & Email Reports' },
     { id: 'license', label: 'License & Subscription' }
+];
+
+/** Must match OPERATOR_ROLES in backend/defaultSettings.js. */
+const OPERATOR_ROLES = [
+    { value: 'owner', label: 'Owner — full access, can approve deposits' },
+    { value: 'manager', label: 'Manager — can approve deposits' },
+    { value: 'cashier', label: 'Cashier — bills and refunds, cannot approve' },
+    { value: 'auditor', label: 'Auditor — read-only' }
 ];
 
 /**
@@ -57,6 +66,9 @@ export class SettingsManager {
         try {
             const res = await adminFetch('/api/settings');
             this.settings = res.ok ? await res.json() : {};
+            // Any in-progress staff edits belong to the copy that was just
+            // replaced, so they are dropped rather than saved against new data.
+            this.staffDraft = null;
             this.renderSection();
         } catch (err) {
             console.error('Failed to load settings:', err);
@@ -69,6 +81,7 @@ export class SettingsManager {
 
         const renderers = {
             profile: () => this.renderProfileSection(),
+            staff: () => this.renderStaffSection(),
             pricing: () => this.renderPricingSection(),
             billing: () => this.renderBillingSection(),
             payment: () => this.renderPaymentSection(),
@@ -728,10 +741,471 @@ export class SettingsManager {
         block.innerHTML = lines.join('');
     }
 
+    /* ------------------------------------------------------------------ Staff
+
+       The roster that puts a NAME on every invoice, refund and approval.
+
+       Until this existed, one shared PIN gated the whole desk, so a sale, a
+       discount, a counter rate override and a cash refund were all filed with
+       nobody attached — and "a manager reconciled this deposit" described a
+       control the software could not enforce, because it had no idea who a
+       manager was. Each person here gets their own PIN; entering it at the lock
+       screen both authenticates and identifies them.
+
+       Editing is local until Save: the roster is held in `this.staffDraft` so a
+       half-typed row cannot be written to disk, and a PIN left blank on an
+       existing person means "leave theirs alone" rather than "clear it". */
+
+    renderStaffSection() {
+        // The draft survives a re-render (adding a row repaints the table), but
+        // is rebuilt from the server's copy whenever the section is opened fresh.
+        if (!this.staffDraft) this.staffDraft = this.cloneRoster();
+
+        const rows = this.staffDraft.map((op, i) => `
+            <tr data-row="${i}">
+                <td><input type="text" class="form-control staff-name" data-row="${i}" value="${escapeHtmlAttr(op.name)}" maxlength="60" placeholder="Full name"></td>
+                <td>
+                    <select class="form-control staff-role" data-row="${i}">
+                        ${OPERATOR_ROLES.map(r => `<option value="${r.value}"${r.value === op.role ? ' selected' : ''}>${escapeHtmlAttr(r.label)}</option>`).join('')}
+                    </select>
+                </td>
+                <td>
+                    <input type="password" class="form-control staff-pin" data-row="${i}" maxlength="8"
+                           placeholder="${op.pinConfigured ? 'unchanged' : '4–8 digits'}" autocomplete="new-password">
+                </td>
+                <td style="text-align:center;">
+                    <input type="checkbox" class="staff-active" data-row="${i}"${op.active !== false ? ' checked' : ''}>
+                </td>
+                <td style="text-align:center; white-space:nowrap;">
+                    ${op.id ? (op.mfaEnabled
+                        ? `<span style="color:var(--color-success, #0f766e); font-weight:600; font-size:12px;">On</span>
+                           <div class="text-muted-small">${op.recoveryCodesRemaining} recovery code${op.recoveryCodesRemaining === 1 ? '' : 's'} left</div>
+                           <button type="button" class="btn btn-secondary btn-sm staff-mfa-off" data-row="${i}" style="margin-top:4px;">Turn off</button>`
+                        : `<button type="button" class="btn btn-secondary btn-sm staff-mfa-on" data-row="${i}">Set up</button>`)
+                      : '<span class="text-muted-small">Save first</span>'}
+                </td>
+                <td class="text-right">
+                    <button type="button" class="btn btn-secondary btn-sm staff-remove" data-row="${i}">Remove</button>
+                </td>
+            </tr>
+        `).join('');
+
+        return `
+            <h3 class="settings-section-title">Counter Staff</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Everyone who works the counter, each with their own PIN. Whoever's PIN unlocks the
+                terminal is the name recorded on every invoice, refund and advance filed from that
+                session — so a discount, a rate override or a cash refund can always be traced to a
+                person. <strong>Approving a customer's unverified UPI deposit needs an Owner or a
+                Manager</strong>; a Cashier is refused.
+            </p>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:18px;">
+                Leaving this list empty is fine — the terminal then falls back to the store's master
+                PIN (Billing &amp; Invoice section), which signs in as the owner. Unticking
+                <strong>Active</strong> stops someone signing in without erasing their name from the
+                invoices they already filed.
+            </p>
+
+            <table class="advances-table">
+                <thead>
+                    <tr>
+                        <th style="width:24%;">Name</th>
+                        <th style="width:26%;">Role</th>
+                        <th style="width:13%;">PIN</th>
+                        <th style="width:7%; text-align:center;">Active</th>
+                        <th style="width:18%; text-align:center;">Two-factor</th>
+                        <th style="width:12%;"></th>
+                    </tr>
+                </thead>
+                <tbody id="staff-rows">
+                    ${rows || `<tr><td colspan="6" style="text-align:center; padding:24px; color:var(--color-text-light); font-style:italic;">No named staff yet — the store master PIN signs in as the owner.</td></tr>`}
+                </tbody>
+            </table>
+
+            <div style="display:flex; gap:10px; margin-top:18px;">
+                <button type="button" id="staff-add-btn" class="btn btn-secondary">+ Add Person</button>
+                <button type="button" id="staff-save-btn" class="btn btn-primary">Save Staff &amp; Roles</button>
+            </div>
+
+            <div id="staff-mfa-panel" style="margin-top:20px;"></div>
+
+            <h3 class="settings-section-title" style="margin-top:30px;">Controls on releasing money</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Two limits on the actions that move money out of the store. Both are off by default,
+                so nothing changes until you set them.
+            </p>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-refund-threshold">Refund needing an Owner/Manager (₹)</label>
+                    <input type="number" id="set-refund-threshold" class="form-control" min="0" step="100"
+                           value="${Number(s.refundApprovalThreshold) || 0}">
+                    <span class="text-muted-small">
+                        A refund at or above this amount is refused for a Cashier. <strong>0 means no
+                        limit</strong> — any signed-in person can refund any amount, which is how the
+                        till has always worked.
+                    </span>
+                </div>
+                <div class="form-group">
+                    <label for="set-require-mfa">Require two-factor to release money</label>
+                    <select id="set-require-mfa" class="form-control">
+                        <option value="false"${s.requireMfaForApprovers ? '' : ' selected'}>No</option>
+                        <option value="true"${s.requireMfaForApprovers ? ' selected' : ''}>Yes</option>
+                    </select>
+                    <span class="text-muted-small">
+                        When Yes, approving a customer's UPI deposit or a refund over the limit needs a
+                        session that passed an authenticator code. <strong>The shared master PIN cannot
+                        satisfy this</strong> — there is no person to enrol — so turn it on only once at
+                        least one Owner or Manager above has two-factor set up.
+                    </span>
+                </div>
+            </div>
+            <button type="button" id="money-controls-save-btn" class="btn btn-primary" style="margin-top:6px;">Save Money Controls</button>
+
+            <h3 class="settings-section-title" style="margin-top:30px;">Who is signed in right now</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:12px;">
+                Every live sign-in on every terminal. Sessions last 12 hours. Removing somebody from the
+                roster, deactivating them, changing their PIN or changing their role ends their sessions
+                automatically — this list is for when you see one you did not expect.
+            </p>
+            <div id="staff-sessions"></div>
+        `;
+    }
+
+    /** A fresh editable copy of the roster the server last sent. */
+    cloneRoster() {
+        return (Array.isArray(this.settings.operators) ? this.settings.operators : []).map(op => ({
+            id: op.id || '',
+            name: op.name || '',
+            role: op.role || 'cashier',
+            active: op.active !== false,
+            // Whether a PIN exists on disk — the value itself is never sent to
+            // the browser (see redactSettingsForBrowser in backend/server.js).
+            pinConfigured: !!op.pinConfigured,
+            pin: null,
+            // Second-factor state is read-only here: it is changed through the
+            // dedicated enrol/disable routes, which prove possession of the
+            // authenticator and of the caller's own PIN respectively.
+            mfaEnabled: !!op.mfaEnabled,
+            recoveryCodesRemaining: Number(op.recoveryCodesRemaining) || 0
+        }));
+    }
+
+    wireStaffSection() {
+        // Read every field back into the draft on change, so adding or removing
+        // a row never discards what was typed into the others.
+        const sync = () => {
+            document.querySelectorAll('.staff-name').forEach(el => {
+                this.staffDraft[el.dataset.row].name = el.value;
+            });
+            document.querySelectorAll('.staff-role').forEach(el => {
+                this.staffDraft[el.dataset.row].role = el.value;
+            });
+            document.querySelectorAll('.staff-active').forEach(el => {
+                this.staffDraft[el.dataset.row].active = el.checked;
+            });
+            document.querySelectorAll('.staff-pin').forEach(el => {
+                // Blank means "keep the stored PIN" — null, not '' — which is
+                // the same write-only contract as every other credential here.
+                this.staffDraft[el.dataset.row].pin = el.value.trim() === '' ? null : el.value.trim();
+            });
+        };
+
+        document.getElementById('staff-add-btn').addEventListener('click', () => {
+            sync();
+            this.staffDraft.push({ id: '', name: '', role: 'cashier', active: true, pinConfigured: false, pin: null });
+            this.renderSection();
+        });
+
+        document.querySelectorAll('.staff-remove').forEach(btn => {
+            btn.addEventListener('click', () => {
+                sync();
+                const row = Number(btn.dataset.row);
+                const person = this.staffDraft[row];
+                if (person.name && !confirm(
+                    `Remove ${person.name} from the roster?\n\nInvoices they already filed keep their name. `
+                    + `If you only want to stop them signing in, untick Active instead.`
+                )) return;
+                this.staffDraft.splice(row, 1);
+                this.renderSection();
+            });
+        });
+
+        // Two-factor: per person, and never editable as a plain field — enrolling
+        // requires proving the authenticator app works, and disabling requires
+        // re-entering your own PIN.
+        document.querySelectorAll('.staff-mfa-on').forEach(btn => {
+            btn.addEventListener('click', () => {
+                sync();
+                this.beginMfaEnrolment(this.staffDraft[Number(btn.dataset.row)]);
+            });
+        });
+        document.querySelectorAll('.staff-mfa-off').forEach(btn => {
+            btn.addEventListener('click', () => {
+                sync();
+                this.disableMfa(this.staffDraft[Number(btn.dataset.row)]);
+            });
+        });
+
+        document.getElementById('money-controls-save-btn').addEventListener('click', () => {
+            const threshold = Number(document.getElementById('set-refund-threshold').value);
+            if (!Number.isFinite(threshold) || threshold < 0) {
+                alert('The refund limit must be zero or a positive amount.');
+                return;
+            }
+            const requireMfa = document.getElementById('set-require-mfa').value === 'true';
+            // A store that turns this on with nobody enrolled locks itself out of
+            // its own approvals, so it is caught here rather than at the counter.
+            const enrolledApprovers = (this.settings.operators || []).filter(op =>
+                op.mfaEnabled && op.active !== false && (op.role === 'owner' || op.role === 'manager')
+            );
+            if (requireMfa && enrolledApprovers.length === 0) {
+                alert(
+                    'No active Owner or Manager has two-factor set up yet, so turning this on would '
+                    + 'leave nobody able to approve a deposit or a large refund.\n\n'
+                    + 'Set up two-factor for at least one of them first (the Two-factor column above).'
+                );
+                return;
+            }
+            this.saveSettings(
+                { refundApprovalThreshold: threshold, requireMfaForApprovers: requireMfa },
+                'Money controls saved.'
+            );
+        });
+
+        this.renderSessions();
+
+        document.getElementById('staff-save-btn').addEventListener('click', () => {
+            sync();
+            const payload = this.staffDraft.map(op => {
+                const row = { name: op.name.trim(), role: op.role, active: op.active };
+                if (op.id) row.id = op.id;
+                // Omit the key entirely when unchanged: an absent pin means
+                // "keep what is on disk" server-side, and a new person with no
+                // PIN is rejected there with a message naming them.
+                if (op.pin !== null) row.pin = op.pin;
+                return row;
+            });
+            this.saveSettings(
+                { operators: payload },
+                'Staff and roles saved. New PINs work at the lock screen immediately.',
+                async () => {
+                    // Re-seed the draft from what was actually persisted, so the
+                    // PIN placeholders flip to "unchanged" and generated ids land.
+                    this.staffDraft = null;
+                    this.renderSection();
+                }
+            );
+        });
+    }
+
+    /* ---------------------------------------------------------- Two-factor */
+
+    /**
+     * Step one: get a secret and a QR to scan. Nothing is stored yet, so an
+     * abandoned setup leaves no half-enrolled operator behind.
+     */
+    async beginMfaEnrolment(person) {
+        const panel = document.getElementById('staff-mfa-panel');
+        if (!panel || !person || !person.id) return;
+        panel.innerHTML = '<p class="text-muted-small">Preparing…</p>';
+        try {
+            const res = await adminFetch('/api/admin/mfa/begin', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ operatorId: person.id })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                panel.innerHTML = `<p class="text-muted-small" style="color:var(--color-danger);">${escapeHtmlAttr(data.message || data.error)}</p>`;
+                return;
+            }
+
+            panel.innerHTML = `
+                <div class="new-deposit-form">
+                    <h3 style="margin:0 0 6px; font-size:15px;">Set up two-factor for ${escapeHtmlAttr(person.name)}</h3>
+                    <p class="text-muted-small" style="max-width:70ch;">
+                        Scan this with Google Authenticator, Authy, or any TOTP app, then type the
+                        6-digit code it shows to confirm it works. Nothing is saved until you do —
+                        that check is what stops the store enrolling a secret nobody actually holds.
+                    </p>
+                    <div style="display:flex; gap:20px; align-items:flex-start; flex-wrap:wrap; margin-top:12px;">
+                        <img src="${data.qrDataUri}" alt="Two-factor QR code" style="width:220px; height:220px; background:#fff; border:1px solid var(--color-border-dark); border-radius:8px;">
+                        <div style="flex:1; min-width:240px;">
+                            <label class="text-muted-small">Can't scan? Enter this key by hand:</label>
+                            <div style="font-family:var(--font-mono); font-size:13px; word-break:break-all; background:var(--color-bg-panel); border:1px solid var(--color-border-dark); border-radius:6px; padding:8px 10px; margin:4px 0 14px;">${escapeHtmlAttr(data.secret)}</div>
+                            <label for="mfa-confirm-code">6-digit code from the app</label>
+                            <input type="text" id="mfa-confirm-code" class="form-control" inputmode="numeric" maxlength="6" placeholder="000000" style="letter-spacing:4px; text-align:center;">
+                            <div style="display:flex; gap:10px; margin-top:12px;">
+                                <button type="button" id="mfa-confirm-btn" class="btn btn-primary">Confirm &amp; Enable</button>
+                                <button type="button" id="mfa-cancel-btn" class="btn btn-secondary">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            document.getElementById('mfa-cancel-btn').addEventListener('click', () => { panel.innerHTML = ''; });
+            document.getElementById('mfa-confirm-btn').addEventListener('click', () =>
+                this.confirmMfaEnrolment(person, data.secret)
+            );
+            document.getElementById('mfa-confirm-code').focus();
+        } catch (err) {
+            panel.innerHTML = '<p class="text-muted-small" style="color:var(--color-danger);">Could not reach the server.</p>';
+        }
+    }
+
+    /**
+     * Step two: prove the app is configured, then show the recovery codes.
+     *
+     * The codes are displayed ONCE and stored only as hashes, so this panel is
+     * the single opportunity to write them down. It says so plainly, because a
+     * store that loses both the phone and the codes is locked out of its own
+     * approvals.
+     */
+    async confirmMfaEnrolment(person, secret) {
+        const code = document.getElementById('mfa-confirm-code').value;
+        const panel = document.getElementById('staff-mfa-panel');
+        try {
+            const res = await adminFetch('/api/admin/mfa/enrol', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ operatorId: person.id, secret, code })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                alert(data.message || data.error || 'That code was not accepted.');
+                return;
+            }
+            panel.innerHTML = `
+                <div class="new-deposit-form" style="border-color:var(--color-warning);">
+                    <h3 style="margin:0 0 6px; font-size:15px;">Two-factor is on for ${escapeHtmlAttr(person.name)}</h3>
+                    <p style="font-size:13px; color:#92400e; background:#fffbeb; border:1px solid #fcd34d; border-radius:6px; padding:10px 12px; max-width:75ch;">
+                        <strong>Write these recovery codes down now and keep them somewhere safe.</strong>
+                        Each one works once, and this is the only time they can be shown — they are
+                        stored hashed. If the phone is lost and these are gone, ${escapeHtmlAttr(person.name)}
+                        cannot approve money until the owner turns two-factor off for them.
+                    </p>
+                    <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px; font-family:var(--font-mono); font-size:14px; margin:12px 0;">
+                        ${data.recoveryCodes.map(c => `<div style="background:var(--color-bg-panel); border:1px solid var(--color-border-dark); border-radius:6px; padding:8px; text-align:center;">${escapeHtmlAttr(c)}</div>`).join('')}
+                    </div>
+                    <div style="display:flex; gap:10px;">
+                        <button type="button" id="mfa-print-btn" class="btn btn-secondary">Print these codes</button>
+                        <button type="button" id="mfa-done-btn" class="btn btn-primary">I have saved them</button>
+                    </div>
+                </div>
+            `;
+            document.getElementById('mfa-print-btn').addEventListener('click', () => window.print());
+            document.getElementById('mfa-done-btn').addEventListener('click', async () => {
+                panel.innerHTML = '';
+                await this.refresh();
+                this.activeSection = 'staff';
+                this.renderSection();
+            });
+        } catch (err) {
+            alert('Could not reach the server to finish setup.');
+        }
+    }
+
+    async disableMfa(person) {
+        if (!person || !person.id) return;
+        const pin = prompt(
+            `Turn off two-factor for ${person.name}?\n\n`
+            + 'Enter YOUR OWN PIN to confirm. (Asked for so an unattended signed-in terminal '
+            + 'cannot be used to strip this protection in one click.)'
+        );
+        if (!pin) return;
+        try {
+            const res = await adminFetch('/api/admin/mfa/disable', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ operatorId: person.id, pin })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                alert(data.message || data.error || 'Could not turn it off.');
+                return;
+            }
+            alert(`Two-factor is off for ${person.name}.`
+                + (data.sessionsRevoked ? ` ${data.sessionsRevoked} of their sign-ins were ended.` : ''));
+            await this.refresh();
+            this.activeSection = 'staff';
+            this.renderSection();
+        } catch (err) {
+            alert('Could not reach the server.');
+        }
+    }
+
+    /* ------------------------------------------------------- Live sessions */
+
+    async renderSessions() {
+        const host = document.getElementById('staff-sessions');
+        if (!host) return;
+        try {
+            const res = await adminFetch('/api/admin/sessions');
+            if (res.status === 403) {
+                host.innerHTML = '<p class="text-muted-small">Only an Owner or Manager can see who is signed in.</p>';
+                return;
+            }
+            if (!res.ok) {
+                host.innerHTML = '<p class="text-muted-small">Could not load the session list.</p>';
+                return;
+            }
+            const data = await res.json();
+            if (!data.results.length) {
+                host.innerHTML = '<p class="text-muted-small">No live sign-ins.</p>';
+                return;
+            }
+
+            host.innerHTML = `
+                <table class="advances-table">
+                    <thead>
+                        <tr>
+                            <th>Person</th><th>Role</th><th>Signed in</th><th>Expires</th>
+                            <th>Two-factor</th><th>From</th><th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${data.results.map(row => {
+                            const isMe = row.handle === data.currentHandle;
+                            return `
+                            <tr${isMe ? ' style="font-weight:600;"' : ''}>
+                                <td>${escapeHtmlAttr(row.actor.name)}${isMe ? ' <span class="text-muted-small">(this browser)</span>' : ''}</td>
+                                <td>${escapeHtmlAttr(row.actor.role)}</td>
+                                <td>${new Date(row.createdAt).toLocaleString()}</td>
+                                <td>${new Date(row.expiresAt).toLocaleTimeString()}</td>
+                                <td>${row.mfaUsed ? 'Yes' : '<span class="text-muted-small">No</span>'}</td>
+                                <td class="text-muted-small">${escapeHtmlAttr(row.ip || '—')}</td>
+                                <td class="text-right">${isMe ? ''
+                                    : `<button type="button" class="btn btn-secondary btn-sm session-revoke-btn" data-handle="${escapeHtmlAttr(row.handle)}">Sign out</button>`}</td>
+                            </tr>`;
+                        }).join('')}
+                    </tbody>
+                </table>
+            `;
+
+            host.querySelectorAll('.session-revoke-btn').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    if (!confirm('End this sign-in? Whoever is using that terminal will be returned to the lock screen on their next action.')) return;
+                    const res2 = await adminFetch('/api/admin/sessions/revoke', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ handle: btn.dataset.handle })
+                    });
+                    const body = await res2.json().catch(() => ({}));
+                    if (!res2.ok) alert(body.message || body.error || 'Could not end that sign-in.');
+                    this.renderSessions();
+                });
+            });
+        } catch (err) {
+            host.innerHTML = '<p class="text-muted-small">Could not load the session list.</p>';
+        }
+    }
+
     // ---------------------------------------------------------------- Shared
     wireSection(sectionId) {
         const wirers = {
             profile: () => this.wireProfileSection(),
+            staff: () => this.wireStaffSection(),
             pricing: () => this.wirePricingSection(),
             billing: () => this.wireBillingSection(),
             payment: () => this.wirePaymentSection(),
@@ -758,7 +1232,12 @@ export class SettingsManager {
                 const data = await res.json();
                 alert(data.message || 'Confirmation required.');
             } else {
-                alert('Failed to save settings.');
+                // Say WHAT was wrong. The server rejects a settings save with a
+                // specific reason — a duplicate operator PIN, an unknown role —
+                // and swallowing it behind a generic failure left the admin with
+                // no way to fix the form. One place, so every section benefits.
+                const data = await res.json().catch(() => ({}));
+                alert(data.message || data.error || 'Failed to save settings.');
             }
         } catch (err) {
             alert('Error saving settings: connection failed.');
