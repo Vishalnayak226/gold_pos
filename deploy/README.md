@@ -9,7 +9,16 @@ separate, single, platform-owner-operated deployment — see §5 below.
 
 ## 1. Prerequisites (once per server)
 
-- A Linux VPS (Ubuntu 22.04+ recommended) or any host with Node.js >= 20.
+- A Linux VPS (Ubuntu 22.04+ recommended) with **Node.js >= 24**. Not 20: ADR-001
+  put persistence on the stdlib `node:sqlite`, which is only stable and flag-free
+  from 24, and `backend/repositories/connection.js` imports it at module load.
+  On an older Node every backend dies with `ERR_UNKNOWN_BUILTIN_MODULE`, and
+  `npm ci` only *warns* about the unsatisfied `engines` field — so the box looks
+  provisioned right up until the first health check fails.
+- **RAM depends on how many processes you run** — see §8.1a. A single-tenant
+  install (§1–7) or the 2-process `--profile minimal` pipeline runs comfortably
+  on 512MB–1GB **with swap**; the full 5-process pipeline (§8.1) wants 2GB.
+  A booted backend measures ~73MB RSS, so the driver is process count, not code.
 - [PM2](https://pm2.keymetrics.io/) process manager: `npm install -g pm2`
 - Nginx (reverse proxy + TLS termination): `apt-get install nginx`
 - [Certbot](https://certbot.eff.org/) for free TLS certs: `apt-get install certbot python3-certbot-nginx`
@@ -120,9 +129,39 @@ testing never touches a paying tenant's server or the real licensing data.
 | Licensing (non-prod) | `develop` | `licensing-nonprod` | 6061 | — | `license-dev.<domain>` |
 | Licensing (production) | `main` | `licensing-live` | 6060 | — | `license.<domain>` |
 
-Recommend a **2GB RAM** droplet/instance (not the 1GB box §1 suggests for a
-single tenant) — 5 Node processes plus Nginx is more headroom than a 1GB box
-comfortably gives.
+### 8.1a Profiles — how many of those five you actually run
+
+The table above is the **full** pipeline. Provisioning all five before there
+are paying tenants buys very little and costs 4× the RAM, so
+`provision-pipeline.sh` takes a `--profile`:
+
+| Profile | Processes | Node RAM | Total w/ OS+Nginx | Droplet |
+|---|---|---|---|---|
+| `minimal` *(default)* | 2 — `live-backend`, `live-licensing` | ~130 MB | ~325 MB | 512MB–1GB |
+| `full` | all 5 | ~325 MB | ~520 MB | 2GB |
+
+The number that drives this: **a Node process costs ~65MB of V8-plus-runtime
+floor regardless of how small the app is** — this backend measures ~73MB RSS
+booted. So the pipeline's weight is the *number of environments*, not the code.
+Nothing about the app is heavy; running five copies of it is.
+
+`minimal` drops Dev (belongs on the developer's own machine — `localhost:5000`)
+and Sandbox (exists to stop a bad deploy reaching a *paying tenant*, so it earns
+its RAM the day one exists, not before), and collapses the two licensing servers
+to one. Moving up is `--profile full` on the same box — idempotent, it adds the
+missing three alongside the running two without disturbing them. Pair it with a
+resize; on DigitalOcean choose **"CPU and RAM only"**, which is reversible,
+rather than "Disk, CPU and RAM", which permanently enlarges the disk.
+
+**On `minimal`, `cd-dev.yml` and `cd-sandbox.yml` will fail** — the checkouts
+they target do not exist. Expected. Ignore them, or disable both in the Actions
+tab until you move up.
+
+**Swap, on any box under 2GB:** what exhausts a small droplet is `npm ci`
+spiking during install, not the running app. `provision-pipeline.sh` creates a
+2G swapfile with `vm.swappiness=10` when it finds <2GB RAM and no existing swap.
+Without it the OOM killer takes the install and provisioning fails halfway
+through, which looks like a script bug and is not one.
 
 ### 8.2 One-time provisioning
 
@@ -130,6 +169,7 @@ comfortably gives.
 in one idempotent run, on a fresh Ubuntu 22.04+ VPS, as root:
 
 ```bash
+# --profile minimal is the default (2 processes); pass --profile full for all 5.
 ./deploy/provision-pipeline.sh --domain yourpos.com --email you@example.com \
     --ssh-pubkey "ssh-ed25519 AAAA... gold-pos-ci-deploy"
 ```
@@ -231,3 +271,53 @@ Repo secrets needed: `VPS_HOST`, `VPS_USER` (the `deploy` user from §8.2),
 **Day-to-day promotion:** `feature branch → PR into develop` (auto-deploys
 Dev) → `PR develop → staging` (auto-deploys Sandbox, do UAT here) →
 `PR staging → main` (blocks on manual Approve, then deploys Live).
+
+## 9. First production boot — the one ordering that is not obvious
+
+Applies to **any** install running `NODE_ENV=production`: the §8.1 Live
+instance and every per-tenant server from §1–7. Dev and Sandbox run
+`NODE_ENV=development` and are unaffected.
+
+`backend/productionGuard.js` runs inside `bootstrapServer()` *before* the
+listener binds, and refuses to start if any of these hold:
+
+| Blocker | Fix |
+|---|---|
+| Razorpay key/secret missing, or still the shipped `rzp_test_xxxxxx` demo pair | Settings → Payment Gateway |
+| No `razorpayWebhookSecret` | Razorpay dashboard → Webhooks → save its secret |
+| No `publicUrl` / `PUBLIC_URL`, or one that is not `https://` | `.env` (the provisioner now writes it) or Settings |
+| Admin PIN still the default `1234` (checked against the scrypt hash, not by string equality) | Settings → change the master PIN |
+| `goldApiProvider` is `mock` | Settings → a real rate provider |
+
+This is deliberate and must not be relaxed — it is what stops an install
+taking money it cannot honour. But it creates a **bootstrap ordering trap**:
+those values live in `settings.json`, which is edited through the admin UI,
+which needs a running server. Deploy `main` to a fresh box and `cd-live.yml`
+smoke-tests a process that exited 1, with no in-app way to fix it.
+
+**Bring a new production install up in this order:**
+
+1. Deploy normally. Expect the Live process to fail its first health check —
+   `pm2 logs gold-pos-live` shows the numbered `REFUSING TO START` list.
+2. Start it once in demo mode so the UI is reachable:
+   ```bash
+   cd /opt/gold-pos/live-backend
+   NODE_ENV=development ENV_NAME=live pm2 start backend/server.js --name gold-pos-bootstrap
+   ```
+3. Open `https://app.<domain>`, activate the license, then set every row in
+   the table above through Settings.
+4. Tear the temporary process down and hand control back to the real config:
+   ```bash
+   pm2 delete gold-pos-bootstrap
+   pm2 startOrRestart deploy/ecosystem.live.config.cjs && pm2 save
+   ```
+5. `curl https://app.<domain>/api/health` → `{"status":"ok","env":"live"}`.
+   A clean boot here means the guard found nothing; that is the real
+   go-live gate.
+
+Re-deploys after this point are ordinary — the settings persist in
+`backend/data/`, which no deploy touches.
+
+**Do not "temporarily" set `NODE_ENV=development` in the Live `.env` to get
+past this.** It disarms the guard permanently and silently, and `.env`
+survives every `git reset --hard`, so nothing will ever remind you.

@@ -23,7 +23,7 @@ need. B/C/D/E are independent of each other and can happen any time.
 
 | # | Track | What | Time | Cost |
 |---|---|---|---|---|
-| **A** | Pipeline infra | Domain + 2GB VPS + DNS + one provisioning command + GitHub wiring | ~90 min | ~₹1,000/yr + ~₹900/mo |
+| **A** | Pipeline infra | Domain + VPS + DNS + one provisioning command + GitHub wiring | ~90 min | ~₹1,000/yr + ~₹350–500/mo on `--profile minimal` (~₹1,100/mo on `full`) |
 | **B** | SMTP | Real mail credentials for the daily report email | ~15 min | Free |
 | **C** | Razorpay | Real test keys now, live keys after KYC | ~10 min (test) | Free (2% per txn live) |
 | **D** | Pricing | One number + billing cycle, typed into the licensing dashboard | ~2 min | — |
@@ -37,16 +37,38 @@ need. B/C/D/E are independent of each other and can happen any time.
 before it ever reaches a paying tenant. Separate from any tenant's own
 server (Track F below). Architecture: `deploy/README.md` §8.
 
+> ### ⚠️ A0 — Get the code onto `main` before A5
+>
+> As of 2026-08-14, `origin/main`, `origin/develop` and `origin/staging` are
+> **all** still at `e4999bc` (Phase 19). Everything from Phase 20 onward —
+> the SQLite repository seam, `backend/productionGuard.js`, payment
+> verification, multi-line invoices, and `deploy/provision-pipeline.sh`
+> itself — exists only on `origin/phase-21-payment-verification-and-production-guard`.
+>
+> Two consequences, both fatal to A5:
+> 1. `deploy/provision-pipeline.sh` **does not exist on `main`**, so the A5
+>    bootstrap clone fails with "No such file or directory".
+> 2. Even if it did, the five checkouts it creates clone `main` — so the
+>    server would run Phase 19 code: no production guard, no SQLite seam, no
+>    verified payments.
+>
+> - [ ] Merge the Phase 20–27 work into `main` (and fast-forward `develop`
+>       and `staging` to match, so the pipeline branches aren't inverted).
+> - [ ] Confirm with: `git cat-file -e origin/main:deploy/provision-pipeline.sh`
+>
+> **A1–A4 and A6 do not depend on this** — buy the droplet, set DNS and
+> generate the SSH key in parallel while it's sorted out. Only A5 is blocked.
+
 ### A1 — Buy a domain
 
 - [ ] **Where:** any registrar — Namecheap, Cloudflare Registrar (cheapest,
       at-cost), GoDaddy, BigRock.
-- [ ] **What:** one domain, e.g. `yourpos.com`. It can be the same domain
+- [ ] **What:** one domain, e.g. `luminapos.in`. It can be the same domain
       you later use for tenant subdomains, or a separate internal one.
 - **Cost:** ~₹800–1,200/yr for a `.com`.
 - **Hand back:** the domain name.
 
-### A2 — Buy a 2GB VPS
+### A2 — Buy the VPS
 
 - [ ] **Where** (pick one — India/Singapore regions keep latency low for
       Indian users):
@@ -56,31 +78,82 @@ server (Track F below). Architecture: `deploy/README.md` §8.
   - Hetzner CX22 (EU only, higher latency from India) — 4GB, **~€4.5/mo**,
     by far the best value if latency doesn't matter for an internal
     pipeline box
-- [ ] **What:** Ubuntu 22.04 or 24.04 LTS, **2GB RAM minimum**. Five Node
-      processes plus Nginx run on it — 1GB will start swapping.
+- [ ] **What:** Ubuntu 22.04 or 24.04 LTS. **Size depends on the profile you
+      provision** (`deploy/README.md` §8.1a):
+
+| Profile | Processes | Droplet | Cost |
+|---|---|---|---|
+| **`minimal`** *(default — start here)* | 2: Live POS + licensing | 512MB–1GB | **$4–6/mo** |
+| `full` | all 5 (adds Dev, Sandbox, non-prod licensing) | 2GB | $12/mo |
+
+  Start `minimal`. A Node process costs ~65MB of runtime floor no matter how
+  small the app is (this backend measures ~73MB), so the pipeline's weight is
+  **how many environments you run**, not the code. Dev belongs on your own
+  laptop at `localhost:5000`, and Sandbox exists to protect a *paying tenant*
+  from a bad deploy — worth its RAM the day you have one, not before. Moving up
+  later is one idempotent re-run with `--profile full` plus a resize.
 - [ ] Add your SSH key during creation (every provider offers this) so you
       can log in without a password.
-- **Cost:** ~$10–12/mo (~₹900–1,100).
 - **Hand back:** the server's public IP.
 
-### A3 — Point 5 DNS A records at it
+**Done 2026-08-14.** DigitalOcean droplet, BLR1, Ubuntu, in its own `Gold POS`
+project (the `Custom ERP` droplet is deliberately left alone).
 
-- [ ] **Where:** your registrar's DNS panel (or Cloudflare if you moved
-      nameservers there).
-- [ ] **What:** five A records, all → the VPS IP from A2. Set TTL to 300
-      (5 min) for now so mistakes are cheap to fix.
+| | |
+|---|---|
+| Public IP | **`139.59.37.153`** ← this is what DNS and `VPS_HOST` use |
+| Private IP | `10.122.0.2` (VPC-internal only; not used by anything yet) |
+| Admin SSH key | `~/.ssh/luminapos_admin` — deliberately *not* the pre-existing `id_ed25519`, whose comment is `erp-deploy@…` and which has no passphrase; one leaked file must not hand over both systems |
+| CI deploy key | `~/.ssh/gold_pos_ci` — public half goes to A5's `--ssh-pubkey`, private half to A6's `VPS_SSH_KEY` |
 
-| Type | Host / Name | Value | Becomes |
-|---|---|---|---|
-| A | `dev` | `<VPS IP>` | Development POS |
-| A | `sandbox` | `<VPS IP>` | Sandbox/UAT POS |
-| A | `app` | `<VPS IP>` | Live POS (your own pilot instance) |
-| A | `license-dev` | `<VPS IP>` | Non-prod licensing server |
-| A | `license` | `<VPS IP>` | **Production licensing server** |
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\luminapos_admin" root@139.59.37.153
+```
 
-- [ ] Verify before moving on — all five must return the VPS IP:
+**Use a separate droplet from any other app you run.** A DigitalOcean
+*Project* is only a folder — it groups resources in the UI and allocates
+nothing, so two droplets in the same project share no RAM, disk or data and
+cannot slow each other down. What *does* cause contention is putting two apps
+on **one** droplet; that is the thing to avoid.
+
+**Resizing later** (e.g. `minimal` → `full`): Droplet → **Resize** → power off
+→ pick the larger plan. Choose **"CPU and RAM only"**, which is reversible;
+"Disk, CPU and RAM" permanently enlarges the disk and **cannot be scaled back
+down**. You keep the IP, so DNS from A3 stays valid. 10GB of disk is ample —
+SQLite tenant databases are megabytes, not gigabytes.
+
+**Swap is handled for you.** On any box under 2GB the provisioner creates a 2G
+swapfile with `vm.swappiness=10`. The real memory risk on a small droplet is
+`npm ci` spiking during install, not the running app — without swap the OOM
+killer takes the install and provisioning dies halfway through.
+
+### A3 — Point the DNS A records at it
+
+- [ ] **Where:** `luminapos.in` is registered at **Hostinger** — its
+      nameservers are `solar.dns-parking.com` / `lunar.dns-parking.com` and the
+      bare domain currently resolves to `2.57.91.91` (a Hostinger parking page).
+      So use **hPanel → Domains → luminapos.in → DNS / Nameservers → DNS
+      Records**, and *keep* Hostinger's nameservers. Moving them to
+      DigitalOcean is optional, buys nothing here, and costs propagation time.
+      Leave the existing parking `@` / `www` records alone — they don't
+      conflict with these subdomains.
+- [ ] **What:** A records → the VPS IP from A2. Set TTL to 300 (5 min) for now
+      so mistakes are cheap to fix. **On `--profile minimal` you only need the
+      first two** — the other three are for `full`, add them when you move up.
+
+| Type | Host / Name | Value | Becomes | Profile |
+|---|---|---|---|---|
+| A | `app` | `<VPS IP>` | Live POS (your own pilot instance) | both |
+| A | `license` | `<VPS IP>` | **Production licensing server** | both |
+| A | `dev` | `<VPS IP>` | Development POS | `full` only |
+| A | `sandbox` | `<VPS IP>` | Sandbox/UAT POS | `full` only |
+| A | `license-dev` | `<VPS IP>` | Non-prod licensing server | `full` only |
+
+- [ ] Verify before moving on — each must return the VPS IP:
       ```bash
-      for h in dev sandbox app license-dev license; do echo -n "$h: "; dig +short $h.yourpos.com; done
+      # minimal:
+      for h in app license; do echo -n "$h: "; dig +short $h.luminapos.in; done
+      # full: for h in dev sandbox app license-dev license; do ... done
       ```
       DNS can take 5–30 minutes. Certbot in A5 fails on any record that
       hasn't propagated, so don't rush this step.
@@ -105,12 +178,16 @@ exactly why it now belongs on your machine, not mine.
 ### A5 — Provision the server (one command)
 
 `deploy/provision-pipeline.sh` does the whole of `deploy/README.md` §8.2 —
-Node/PM2/Nginx/Certbot, the 5 git checkouts, 5 `.env` files with the right
-ports and licensing URLs, 5 PM2 apps, 5 Nginx vhosts, TLS certs, firewall,
-and signing-key setup — in one idempotent run. It exists because the five
-checkout directory names must match what `.github/workflows/cd-*.yml`
-hardcodes exactly; typing them by hand is the single easiest thing to get
-wrong.
+Node 24/PM2/Nginx/Certbot, swap, the git checkouts, their `.env` files with the
+right ports and licensing URLs, the PM2 apps, the Nginx vhosts, TLS certs,
+firewall, and signing-key setup — in one idempotent run (2 of each on
+`--profile minimal`, 5 on `full`). It exists because the checkout directory
+names must match what `.github/workflows/cd-*.yml` hardcodes exactly; typing
+them by hand is the single easiest thing to get wrong.
+
+> **Prerequisite that is easy to miss:** this clones the repo's **default
+> branch** from GitHub. The script — and the whole Phase 20–27 codebase — must
+> actually be on that branch first. See the note at the top of Track A.
 
 - [ ] **Where:** SSH'd into the VPS as root.
 - [ ] **How:**
@@ -121,10 +198,14 @@ wrong.
       cd /tmp/gold-pos-bootstrap
       chmod +x deploy/provision-pipeline.sh
       ./deploy/provision-pipeline.sh \
-          --domain yourpos.com \
-          --email you@example.com \
+          --profile minimal \
+          --domain luminapos.in \
+          --email your-real-email@example.com \
           --ssh-pubkey "ssh-ed25519 AAAA...   gold-pos-ci-deploy"
       ```
+      (`--profile minimal` is the default; pass `--profile full` for all 5
+      processes. Re-running with `full` later adds the missing three without
+      disturbing the running two.)
       (`--email` is for Let's Encrypt expiry notices. Add `--skip-tls` if
       DNS isn't ready yet and run certbot later.)
 - [ ] **If the repo is private**, the clone fails and the script tells you
@@ -150,34 +231,70 @@ wrong.
 | Secret | `VPS_HOST` | the VPS IP from A2 |
 | Secret | `VPS_USER` | `deploy` |
 | Secret | `VPS_SSH_KEY` | **entire** contents of the private key file from A4, including the `-----BEGIN/END OPENSSH PRIVATE KEY-----` lines |
-| Variable *(Variables tab, not Secrets)* | `PIPELINE_DOMAIN` | `yourpos.com` — bare domain, no `https://`, no subdomain |
+| Variable *(Variables tab, not Secrets)* | `PIPELINE_DOMAIN` | `luminapos.in` — bare domain, no `https://`, no subdomain |
 
 - [ ] **Where:** same Settings page → **Environments** → New environment.
-      Create all three, exact lowercase names — the workflows reference them
-      by name and fail if missing:
+      Exact lowercase names — the workflows reference them by name and fail if
+      missing. **On `minimal` you only need `production`:**
 
-| Environment | Protection |
-|---|---|
-| `development` | none |
-| `sandbox` | none |
-| `production` | **Required reviewers → add yourself.** This is the manual Approve click that stands between `main` and your Live instance. |
+| Environment | Profile | Protection |
+|---|---|---|
+| `production` | both | **Required reviewers → add yourself.** This is the manual Approve click that stands between `main` and your Live instance. |
+| `development` | `full` only | none |
+| `sandbox` | `full` only | none |
+
+- [ ] **On `minimal`, expect `cd-dev.yml` and `cd-sandbox.yml` to fail** — the
+      `dev-backend` / `sandbox-backend` checkouts they SSH to simply don't
+      exist yet. Harmless. Either ignore the red X's or disable both workflows
+      in the Actions tab until you move up to `--profile full`.
 
 ### A7 — Prove it works end to end
 
-- [ ] Push any trivial change to `develop` → the Actions tab should show
-      **Deploy — Development** go fully green, and
-      `https://dev.yourpos.com/api/health` should return
-      `{"status":"ok","env":"dev"}`.
-- [ ] PR `develop` → `staging`, merge → Sandbox deploys the same way.
-- [ ] PR `staging` → `main`, merge → the run should **pause** on
+**On `--profile minimal`:**
+
+- [ ] Push any trivial change to `main` → the run should **pause** on
       "Deploy to Live (requires manual approval)" until you click Approve.
       If it doesn't pause, the `production` environment's reviewer rule
       isn't saved.
+- [ ] After approving, `https://license.luminapos.in/api/health` returns
+      `{"status":"ok",...}`. The POS at `https://app.luminapos.in` is the one
+      that will still refuse to boot — that's A8 below, and it's expected.
+
+**Additionally, on `--profile full`:**
+
+- [ ] Push any trivial change to `develop` → the Actions tab should show
+      **Deploy — Development** go fully green, and
+      `https://dev.luminapos.in/api/health` should return
+      `{"status":"ok","env":"dev"}`.
+- [ ] PR `develop` → `staging`, merge → Sandbox deploys the same way.
 - [ ] Sanity-check license isolation: activate a fake key against
-      `license-dev.yourpos.com`'s dashboard and confirm it does **not**
-      appear in `license.yourpos.com`'s dashboard.
+      `license-dev.luminapos.in`'s dashboard and confirm it does **not**
+      appear in `license.luminapos.in`'s dashboard.
 - **Hand back:** a shout if any of these go red — paste the failing job log
   and I'll fix it.
+
+### A8 — Expect Live to refuse its first boot (this is correct)
+
+Dev and Sandbox come up clean. **Live will not**, and that is the safety
+feature working, not a bug. `backend/productionGuard.js` refuses to bind the
+port until real Razorpay credentials, a webhook secret, an https public URL,
+a changed admin PIN, and a real gold-rate provider are all configured — so a
+production install can never quietly take money it cannot honour.
+
+The trap: those live in Settings, edited through the admin UI, which needs a
+running server. So bring Live up once in demo mode, configure it, then hand
+control back.
+
+- [ ] Full procedure: **`deploy/README.md` §9** — blocker→fix table and the
+      exact four commands. Do not shortcut it by setting
+      `NODE_ENV=development` in the Live `.env`; that disarms the guard
+      permanently and silently.
+- [ ] Done when `https://app.<domain>/api/health` returns
+      `{"status":"ok","env":"live"}` **from the real
+      `ecosystem.live.config.cjs` process**. A clean boot there means the
+      guard found nothing — that is the actual go-live gate.
+- Needs Track C's Razorpay keys first (test keys are enough to get past the
+  guard and are instant, no KYC).
 
 ---
 
@@ -245,7 +362,7 @@ you issue the first real key**, not a code change.
 - [ ] Decide two things: the number (e.g. ₹2,000) and the cycle
       (monthly or yearly).
 - [ ] Enter them in the Amount / Billing Cycle fields when creating the key
-      in `https://license.yourpos.com` (admin token = the live
+      in `https://license.luminapos.in` (admin token = the live
       `ADMIN_SECRET` from A5).
 
 **Hand back:** tell me the number only if you want it as a *default*
@@ -290,7 +407,7 @@ never share the Track A pipeline box.
 
 1. [ ] Cheapest Ubuntu 22.04+ VPS, 1GB RAM is plenty for one tenant
        (~$5–6/mo).
-2. [ ] One DNS A record: `storename.yourpos.com` → that server's IP.
+2. [ ] One DNS A record: `storename.luminapos.in` → that server's IP.
 3. [ ] Follow `deploy/README.md` §1–7 top to bottom — Node, PM2, Nginx,
        Certbot, then first-boot license activation using a key you issue
        from the production licensing dashboard.

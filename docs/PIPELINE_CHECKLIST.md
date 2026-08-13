@@ -28,7 +28,61 @@ tracked separately in `docs/GO_LIVE_CHECKLIST.md`.
       and `updateEngine.js` would have rejected every release. Keys are now
       pinned in `/opt/gold-pos/keys/<checkout>/`, outside any checkout, and
       re-applied after each reset.
-- [x] Docs updated: `deploy/README.md` §8, `docs/PROJECT_PLAN.md` §5.14, `docs/GO_LIVE_CHECKLIST.md` §6, `CHANGELOG.md`
+- [x] **Node floor corrected to 24 in the provisioner (2026-08-13).** Latent
+      deploy-breaker found before the VPS was bought, not after:
+      `provision-pipeline.sh` installed `setup_20.x` and floored its
+      "is Node new enough" check at 18, both predating ADR-001's move to the
+      stdlib `node:sqlite`. Since `backend/repositories/connection.js` imports
+      `node:sqlite` at module load, all five checkouts would have died with
+      `ERR_UNKNOWN_BUILTIN_MODULE` — and silently, because `npm ci` only *warns*
+      on an unsatisfied `engines` field while `cd-*.yml` already builds on Node
+      24, so CI would have stayed green against a dead box. Now installs 24 and
+      **hard-fails after install** if the running major is still below 24.
+      `deploy/README.md` §1 corrected from ">= 20" to ">= 24".
+- [x] **`PUBLIC_URL` written into every backend `.env` (2026-08-13).**
+      `backend/productionGuard.js` (Phase 21) refuses to boot a
+      `NODE_ENV=production` install that cannot state its own https origin, but
+      neither the provisioner nor `backend/.env.example` had ever heard of the
+      variable — so Live could not have booted at all. Both now set it
+      (`https://<sub>.<domain>`, derived from the row table).
+- [x] **First-production-boot ordering documented — `deploy/README.md` §9
+      (2026-08-13).** The guard reads `settings.json`, which is edited through
+      the admin UI, which needs a running server: a fresh `main` deploy
+      smoke-tests a process that exited 1 with no in-app way out. §9 gives the
+      demo-mode bootstrap, the blocker→fix table, and an explicit warning
+      against "temporarily" setting `NODE_ENV=development` in the Live `.env`.
+- [x] **`--profile minimal|full` added to the provisioner (2026-08-14).**
+      The 5-process pipeline was sized for a business that has paying tenants;
+      before that exists it costs 4× the RAM to protect nothing. Measured the
+      actual driver first: a booted backend is **~73MB RSS**, and ~65MB of any
+      Node process is V8-plus-runtime floor irrespective of app size — so the
+      weight is the *number of environments*, never the code. `minimal`
+      (default) provisions `live-backend` + `live-licensing` only: ~130MB of
+      Node, ~325MB all-in, fits a 512MB–1GB droplet. `full` is unchanged.
+      `ENVIRONMENTS` is now filtered from `ALL_ENVIRONMENTS` at one choke
+      point, so clones, `.env`s, PM2 apps, vhosts, certs, health checks and the
+      summary all follow the profile without further branching. Verified both
+      profiles' row selection, DNS list, licensing-secret emission and rejection
+      of an invalid `--profile` against a standalone harness.
+- [x] **Fixed a latent crash in the provisioner's final summary (2026-08-14).**
+      `${SERVER_IP:-<this server's IP>}` inside the closing heredoc: the
+      apostrophe in "server's" opens a single quote *inside* a parameter
+      expansion, so bash aborts with ``bad substitution: no closing `}` ``.
+      Pre-existing since `5f99916`, and nasty for three reasons — `bash -n`
+      does **not** catch it (the file is syntactically valid), it fires only at
+      runtime on the very last statement after ~10 minutes of successful
+      provisioning, and `set -e` then kills the script *before it prints the
+      two `ADMIN_SECRET` values, which exist nowhere else on the box*. Found by
+      rendering the heredoc against mock data rather than trusting `bash -n`.
+      Both profiles' summaries now render and exit 0.
+- [x] **Swap provisioning for sub-2GB boxes (2026-08-14).** `npm ci`, not the
+      running app, is what OOM-kills a small droplet. The provisioner now
+      creates a 2G swapfile at `vm.swappiness=10` when it finds <2GB RAM and no
+      existing swap; idempotent, and `/etc/fstab` is appended only once.
+- [x] Docs updated: `deploy/README.md` §8 + new §8.1a (profiles) and §9 (first
+      production boot), `docs/PROJECT_PLAN.md` §5.14,
+      `docs/GO_LIVE_CHECKLIST.md` Track A (A2/A3/A5/A6/A7 now profile-aware,
+      new A8), `CHANGELOG.md`
 - [x] Verified locally: ecosystem configs load, `node --check` passes, full `backend/test_suite.js` suite green, `/api/health` responds correctly and is exempt from the license gate
 
 ## Done — repo/git

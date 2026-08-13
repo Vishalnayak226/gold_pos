@@ -16,6 +16,22 @@ machine that has them.
   tenant's live, deployed `customer.html` (HTTPS required — Capacitor
   disallows cleartext by default). This is a thin native wrapper, not a
   bundled offline copy: the app always shows the live portal.
+  Set to `https://app.luminapos.in/customer.html` on 2026-08-14 — the platform
+  owner's own pilot instance. `server.url` is free to change at any time; the
+  next field is not.
+
+> ### ⚠️ `appId` is a one-way door — already decided, do not change it
+>
+> **`in.luminapos.customer`**, settled 2026-08-14 (was the scaffold default
+> `com.goldpos.customerportal`, which predated the brand).
+>
+> A Play Store listing's package name **can never be changed after the first
+> release is published** — not renamed, not migrated. Changing it after
+> publication means a brand-new listing that loses every install, rating and
+> review, and the old package name can never be reused by anyone, ever.
+>
+> It was free to set today. From the first upload onward it is permanent, so
+> treat this line as frozen unless nothing has ever been published.
 - `package.json` — Capacitor Core/CLI/Android dependencies.
 - `www/index.html` — a required-but-unused placeholder (Capacitor needs a
   non-empty `webDir` even when `server.url` is set).

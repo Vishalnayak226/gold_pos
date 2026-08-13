@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One-shot provisioner for the platform owner's Dev/Sandbox/Live pipeline VPS
 # — i.e. deploy/README.md §8.2, done by a script instead of by hand. Run it
-# once, as root, on a fresh Ubuntu 22.04+ box with the 5 DNS records already
-# pointed at it.
+# once, as root, on a fresh Ubuntu 22.04+ box with this profile's DNS records
+# already pointed at it (2 for --profile minimal, 5 for --profile full).
 #
 # Why this exists rather than the hand-typed §8.2 steps: the checkout
 # directory names, ports, branches and PM2 app names must match what
@@ -13,9 +13,26 @@
 #
 # Usage (as root):
 #   ./provision-pipeline.sh --domain yourpos.com --email you@example.com \
+#       [--profile minimal|full] \
 #       [--repo https://github.com/OWNER/REPO.git] \
 #       [--ssh-pubkey "ssh-ed25519 AAAA... gold-pos-ci-deploy"] \
 #       [--skip-tls]
+#
+# --profile minimal (the default) provisions 2 processes: the Live POS and the
+# production licensing server. --profile full provisions all 5 of README §8.1.
+#
+#   profile  | processes | Node RAM | +OS/Nginx | droplet
+#   ---------|-----------|----------|-----------|-------------
+#   minimal  |     2     | ~130 MB  | ~325 MB   | 512MB-1GB
+#   full     |     5     | ~325 MB  | ~520 MB   | 2GB
+#
+# minimal is the correct default before there are paying tenants. A Node
+# process costs ~65MB of V8-plus-runtime floor no matter how small the app is
+# (this one measures ~73MB), so the pipeline's weight is the *number of
+# environments*, not the code. Development belongs on the developer's own
+# machine, and Sandbox exists to stop a bad deploy reaching a paying tenant —
+# it is worth its RAM the day such a tenant exists, and not before. Move up
+# with: --profile full (idempotent, adds the missing 3 alongside the existing 2).
 #
 # Safe to re-run: every step is idempotent (existing checkouts are fetched
 # rather than re-cloned, existing .env files are never overwritten, existing
@@ -28,6 +45,7 @@ DOMAIN=""
 EMAIL=""
 SSH_PUBKEY=""
 SKIP_TLS=0
+PROFILE="minimal"
 DEPLOY_USER="deploy"
 BASE_DIR="/opt/gold-pos"
 # Public/private PEMs that must survive `git reset --hard` on every future
@@ -41,7 +59,8 @@ while [[ $# -gt 0 ]]; do
         --repo)       REPO_URL="${2:?}"; shift 2 ;;
         --ssh-pubkey) SSH_PUBKEY="${2:?}"; shift 2 ;;
         --skip-tls)   SKIP_TLS=1; shift ;;
-        -h|--help)    sed -n '2,25p' "$0"; exit 0 ;;
+        --profile)    PROFILE="${2:?}"; shift 2 ;;
+        -h|--help)    sed -n '2,41p' "$0"; exit 0 ;;
         *) echo "error: unknown argument '$1' (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -53,10 +72,14 @@ if [[ $SKIP_TLS -eq 0 && -z "$EMAIL" ]]; then
     exit 2
 fi
 
+log() { echo -e "\n\033[1;36m==> $*\033[0m"; }
+warn() { echo -e "\033[1;33mwarning: $*\033[0m" >&2; }
+die() { echo -e "\033[1;31merror: $*\033[0m" >&2; exit 1; }
+
 # name | branch | module-dir | port | subdomain-prefix | ecosystem file
 # The name column IS the /opt/gold-pos/<name> directory the cd-*.yml
 # workflows hardcode — do not rename without editing those workflows too.
-ENVIRONMENTS=(
+ALL_ENVIRONMENTS=(
     "dev-backend|develop|backend|5001|dev|deploy/ecosystem.dev.config.cjs"
     "sandbox-backend|staging|backend|5002|sandbox|deploy/ecosystem.sandbox.config.cjs"
     "live-backend|main|backend|5000|app|deploy/ecosystem.live.config.cjs"
@@ -64,8 +87,21 @@ ENVIRONMENTS=(
     "live-licensing|main|licensing_server|6060|license|deploy/ecosystem.licensing-live.config.cjs"
 )
 
-log() { echo -e "\n\033[1;36m==> $*\033[0m"; }
-warn() { echo -e "\033[1;33mwarning: $*\033[0m" >&2; }
+# Which of those rows this profile provisions. Everything downstream — clones,
+# .env files, PM2 apps, Nginx vhosts, certs, health checks, the summary — reads
+# $ENVIRONMENTS, so this filter is the single place the profile is decided.
+case "$PROFILE" in
+    minimal) PROFILE_ROWS="live-backend live-licensing" ;;
+    full)    PROFILE_ROWS="dev-backend sandbox-backend live-backend nonprod-licensing live-licensing" ;;
+    *)       die "--profile must be 'minimal' or 'full' (got '$PROFILE')" ;;
+esac
+
+ENVIRONMENTS=()
+for row in "${ALL_ENVIRONMENTS[@]}"; do
+    if [[ " $PROFILE_ROWS " == *" ${row%%|*} "* ]]; then
+        ENVIRONMENTS+=("$row")
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # 0. Fail fast on an unreachable repo, before touching the system at all.
@@ -101,15 +137,56 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git curl nginx ufw certbot python3-certbot-nginx
 
-if ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'process.versions.node.split(".")[0]')" -lt 18 ]]; then
-    log "Installing Node.js 20 (NodeSource)"
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+# Node 24 is a hard floor, not a preference. ADR-001 put persistence on the
+# stdlib `node:sqlite`, which is only stable and flag-free from 24, and
+# backend/repositories/connection.js imports it at module load. On Node 20 every
+# backend dies with ERR_UNKNOWN_BUILTIN_MODULE — and because `npm ci` only
+# *warns* about an unsatisfied `engines` field, provisioning appears to succeed
+# right up until the first health check. Hence the post-install assertion below.
+NODE_MAJOR_MIN=24
+node_major() { node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+
+if ! command -v node >/dev/null 2>&1 || [[ "$(node_major)" -lt "$NODE_MAJOR_MIN" ]]; then
+    log "Installing Node.js $NODE_MAJOR_MIN (NodeSource)"
+    curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR_MIN}.x" | bash -
     apt-get install -y -qq nodejs
 else
     log "Node $(node -v) already present — leaving it alone"
 fi
 
+if [[ "$(node_major)" -lt "$NODE_MAJOR_MIN" ]]; then
+    die "Node $(node -v 2>/dev/null || echo 'not installed') is below the required v$NODE_MAJOR_MIN.
+     backend/repositories/ imports node:sqlite, which does not exist before v$NODE_MAJOR_MIN.
+     Install Node $NODE_MAJOR_MIN manually, then re-run this script."
+fi
+
 command -v pm2 >/dev/null 2>&1 || { log "Installing PM2"; npm install -g pm2 --silent; }
+
+# --- Swap ------------------------------------------------------------------
+# What actually exhausts a small droplet is `npm ci`, not the running app: a
+# booted backend holds ~65-75MB, while npm resolving and unpacking a tree
+# transiently spikes several hundred MB. Without swap the OOM killer takes the
+# install and provisioning fails halfway through, which looks like a script bug
+# and is not one. Swap costs disk (there is plenty) rather than RAM.
+#
+# Idempotent: skipped entirely if any swap is already active, and /etc/fstab is
+# only appended to once, so re-running never stacks up swapfiles.
+TOTAL_RAM_MB="$(free -m | awk '/^Mem:/{print $2}')"
+if [[ -z "$(swapon --show --noheadings 2>/dev/null)" && "$TOTAL_RAM_MB" -lt 2048 ]]; then
+    log "${TOTAL_RAM_MB}MB RAM and no swap — creating a 2G swapfile so npm ci cannot be OOM-killed"
+    fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+    swapon /swapfile
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    # Small boxes benefit from swapping reluctantly: this keeps the working set
+    # in RAM during normal operation and uses swap as the burst valve it is.
+    sysctl -qw vm.swappiness=10
+    grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
+    log "Swap active: $(free -h | awk '/^Swap:/{print $2}')"
+else
+    log "Swap already present or RAM >= 2GB — leaving memory config alone"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. The low-privilege deploy user CI SSHes in as (README §8.2 step 3)
@@ -187,6 +264,10 @@ for row in "${ENVIRONMENTS[@]}"; do
 PORT=$PORT
 LICENSING_SERVER_URL=$LICENSING_URL
 NODE_ENV=$NODE_ENV_VAL
+# The address Razorpay delivers webhooks to. backend/productionGuard.js refuses
+# to boot a NODE_ENV=production install that cannot state its own https origin,
+# because an unconfirmable capture silently loses credit for money already taken.
+PUBLIC_URL=https://$SUB.$DOMAIN
 EOF
     else
         SECRET="$(gen_secret)"
@@ -264,7 +345,11 @@ overlay_keys() {
     done
 }
 
-overlay_keys "nonprod-licensing" "dev-backend" "sandbox-backend"
+# Only the full profile has a non-prod licensing server or the two backends
+# that trust it; in minimal, Live is the only pair that exists.
+if [[ "$PROFILE" == "full" ]]; then
+    overlay_keys "nonprod-licensing" "dev-backend" "sandbox-backend"
+fi
 overlay_keys "live-licensing" "live-backend"
 
 for row in "${ENVIRONMENTS[@]}"; do
@@ -341,27 +426,40 @@ cat <<EOF
  Provisioning complete$([[ $HEALTH_FAIL -eq 1 ]] && echo " — WITH FAILURES, see above")
 =========================================================================
 
+Profile: $PROFILE ($(printf '%s' "${#ENVIRONMENTS[@]}") processes)$([[ "$PROFILE" == "minimal" ]] && printf '\n  Grow to the full 5-process pipeline later by re-running with --profile full.')
+
 Environments (deploy/README.md §8.1):
-  https://dev.$DOMAIN          gold-pos-dev        :5001  branch develop
-  https://sandbox.$DOMAIN      gold-pos-sandbox    :5002  branch staging
-  https://app.$DOMAIN          gold-pos-live       :5000  branch main
-  https://license-dev.$DOMAIN  licensing-nonprod   :6061  branch develop
-  https://license.$DOMAIN      licensing-live      :6060  branch main
+$(for row in "${ENVIRONMENTS[@]}"; do
+    IFS='|' read -r N BR _M P S _E <<< "$row"
+    printf '  %-36s %-20s :%-6s branch %s\n' "https://$S.$DOMAIN" "$N" "$P" "$BR"
+  done)
 
 Licensing admin tokens (ADMIN_SECRET) — record these in your password
 manager now, they are not stored anywhere else:
-  non-prod: $(grep -h '^ADMIN_SECRET=' "$BASE_DIR/nonprod-licensing/licensing_server/.env" | cut -d= -f2-)
-  live:     $(grep -h '^ADMIN_SECRET=' "$BASE_DIR/live-licensing/licensing_server/.env" | cut -d= -f2-)
+$(for row in "${ENVIRONMENTS[@]}"; do
+    IFS='|' read -r N _B M _P _S _E <<< "$row"
+    [[ "$M" == "licensing_server" ]] || continue
+    printf '  %-20s %s\n' "$N:" "$(grep -h '^ADMIN_SECRET=' "$BASE_DIR/$N/licensing_server/.env" | cut -d= -f2-)"
+  done)
 $(if [[ ${#TLS_SKIPPED[@]} -gt 0 ]]; then printf '\nTLS still missing for: %s\n(fix DNS, then: certbot --nginx -d <fqdn>)\n' "${TLS_SKIPPED[*]}"; fi)
+IF live-backend SHOWS 'FAIL' ABOVE, THAT IS EXPECTED ON A NEW SERVER.
+It runs NODE_ENV=production, so backend/productionGuard.js refuses to bind
+the port until real Razorpay credentials, a webhook secret, a changed admin
+PIN and a real rate provider are configured — which is the point: a
+production install must never quietly take money it cannot honour. Those
+settings are edited in the admin UI, which needs a running server, so there
+is a specific first-boot order. Follow deploy/README.md §9. Do NOT set
+NODE_ENV=development in the Live .env to get past it.
+  pm2 logs live-backend   # prints the numbered list of what is missing
+
 Next, in GitHub (Settings → Secrets and variables → Actions):
-  secret   VPS_HOST        = ${SERVER_IP:-<this server's IP>}
+  secret   VPS_HOST        = ${SERVER_IP:-<the public IP of this server>}
   secret   VPS_USER        = $DEPLOY_USER
   secret   VPS_SSH_KEY     = the CI private key matching the installed pubkey
   variable PIPELINE_DOMAIN = $DOMAIN
-And Settings → Environments: create development, sandbox, production —
-add required reviewers on production only.
+And Settings → Environments: create $([[ "$PROFILE" == "full" ]] && printf 'development, sandbox, production' || printf 'production')$([[ "$PROFILE" == "full" ]] && printf ' —\nadd required reviewers on production only.' || printf ' — add yourself as a\nrequired reviewer, so main never reaches Live without your click.')
 
-Then push anything to develop and watch cd-dev.yml go green.
+$([[ "$PROFILE" == "full" ]] && printf 'Then push anything to develop and watch cd-dev.yml go green.' || printf 'Then push to main and watch cd-live.yml pause for your approval.\n(cd-dev.yml / cd-sandbox.yml will fail on this profile — dev and sandbox\ncheckouts do not exist here. Ignore them, or disable both workflows in the\nActions tab until you move up to --profile full.)')
 =========================================================================
 EOF
 
