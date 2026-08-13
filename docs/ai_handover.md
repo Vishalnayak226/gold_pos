@@ -12,62 +12,43 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `3198072` — "Verify payments with Razorpay and fail closed in production"
-  (2026-08-11), on branch **`phase-21-payment-verification-and-production-guard`**. The Phase 22 /
-  23 / Phase-0-remediation work that this section previously described as uncommitted **has since
-  been committed** across `f04f138`, `7bf4df3`, `818b401` and `3198072`.
-- **⚠️ UNCOMMITTED WORK IS IN THE TREE RIGHT NOW (2026-08-12) — TWO SEPARATE UNITS.** Review and
-  commit before starting anything else, or a concurrent session will trip over it.
-  - **Phase 24** — ADR-001 plus the transactional-schema foundation. Finished and fully tested.
-    New paths: `docs/adr/`, `backend/repositories/` (`connection.js`, `migrate.js`,
-    `migrations/001_initial_schema.sql`), `backend/test_schema.js`. Modified: `CLAUDE.md`,
-    `backend/package.json`, all four workflows, `deploy/README.md`.
-  - **Phase 27** — the four security gaps Phase 25 left open (see "Last unit of work" below).
-    Finished, fully tested, verified against a running server. Modified: `backend/adminAuth.js`,
-    `backend/server.js`, `backend/defaultSettings.js`, `backend/productionGuard.js`,
-    `frontend/index.html`, `frontend/js/app.js`,
-    `frontend/js/components/SettingsManager.js`, `backend/test_suite.js`, `backend/test_http.js`,
-    `backend/test_routes.js`, plus the usual docs. **No new files, no new dependency.**
-  - **Phase 25** — the four audit gaps. Finished, fully tested, and
-    verified against a running server. Modified: `backend/server.js`, `backend/adminAuth.js`,
-    `backend/defaultSettings.js`, `frontend/js/lib/billingMath.js`, `frontend/js/app.js`,
-    `frontend/index.html`, five components under `frontend/js/components/`,
-    `backend/test_billing_math.js`, `backend/test_http.js`, three specs under
-    `backend/tests/e2e/`, `CLAUDE.md`, `docs/LEDGER.md`,
-    `docs/PRODUCTION_READINESS_ROADMAP.md`, `docs/TESTING_CHECKLIST.md`, this file.
-  - **Phase 26 — the SQLite seam below the routes.** A THIRD unit, from a separate concurrent
-    session, finished 2026-08-13. **Everything below `server.js` is done and green; no route is cut
-    over and `server.js` imports none of it**, so this unit changes no runtime behaviour yet — it is
-    additive and safe to commit on its own. New paths: `backend/services/`
-    (`saleService.js`, `returnService.js`, `advanceService.js`, `paymentService.js`),
-    `backend/importLegacyJson.js`, `backend/test_repositories.js`, `backend/test_concurrency.js`,
-    and under `backend/repositories/`: `index.js`, `calendar.js`, `invoiceRepository.js`,
-    `creditNoteRepository.js`, `advanceRepository.js`, `paymentRepository.js`,
-    `customerRepository.js`, `userRepository.js`, `rateRepository.js`, `sequenceRepository.js`,
-    `organisationRepository.js`, `auditRepository.js`, `migrations/002_credit_note_projection.sql`,
-    `migrations/003_reference_reuse_after_rejection.sql`. Modified: `repositories/connection.js`
-    (PRAGMA order + `checkpointAndCopy`), `backend/package.json` (two suites added to `npm test`),
-    `docs/LEDGER.md`, `docs/PRODUCTION_READINESS_ROADMAP.md`, this file. **Not filed in the brain
-    map yet.**
-  - **⚠️ THESE UNITS OVERLAP AND WILL NEED RECONCILING — but less than it looks.** Phase 25 extended
-    the **JSON** sale and return paths in `server.js`; Phase 26 built the **SQLite** service layer
-    that replaces them, and deliberately stopped short of `server.js` precisely so the two would not
-    collide mid-write. Phase 25 was built to the SQL schema's own vocabulary, so the mapping is
-    one-for-one rather than a redesign: `actor` → `invoices.created_by_user_id`, `reviewedBy` →
-    `advance_entries.approved_by_user_id`, `lines[]` → `invoice_lines`, `tenders[]` → `tenders`.
-    - **The two checks Phase 25 asked the merger to make have been answered.** Per-line sums equal
-      the header: asserted in `test_concurrency.js` ("every concurrently written invoice is complete,
-      with its line") and structurally in `saleService`, which derives both from one
-      `computeInvoiceTotals()` call. Tender sum = total inside the same transaction: **enforced only
-      when the caller supplies tenders.** A sale with no tender split writes no speculative tender —
-      the Billing Desk does not yet capture one, and inventing a "cash" row for the balance would be
-      recording a fact about how the customer paid that nobody established. An absent tender means
-      unknown, not zero. If Phase 25's `tenders[]` now carries a real split, pass it through as
-      `input.tenders` and the balance assertion fires.
-    - **The remaining merge work is the route cut-over itself**, plus `customerAuth.js`'s
-      `readAccounts`/`writeAccounts` pair (a two-function change — `customerRepository.loadAccounts`
-      / `saveAccounts` already speak the exact legacy account shape), plus retiring the ledger seeds
-      in `db.js#initDatabaseFiles`.
+- **Latest commit:** `82d8b3e` — "Add SQLite repository seam, MFA/session security, and multi-line
+  invoices" (2026-08-13), on branch **`phase-21-payment-verification-and-production-guard`**.
+- **The working tree is CLEAN as of 2026-08-13.** Phases 24, 25, 26 and 27 — which this section
+  previously described as four separate uncommitted units — are all in `82d8b3e`. They went in as
+  one commit because their `CLAUDE.md`, `backend/package.json` and `docs/` changes interleaved and
+  could not be split at file granularity. `npm test` was green across all eight suites (403 checks)
+  immediately before the commit.
+  - **Phase 24** — ADR-001 plus the transactional-schema foundation: `docs/adr/`,
+    `backend/repositories/{connection,migrate}.js`, `migrations/001_initial_schema.sql`,
+    `backend/test_schema.js`. Node floor moved to 24.
+  - **Phase 25** — multi-line invoices and the four audit gaps: `lines[]` alongside the flat
+    rollup, read through `saleLines()` in `frontend/js/lib/billingMath.js`.
+  - **Phase 26** — the SQLite seam below the routes: `backend/repositories/` (all SQL),
+    `backend/services/` (sale, return, advance, payment), `backend/importLegacyJson.js`,
+    `test_repositories.js`, `test_concurrency.js`.
+  - **Phase 27** — scrypt-hashed PINs, TOTP enrolment with recovery codes, session revocation,
+    secret masking on `GET /api/settings` and the support export.
+- **⚠️ THE NEXT UNIT OF WORK IS THE ROUTE CUT-OVER, and it is the one thing still outstanding
+  from the above.** `server.js` imports nothing from `repositories/` or `services/`, so the whole
+  SQLite seam is tested but dormant: every route still reads and writes `backend/data/*.json`.
+  Phase 25 extended the **JSON** sale and return paths; Phase 26 built the **SQLite** service layer
+  that replaces them and deliberately stopped short of `server.js` so the two would not collide
+  mid-write. Phase 25 was built to the SQL schema's own vocabulary, so the mapping is one-for-one
+  rather than a redesign: `actor` → `invoices.created_by_user_id`, `reviewedBy` →
+  `advance_entries.approved_by_user_id`, `lines[]` → `invoice_lines`, `tenders[]` → `tenders`.
+  - **Per-line sums equal the header** — asserted in `test_concurrency.js` ("every concurrently
+    written invoice is complete, with its line") and structurally in `saleService`, which derives
+    both from one `computeInvoiceTotals()` call.
+  - **Tender sum = total is enforced only when the caller supplies tenders.** A sale with no tender
+    split writes no speculative tender — the Billing Desk does not yet capture one, and inventing a
+    "cash" row for the balance would be recording a fact about how the customer paid that nobody
+    established. An absent tender means unknown, not zero. Pass a real split through as
+    `input.tenders` and the balance assertion fires.
+  - **Beyond the routes themselves**, the cut-over also needs `customerAuth.js`'s
+    `readAccounts`/`writeAccounts` pair (a two-function change — `customerRepository.loadAccounts`
+    / `saveAccounts` already speak the exact legacy account shape), plus retiring the ledger seeds
+    in `db.js#initDatabaseFiles`.
 - **Two owner decisions were taken on 2026-08-11 and are now binding:** ADR-001 accepted as the
   **SQLite bridge** (not PostgreSQL — `docs/adr/ADR-001-transactional-datastore.md` has the
   argument and the four revisit triggers), and the manual-UPI approver is a **distinct named
@@ -89,7 +70,7 @@ This document contains key architectural details, non-negotiable design guidelin
   Runtime deps are unchanged. Playwright additionally needs `npx playwright install chromium`
   (one-off, ~130 MB) before `npm run test:e2e` will run; `npm test` does not need it.
 - **Branches:** `origin/main`, `origin/develop` and `origin/staging` are ALL still at `e4999bc`
-  (Phase 19). The local branch is **9 commits ahead** and nothing has ever been pushed past
+  (Phase 19). The local branch is **10 commits ahead** and nothing has ever been pushed past
   Phase 19. **This is why the CI gate has never executed** — not the missing deploy target. The
   trigger was fixed on 2026-08-11 (`daily-checks.yml` now also runs on `pull_request` against any
   branch), but a green run still needs the branch pushed and a PR opened.
@@ -97,11 +78,11 @@ This document contains key architectural details, non-negotiable design guidelin
   Phase 25 verification used a throwaway tenant on :5099 via `GOLD_POS_DATA_DIR`; it was stopped and
   its directory deleted. Note `GOLD_POS_DISABLE_BOOTSTRAP=1` suppresses the listener entirely — set
   it only for suites that own their own listener.
-- **Concurrent-session risk:** high — two units of uncommitted work plus another session's
-  `backend/services/` and `backend/importLegacyJson.js` in the tree. Run `git status`/`git diff` and
-  stage only files you reviewed — never `git add -A`.
+- **Concurrent-session risk:** normal — the tree is clean as of 2026-08-13, so there is no longer
+  another session's half-finished work sitting in it. Still run `git status`/`git diff` and stage
+  only files you reviewed — never `git add -A`.
 - **Last unit of work:** **Phase 27 — the four security gaps Phase 25 left open** (2026-08-13,
-  uncommitted). Full detail in `docs/LEDGER.md`; the four in one line each:
+  committed in `82d8b3e`). Full detail in `docs/LEDGER.md`; the four in one line each:
   1. **PINs are scrypt hashes**, master and per-operator, in the same format `customerAuth.js` uses
      for customer passwords. An existing tenant migrates on its next boot with nobody retyping
      anything. **One tenant-wide `authSalt`** because a PIN-only login has no username to look a
