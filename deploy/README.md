@@ -297,19 +297,43 @@ smoke-tests a process that exited 1, with no in-app way to fix it.
 
 **Bring a new production install up in this order:**
 
-1. Deploy normally. Expect the Live process to fail its first health check —
-   `pm2 logs gold-pos-live` shows the numbered `REFUSING TO START` list.
-2. Start it once in demo mode so the UI is reachable:
+**Every `pm2` command below runs as the `deploy` user**, not root. The
+provisioner starts all processes as `deploy`, and PM2 keeps one daemon *per
+user* — a root-run `pm2` silently talks to a different, empty daemon, so
+`pm2 list` shows nothing and `pm2 start` launches a second copy competing for
+the same port. This is the single easiest thing to get wrong here.
+
+1. Deploy normally. Expect the Live process to fail its first health check:
+   ```bash
+   sudo -u deploy pm2 list                                  # gold-pos-live: errored
+   sudo -u deploy pm2 logs gold-pos-live --lines 40 --nostream
+   ```
+   That prints the numbered `REFUSING TO START` list. On stock settings it is
+   exactly three items — demo Razorpay credentials, no webhook secret, and the
+   default admin PIN. (`publicUrl` is already satisfied by the `PUBLIC_URL` the
+   provisioner writes, and `goldApiProvider` defaults to `public`, not `mock`.)
+2. Start it once in demo mode so the UI is reachable. Port 5000 is free
+   because the real process is not running, so Nginx proxies to this one:
    ```bash
    cd /opt/gold-pos/live-backend
-   NODE_ENV=development ENV_NAME=live pm2 start backend/server.js --name gold-pos-bootstrap
+   sudo -u deploy env NODE_ENV=development ENV_NAME=live \
+       pm2 start backend/server.js --name gold-pos-bootstrap
    ```
-3. Open `https://app.<domain>`, activate the license, then set every row in
-   the table above through Settings.
+   `NODE_ENV=development` wins over the `.env` because dotenv never overrides
+   a variable already in the environment — which is exactly what disarms the
+   guard for this one temporary process.
+3. Open `https://app.<domain>`. It shows the license activation overlay first:
+   issue a key at `https://license.<domain>` (bearer token = the
+   `ADMIN_SECRET` in `/opt/gold-pos/live-licensing/licensing_server/.env`),
+   activate it, then set every row of the table above through Settings.
+   **Track C first** — you need real Razorpay keys to clear two of the three
+   blockers, and test keys are instant and need no KYC.
 4. Tear the temporary process down and hand control back to the real config:
    ```bash
-   pm2 delete gold-pos-bootstrap
-   pm2 startOrRestart deploy/ecosystem.live.config.cjs && pm2 save
+   sudo -u deploy pm2 delete gold-pos-bootstrap
+   cd /opt/gold-pos/live-backend
+   sudo -u deploy pm2 startOrRestart deploy/ecosystem.live.config.cjs --update-env
+   sudo -u deploy pm2 save
    ```
 5. `curl https://app.<domain>/api/health` → `{"status":"ok","env":"live"}`.
    A clean boot here means the guard found nothing; that is the real
