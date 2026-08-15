@@ -55,8 +55,8 @@ async function fileASale(page, posServer, { weight = '10', name = 'Return Subjec
     await page.click('#generate-invoice-btn');
     expect(await readAlert(page)).toContain('Invoice Saved Successfully');
 
-    const sales = posServer.readData('sales_2026.json');
-    return sales[sales.length - 1];
+    // Newest first, bounded at now — see readLedger.mjs.
+    return posServer.readLedger('sales')[0];
 }
 
 async function search(page, query) {
@@ -79,7 +79,7 @@ test.describe('Return desk', () => {
         acceptConfirmations(page);
         await loginAsAdmin(page, posServer);
         const filed = await fileASale(page, posServer);
-        const advancesBefore = posServer.readData('advances.json').length;
+        const advancesBefore = posServer.readLedger('advances').length;
 
         await openReturnDesk(page);
         await search(page, filed.id);
@@ -116,7 +116,7 @@ test.describe('Return desk', () => {
         await expect(note).toContainText('REFUNDED (CASH)');
         await expect(note).toContainText('Partial return');
 
-        const filedReturns = posServer.readData('returns_2026.json')
+        const filedReturns = posServer.readLedger('returns')
             .filter(r => r.originalInvoiceId === filed.id);
         expect(filedReturns).toHaveLength(1);
         expect(filedReturns[0].refundAmount).toBe(31157.5);
@@ -124,10 +124,10 @@ test.describe('Return desk', () => {
         expect(filedReturns[0].note).toBe('Clasp faulty');
 
         // Cash is handed over the counter. It must not also become credit.
-        expect(posServer.readData('advances.json')).toHaveLength(advancesBefore);
+        expect(posServer.readLedger('advances')).toHaveLength(advancesBefore);
 
         // And the invoice itself is untouched — a reprint must still reproduce it.
-        const sale = posServer.readData('sales_2026.json').find(s => s.id === filed.id);
+        const sale = posServer.readLedger('sales').find(s => s.id === filed.id);
         expect(sale.totalAmount).toBe(77893.75);
         expect(sale.weightGrams).toBe(10);
     });
@@ -156,7 +156,7 @@ test.describe('Return desk', () => {
 
         // By invoice, not just by source — the seeded fixture already carries
         // a return credit of its own.
-        const credit = posServer.readData('advances.json')
+        const credit = posServer.readLedger('advances')
             .find(a => a.source === 'return' && a.invoiceId === filed.id);
         expect(credit).toBeTruthy();
         expect(credit.type).toBe('deposit');
@@ -220,7 +220,7 @@ test.describe('Return desk', () => {
         // races it.
         await expect(page.locator('#return-note-container .invoice-sheet')).toBeVisible();
 
-        const record = posServer.readData('returns_2026.json')
+        const record = posServer.readLedger('returns')
             .find(r => r.originalInvoiceId === filed.id);
         expect(record.refundAmount).toBe(77893.75);
         expect(record.goldPricePerGram).toBe(6875);
@@ -259,7 +259,7 @@ test.describe('Return desk', () => {
         await expect(page.locator('#return-note-container .invoice-sheet')).toContainText('fully returned');
 
         // The two refunds sum to exactly what the invoice charged.
-        const rows = posServer.readData('returns_2026.json')
+        const rows = posServer.readLedger('returns')
             .filter(r => r.originalInvoiceId === filed.id);
         expect(rows).toHaveLength(2);
         expect(Math.round(rows.reduce((sum, r) => sum + r.refundAmount, 0) * 100) / 100).toBe(77893.75);

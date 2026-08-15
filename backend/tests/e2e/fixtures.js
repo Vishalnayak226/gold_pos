@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -99,9 +99,38 @@ export const test = base.extend({
                 baseUrl,
                 dataDir,
                 seeded,
-                /** Reads a database file straight off disk, to assert what was persisted. */
+                /**
+                 * Reads a CONFIGURATION file straight off disk.
+                 *
+                 * Only `settings.json` and `license.json` still live here —
+                 * configuration stayed JSON on purpose (CLAUDE.md §0). The
+                 * ledger did not: reaching for `sales_2026.json` through this
+                 * helper reads the importer's frozen seed, not the journey's
+                 * own work. Use `readLedger()` for anything the store files.
+                 */
                 readData(filename) {
                     return JSON.parse(fs.readFileSync(path.join(dataDir, filename), 'utf8'));
+                },
+
+                /**
+                 * Reads a ledger collection out of THIS test's SQLite database,
+                 * in the wire shape the routes serve.
+                 *
+                 * One of: sales, returns, advances, customerAccounts,
+                 * paymentOrders (which takes a customer phone). Rows come back
+                 * NEWEST FIRST, matching `ORDER BY issued_at DESC` in the
+                 * repositories — so the row a journey just filed is [0].
+                 *
+                 * Runs out of process; see readLedger.mjs for why that is not
+                 * an optimisation but a correctness requirement.
+                 */
+                readLedger(collection, argument = '') {
+                    const out = execFileSync(
+                        process.execPath,
+                        [path.join(BACKEND_DIR, 'tests', 'e2e', 'readLedger.mjs'), dataDir, collection, String(argument)],
+                        { env: { ...process.env, GOLD_POS_DATA_DIR: dataDir, GOLD_POS_LOGS_DIR: logsDir }, encoding: 'utf8' }
+                    );
+                    return JSON.parse(out);
                 }
             });
         } finally {

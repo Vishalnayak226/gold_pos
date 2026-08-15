@@ -43,8 +43,8 @@ async function fileASale(page, posServer, { weight = '10', name = 'Reprint Subje
     await page.click('#generate-invoice-btn');
     expect(await readAlert(page)).toContain('Invoice Saved Successfully');
 
-    const sales = posServer.readData('sales_2026.json');
-    return sales[sales.length - 1];
+    // Newest first, bounded at now — see readLedger.mjs.
+    return posServer.readLedger('sales')[0];
 }
 
 async function search(page, query) {

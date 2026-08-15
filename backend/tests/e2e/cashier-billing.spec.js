@@ -54,8 +54,8 @@ test.describe('Cashier billing journey', () => {
         // server's recomputation agreed to the paisa.
         expect(await readAlert(page)).toContain('Invoice Saved Successfully');
 
-        const sales = posServer.readData('sales_2026.json');
-        const saved = sales[sales.length - 1];
+        // Newest first — the invoice this journey just filed is [0].
+        const saved = posServer.readLedger('sales')[0];
         expect(saved.customerName).toBe('E2E Walk-in');
         expect(saved.purity).toBe('22K');
         expect(saved.weightGrams).toBe(10);
@@ -96,15 +96,14 @@ test.describe('Cashier billing journey', () => {
         await page.click('#generate-invoice-btn');
         expect(await readAlert(page)).toMatch(/Invoice Saved Successfully|recalculated/);
 
-        const sales = posServer.readData('sales_2026.json');
-        const saved = sales[sales.length - 1];
+        const saved = posServer.readLedger('sales')[0];
         expect(saved.appliedAdvance).toBe(20000);
         expect(saved.customerPhone).toBe(customer.phone);
 
         // The redemption row is the other half of the same transaction: an
         // invoice that consumed an advance but left no ledger entry would show
         // the customer a balance they no longer have.
-        const advances = posServer.readData('advances.json');
+        const advances = posServer.readLedger('advances');
         const redemption = advances.find(a => a.type === 'redeem' && a.invoiceId === saved.id);
         expect(redemption).toBeTruthy();
         expect(redemption.amount).toBe(20000);
@@ -137,8 +136,7 @@ test.describe('Cashier billing journey', () => {
         expect(message).toContain('recalculated');
         expect(message).toContain('reprint');
 
-        const sales = posServer.readData('sales_2026.json');
-        const saved = sales[sales.length - 1];
+        const saved = posServer.readLedger('sales')[0];
         expect(saved.goldPricePerGram).toBe(6875);
         expect(saved.metalValue).toBe(27500); // 4 × 6875, not 4 × 1000
     });
@@ -174,9 +172,14 @@ test.describe('Cashier billing journey', () => {
         expect(response.status).toBe(400);
         expect(response.body.error).toContain('exceeds');
 
-        // A refused sale must not consume an invoice number.
-        expect(posServer.readData('settings.json').invoiceSeqStart)
-            .toBe(posServer.seeded.nextInvoiceSeq);
+        /* A refused sale must file nothing at all.
+         *
+         * This used to assert that settings.json's `invoiceSeqStart` had not
+         * moved. Phase 29 made `document_sequences` the allocator and left
+         * `invoiceSeqStart` as nothing but its seed, so that assertion could
+         * no longer fail — it passed whether or not the sale was refused. */
+        expect(posServer.readLedger('sales').find(s => s.customerName === 'Overdraw Attempt'))
+            .toBeUndefined();
     });
 
     test('refuses to file a sale against a partial customer number', async ({ page, posServer }) => {
@@ -187,7 +190,6 @@ test.describe('Cashier billing journey', () => {
         await page.fill('#customer-name', 'Half A Number');
         await page.fill('#customer-phone', '98765');
 
-        const seqBefore = posServer.readData('settings.json').invoiceSeqStart;
         await page.click('#generate-invoice-btn');
 
         /* The desk stops this, not the server.
@@ -202,16 +204,22 @@ test.describe('Cashier billing journey', () => {
         await expect(page.locator('#custom-alert-box')).toBeHidden();
         await expect(page.locator('#customer-phone')).toBeFocused();
 
-        // Nothing was filed and no invoice number was burned.
-        expect(posServer.readData('settings.json').invoiceSeqStart).toBe(seqBefore);
+        // Nothing was filed.
+        expect(posServer.readLedger('sales').find(s => s.customerName === 'Half A Number'))
+            .toBeUndefined();
 
         // Completing the number clears the block and the sale files normally.
         await page.fill('#customer-phone', '9876543210');
         await page.click('#generate-invoice-btn');
         expect(await readAlert(page)).toContain('Invoice Saved Successfully');
 
-        const sales = posServer.readData('sales_2026.json');
-        expect(sales[sales.length - 1].customerPhone).toBe('9876543210');
+        const saved = posServer.readLedger('sales')[0];
+        expect(saved.customerPhone).toBe('9876543210');
+
+        /* ...and it took the number the blocked attempt would have taken, which
+           is what proves the refusal burned nothing. The allocator is
+           `document_sequences` now, so this is the observable end of it. */
+        expect(saved.id).toContain(String(posServer.seeded.nextInvoiceSeq).padStart(6, '0'));
     });
 
     test('a blank customer number still files as a cash sale', async ({ page, posServer }) => {
@@ -225,7 +233,6 @@ test.describe('Cashier billing journey', () => {
         await page.click('#generate-invoice-btn');
 
         expect(await readAlert(page)).toContain('Invoice Saved Successfully');
-        const sales = posServer.readData('sales_2026.json');
-        expect(sales[sales.length - 1].customerPhone).toBe('');
+        expect(posServer.readLedger('sales')[0].customerPhone).toBe('');
     });
 });

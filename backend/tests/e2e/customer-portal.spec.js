@@ -56,7 +56,7 @@ test.describe('Customer portal journey', () => {
         // Matched on payment method, not on amount: this customer's seeded
         // ledger already holds a REJECTED ₹5,000 claim, which is exactly the
         // row that must not be mistaken for a settled one.
-        const advances = posServer.readData('advances.json');
+        const advances = posServer.readLedger('advances');
         const deposit = advances.find(a =>
             a.customerPhone === customer.phone && a.type === 'deposit' && a.paymentMethod === 'Razorpay');
         expect(deposit).toBeTruthy();
@@ -69,7 +69,7 @@ test.describe('Customer portal journey', () => {
         expect(rejected).toHaveLength(1);
 
         // The order record is what bound that amount server-side, in paise.
-        const order = posServer.readData('payment_orders.json')
+        const order = posServer.readLedger('paymentOrders', customer.phone)
             .find(o => o.customerPhone === customer.phone);
         expect(order).toBeTruthy();
         expect(order.amountPaise).toBe(500000);
@@ -91,7 +91,7 @@ test.describe('Customer portal journey', () => {
 
         await readAlert(page);
 
-        const claim = posServer.readData('advances.json')
+        const claim = posServer.readLedger('advances')
             .find(a => a.referenceId === 'E2E-UTR-000123');
         expect(claim).toBeTruthy();
         // The whole point of the manual path: a customer's unverified claim to
@@ -117,7 +117,7 @@ test.describe('Customer portal journey', () => {
         // One real-world transfer, one ledger row — otherwise the same UTR
         // submitted three times gets credited three times, each row looking
         // individually plausible to whoever approves it.
-        const claims = posServer.readData('advances.json')
+        const claims = posServer.readLedger('advances')
             .filter(a => a.referenceId === 'E2E-UTR-DUPLICATE');
         expect(claims).toHaveLength(1);
         expect(claims[0].amount).toBe(1500);
@@ -276,7 +276,7 @@ test.describe('Customer self-service password reset', () => {
         await page.click('#register-submit-btn');
         await expect(page.locator('#portal-view')).toBeVisible();
 
-        const account = posServer.readData('customer_auth.json')
+        const account = posServer.readLedger('customerAccounts')
             .find(a => a.phone === '9000000077');
         expect(account.email).toBe('noemail@example.test');
     });
@@ -333,7 +333,7 @@ test.describe('Customer self-service password reset', () => {
         await readAlert(page);
         await expect(prompt).toBeHidden();
 
-        const account = posServer.readData('customer_auth.json')
+        const account = posServer.readLedger('customerAccounts')
             .find(a => a.phone === '9000000088');
         expect(account.email).toBe('counter.issued@example.test');
     });
