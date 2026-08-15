@@ -80,6 +80,37 @@ export function peek({ tenantId, branchId, documentType, financialYear }) {
 }
 
 /**
+ * Sets where a sequence resumes, in EITHER direction.
+ *
+ * This is what makes `invoiceSeqStart` in Settings still mean something after
+ * the cutover. That key seeds a financial year's first allocation, but a store
+ * that wants its numbering to jump — a new GST registration, a move from a
+ * previous system, correcting a misconfigured series — edits it mid-year, and
+ * before the ledger moved to SQL that edit took effect on the very next sale.
+ * Without this the setting would save, report success, and silently do nothing.
+ *
+ * LOWERING IS ALLOWED HERE AND GUARDED ABOVE. Moving a sequence backwards can
+ * reissue a number a customer already holds, so `POST /api/settings` refuses it
+ * without `confirmDestructive`. That check belongs at the boundary, where the
+ * operator can be asked; `uq_invoices_number` remains the backstop that turns a
+ * genuine collision into a failed insert rather than a duplicate document.
+ */
+export function setNextValue({ tenantId, branchId, documentType, financialYear, prefix = '', nextValue }) {
+    if (!inTransactionNow()) {
+        throw new Error('setNextValue() must run inside inTransaction().');
+    }
+    const value = Math.trunc(Number(nextValue) || 0);
+    if (value < 1) throw new Error('setNextValue() needs a positive sequence value.');
+
+    getDb().prepare(`
+        INSERT INTO document_sequences (tenant_id, branch_id, document_type, financial_year, prefix, next_value)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (tenant_id, branch_id, document_type, financial_year)
+        DO UPDATE SET next_value = excluded.next_value, prefix = excluded.prefix
+    `).run(tenantId, branchId, documentType, financialYear, prefix, value);
+}
+
+/**
  * Raises the floor of a sequence without ever lowering it — the importer's
  * entry point, so that after history is imported the next live invoice
  * continues past the highest imported number instead of colliding with it.

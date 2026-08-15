@@ -5,8 +5,8 @@ import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { readJSON, writeJSON, writeJSONTransaction, logError, logTelemetry, newId, DATA_DIR } from './db.js';
-import { redactSettings, OPERATOR_ROLES } from './defaultSettings.js';
+import { readJSON, writeJSON, logError, logTelemetry, newId, DATA_DIR } from './db.js';
+import { redactSettings, OPERATOR_ROLES, validateSettingsPatch } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
 import https from 'https';
@@ -17,7 +17,7 @@ import { assertProductionReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import {
     requireAdminSession, requireApprover, verifyAdminPin, createAdminSession, destroyAdminSession,
-    loginRateLimiter, recordLoginResult, roleCanApprove, listOperators, SYSTEM_ACTOR, OWNER_ACTOR,
+    loginRateLimiter, recordLoginResult, roleCanApprove, listOperators, OWNER_ACTOR,
     ensureAuthSalt, hashPin, migrateStoredPins,
     generateTotpSecret, verifyTotp, totpEnrolmentUri, generateRecoveryCodes, consumeRecoveryCode,
     listAdminSessions, revokeAdminSessionByHandle, revokeSessionsForActor, revokeSessionsForRosterChange
@@ -33,15 +33,20 @@ import {
 import { initReportScheduler, sendSummaryReport, sendMailIfConfigured } from './emailReporter.js';
 import { logBlackBoxEvent, exportBlackBoxEnvelope } from './blackBoxLogger.js';
 import { loadExtensions, fireHook } from './extensions/index.js';
+/* The ledger. Every route below reaches persistence through these two modules
+   and never through a SQL string of its own — ADR-001 §3, and the reason the
+   documented move to PostgreSQL stays a swap rather than a rewrite. */
+import * as repo from './repositories/index.js';
+import * as saleService from './services/saleService.js';
+import * as returnService from './services/returnService.js';
+import * as advanceService from './services/advanceService.js';
+import * as paymentService from './services/paymentService.js';
+import { importLegacyJson, collectSource, formatReport } from './importLegacyJson.js';
 // Shared invoice arithmetic — the exact module the Billing Desk renders its
 // preview from, so the persisted ledger and the cashier's screen can never
 // drift apart. Lives under frontend/ because release_pipeline.js and
 // updateEngine.js ship and replace backend/ and frontend/ as a pair.
-import {
-    computeInvoiceTotals, normalizeTaxMode, round2, round3, toPaise, fromPaise, computeMetalValue,
-    computeReturnRefund, saleLines,
-    ADVANCE_STATUS, normalizeAdvanceStatus, summarizeAdvanceLedger, summarizeAdvanceLiability
-} from '../frontend/js/lib/billingMath.js';
+import { normalizeTaxMode, round2, toPaise, fromPaise, ADVANCE_STATUS } from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
 
 const app = express();
@@ -502,8 +507,7 @@ app.post('/api/admin/logout', (req, res) => {
  * instead (POST /api/customer-accounts/issue-login).
  */
 function phoneHasStoreHistory(phone) {
-    const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
-    return advances.some(a => a.customerPhone === phone);
+    return advanceService.phoneHasStoreHistory(phone);
 }
 
 /**
@@ -691,7 +695,7 @@ app.post('/api/customer/password/reset', customerLoginRateLimiter, (req, res) =>
  */
 app.get('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
     try {
-        res.json(computeAdvanceLedger(req.customerPhone));
+        res.json(advanceService.customerLedger(req.customerPhone));
     } catch (err) {
         logError('Customer advance lookup failed: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to load your balance.' });
@@ -715,8 +719,9 @@ app.get('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
  */
 app.get('/api/customer/returns', requireEstablishedCustomer, (req, res) => {
     try {
-        const rows = readReturnRecords()
-            .filter(r => r && r.customerPhone === req.customerPhone)
+        const rows = returnService
+            .listReturns({ customerPhone: req.customerPhone, limit: LEDGER_PAGE_MAX })
+            .results
             .map(r => ({
                 id: r.id,
                 timestamp: r.timestamp,
@@ -746,7 +751,7 @@ app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
         if (!referenceId || !String(referenceId).trim()) {
             return res.status(400).json({ error: 'A transaction reference ID is required.' });
         }
-        const result = recordAdvanceDeposit({
+        const result = advanceService.recordDeposit({
             customerPhone: req.customerPhone,
             customerName: (req.customerAccount && req.customerAccount.name) || 'Regular Customer',
             amount,
@@ -756,11 +761,21 @@ app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
             // has typed an amount and a reference they assert they sent. Crediting
             // that instantly made the portal a self-service way to award yourself
             // an arbitrary advance balance and redeem it against a real bill.
-            status: ADVANCE_STATUS.PENDING
+            status: ADVANCE_STATUS.PENDING,
+            source: 'portal'
+        }, {
+            getActiveGoldRates,
+            isValidPhone,
+            // The customer is the actor, and a customer is not a `users` row —
+            // `system` is the honest identity for "submitted through the
+            // portal", and it is outside the approvers view, which is exactly
+            // right for a claim that still needs a cashier to release it.
+            actorLabel: `portal:${req.customerPhone}`,
+            ipAddress: req.ip
         });
         if (!result.success) {
-            const status = result.code === 'DUPLICATE_REFERENCE' ? 409
-                : result.error.startsWith('Failed to persist') ? 500 : 400;
+            const status = result.status
+                || (result.code === 'DUPLICATE_REFERENCE' ? 409 : 400);
             return res.status(status).json({ error: result.error, code: result.code });
         }
         res.json({
@@ -792,7 +807,7 @@ app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
  */
 app.get('/api/customer-accounts', requireAdminSession, (req, res) => {
     try {
-        const accounts = readJSON(path.join(DATA_DIR, 'customer_auth.json'), []);
+        const accounts = repo.customers.loadAccounts(repo.dataStoreContext().tenantId);
         res.json(accounts.map(a => ({
             ...publicAccountView(a),
             activeSessions: (a.sessions || []).length,
@@ -1124,14 +1139,33 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const currentSettings = readJSON(settingsFile, {});
 
+        /* TYPE-CHECK BEFORE ANYTHING ELSE.
+           `newSettings` below spreads req.body straight over the stored
+           document, and the billing pipeline reads these keys with plain JS
+           coercion — so a wrong TYPE did not fail, it produced a wrong invoice.
+           A string "10" made the invoice sequence CONCATENATE (10 → 101 → 1011),
+           a non-numeric tax slab silently billed 0% GST, and an object
+           invoicePrefix stamped "[object Object]" into permanent invoice
+           numbers. See SETTINGS_FIELD_RULES in defaultSettings.js.
+
+           `checked.values` holds the CANONICALISED value for each key, which is
+           what gets merged: storing a validated-but-still-stringified "10" would
+           leave the concatenation bug in place. */
+        const checked = validateSettingsPatch(req.body);
+        if (!checked.ok) {
+            return res.status(400).json({ error: checked.error });
+        }
+
         // Destructive-action guard: lowering the invoice sequence can produce
         // duplicate invoice numbers against already-issued invoices. Require
         // an explicit confirmDestructive flag (the frontend triple-confirms
         // with the user before setting it) instead of silently applying it.
-        if (req.body.invoiceSeqStart !== undefined && currentSettings.invoiceSeqStart !== undefined) {
-            const requested = parseInt(req.body.invoiceSeqStart);
+        // Reads the canonicalised number, so a string "5" is compared as 5
+        // rather than slipping through on a parseInt that returned NaN.
+        if (checked.values.invoiceSeqStart !== undefined && currentSettings.invoiceSeqStart !== undefined) {
+            const requested = checked.values.invoiceSeqStart;
             const current = parseInt(currentSettings.invoiceSeqStart);
-            if (!isNaN(requested) && requested < current && !req.body.confirmDestructive) {
+            if (!isNaN(current) && requested < current && !req.body.confirmDestructive) {
                 return res.status(409).json({
                     error: 'CONFIRMATION_REQUIRED',
                     message: `Lowering the invoice sequence from ${current} to ${requested} can cause duplicate invoice numbers against already-issued invoices. Resubmit with confirmDestructive: true after explicit user confirmation.`
@@ -1169,6 +1203,10 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         const newSettings = {
             ...currentSettings,
             ...req.body,
+            // Canonicalised types win over the raw body: "10" is stored as 10,
+            // " inclusive " as 'Inclusive'. Placed after the spread so the
+            // checked value replaces the raw one it was derived from.
+            ...checked.values,
             authSalt,
             operators: roster.operators,
             requireMfaForApprovers: req.body.requireMfaForApprovers === undefined
@@ -1234,6 +1272,37 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
             return res.status(500).json({ error: 'Failed to persist settings. Please retry.' });
         }
 
+        /* THE INVOICE SERIES FOLLOWS THE SETTING.
+           `invoiceSeqStart` seeds a financial year's first allocation, but the
+           allocator lives in `document_sequences` now — so an owner editing
+           this key mid-year would otherwise save successfully, be told it
+           worked, and see the very next invoice ignore them. Applied after the
+           settings write, and only when the value actually moved, so a save
+           that changed something else does not disturb a live series.
+           Lowering was already refused above without confirmDestructive. */
+        if (checked.values.invoiceSeqStart !== undefined
+            && Number(checked.values.invoiceSeqStart) !== Number(currentSettings.invoiceSeqStart)) {
+            try {
+                const context = repo.dataStoreContext();
+                repo.inTransaction(() => {
+                    repo.sequences.setNextValue({
+                        tenantId: context.tenantId,
+                        branchId: context.branchId,
+                        documentType: 'invoice',
+                        financialYear: repo.financialYear(),
+                        prefix: newSettings.invoicePrefix || 'GOLD',
+                        nextValue: checked.values.invoiceSeqStart
+                    });
+                });
+            } catch (err) {
+                // The setting is saved; the series is not. Loud rather than
+                // silent — an operator who thinks the numbering moved and finds
+                // it did not is exactly the confusion worth logging.
+                logError(`Settings saved but the invoice sequence could not be moved to `
+                    + `${checked.values.invoiceSeqStart}: ${err.message}`, err.stack);
+            }
+        }
+
         /* Access follows the roster. Someone deactivated, removed, re-PINned or
            demoted has their live sessions ended right here — otherwise the
            credential would be gone while the access ran on for up to twelve
@@ -1268,135 +1337,6 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
    API Routes: Sales & Customer Billing Desk
    ========================================================================== */
 
-/**
- * Every sale on file, newest first, optionally narrowed to a set of years.
- *
- * Sales are partitioned one JSON file per year (sales_2026.json). Passing the
- * years a query actually spans means a date-bounded reprint search on a store
- * with a decade of history reads one file instead of ten. Omitting `years`
- * reads them all, which is what GET /api/sales has always done.
- */
-function readSalesRecords(years = null) {
-    return readLedgerPartitions('sales_', years);
-}
-
-/**
- * Every row of a year-partitioned ledger, newest first.
- *
- * Sales and returns are both filed one JSON file per year under the same
- * naming convention (sales_2026.json, returns_2026.json), for the same reason:
- * a store with a decade of history should read one file to answer a question
- * about one month. This is that read, written once rather than once per
- * ledger.
- *
- * @param {string} prefix   filename prefix, including the trailing underscore
- * @param {string[]|number[]|null} years  restrict to these years, or all
- */
-function readLedgerPartitions(prefix, years = null) {
-    const wanted = years ? new Set(years.map(String)) : null;
-    let all = [];
-    for (const f of fs.readdirSync(DATA_DIR)) {
-        if (!f.startsWith(prefix) || !f.endsWith('.json')) continue;
-        if (wanted && !wanted.has(f.slice(prefix.length, -'.json'.length))) continue;
-        all = all.concat(readJSON(path.join(DATA_DIR, f), []));
-    }
-    return all.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-}
-
-/**
- * Every return on file, newest first, optionally narrowed to a set of years.
- *
- * Note the asymmetry with sales: a return is filed under the year it HAPPENED,
- * not the year of the invoice it reverses. A January refund of a December sale
- * belongs in this January's books. So narrowing by year here answers "what did
- * we refund in that period", which is the question the accounts actually ask —
- * and it is why looking up how much of one invoice has been returned reads
- * every partition rather than just the invoice's own year.
- */
-function readReturnRecords(years = null) {
-    return readLedgerPartitions('returns_', years);
-}
-
-/**
- * How much of one invoice has already gone back — the number every further
- * return against it has to be measured against.
- *
- * Derived from the returns ledger on every read rather than stamped onto the
- * sale record. The filed invoice is immutable by design (it is what a reprint
- * must reproduce, see the Reprint Desk), and a mutable "returned so far"
- * counter living on it would be a second source of truth that can disagree
- * with the rows it is supposed to summarise.
- */
-function summarizeInvoiceReturns(invoiceId, returns = readReturnRecords()) {
-    const rows = returns.filter(r => r && r.originalInvoiceId === invoiceId);
-
-    // Per line, because that is the level a return is priced and limited at. A
-    // return row filed before invoices had lines carries no lineNumber and
-    // belongs to line 1 — which is the only line such an invoice has.
-    const byLine = new Map();
-    for (const r of rows) {
-        const lineNumber = Number(r.lineNumber) || 1;
-        byLine.set(lineNumber, round3((byLine.get(lineNumber) || 0) + (Number(r.weightGrams) || 0)));
-    }
-
-    return {
-        count: rows.length,
-        returnedWeightGrams: round3(rows.reduce((sum, r) => sum + (Number(r.weightGrams) || 0), 0)),
-        refundedAmount: round2(rows.reduce((sum, r) => sum + (Number(r.refundAmount) || 0), 0)),
-        returnedByLine: byLine
-    };
-}
-
-/**
- * A sale, with what has been returned against it attached — per line and in
- * total.
- *
- * Both the Reprint Desk and the Return Desk need this pairing — one to stamp a
- * duplicate that is no longer fully payable, the other to decide what is still
- * returnable — so the join happens once, here, instead of each screen
- * re-deriving it from two endpoints and rounding differently.
- *
- * `lineReturnState` is what lets the Return Desk offer only the lines that still
- * have weight on them. Without it a cashier picking from a multi-line invoice
- * would have to guess, and would learn a line was exhausted only by being
- * refused.
- */
-function withReturnState(sale, returns) {
-    const summary = summarizeInvoiceReturns(sale.id, returns);
-    const lines = saleLines(sale);
-
-    const lineReturnState = lines.map(line => {
-        const returned = round3(summary.returnedByLine.get(line.lineNumber) || 0);
-        const returnable = round3(Math.max(0, round3(line.weightGrams) - returned));
-        return {
-            lineNumber: line.lineNumber,
-            description: line.description,
-            purity: line.purity,
-            weightGrams: line.weightGrams,
-            goldPricePerGram: line.goldPricePerGram,
-            makingChargePercent: line.makingChargePercent,
-            makingChargeAmount: line.makingChargeAmount,
-            discountPercent: line.discountPercent,
-            returnedWeightGrams: returned,
-            returnableWeightGrams: returnable,
-            fullyReturned: returnable <= 0
-        };
-    });
-
-    const returnableWeightGrams = round3(
-        lineReturnState.reduce((total, l) => total + l.returnableWeightGrams, 0)
-    );
-
-    return {
-        ...sale,
-        returnedWeightGrams: summary.returnedWeightGrams,
-        refundedAmount: summary.refundedAmount,
-        returnCount: summary.count,
-        returnableWeightGrams,
-        fullyReturned: summary.count > 0 && returnableWeightGrams <= 0,
-        lineReturnState
-    };
-}
 
 /* ==========================================================================
    Ledger list responses — one clamp and one envelope for every ledger
@@ -1429,9 +1369,11 @@ const LEDGER_PAGE_MAX = 500;
  * Parses the `from` / `to` / `limit` triple every ledger list accepts.
  *
  * Returns `{ok: false, error}` on a malformed date rather than throwing, so
- * each route answers 400 with the same wording, and `years` — the only year
- * partitions a bounded range can touch — so a date-bounded query on a store
- * with a decade of history reads one file instead of ten.
+ * every route answers 400 with the same wording.
+ *
+ * The `years` hint this used to return is gone with the JSON partitions it
+ * existed to narrow — the database has an index on `issued_at`, so a bounded
+ * range is a WHERE clause rather than a decision about which files to open.
  */
 function parseLedgerQuery(query = {}, { defaultLimit = LEDGER_PAGE_DEFAULT, maxLimit = LEDGER_PAGE_MAX } = {}) {
     const limit = Math.min(maxLimit, Math.max(1, parseInt(query.limit, 10) || defaultLimit));
@@ -1448,35 +1390,9 @@ function parseLedgerQuery(query = {}, { defaultLimit = LEDGER_PAGE_DEFAULT, maxL
         return { ok: false, error: 'The "from" date cannot be after the "to" date.' };
     }
 
-    let years = null;
-    if (from !== null || to !== null) {
-        const firstYear = new Date(from ?? to).getFullYear();
-        const lastYear = new Date(to ?? from).getFullYear();
-        years = [];
-        for (let y = firstYear; y <= lastYear; y++) years.push(y);
-    }
-
-    return { ok: true, from, to, years, limit };
+    return { ok: true, from, to, limit };
 }
 
-/** Whether a row's timestamp falls inside a (possibly half-open) range. */
-function withinRange(row, from, to) {
-    const ts = (row && row.timestamp) || 0;
-    if (from !== null && ts < from) return false;
-    if (to !== null && ts > to) return false;
-    return true;
-}
-
-/** The standard page envelope. `extra` carries each ledger's own aggregates. */
-function pagedLedger(rows, limit, extra = {}) {
-    return {
-        results: rows.slice(0, limit),
-        total: rows.length,
-        truncated: rows.length > limit,
-        limit,
-        ...extra
-    };
-}
 
 /**
  * GET /api/sales?from=&to=&limit=
@@ -1491,15 +1407,22 @@ app.get('/api/sales', requireAdminSession, (req, res) => {
         const q = parseLedgerQuery(req.query);
         if (!q.ok) return res.status(400).json({ error: q.error });
 
-        const matched = readSalesRecords(q.years).filter(s => withinRange(s, q.from, q.to));
-        res.json(pagedLedger(matched, q.limit, {
-            totals: {
-                count: matched.length,
-                totalAmount: round2(matched.reduce((sum, s) => sum + (Number(s.totalAmount) || 0), 0)),
-                appliedAdvance: round2(matched.reduce((sum, s) => sum + (Number(s.appliedAdvance) || 0), 0)),
-                weightGrams: round3(matched.reduce((sum, s) => sum + (Number(s.weightGrams) || 0), 0))
-            }
-        }));
+        /* The database filters, pages and sums. The route this replaces read
+           every sales_YYYY.json off disk, concatenated the store's entire
+           history into one array and serialised the lot — the single largest
+           thing the server did, and it got slower every day the store traded. */
+        const context = repo.dataStoreContext();
+        const filter = { tenantId: context.tenantId, fromAt: q.from, toAt: q.to };
+        const { rows, total } = repo.invoices.search({ ...filter, limit: q.limit, offset: 0 });
+
+        res.json({
+            results: saleService.projectSalesPage(rows),
+            total,
+            truncated: total > rows.length,
+            limit: q.limit,
+            // Over the whole matched period, not over the page — see periodTotals().
+            totals: repo.invoices.periodTotals(filter)
+        });
     } catch (err) {
         logError('Error retrieving sales logs: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve sales' });
@@ -1533,38 +1456,99 @@ app.get('/api/sales/lookup', requireAdminSession, (req, res) => {
             maxLimit: REPRINT_MAX_RESULTS
         });
         if (!parsed.ok) return res.status(400).json({ error: parsed.error });
-        const { from, to, years, limit } = parsed;
+        const { from, to, limit } = parsed;
 
-        const q = String(req.query.q || '').trim().toLowerCase();
-        const digitsOnly = q.replace(/\D/g, '');
-        const results = readSalesRecords(years).filter(sale => {
-            if (!withinRange(sale, from, to)) return false;
-            if (!q) return true;
-            return String(sale.id || '').toLowerCase().includes(q)
-                || String(sale.customerName || '').toLowerCase().includes(q)
-                || (digitsOnly.length > 0 && String(sale.customerPhone || '').includes(digitsOnly));
+        /* Return state rides along on every hit — the Return Desk searches
+           through this same route (it is the same "find the invoice the
+           customer is holding" question) and needs to know what is still
+           returnable, while the Reprint Desk needs it to stamp a duplicate of
+           an invoice that has since been refunded. `projectSalesPage` attaches
+           it in three queries for the whole page rather than three per row. */
+        const result = saleService.listSales({
+            q: req.query.q,
+            fromAt: from,
+            toAt: to,
+            limit,
+            offset: 0
         });
 
-        // Return state rides along on every hit. The Return Desk searches
-        // through this same route — it is the same "find the invoice the
-        // customer is holding" question — and needs to know what is still
-        // returnable; the Reprint Desk needs it to stamp a duplicate of an
-        // invoice that has since been refunded. The whole returns ledger is
-        // read once here and shared across the page of results, rather than
-        // once per row.
-        const page = results.slice(0, limit);
-        const returns = page.length > 0 ? readReturnRecords() : [];
-
         res.json({
-            results: page.map(sale => withReturnState(sale, returns)),
-            total: results.length,
-            truncated: results.length > limit
+            results: result.results,
+            total: result.total,
+            truncated: result.truncated
         });
     } catch (err) {
         logError('Invoice reprint lookup failed: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to search invoices' });
     }
 });
+
+/**
+ * The `users.id` a session's actor writes as.
+ *
+ * TWO IDENTITY SYSTEMS MEET HERE. The operator roster is configuration — it
+ * lives in settings.json and stays there (§0) — while every accountability
+ * column on the ledger is a foreign key into `users`. This resolves one to the
+ * other, creating or refreshing the row as needed, so `invoices.created_by_user_id`
+ * and `advance_entries.approved_by_user_id` name the person who actually acted
+ * instead of defaulting to the store owner.
+ *
+ * That default is not a cosmetic difference. `advanceService` gates posting a
+ * claim on `users.isApprover()`, and `owner` is an approver — so writing every
+ * row as the owner would have let a cashier pass the check that exists to stop
+ * a cashier releasing money to themselves.
+ */
+/**
+ * The store's settings, with the invoice-numbering fields repaired on disk.
+ *
+ * POST /api/settings type-checks these on the way in, but a settings.json can
+ * also arrive from a restored backup, a hand edit, or an older build — and this
+ * is the last point before the values reach a permanent, legally-relevant
+ * ledger. The sale service defends itself against the same garbage, but only in
+ * memory; repairing the FILE is what stops a poisoned document producing an
+ * identical warning on every sale forever.
+ *
+ * Writing lives here rather than in the service because settings.json is
+ * configuration and the routes own it — the service is handed a document and
+ * never a path.
+ */
+function billingSettings() {
+    const settingsFile = path.join(DATA_DIR, 'settings.json');
+    const settings = readJSON(settingsFile, {});
+
+    const rawPrefix = settings.invoicePrefix;
+    const prefix = typeof rawPrefix === 'string' && /^[A-Za-z0-9_-]+$/.test(rawPrefix.trim())
+        ? rawPrefix.trim()
+        : 'GOLD';
+    const rawSeq = Number(settings.invoiceSeqStart);
+    const seqStart = Number.isInteger(rawSeq) && rawSeq >= 1 ? rawSeq : 1;
+
+    if (prefix !== settings.invoicePrefix || seqStart !== settings.invoiceSeqStart) {
+        settings.invoicePrefix = prefix;
+        settings.invoiceSeqStart = seqStart;
+        // Best-effort. A repair that cannot be written must not stop the store
+        // trading — the in-memory values above are already usable.
+        if (!writeJSON(settingsFile, settings)) {
+            logError('Invoice numbering settings were unusable and could not be repaired on disk.');
+        }
+    }
+
+    return settings;
+}
+
+function resolveActorUserId(actor) {
+    const context = repo.dataStoreContext();
+    if (!actor || !actor.id) return context.systemUserId;
+    try {
+        return repo.users.ensureActorUser(context.tenantId, context.branchId, actor);
+    } catch (err) {
+        // Never fail a sale because the identity row could not be refreshed —
+        // but never silently upgrade rights either. `system` is outside the
+        // approvers view, so the fallback is the safe direction.
+        logError(`Could not resolve actor ${actor.id} onto a users row: ${err.message}`);
+        return context.systemUserId;
+    }
+}
 
 /* ==========================================================================
    Sale line items
@@ -1578,197 +1562,18 @@ app.get('/api/sales/lookup', requireAdminSession, (req, res) => {
 
    BOTH REQUEST SHAPES ARE ACCEPTED, permanently:
      - `lines: [{purity, weightGrams, makingChargeAmount, ...}, ...]`
-     - the flat `purity` / `weightGrams` / `makingChargeAmount` fields, which
-       are normalised into a single line here.
+     - the flat `purity` / `weightGrams` / `makingChargeAmount` fields.
    The stored record carries `lines` AND the flat rollup fields, so every reader
    that has not been taught about lines keeps working unchanged. See saleLines()
    in frontend/js/lib/billingMath.js for the reading half of the same seam.
+
+   VALIDATION AND PRICING BOTH LIVE IN backend/services/saleService.js now, not
+   here. They moved together on purpose: the limits on what a sale may be are
+   properties of a sale, not of HTTP, and keeping a second copy at the boundary
+   meant two implementations to hold in step. The route parses the request and
+   chooses the status code; everything below that is the service's.
    ========================================================================== */
 
-const VALID_PURITIES = ['24K', '22K', '18K'];
-const MAX_INVOICE_LINES = 50;
-
-/**
- * Validates one requested line and prices its metal at the STORE's rate.
- *
- * The rate is never taken from the request — same rule as the single-line path
- * it replaces, and for the same reason: recomputing tax and discount over a
- * client-supplied metal value only derives correct percentages of a number the
- * client chose. A tampered payload could bill 50 g of 22K at ₹1/g and the
- * stored invoice would be internally consistent and completely wrong.
- *
- * @returns {{ok: true, line: object}|{ok: false, error: string, status?: number}}
- */
-function validateSaleLine(raw, index, activeRates) {
-    const where = `Line ${index + 1}`;
-    if (!raw || typeof raw !== 'object') {
-        return { ok: false, error: `${where} is not a valid item.` };
-    }
-
-    const purity = raw.purity;
-    if (!VALID_PURITIES.includes(purity)) {
-        return { ok: false, error: `${where} needs a valid purity (24K, 22K, or 18K).` };
-    }
-
-    const weightGrams = Number(raw.weightGrams);
-    if (!Number.isFinite(weightGrams) || weightGrams <= 0) {
-        return { ok: false, error: `${where} needs a positive gold weight.` };
-    }
-    if (weightGrams > MAX_SANE_WEIGHT_GRAMS) {
-        return { ok: false, error: `${where} exceeds the ${MAX_SANE_WEIGHT_GRAMS}g limit.` };
-    }
-
-    const makingChargeAmount = raw.makingChargeAmount === undefined ? 0 : Number(raw.makingChargeAmount);
-    if (!Number.isFinite(makingChargeAmount) || makingChargeAmount < 0) {
-        return { ok: false, error: `${where} has an invalid making charge.` };
-    }
-
-    // Descriptive only — makingChargeAmount is what the money math uses — but it
-    // prints on the invoice, so it is validated rather than trusted through.
-    const makingChargePercent = raw.makingChargePercent === undefined ? 0 : Number(raw.makingChargePercent);
-    if (!Number.isFinite(makingChargePercent) || makingChargePercent < 0 || makingChargePercent > 100) {
-        return { ok: false, error: `${where} has an invalid making charge percent.` };
-    }
-
-    const discountPercent = raw.discountPercent === undefined ? 0 : Number(raw.discountPercent);
-    if (!Number.isFinite(discountPercent) || discountPercent < 0 || discountPercent > 100) {
-        return { ok: false, error: `${where} has a discount outside 0–100%.` };
-    }
-
-    const rateKey = PURITY_RATE_KEY[purity];
-    const ratePerGram = Number(activeRates[rateKey]);
-    if (!Number.isFinite(ratePerGram) || ratePerGram <= 0) {
-        logError(`Refusing to bill ${purity}: the active gold rate is unusable (${activeRates[rateKey]}).`);
-        return {
-            ok: false,
-            status: 503,
-            error: 'The current gold rate is unavailable, so this invoice cannot be priced. Check the gold rate in Settings and retry.'
-        };
-    }
-
-    return {
-        ok: true,
-        line: {
-            lineNumber: index + 1,
-            description: String(raw.description || '').trim().slice(0, 120),
-            purity,
-            weightGrams,
-            goldPricePerGram: ratePerGram,
-            // Provenance of the rate this line was priced at, so a later audit
-            // can tell a synced market rate from a counter override without
-            // having to guess from the number alone.
-            goldRateSource: activeRates.sources[rateKey],
-            metalValue: computeMetalValue(weightGrams, ratePerGram),
-            makingChargePercent,
-            makingChargeAmount: round2(makingChargeAmount),
-            discountPercent,
-            // What the cashier's screen quoted for this line, kept only to
-            // detect and log a disagreement — never persisted as money.
-            clientRate: Number(raw.goldPricePerGram)
-        }
-    };
-}
-
-/* ==========================================================================
-   Tenders — HOW the invoice was paid
-
-   A sale used to record no payment method at all. Not "no split tender": no
-   tender. Nothing on the record said whether a bill was settled in cash, on a
-   card, or by UPI, which meant a cash-drawer close, a shift variance and a card
-   settlement reconciliation were not features waiting to be built — they were
-   arithmetic with no data to perform it on.
-
-   Tenders are OPTIONAL on the request and additive on the record, because every
-   invoice already on disk has none and must stay readable. When they are
-   supplied they are checked hard: the posted tenders must sum to exactly the
-   amount payable, or the invoice is refused. A tender list that does not add up
-   to the bill is worse than no tender list, since it would reconcile against
-   nothing while looking authoritative.
-
-   Method vocabulary matches `tenders.method` in the SQL schema exactly, so the
-   cutover is a copy rather than a translation.
-   ========================================================================== */
-
-const TENDER_METHODS = ['cash', 'card', 'upi', 'razorpay', 'advance', 'bank_transfer', 'other'];
-const MAX_TENDERS = 10;
-
-/**
- * Validates the tender list against the amount actually payable.
- *
- * `payable` is the total AFTER any advance redemption, because a redeemed
- * advance is not tendered at the counter — it was tendered when the customer
- * deposited it, and it appears on the record as `appliedAdvance`. Counting it
- * twice is exactly the reconciliation error this validation exists to prevent.
- */
-function validateTenders(raw, payable) {
-    if (raw === undefined || raw === null) return { ok: true, tenders: [] };
-    if (!Array.isArray(raw)) {
-        return { ok: false, error: 'Tenders must be a list.' };
-    }
-    if (raw.length === 0) return { ok: true, tenders: [] };
-    if (raw.length > MAX_TENDERS) {
-        return { ok: false, error: `An invoice may be split across at most ${MAX_TENDERS} tenders.` };
-    }
-    // Nothing left to pay — an invoice fully settled by a redeemed advance has
-    // no counter tender, and recording a ₹0 one would just be a row that means
-    // nothing.
-    if (round2(payable) <= 0) return { ok: true, tenders: [] };
-
-    const tenders = [];
-    for (const [i, entry] of raw.entries()) {
-        if (!entry || typeof entry !== 'object') {
-            return { ok: false, error: `Tender ${i + 1} is not a valid payment.` };
-        }
-        const method = String(entry.method || '').trim().toLowerCase();
-        if (!TENDER_METHODS.includes(method)) {
-            return { ok: false, error: `Tender ${i + 1} has an unknown method. Use one of: ${TENDER_METHODS.join(', ')}.` };
-        }
-
-        /* A LONE TENDER WITH NO AMOUNT means "the whole bill, by this method".
-           The desk sends that for the ordinary unsplit sale, and it matters
-           because the server may legitimately price the invoice differently
-           from the browser — a rate synced overnight, a tax slab edited
-           mid-shift. The cashier's intent there was "the customer is paying the
-           whole bill in cash", not "the customer is paying ₹4,532", so pinning
-           the amount to the browser's stale total would refuse a sale the store
-           genuinely wants to make.
-
-           A cashier who has actually split the payment sends explicit amounts,
-           and those must reconcile exactly — see the check below. */
-        const amountOmitted = raw.length === 1
-            && (entry.amount === undefined || entry.amount === null || entry.amount === '');
-        const amount = amountOmitted ? payable : Number(entry.amount);
-        if (!Number.isFinite(amount) || amount <= 0) {
-            return { ok: false, error: `Tender ${i + 1} needs a positive amount.` };
-        }
-        if (amount > MAX_SANE_AMOUNT) {
-            return { ok: false, error: `Tender ${i + 1} exceeds the per-payment limit.` };
-        }
-        tenders.push({
-            method,
-            amount: round2(amount),
-            // A card slip number, a UPI UTR, a cheque number — whatever the
-            // reconciliation will be done against. Free text by necessity;
-            // clamped, and never used as an identifier by this system.
-            reference: String(entry.reference || '').trim().slice(0, 100)
-        });
-    }
-
-    // Compared in integer paise, not rupees. Two rupee floats that both look
-    // like the same amount need not be equal, and this is precisely the
-    // comparison that must not be approximate.
-    const tenderedPaise = tenders.reduce((total, t) => total + toPaise(t.amount), 0);
-    const payablePaise = toPaise(payable);
-    if (tenderedPaise !== payablePaise) {
-        return {
-            ok: false,
-            error: `The payments recorded (₹${fromPaise(tenderedPaise)}) do not add up to the amount due (₹${fromPaise(payablePaise)}). `
-                + 'Adjust the split so the two match.'
-        };
-    }
-
-    return { ok: true, tenders };
-}
 
 /**
  * POST /api/sales
@@ -1799,285 +1604,69 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             return res.status(400).json({ error: 'Customer name is too long (max 200 characters).' });
         }
 
-        /* The lines, priced at the store's rates.
-           The flat single-item form is normalised into a one-line cart so there
-           is exactly one code path below, whichever shape the request took. */
-        const requestedLines = Array.isArray(req.body.lines) && req.body.lines.length > 0
-            ? req.body.lines
-            : [{
-                purity: req.body.purity,
-                weightGrams: req.body.weightGrams,
-                goldPricePerGram: req.body.goldPricePerGram,
-                makingChargeAmount: req.body.makingChargeAmount,
-                makingChargePercent: req.body.makingChargePercent,
-                discountPercent: req.body.discountPercent,
-                description: req.body.description
-            }];
+        /* Everything below the parse is the sale service's: the store's rate,
+           the store's tax configuration, the arithmetic, the numbering and the
+           persistence. The route's job stops at deciding what is a well-formed
+           request and what status code the answer gets.
 
-        if (requestedLines.length > MAX_INVOICE_LINES) {
-            return res.status(400).json({ error: `An invoice may hold at most ${MAX_INVOICE_LINES} items.` });
-        }
-
-        /* The rate is the store's, not the browser's — see validateSaleLine.
-           Fetched once for the whole invoice so every line on one document is
-           priced against the same snapshot, rather than a midnight sync landing
-           between line 2 and line 3. */
-        const activeRates = getActiveGoldRates();
-        const saleLineItems = [];
-        for (const [i, raw] of requestedLines.entries()) {
-            const checked = validateSaleLine(raw, i, activeRates);
-            if (!checked.ok) {
-                return res.status(checked.status || 400).json({ error: checked.error });
-            }
-            saleLineItems.push(checked.line);
-        }
-
-        const totalWeight = round3(saleLineItems.reduce((total, l) => total + l.weightGrams, 0));
-        if (totalWeight > MAX_SANE_WEIGHT_GRAMS) {
-            return res.status(400).json({
-                error: `The invoice totals ${totalWeight}g, over the ${MAX_SANE_WEIGHT_GRAMS}g per-invoice limit.`
-            });
-        }
-
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
-
-        // 0. Recompute the money server-side. The browser renders a live
-        // preview with this same shared module, but what gets persisted to the
-        // ledger is always the server's own arithmetic over the server's own
-        // tax configuration — a stale cached bundle or a tampered payload can
-        // no longer write a total that disagrees with the tax slab and tax
-        // mode actually configured in Settings.
-        const taxSlab = Number(settings.goldTaxSlab) || 0;
-        // Canonicalised through the shared helper, so a settings.json written
-        // by an older build, edited by hand, or restored from a backup with
-        // 'inclusive' in it cannot leave the server billing Exclusive while
-        // the browser bills Inclusive.
-        const taxMode = normalizeTaxMode(settings.taxMode);
-
-        // The cashier quoted a rate on screen, per line. If any of them moved
-        // between then and Save — an overnight sync, or an override edited
-        // mid-shift — the server's figure is what gets filed, and the desk is
-        // told so it can reprint rather than hand over a slip that disagrees
-        // with the ledger.
-        const rateWasCorrected = saleLineItems.some(l =>
-            Number.isFinite(l.clientRate) && Math.abs(l.clientRate - l.goldPricePerGram) > 0.01
-        );
-        if (rateWasCorrected) {
-            for (const l of saleLineItems) {
-                if (!Number.isFinite(l.clientRate) || Math.abs(l.clientRate - l.goldPricePerGram) <= 0.01) continue;
-                logError(
-                    `Sale rate mismatch — client billed line ${l.lineNumber} (${l.purity}) at ${l.clientRate}/g, ` +
-                    `server's active rate is ${l.goldPricePerGram}/g (source: ${l.goldRateSource}). Persisting the server rate.`
-                );
-                logTelemetry('SALE_RATE_MISMATCH', 0, `client: ${l.clientRate}, server: ${l.goldPricePerGram}`);
-            }
-        }
-        // `clientRate` was only ever needed for that comparison — it is not a
-        // money field and must not reach the ledger.
-        saleLineItems.forEach(l => { delete l.clientRate; });
-
-        let advancesFile = null;
-        let advances = null;
-        let customerAdvanceBalance = 0;
-        if (numAppliedAdvance > 0) {
-            if (!customerPhone) {
-                return res.status(400).json({ error: 'Customer phone is required when redeeming an advance.' });
-            }
-            advancesFile = path.join(DATA_DIR, 'advances.json');
-            advances = readJSON(advancesFile, []);
-            customerAdvanceBalance = computeAdvanceLedger(customerPhone, advances).balance;
-            if (round2(numAppliedAdvance) > round2(customerAdvanceBalance)) {
-                return res.status(400).json({
-                    error: `Applied advance exceeds the customer's available balance of ${round2(customerAdvanceBalance)}.`
-                });
-            }
-        }
-
-        const totals = computeInvoiceTotals({
-            lines: saleLineItems.map(l => ({
-                metalValue: l.metalValue,
-                makingChargeAmount: l.makingChargeAmount,
-                discountPercent: l.discountPercent
-            })),
+           ONE TRANSACTION. Invoice-number allocation, the header, its lines,
+           its tenders, the advance redemption and the audit row now commit
+           together or not at all. The JSON path could not make the NUMBER part
+           of that unit — the counter lived in settings.json behind a
+           read-modify-write, so a failed write silently reissued a number that
+           was already on a customer's slip. */
+        const result = saleService.createSale({
+            lines: Array.isArray(req.body.lines) && req.body.lines.length > 0 ? req.body.lines : null,
+            purity: req.body.purity,
+            weightGrams: req.body.weightGrams,
+            goldPricePerGram: req.body.goldPricePerGram,
+            makingChargeAmount: req.body.makingChargeAmount,
+            makingChargePercent: req.body.makingChargePercent,
+            description: req.body.description,
             discountPercent: numDiscountPercent,
-            taxSlab,
-            taxMode,
+            customerName,
+            customerPhone,
             appliedAdvance: numAppliedAdvance,
-            customerAdvanceBalance
+            clientTotal: numTotal,
+            tenders: req.body.tenders,
+            idempotencyKey: req.get('Idempotency-Key') || req.body.idempotencyKey || null
+        }, {
+            getActiveGoldRates,
+            getSettings: billingSettings,
+            // WHO BILLED THIS — taken from the session, never from the body. A
+            // client-supplied cashier name is worth nothing as an audit trail,
+            // since the whole point is to bind the record to the credential
+            // that was used. `ensureActorUser` maps that identity onto the
+            // `users` row the ledger's foreign keys point at.
+            actorUserId: resolveActorUserId(req.actor),
+            actor: req.actor,
+            actorLabel: (req.actor && req.actor.name) || 'counter',
+            ipAddress: req.ip
         });
 
-        // A mismatch means the client's math and the server's disagree — the
-        // server's value is what gets stored either way, but it is worth a
-        // loud log line: it is the signature of a stale cached frontend or a
-        // settings change mid-session.
-        const serverTotal = round2(totals.totalAmount);
-        const totalWasCorrected = Math.abs(round2(numTotal) - serverTotal) > 0.01;
-        if (totalWasCorrected) {
-            logError(
-                `Sale total mismatch — client submitted ${round2(numTotal)}, server computed ${serverTotal} ` +
-                `(taxSlab ${taxSlab}%, taxMode ${taxMode}, discount ${numDiscountPercent}%). Persisting the server value.`
-            );
-            logTelemetry('SALE_TOTAL_MISMATCH', 0, `client: ${round2(numTotal)}, server: ${serverTotal}`);
+        if (!result.ok) {
+            return res.status(result.status || 400).json({ error: result.error });
         }
 
-        // How the bill was settled, checked against what is actually payable.
-        // Validated BEFORE the invoice number is consumed — a tender split that
-        // does not add up must not burn a sequential, legally-relevant number.
-        const tendered = validateTenders(req.body.tenders, serverTotal);
-        if (!tendered.ok) {
-            return res.status(400).json({ error: tendered.error });
-        }
-
-        // 1. Generate Incrementing Serial Invoice ID
-        const prefix = settings.invoicePrefix || 'GOLD';
-        const startSeq = settings.invoiceSeqStart || 1;
-        const currentYearShort = new Date().getFullYear().toString().slice(-2);
-
-        const invoiceId = `${prefix}-${startSeq.toString().padStart(6, '0')}-${currentYearShort}`;
-
-        // The increment is committed together with the sale and any advance
-        // redemption below; no invoice can exist in only one of those ledgers.
-        settings.invoiceSeqStart = startSeq + 1;
-
-        /* 2. Prepare the sale record — field by field, never `...req.body`.
-
-           Spreading the body meant any key the client felt like sending landed
-           in the permanent ledger: a `timestamp` of the client's choosing (so
-           an invoice could be back- or post-dated from the browser, and the
-           annual partition it was filed under argued with the date printed on
-           it), a second copy of a money field under a name the recompute above
-           does not cover, or simply unbounded junk inflating sales_YYYY.json.
-
-           An allowlist inverts that. Money fields are the server's own
-           arithmetic; descriptive fields are taken deliberately and clamped;
-           anything else the client sends is dropped. */
-        const now = Date.now();
-        const sale = {
-            id: invoiceId,
-            // Server clock, always. The business date an invoice is filed under
-            // is the store's, not the till browser's — a wrong workstation clock
-            // (or a crafted payload) must not decide which year's ledger and
-            // which tax period a sale belongs to.
-            timestamp: now,
-            customerName: customerName ? String(customerName).slice(0, 200) : 'Cash Sale',
-            customerPhone: customerPhone || '',
-
-            /* THE ITEMS. Each line's own purity, weight, rate, making charge and
-               discount, with its allocated share of the invoice's taxable value
-               and GST merged in from computeInvoiceTotals — so the rows on the
-               printed invoice sum exactly to the total at the bottom. */
-            lines: saleLineItems.map((l, i) => ({ ...l, ...totals.lines[i] })),
-
-            /* THE ROLLUP, kept deliberately.
-
-               These are the same scalar fields a single-line invoice has always
-               carried, now describing the whole document. They are redundant
-               with `lines` above and that is the point: every reader written
-               before lines existed — the dashboard tile, the email report, a
-               tenant's extension, an accountant's export — keeps working
-               untouched, and reads the right figures for a multi-line invoice
-               rather than the first line's.
-
-               `purity` is the invoice's only when every line agrees on it;
-               'MIXED' otherwise, because silently reporting line 1's purity for
-               a mixed cart would be a wrong answer rather than a missing one. */
-            purity: [...new Set(saleLineItems.map(l => l.purity))].length === 1
-                ? saleLineItems[0].purity
-                : 'MIXED',
-            weightGrams: totalWeight,
-            // A single-rate invoice states its rate; a mixed one has no single
-            // rate to state, and 0 is how every downstream reader already
-            // represents "not applicable" for this field.
-            goldPricePerGram: [...new Set(saleLineItems.map(l => l.goldPricePerGram))].length === 1
-                ? saleLineItems[0].goldPricePerGram
-                : 0,
-            // Provenance of the rates this invoice was priced at, so a later
-            // audit can tell a synced market rate from a counter override
-            // without having to guess from the number alone.
-            goldRateSource: [...new Set(saleLineItems.map(l => l.goldRateSource))].join('+'),
-            metalValue: round2(saleLineItems.reduce((t, l) => t + l.metalValue, 0)),
-            makingChargePercent: [...new Set(saleLineItems.map(l => l.makingChargePercent))].length === 1
-                ? saleLineItems[0].makingChargePercent
-                : 0,
-            makingChargeAmount: round2(saleLineItems.reduce((t, l) => t + l.makingChargeAmount, 0)),
-            taxPercent: taxSlab,
-            taxMode,
-            taxableAmount: round2(totals.taxableAmount),
-            taxAmount: round2(totals.taxAmount),
-            discountPercent: numDiscountPercent,
-            discount: round2(totals.discountAmount),
-            appliedAdvance: round2(totals.appliedAdvance),
-            totalAmount: serverTotal,
-
-            /* HOW IT WAS PAID. Empty when the desk did not record a split, which
-               is what every invoice filed before tenders existed looks like —
-               so an empty list means "not recorded", never "paid nothing". When
-               non-empty it is guaranteed to sum to totalAmount (validateTenders
-               refuses the sale otherwise), which is what makes a cash-drawer
-               close and a card settlement reconcilable against it. */
-            tenders: tendered.tenders,
-            /* WHO BILLED THIS. Taken from the session, never from the body —
-               a client-supplied cashier name is worth nothing as an audit
-               trail, since the whole point is to bind the record to the
-               credential that was used.
-
-               Every invoice used to be filed anonymously: one shared PIN
-               gated the desk, so a discount, a counter rate override and the
-               sale itself named nobody. Maps to invoices.created_by_user_id +
-               the actor label in the SQL schema at cutover. */
-            actor: req.actor
-        };
-
-        // 3. Save to partitioned annual file (e.g. sales_2026.json)
-        const year = new Date().getFullYear();
-        const salesFile = path.join(DATA_DIR, `sales_${year}.json`);
-        const sales = readJSON(salesFile, []);
-        sales.push(sale);
-        // 4. Prepare Customer Advance Redemption in the same transaction.
-        if (sale.appliedAdvance > 0 && sale.customerPhone) {
-            advances.push({
-                id: newId('RED'),
-                customerPhone: sale.customerPhone,
-                customerName: sale.customerName,
-                type: 'redeem',
-                amount: parseFloat(sale.appliedAdvance),
-                invoiceId: invoiceId,
-                timestamp: Date.now(),
-                // Spending a customer's credit is a money movement, so it
-                // carries the same signature as the invoice that spent it.
-                actor: req.actor
-            });
-        }
-
-        const transactionWrites = [
-            { filepath: settingsFile, data: settings },
-            { filepath: salesFile, data: sales }
-        ];
-        if (advancesFile && advances) transactionWrites.push({ filepath: advancesFile, data: advances });
-        if (!writeJSONTransaction(transactionWrites)) {
-            return res.status(500).json({
-                error: 'Failed to persist the complete sale transaction. Nothing was saved; please retry.'
-            });
-        }
-
-        logTelemetry('SAVE_SALE', 0, `Invoice: ${invoiceId}, Total: ${sale.totalAmount}`);
-        fireHook('onSaleSaved', sale);
+        logTelemetry('SAVE_SALE', 0, `Invoice: ${result.invoiceId}, Total: ${result.sale.totalAmount}`);
+        fireHook('onSaleSaved', result.sale);
         // `totalCorrected` / `rateCorrected` let the cashier know the printed
         // preview no longer matches what was filed, instead of the two
         // silently diverging.
-        res.json({
+        return res.json({
             success: true,
-            invoiceId,
-            sale,
-            totalCorrected: totalWasCorrected,
-            rateCorrected: rateWasCorrected
+            invoiceId: result.invoiceId,
+            sale: result.sale,
+            totalCorrected: result.totalCorrected,
+            rateCorrected: result.rateCorrected,
+            ...(result.duplicate ? { duplicate: true } : {})
         });
     } catch (err) {
         logError('Error saving sale transaction: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to process sale transaction: ' + err.message });
     }
 });
+
 
 /* ==========================================================================
    API Routes: Returns & Refunds
@@ -2111,14 +1700,20 @@ app.get('/api/returns', requireAdminSession, (req, res) => {
         const q = parseLedgerQuery(req.query);
         if (!q.ok) return res.status(400).json({ error: q.error });
 
-        const matched = readReturnRecords(q.years).filter(r => withinRange(r, q.from, q.to));
-        res.json(pagedLedger(matched, q.limit, {
-            totals: {
-                count: matched.length,
-                refundAmount: round2(matched.reduce((sum, r) => sum + (Number(r.refundAmount) || 0), 0)),
-                weightGrams: round3(matched.reduce((sum, r) => sum + (Number(r.weightGrams) || 0), 0))
-            }
-        }));
+        const context = repo.dataStoreContext();
+        const result = returnService.listReturns({
+            fromAt: q.from, toAt: q.to, limit: q.limit, offset: 0
+        });
+
+        res.json({
+            results: result.results,
+            total: result.total,
+            truncated: result.total > result.results.length,
+            limit: q.limit,
+            totals: repo.creditNotes.periodTotals({
+                tenantId: context.tenantId, fromAt: q.from, toAt: q.to
+            })
+        });
     } catch (err) {
         logError('Error retrieving returns ledger: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve returns' });
@@ -2135,235 +1730,108 @@ app.get('/api/returns', requireAdminSession, (req, res) => {
  * payload cannot name its own refund figure.
  *
  * Gold mode credits the customer's advance ledger in the SAME transaction as
- * the return row, so the two can never exist apart. That is also why the row
- * is built through buildAdvanceDepositRow() and pushed here rather than going
- * through recordAdvanceDeposit(), which commits on its own.
+ * the credit note, so the two can never exist apart — a foreign key from the
+ * advance entry to the credit note now makes an orphaned credit
+ * unrepresentable rather than merely unlikely.
  */
 app.post('/api/returns', requireAdminSession, (req, res) => {
     try {
         const { invoiceId, weightGrams, refundMode, note, lineNumber } = req.body || {};
 
-        const cleanInvoiceId = String(invoiceId || '').trim();
-        if (!cleanInvoiceId) {
-            return res.status(400).json({ error: 'An invoice number is required to file a return.' });
-        }
-        if (!REFUND_MODES.includes(refundMode)) {
-            return res.status(400).json({ error: 'Refund mode must be either "cash" or "gold".' });
-        }
-        const numWeight = Number(weightGrams);
-        if (!Number.isFinite(numWeight) || numWeight <= 0) {
-            return res.status(400).json({ error: 'A valid positive return weight is required.' });
-        }
         // Which item on the invoice is coming back. Optional on a single-line
-        // invoice — computeReturnRefund resolves it — and required on a
-        // multi-line one, which it enforces rather than guessing.
+        // invoice — the service resolves it — and required on a multi-line one,
+        // which it enforces rather than guessing: pricing a 22K return at an
+        // 18K line's rate would refund the wrong money, and do it quietly.
         const numLine = lineNumber === undefined || lineNumber === null ? null : Number(lineNumber);
         if (numLine !== null && (!Number.isInteger(numLine) || numLine < 1)) {
             return res.status(400).json({ error: 'Line number must be a positive whole number.' });
         }
 
-        const sale = readSalesRecords().find(s => s && s.id === cleanInvoiceId);
-        if (!sale) {
-            return res.status(404).json({
-                error: `No filed invoice ${cleanInvoiceId} exists. Only saved invoices can be returned against.`
-            });
-        }
-
-        // Gold credit has to land in somebody's account, and this platform
-        // keys every customer ledger on the phone number. A walk-in "Cash
-        // Sale" filed without one can still be refunded — in cash, over the
-        // counter, which is how it was paid.
-        if (refundMode === 'gold' && !isValidPhone(sale.customerPhone)) {
-            return res.status(400).json({
-                error: 'This invoice has no customer phone number on it, so there is no account to credit. Refund it as cash, or re-file the sale against a customer.'
-            });
-        }
-
-        const returns = readReturnRecords();
-        const priorReturns = summarizeInvoiceReturns(cleanInvoiceId, returns);
-        const state = withReturnState(sale, returns);
-
-        // Prior returns are measured PER LINE — a line's remaining weight is its
-        // own, and exhausting line 2 must not consume line 1's returnable
-        // weight. `invoiceRemainingGrams` is the whole-invoice figure, which is
-        // what the money true-up on the closing return keys on.
-        const resolvedLine = numLine !== null
-            ? numLine
-            : (saleLines(sale).length === 1 ? 1 : null);
-        const priorOnLine = resolvedLine === null
-            ? 0
-            : round3(priorReturns.returnedByLine.get(resolvedLine) || 0);
-
-        const refund = computeReturnRefund({
-            sale,
-            returnWeightGrams: numWeight,
-            lineNumber: numLine,
-            alreadyReturnedGrams: priorOnLine,
-            invoiceRemainingGrams: state.returnableWeightGrams,
-            alreadyRefundedAmount: priorReturns.refundedAmount
-        });
-        if (!refund.ok) {
-            return res.status(400).json({ error: refund.error });
-        }
-        if (!(refund.refundAmount > 0)) {
-            return res.status(400).json({
-                error: 'This return prices to a zero refund, so there is nothing to pay back. Check the weight entered.'
-            });
-        }
-
-        /* APPROVAL THRESHOLD. A refund is the one counter action that takes money
-           out of the till on the cashier's own say-so, and it was the obvious
-           remaining insider-fraud gap once roles existed.
-
-           Checked HERE, after the server has priced the refund, because the
-           amount that matters is the one about to be filed — not one the client
-           proposed. Zero disables the control, which is the previous behaviour
-           and therefore the default: no existing store is surprised by a refusal
-           it never configured.
-
-           The MFA condition is the same one requireApprover applies, restated
-           rather than shared because this is not a whole-route gate: a cashier
-           may file small refunds all day, and only crossing the threshold turns
-           this into an approver's decision. */
         const refundSettings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
         const threshold = round2(refundSettings.refundApprovalThreshold || 0);
-        if (threshold > 0 && refund.refundAmount >= threshold) {
-            if (!roleCanApprove(req.actor.role)) {
-                logTelemetry('REFUND_APPROVAL_DENIED', 0,
-                    `${req.actor.name} (${req.actor.role}) attempted ${refund.refundAmount} on ${sale.id}`);
-                return res.status(403).json({
-                    error: 'APPROVER_REQUIRED',
-                    message: `A refund of ₹${refund.refundAmount} needs a manager or the owner to authorise it `
-                        + `(this store's limit is ₹${threshold}). ${req.actor.name} is signed in as ${req.actor.role}.`
-                });
-            }
-            if (refundSettings.requireMfaForApprovers === true && req.adminSession && !req.adminSession.mfaUsed) {
-                logTelemetry('REFUND_APPROVAL_DENIED_NO_MFA', 0,
-                    `${req.actor.name} (${req.actor.role}) attempted ${refund.refundAmount} on ${sale.id}`);
-                return res.status(403).json({
-                    error: 'MFA_REQUIRED',
-                    message: `A refund of ₹${refund.refundAmount} is at or above this store's ₹${threshold} limit, `
-                        + 'and this store requires two-factor authentication to authorise one. Sign in with your authenticator code.'
-                });
-            }
-        }
+        const invoiceLabel = String(invoiceId || '').trim();
 
-        const returnId = newId('RET');
-        const now = Date.now();
-        // Filed under the year the refund HAPPENED — see readReturnRecords().
-        const year = new Date(now).getFullYear();
-        const returnsFile = path.join(DATA_DIR, `returns_${year}.json`);
-        const yearRows = readJSON(returnsFile, []);
-
-        // Field by field, never `...req.body` — same reasoning as POST
-        // /api/sales: the client may name the invoice, the weight and the
-        // mode, and nothing else reaches the permanent ledger.
-        const returnRecord = {
-            id: returnId,
-            timestamp: now,
-            originalInvoiceId: sale.id,
-            originalTimestamp: sale.timestamp || null,
-            customerName: sale.customerName || 'Cash Sale',
-            customerPhone: sale.customerPhone || '',
-            // WHICH ITEM came back. Load-bearing on a multi-line invoice: it is
-            // what limits further returns against that line and what lets the
-            // refund be re-priced at the right rate. A row without it reads as
-            // line 1, which is correct for every invoice filed before lines.
-            lineNumber: refund.lineNumber,
-            description: refund.description,
-            purity: refund.purity,
-            weightGrams: refund.weightGrams,
-            // The weight of the LINE being returned, not of the whole invoice —
-            // it is what this return's share was computed against.
-            originalWeightGrams: round3(
-                (saleLines(sale).find(l => l.lineNumber === refund.lineNumber) || {}).weightGrams
-            ),
-            invoiceWeightGrams: round3(sale.weightGrams),
-            // The rate the goods were SOLD at, restated on the credit note so
-            // the customer can see the refund was not re-priced against today.
-            goldPricePerGram: refund.goldPricePerGram,
-            makingChargePercent: refund.makingChargePercent,
-            discountPercent: refund.discountPercent,
-            taxPercent: refund.taxPercent,
-            taxMode: refund.taxMode,
-            // Null on an invoice whose stored figures cannot be split — the
-            // credit note then prints the refund total and says so, rather
-            // than inventing a GST line. See computeReturnRefund().
-            metalValue: refund.itemised ? refund.components.metalValue : null,
-            makingChargeAmount: refund.itemised ? refund.components.makingChargeAmount : null,
-            discount: refund.itemised ? refund.components.discountAmount : null,
-            taxableAmount: refund.itemised ? refund.components.taxableAmount : null,
-            taxAmount: refund.itemised ? refund.components.taxAmount : null,
-            itemised: refund.itemised,
-            refundAmount: refund.refundAmount,
+        const result = returnService.createReturn({
+            invoiceId,
+            weightGrams,
             refundMode,
-            closesLine: refund.closesLine,
-            closesInvoice: refund.closesInvoice,
-            note: String(note || '').trim().slice(0, 300),
-            // WHO AUTHORISED THE REFUND. A cash refund moves money out of the
-            // till, which makes it the single most fraud-sensitive write in the
-            // system and the one that least tolerated being anonymous. From the
-            // session, never the body — see POST /api/sales.
-            actor: req.actor
-        };
+            note,
+            lineNumber: numLine,
+            idempotencyKey: req.get('Idempotency-Key') || (req.body || {}).idempotencyKey || null
+        }, {
+            getActiveGoldRates,
+            isValidPhone,
+            actorUserId: resolveActorUserId(req.actor),
+            actor: req.actor,
+            actorLabel: (req.actor && req.actor.name) || 'counter',
+            ipAddress: req.ip,
+            /* THE APPROVAL THRESHOLD, applied to the server's own priced refund
+               rather than to any figure the client proposed. Zero disables the
+               control, which is the previous behaviour and therefore the
+               default: no existing store is surprised by a refusal it never
+               configured.
 
-        const transactionWrites = [];
-        let creditRow = null;
+               The MFA condition is the same one requireApprover applies,
+               restated rather than shared because this is not a whole-route
+               gate — a cashier may file small refunds all day, and only
+               crossing the threshold makes this an approver's decision. */
+            authorizeRefund: (refundAmount) => {
+                if (!(threshold > 0) || refundAmount < threshold) return { ok: true };
 
-        if (refundMode === 'gold') {
-            const advancesFile = path.join(DATA_DIR, 'advances.json');
-            const advances = readJSON(advancesFile, []);
-            creditRow = buildAdvanceDepositRow({
-                customerPhone: sale.customerPhone,
-                customerName: sale.customerName,
-                amount: refund.refundAmount,
-                paymentMethod: 'Return Credit',
-                // Approved outright, not pending: unlike a customer's claim to
-                // have sent a UPI transfer, this credit was created by the
-                // store itself at the counter. There is nothing left to verify.
-                status: ADVANCE_STATUS.APPROVED,
-                source: 'return',
-                invoiceId: sale.id,
-                returnId,
-                // The same person the return names — the credit and the refund
-                // that created it are one counter decision.
-                actor: req.actor
-            });
-            returnRecord.advanceCreditId = creditRow.id;
-            returnRecord.lockedGoldRate22K = creditRow.lockedGoldRate22K;
-            advances.push(creditRow);
-            transactionWrites.push({ filepath: advancesFile, data: advances });
-        }
+                if (!roleCanApprove(req.actor.role)) {
+                    logTelemetry('REFUND_APPROVAL_DENIED', 0,
+                        `${req.actor.name} (${req.actor.role}) attempted ${refundAmount} on ${invoiceLabel}`);
+                    return {
+                        ok: false,
+                        status: 403,
+                        error: 'APPROVER_REQUIRED',
+                        message: `A refund of ₹${refundAmount} needs a manager or the owner to authorise it `
+                            + `(this store's limit is ₹${threshold}). ${req.actor.name} is signed in as ${req.actor.role}.`
+                    };
+                }
 
-        yearRows.push(returnRecord);
-        transactionWrites.unshift({ filepath: returnsFile, data: yearRows });
+                if (refundSettings.requireMfaForApprovers === true && req.adminSession && !req.adminSession.mfaUsed) {
+                    logTelemetry('REFUND_APPROVAL_DENIED_NO_MFA', 0,
+                        `${req.actor.name} (${req.actor.role}) attempted ${refundAmount} on ${invoiceLabel}`);
+                    return {
+                        ok: false,
+                        status: 403,
+                        error: 'MFA_REQUIRED',
+                        message: `A refund of ₹${refundAmount} is at or above this store's ₹${threshold} limit, `
+                            + 'and this store requires two-factor authentication to authorise one. '
+                            + 'Sign in with your authenticator code.'
+                    };
+                }
 
-        if (!writeJSONTransaction(transactionWrites)) {
-            return res.status(500).json({
-                error: 'Failed to persist the complete return. Nothing was saved; please retry.'
+                return { ok: true };
+            }
+        });
+
+        if (!result.ok) {
+            return res.status(result.status || 400).json({
+                error: result.error,
+                ...(result.message ? { message: result.message } : {})
             });
         }
 
         logTelemetry(
             'SAVE_RETURN', 0,
-            `Return: ${returnId}, Invoice: ${sale.id}, Weight: ${refund.weightGrams}g, ` +
-            `Refund: ${refund.refundAmount} (${refundMode})`
+            `Return: ${result.returnId}, Invoice: ${result.return.originalInvoiceId}, `
+            + `Weight: ${result.return.weightGrams}g, Refund: ${result.return.refundAmount} (${refundMode})`
         );
-        fireHook('onReturnSaved', returnRecord);
-        if (creditRow) fireHook('onAdvanceDeposit', creditRow);
+        fireHook('onReturnSaved', result.return);
+        if (result.advanceCredit) fireHook('onAdvanceDeposit', result.advanceCredit);
 
         res.json({
             success: true,
-            returnId,
-            return: returnRecord,
-            advanceCredit: creditRow,
+            returnId: result.returnId,
+            return: result.return,
+            advanceCredit: result.advanceCredit,
             // What is left on the LINE just returned against…
-            remainingWeightGrams: refund.remainingWeightAfter,
+            remainingWeightGrams: result.remainingWeightGrams,
             // …and on the invoice as a whole, which is what the desk needs to
             // decide whether to offer another return against this bill at all.
-            invoiceRemainingWeightGrams: round3(
-                Math.max(0, state.returnableWeightGrams - refund.weightGrams)
-            )
+            invoiceRemainingWeightGrams: result.invoiceRemainingWeightGrams
         });
     } catch (err) {
         logError('Error filing return: ' + err.message, err.stack);
@@ -2402,25 +1870,26 @@ app.get('/api/advances', requireAdminSession, (req, res) => {
             return res.status(400).json({ error: `Type must be one of: ${ADVANCE_ROW_TYPES.join(', ')}.` });
         }
 
-        const advancesFile = path.join(DATA_DIR, 'advances.json');
-        const advances = readJSON(advancesFile, []);
-        advances.sort((a, b) => b.timestamp - a.timestamp);
+        const context = repo.dataStoreContext();
+        const filter = {
+            tenantId: context.tenantId,
+            entryType: type || null,
+            fromAt: q.from,
+            toAt: q.to
+        };
+        const { rows, total } = repo.advances.search({ ...filter, limit: q.limit, offset: 0 });
 
-        const matched = advances.filter(a =>
-            withinRange(a, q.from, q.to) && (!type || (a && a.type === type))
-        );
-        res.json(pagedLedger(matched, q.limit, {
-            summary: summarizeAdvanceLiability(advances),
-            totals: {
-                count: matched.length,
-                depositAmount: round2(matched
-                    .filter(a => a && a.type === 'deposit')
-                    .reduce((sum, a) => sum + Math.abs(Number(a.amount) || 0), 0)),
-                redeemedAmount: round2(matched
-                    .filter(a => a && a.type === 'redeem')
-                    .reduce((sum, a) => sum + Math.abs(Number(a.amount) || 0), 0))
-            }
-        }));
+        res.json({
+            results: repo.advances.toLegacyAdvances(rows),
+            total,
+            truncated: total > rows.length,
+            limit: q.limit,
+            // The store's whole outstanding liability, deliberately NOT narrowed
+            // by the date filter: what the store owes its customers is not a
+            // property of the period being browsed.
+            summary: repo.advances.liabilitySummary(context.tenantId),
+            totals: repo.advances.periodTotals(filter)
+        });
     } catch (err) {
         logError('Error retrieving advances ledger: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve advances ledger' });
@@ -2448,264 +1917,23 @@ app.get('/api/advances/customers', requireAdminSession, (req, res) => {
         const limit = Math.min(LEDGER_PAGE_MAX, Math.max(1, parseInt(req.query.limit, 10) || LEDGER_PAGE_DEFAULT));
         const q = String(req.query.q || '').trim().toLowerCase();
 
-        const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
-        const byPhone = new Map();
-        for (const row of advances) {
-            if (!row) continue;
-            const phone = row.customerPhone || '';
-            if (!byPhone.has(phone)) byPhone.set(phone, { phone, name: '', lastActivity: 0, entries: [] });
-            const c = byPhone.get(phone);
-            c.lastActivity = Math.max(c.lastActivity, row.timestamp || 0);
-            c.entries.push(row);
-            // A deposit is the more authoritative "who this customer is" source
-            // than a redemption, which copies the name off the sale.
-            if (row.type === 'deposit' && row.customerName) c.name = row.customerName;
-            else if (!c.name && row.customerName) c.name = row.customerName;
-        }
-
-        let customers = Array.from(byPhone.values()).map(c => {
-            // The same summariser the tile, the portal and the redemption
-            // lookup use — one rule for what counts as spendable credit.
-            const summary = summarizeAdvanceLedger(c.entries);
-            return {
-                phone: c.phone,
-                name: c.name,
-                balance: summary.balance,
-                pendingTotal: summary.pendingTotal,
-                pendingCount: summary.pendingCount,
-                entryCount: c.entries.length,
-                lastActivity: c.lastActivity
-            };
+        const context = repo.dataStoreContext();
+        const { rows, total } = repo.advances.customerRollup({
+            tenantId: context.tenantId, q, limit, offset: 0
         });
 
-        if (q) {
-            const digits = q.replace(/\D/g, '');
-            customers = customers.filter(c =>
-                (digits.length > 0 && String(c.phone).includes(digits))
-                || String(c.name || '').toLowerCase().includes(q)
-            );
-        }
-        customers.sort((a, b) => b.lastActivity - a.lastActivity);
-
-        res.json(pagedLedger(customers, limit, { summary: summarizeAdvanceLiability(advances) }));
+        res.json({
+            results: rows,
+            total,
+            truncated: total > rows.length,
+            limit,
+            summary: repo.advances.liabilitySummary(context.tenantId)
+        });
     } catch (err) {
         logError('Error rolling up advance customers: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve advance customers' });
     }
 });
-
-/**
- * Computes one customer's advance balance and ledger history from the flat
- * advances.json file. Shared by the admin lookup (Billing Desk redemption)
- * and the session-scoped customer portal route so the cashier's screen and
- * the customer's screen can never show different balances.
- */
-function computeAdvanceLedger(phone, advances = readJSON(path.join(DATA_DIR, 'advances.json'), [])) {
-    const history = advances.filter(a => a.customerPhone === phone);
-    // Shared with the Dashboard tile and the Advances tab rollup — a pending
-    // deposit must not read as spendable credit in any of the three.
-    const summary = summarizeAdvanceLedger(history);
-    return {
-        phone,
-        balance: summary.balance,
-        pendingTotal: summary.pendingTotal,
-        pendingCount: summary.pendingCount,
-        history
-    };
-}
-
-/**
- * Appends a single deposit row to the advances ledger. This is the one write
- * path for every deposit source — counter entry, customer manual UPI, and
- * verified Razorpay — so the row shape and the locked-rate snapshot that the
- * Gold Appreciation calculator depends on are identical whichever door the
- * money came through.
- *
- * `status` is what separates money the store has actually seen from a
- * customer's unverified claim to have sent it:
- *   - counter entry and signature-verified Razorpay → 'approved' (the default)
- *   - customer-submitted manual UPI → 'pending', credited only once a cashier
- *     approves it at POST /api/advances/:id/approve
- * See ADVANCE_STATUS in frontend/js/lib/billingMath.js for how the balance
- * arithmetic treats each state.
- *
- * @returns {{success: boolean, error?: string, code?: string, deposit?: object}}
- */
-/**
- * The shape of a deposit row in advances.json — built in exactly one place.
- *
- * Most deposits go through recordAdvanceDeposit(), which validates, checks the
- * reference for reuse, and commits on its own. A gold-mode refund cannot: its
- * credit row has to land in the SAME transaction as the return that created it
- * (POST /api/returns), or a crash between the two writes leaves either a
- * refund nobody was credited for or credit against a return that never
- * happened. So the row construction is split out here and both callers share
- * it, rather than the returns route growing a second, subtly-different idea of
- * what a deposit row looks like — which is how a field like
- * `lockedGoldRate22K` ends up missing on one code path and silently breaking
- * the customer portal's Gold Appreciation panel.
- *
- * `source` marks where the credit came from ('counter' by default,
- * 'return' for a refund). Additive: rows already on disk have no such field
- * and read as a counter deposit, which is what they are.
- */
-function buildAdvanceDepositRow({
-    customerPhone, customerName, amount, paymentMethod, referenceId,
-    status = ADVANCE_STATUS.APPROVED, source = 'counter', invoiceId = '', returnId = '',
-    actor = SYSTEM_ACTOR
-}) {
-    return {
-        id: newId('ADV'),
-        customerPhone,
-        customerName: customerName || 'Regular Customer',
-        type: 'deposit',
-        amount: parseFloat(amount),
-        paymentMethod: paymentMethod || 'UPI',
-        referenceId: String(referenceId || '').trim(),
-        status: normalizeAdvanceStatus({ type: 'deposit', status }),
-        source,
-        // Present only on a refund credit, so the customer portal and the
-        // advances tab can say which invoice the credit came back from
-        // instead of showing an unexplained deposit the customer never made.
-        ...(invoiceId ? { invoiceId } : {}),
-        ...(returnId ? { returnId } : {}),
-        // Snapshotted at submission, NOT at approval: the customer's money moved
-        // when they sent it, so the Gold Appreciation figure they were shown at
-        // that moment is the one they are owed. A rate move during the approval
-        // wait is the store's timing, not the customer's.
-        lockedGoldRate22K: getActiveGoldRates().price22K,
-        timestamp: Date.now(),
-        /* WHO CREATED THIS ROW. Not who the money belongs to — who put it in the
-           ledger. Defaults to SYSTEM_ACTOR because most callers are machinery: a
-           signature-verified Razorpay capture, the webhook, a return credit
-           filed by the store itself. A cashier keying a counter deposit passes
-           their own session actor, so "the shop says this cash arrived" and
-           "the gateway proved this transfer arrived" are distinguishable
-           afterwards, which is the distinction the approval queue rests on.
-
-           A CUSTOMER's own unverified UPI claim is neither: it is recorded with
-           the system actor and status 'pending', and gains an `approvedBy` only
-           when a manager releases it. */
-        actor: { id: actor.id, name: actor.name, role: actor.role }
-    };
-}
-
-function recordAdvanceDeposit({
-    customerPhone, customerName, amount, paymentMethod, referenceId,
-    status = ADVANCE_STATUS.APPROVED, actor = SYSTEM_ACTOR
-}) {
-    if (!isValidPhone(customerPhone)) {
-        return { success: false, error: 'Valid 10-digit customer phone number required' };
-    }
-    const numAmount = parseFloat(amount);
-    if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > MAX_SANE_AMOUNT) {
-        return { success: false, error: 'Valid deposit amount required' };
-    }
-    if (customerName && String(customerName).length > 200) {
-        return { success: false, error: 'Customer name is too long (max 200 characters).' };
-    }
-
-    const advancesFile = path.join(DATA_DIR, 'advances.json');
-    const advances = readJSON(advancesFile, []);
-    const cleanReference = String(referenceId || '').trim();
-
-    // A payment reference identifies one real-world transfer, so it may appear
-    // in the ledger exactly once. Without this, a customer could submit the
-    // same UTR on three separate deposits and — since each row looks
-    // individually plausible to whoever approves it — be credited three times
-    // for one transfer. Enforced here rather than at the routes so every
-    // present and future caller of this function inherits it.
-    if (cleanReference) {
-        const clash = advances.find(a =>
-            a.type === 'deposit' && a.referenceId &&
-            String(a.referenceId).trim().toLowerCase() === cleanReference.toLowerCase() &&
-            normalizeAdvanceStatus(a) !== ADVANCE_STATUS.REJECTED
-        );
-        if (clash) {
-            return {
-                success: false,
-                code: 'DUPLICATE_REFERENCE',
-                error: `Reference "${cleanReference}" has already been submitted against deposit ${clash.id}. Each transaction reference can only be used once.`
-            };
-        }
-    }
-
-    const deposit = buildAdvanceDepositRow({
-        customerPhone, customerName, amount: numAmount,
-        paymentMethod, referenceId: cleanReference, status, actor
-    });
-    const resolvedStatus = deposit.status;
-
-    advances.push(deposit);
-    // Committed through the journalled path rather than a bare writeJSON so
-    // advances.json has exactly one writer mechanism: /api/sales already
-    // commits this same file inside a transaction when a sale redeems an
-    // advance, and two different write mechanisms on one ledger is the kind of
-    // parallel path that eventually loses a row.
-    if (!writeJSONTransaction([{ filepath: advancesFile, data: advances }])) {
-        return { success: false, error: 'Failed to persist advance deposit. Please retry.' };
-    }
-
-    logTelemetry('SAVE_ADVANCE_DEPOSIT', 0, `Amount: ${numAmount}, Method: ${deposit.paymentMethod}, Status: ${resolvedStatus}`);
-    // Only settled money fires the deposit hook — an extension sending a
-    // "deposit received" receipt must not fire on a claim awaiting approval.
-    if (resolvedStatus === ADVANCE_STATUS.APPROVED) fireHook('onAdvanceDeposit', deposit);
-    return { success: true, deposit };
-}
-
-/**
- * Moves a pending deposit to approved or rejected, in one read-modify-write so
- * a double-tapped Approve button cannot credit the same claim twice.
- *
- * `approver` is stamped onto the row and is the point of the whole pending
- * state: an unverified customer claim becomes spendable credit only when a named
- * person with an approving role says the transfer landed. Without a name on it,
- * "reconciled by a manager" was an aspiration rather than a record.
- *
- * @returns {{success: boolean, error?: string, status?: number, deposit?: object}}
- */
-function reviewPendingDeposit(depositId, decision, note, approver = SYSTEM_ACTOR) {
-    const advancesFile = path.join(DATA_DIR, 'advances.json');
-    const advances = readJSON(advancesFile, []);
-    const index = advances.findIndex(a => a.id === depositId && a.type === 'deposit');
-
-    if (index === -1) {
-        return { success: false, status: 404, error: 'No such deposit in the advances ledger.' };
-    }
-    const current = advances[index];
-    const currentStatus = normalizeAdvanceStatus(current);
-    if (currentStatus !== ADVANCE_STATUS.PENDING) {
-        return {
-            success: false,
-            status: 409,
-            error: `Deposit ${depositId} is already ${currentStatus} and cannot be reviewed again.`
-        };
-    }
-
-    const reviewed = {
-        ...current,
-        status: decision,
-        reviewedAt: Date.now(),
-        reviewNote: String(note || '').trim().slice(0, 300),
-        // Maps to advance_entries.approved_by_user_id, which the SQL schema
-        // guards with CHECK (status <> 'posted' OR approved_by_user_id IS NOT
-        // NULL) — no money claim may be posted anonymously.
-        reviewedBy: { id: approver.id, name: approver.name, role: approver.role }
-    };
-    advances[index] = reviewed;
-    if (!writeJSONTransaction([{ filepath: advancesFile, data: advances }])) {
-        return { success: false, status: 500, error: 'Failed to save the review. Please retry.' };
-    }
-
-    logTelemetry(
-        'REVIEW_ADVANCE_DEPOSIT', 0,
-        `Deposit: ${depositId}, Decision: ${decision}, Amount: ${reviewed.amount}, By: ${approver.name} (${approver.role})`
-    );
-    // The hook deliberately fires here, on approval, rather than at submission:
-    // this is the moment the credit becomes real for the customer.
-    if (decision === ADVANCE_STATUS.APPROVED) fireHook('onAdvanceDeposit', reviewed);
-    return { success: true, deposit: reviewed };
-}
 
 /**
  * GET /api/advances/lookup?phone=
@@ -2722,7 +1950,7 @@ app.get('/api/advances/lookup', requireAdminSession, (req, res) => {
         if (!isValidPhone(phone)) {
             return res.status(400).json({ error: 'Valid 10-digit phone number required' });
         }
-        res.json(computeAdvanceLedger(phone));
+        res.json(advanceService.customerLedger(phone));
     } catch (err) {
         logError('Error looking up customer advance balance: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to lookup customer balance' });
@@ -2742,14 +1970,20 @@ app.post('/api/advances', requireAdminSession, (req, res) => {
         // body so this route can never be used to inject a pending row — and
         // `actor` likewise, so the row names whoever's PIN opened this session
         // rather than whatever the payload claimed.
-        const result = recordAdvanceDeposit({
+        const result = advanceService.recordDeposit({
             ...(req.body || {}),
             status: ADVANCE_STATUS.APPROVED,
-            actor: req.actor
+            source: 'counter'
+        }, {
+            getActiveGoldRates,
+            isValidPhone,
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'counter',
+            ipAddress: req.ip
         });
         if (!result.success) {
-            const status = result.code === 'DUPLICATE_REFERENCE' ? 409
-                : result.error.startsWith('Failed to persist') ? 500 : 400;
+            const status = result.status
+                || (result.code === 'DUPLICATE_REFERENCE' ? 409 : 400);
             return res.status(status).json({ error: result.error, code: result.code });
         }
         res.json({ success: true, id: result.deposit.id, deposit: result.deposit });
@@ -2767,11 +2001,12 @@ app.post('/api/advances', requireAdminSession, (req, res) => {
  */
 app.get('/api/advances/pending', requireAdminSession, (req, res) => {
     try {
-        const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
-        const pending = advances
-            .filter(a => a.type === 'deposit' && normalizeAdvanceStatus(a) === ADVANCE_STATUS.PENDING)
-            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-        res.json(pending);
+        /* The bare array is the wire shape this route has always returned, and
+           the approval queue is bounded by how fast a counter reviews claims
+           rather than by how long the store has traded — so it stays a list
+           rather than growing a page envelope its one consumer would have to
+           be taught. The limit is a backstop, not a pager. */
+        res.json(advanceService.listPending({ limit: LEDGER_PAGE_MAX }).results);
     } catch (err) {
         logError('Error retrieving pending advance deposits: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve pending deposits' });
@@ -2791,10 +2026,20 @@ app.get('/api/advances/pending', requireAdminSession, (req, res) => {
  */
 app.post('/api/advances/:id/approve', requireAdminSession, requireApprover, (req, res) => {
     try {
-        const result = reviewPendingDeposit(
-            req.params.id, ADVANCE_STATUS.APPROVED, (req.body || {}).note, req.actor
+        const result = advanceService.reviewDeposit(
+            req.params.id, ADVANCE_STATUS.APPROVED, (req.body || {}).note,
+            {
+                actorUserId: resolveActorUserId(req.actor),
+                actorLabel: (req.actor && req.actor.name) || 'counter',
+                ipAddress: req.ip
+            }
         );
-        if (!result.success) return res.status(result.status).json({ error: result.error });
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        // Fired on APPROVAL rather than at submission: this is the moment the
+        // credit becomes real for the customer. Raised at the route because
+        // extensions are a delivery concern, not something the service layer
+        // should know about.
+        fireHook('onAdvanceDeposit', result.deposit);
         res.json({ success: true, deposit: result.deposit });
     } catch (err) {
         logError('Error approving advance deposit: ' + err.message, err.stack);
@@ -2818,8 +2063,12 @@ app.post('/api/advances/:id/reject', requireAdminSession, requireApprover, (req,
         if (!note) {
             return res.status(400).json({ error: 'A reason is required when rejecting a deposit claim.' });
         }
-        const result = reviewPendingDeposit(req.params.id, ADVANCE_STATUS.REJECTED, note, req.actor);
-        if (!result.success) return res.status(result.status).json({ error: result.error });
+        const result = advanceService.reviewDeposit(req.params.id, ADVANCE_STATUS.REJECTED, note, {
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'counter',
+            ipAddress: req.ip
+        });
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
         res.json({ success: true, deposit: result.deposit });
     } catch (err) {
         logError('Error rejecting advance deposit: ' + err.message, err.stack);
@@ -2930,107 +2179,18 @@ function fetchRazorpayPayment(paymentId, keyId, keySecret) {
    the amount from this file and ignores the body's entirely.
    -------------------------------------------------------------------------- */
 
-const PAYMENT_ORDERS_FILE = () => path.join(DATA_DIR, 'payment_orders.json');
+/* The order intent, and the record of what it was FOR, now live in the
+   payment_orders table behind services/paymentService.js. The JSON file this
+   replaced was pruned on every write to stay bounded; a table with an index
+   does not need pruning to stay fast, and an order that has been paid is
+   history worth keeping rather than a row to expire.
 
-// An order is a short-lived intent, not history worth keeping — the ledger is
-// the permanent record. Keeping the file bounded stops an abandoned-checkout
-// habit growing it without limit.
-const PAYMENT_ORDER_TTL_MS = 24 * 60 * 60 * 1000;
-const PAYMENT_ORDER_MAX_ROWS = 2000;
-
-/* Amounts on the wire to Razorpay are integer paise, never rupees. A rupee
-   float cannot represent every payable amount exactly (₹1234.35 is stored as
-   1234.3499999999999), so comparing "what the gateway captured" against "what
-   we recorded" in rupees means comparing two roundings and hoping they agree.
-   In paise both sides are integers and the comparison is exact — which is the
-   whole point of confirming capture at all. `amountPaise` is therefore the
-   authoritative field on an order; `amount` is kept alongside it, in rupees,
-   only so order rows written by earlier builds stay readable.
-
-   toPaise/fromPaise live in frontend/js/lib/billingMath.js with the rest of
-   this project's money arithmetic. */
-
-/** When a stored order lapses, tolerating rows written before `expiresAt`. */
-function paymentOrderExpiry(order) {
-    return Number.isFinite(order.expiresAt)
-        ? order.expiresAt
-        : (order.createdAt || 0) + PAYMENT_ORDER_TTL_MS;
-}
-
-/** The authoritative paise amount of a stored order, tolerating legacy rows. */
-function orderAmountPaise(order) {
-    return Number.isInteger(order.amountPaise) ? order.amountPaise : toPaise(order.amount);
-}
-
-/**
- * Records what an order was created for, so verification has a server-side
- * amount to trust instead of the client's claim.
- * @returns {boolean} false if the record could not be persisted
- */
-function recordPaymentOrder({ orderId, customerPhone, amountPaise, currency = 'INR' }) {
-    const file = PAYMENT_ORDERS_FILE();
-    const now = Date.now();
-    const orders = readJSON(file, [])
-        // Prune on write — an expired order intent has no further use, and this
-        // is the only moment the file is already open. Rows written before
-        // expiresAt existed fall back to their creation time plus the TTL.
-        .filter(o => o && o.orderId &&
-            paymentOrderExpiry(o) > now &&
-            o.orderId !== orderId)
-        .slice(-PAYMENT_ORDER_MAX_ROWS);
-
-    orders.push({
-        orderId,
-        customerPhone,
-        amountPaise,
-        // Rupee mirror, for legacy readers and for logging only. Never compared
-        // against a gateway figure — see the paise note above.
-        amount: fromPaise(amountPaise),
-        currency,
-        status: 'created',
-        createdAt: now,
-        // Stored explicitly rather than left implicit in the prune arithmetic,
-        // so the lifetime an order was actually issued under travels with the
-        // row — changing PAYMENT_ORDER_TTL_MS then cannot retroactively expire
-        // orders that were promised a longer life.
-        //
-        // Note what expiry deliberately does NOT do: it never refuses credit.
-        // An expired order whose payment the gateway confirms as captured is
-        // real money that really moved, and refusing it would strand the
-        // customer rather than protect anyone. Expiry bounds how long an
-        // *unpaid* intent is kept, nothing more; the capture confirmation in
-        // /api/payment/verify is what actually authorises a credit.
-        expiresAt: now + PAYMENT_ORDER_TTL_MS
-    });
-    return writeJSONTransaction([{ filepath: file, data: orders }]);
-}
-
-/** The stored order behind an order id, or null if we never created it. */
-function findPaymentOrder(orderId) {
-    return readJSON(PAYMENT_ORDERS_FILE(), [])
-        .find(o => o && o.orderId === orderId) || null;
-}
-
-/**
- * Moves an order to a terminal state, linking it to the payment and, when the
- * money was credited, to the ledger row it produced.
- */
-function settlePaymentOrder(orderId, status, { paymentId, depositId, note } = {}) {
-    const file = PAYMENT_ORDERS_FILE();
-    const orders = readJSON(file, []);
-    const index = orders.findIndex(o => o && o.orderId === orderId);
-    if (index === -1) return;
-    orders[index] = {
-        ...orders[index],
-        status,
-        ...(paymentId ? { paymentId } : {}),
-        ...(depositId ? { depositId } : {}),
-        ...(note ? { note } : {}),
-        settledAt: Date.now()
-    };
-    writeJSONTransaction([{ filepath: file, data: orders }]);
-}
-
+   Amounts crossing the wire to Razorpay are integer paise, never rupees. A
+   rupee float cannot represent every payable amount exactly (₹1234.35 is
+   stored as 1234.3499999999999), so comparing "what the gateway captured"
+   against "what we recorded" in rupees compares two roundings and hopes they
+   agree. In paise both sides are integers and the comparison is exact — which
+   is the entire point of confirming a capture. */
 /**
  * POST /api/payment/order
  * Initiates order with Razorpay. Returns orderId. Customer-session-gated: an
@@ -3078,7 +2238,7 @@ app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
             const mockOrderId = 'order_mock_' + crypto.randomBytes(6).toString('hex');
             // Mock orders are persisted too, so the demo path exercises the same
             // amount-binding the real one does instead of diverging from it.
-            if (!recordPaymentOrder({ orderId: mockOrderId, customerPhone: req.customerPhone, amountPaise, currency })) {
+            if (!paymentService.recordOrder({ providerOrderId: mockOrderId, customerPhone: req.customerPhone, amountPaise, currency, provider: 'mock' })) {
                 return res.status(500).json({ error: 'Could not start the payment. Please retry.' });
             }
             logTelemetry('PAYMENT_ORDER_MOCKED', 0, `Order: ${mockOrderId}, Paise: ${amountPaise}`);
@@ -3094,7 +2254,7 @@ app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
         // Recorded BEFORE the id reaches the browser: an order the customer can
         // pay but that we have no record of would be unverifiable, and the
         // customer would be out of pocket with nothing to show for it.
-        if (!recordPaymentOrder({ orderId: order.id, customerPhone: req.customerPhone, amountPaise, currency })) {
+        if (!paymentService.recordOrder({ providerOrderId: order.id, customerPhone: req.customerPhone, amountPaise, currency })) {
             logError(`Razorpay order ${order.id} was created at the gateway but could not be recorded locally — not returning it to the customer.`);
             return res.status(500).json({ error: 'Could not start the payment. Please retry.' });
         }
@@ -3127,75 +2287,13 @@ app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
    deduplication, the ledger row, settling the order — happens here once.
    -------------------------------------------------------------------------- */
 
-/**
- * @param {object} args
- * @param {object} args.order       the stored payment order this payment settles
- * @param {string} args.paymentId   the gateway's payment id (the idempotency key)
- * @param {number} args.capturedPaise what the gateway reports it actually took
- * @param {string} args.source      'checkout' or 'webhook', for the audit trail
- * @returns {{ok: boolean, duplicate?: boolean, deposit?: object, status?: number, error?: string}}
- */
-function creditCapturedPayment({ order, paymentId, capturedPaise, source }) {
-    const expectedPaise = orderAmountPaise(order);
-
-    // Exact integer comparison. A capture that does not match the order we
-    // created is never credited on a guess in either direction: crediting the
-    // larger figure would let a tampered checkout mint balance, and crediting
-    // the smaller would quietly short a customer who really did pay more.
-    if (!Number.isInteger(capturedPaise) || capturedPaise !== expectedPaise) {
-        logError(
-            `Razorpay payment ${paymentId} was captured for ${capturedPaise} paise but order ` +
-            `${order.orderId} was created for ${expectedPaise} paise. Refusing to credit; manual reconciliation required.`
-        );
-        logTelemetry('PAYMENT_AMOUNT_MISMATCH', 0, `Order: ${order.orderId}, captured: ${capturedPaise}, expected: ${expectedPaise}`);
-        settlePaymentOrder(order.orderId, 'mismatched', {
-            paymentId,
-            note: `captured ${capturedPaise} paise against an expected ${expectedPaise}`
-        });
-        return {
-            ok: false,
-            status: 409,
-            error: 'The captured amount does not match this payment order. Please contact the store with your payment ID: ' + paymentId
-        };
-    }
-
-    const account = findAccount(order.customerPhone);
-    const result = recordAdvanceDeposit({
-        customerPhone: order.customerPhone,
-        customerName: (account && account.name) || 'Regular Customer',
-        amount: fromPaise(expectedPaise),
-        paymentMethod: 'Razorpay',
-        // The gateway payment id doubles as the ledger's idempotency key — see
-        // the duplicate-reference guard inside recordAdvanceDeposit. That guard
-        // is what makes the checkout/webhook race safe rather than merely
-        // unlikely: whichever arrives second is rejected as a duplicate.
-        referenceId: paymentId,
-        status: ADVANCE_STATUS.APPROVED
-    });
-
-    if (!result.success) {
-        if (result.code === 'DUPLICATE_REFERENCE') {
-            const existing = readJSON(path.join(DATA_DIR, 'advances.json'), [])
-                .find(a => a.referenceId && String(a.referenceId).trim() === paymentId);
-            logTelemetry('PAYMENT_CREDIT_DUPLICATE', 0, `PayId: ${paymentId}, via: ${source}`);
-            return { ok: true, duplicate: true, deposit: existing || null };
-        }
-        // The money has already left the customer's account at this point, so
-        // this is a reconciliation incident, not a retryable error.
-        logError(`CRITICAL: Razorpay payment ${paymentId} was captured but the advance deposit failed to persist — customer ${order.customerPhone} paid but has no ledger credit. Manual reconciliation required.`);
-        return {
-            ok: false,
-            status: 500,
-            error: 'Payment captured but could not be recorded. Please contact support with your payment ID: ' + paymentId
-        };
-    }
-
-    // Settled last: the ledger row above is the entry that matters, and a
-    // failure to annotate the order must not fail a payment already credited.
-    settlePaymentOrder(order.orderId, 'paid', { paymentId, depositId: result.deposit.id, note: source });
-    logTelemetry('PAYMENT_CREDITED', 0, `Deposit: ${result.deposit.id}, PayId: ${paymentId}, via: ${source}`);
-    return { ok: true, deposit: result.deposit };
-}
+/*  Crediting a confirmed capture is services/paymentService.js's job now: the
+    amount check, the duplicate guard keyed on the gateway payment id, the
+    ledger credit and the order settlement all happen inside ONE transaction
+    there. In the JSON version the credit and the order settlement were two
+    separate writes, and a crash between them left a customer credited against
+    an order still reading 'created' — or, on the other ordering, an order
+    marked paid with no ledger row behind it. */
 
 /**
  * POST /api/payment/verify
@@ -3221,8 +2319,11 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
         // after PAYMENT_ORDER_TTL_MS, so a late replay of a payment that WAS
         // credited must still be answered with its ledger row rather than the
         // "order not recognised" error a pruned lookup would produce.
-        const alreadyRecorded = readJSON(path.join(DATA_DIR, 'advances.json'), [])
-            .find(a => a.referenceId && a.referenceId === razorpay_payment_id);
+        const alreadyRecorded = repo.advances.toLegacyAdvance(
+            repo.advances.findEntryByReference(
+                repo.dataStoreContext().tenantId, 'razorpay', razorpay_payment_id
+            )
+        );
         if (alreadyRecorded) {
             logTelemetry('PAYMENT_VERIFY_REPLAYED', 0, `PayId: ${razorpay_payment_id}`);
             return res.json({
@@ -3237,7 +2338,7 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
         // request body — see the payment order records block above for why the
         // signature cannot police this. req.body.amount is deliberately not
         // read here at all; the portal no longer sends it.
-        const storedOrder = findPaymentOrder(razorpay_order_id);
+        const storedOrder = paymentService.findOrder(razorpay_order_id);
         if (!storedOrder) {
             logTelemetry('PAYMENT_VERIFY_UNKNOWN_ORDER', 0, `Order: ${razorpay_order_id}`);
             return res.status(400).json({
@@ -3250,7 +2351,7 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
             logError(`Customer ${customerPhone} attempted to verify payment order ${razorpay_order_id}, which belongs to another customer.`);
             return res.status(403).json({ error: 'This payment order does not belong to your account.' });
         }
-        const expectedPaise = orderAmountPaise(storedOrder);
+        const expectedPaise = storedOrder.amountPaise;
         if (!Number.isSafeInteger(expectedPaise) || expectedPaise <= 0 || expectedPaise > MAX_SANE_AMOUNT * 100) {
             logError(`Payment order ${razorpay_order_id} carries an unusable stored amount (${storedOrder.amountPaise ?? storedOrder.amount}).`);
             return res.status(500).json({ error: 'This payment order is not in a verifiable state. Please contact the store.' });
@@ -3340,18 +2441,22 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
 
             if (gatewayStatus !== 'captured') {
                 logTelemetry('PAYMENT_NOT_CAPTURED', 0, `PayId: ${razorpay_payment_id}, status: ${gatewayStatus}`);
-                settlePaymentOrder(razorpay_order_id, 'failed', { paymentId: razorpay_payment_id, note: `gateway status ${gatewayStatus}` });
+                paymentService.settleOrder(razorpay_order_id, 'failed', { paymentId: razorpay_payment_id, note: `gateway status ${gatewayStatus}`, provider: storedOrder.provider });
                 return res.status(400).json({
                     error: `This payment was not completed (gateway status: ${gatewayStatus}). Nothing has been credited.`
                 });
             }
         }
 
-        const credit = creditCapturedPayment({
+        const credit = paymentService.creditCapturedPayment({
             order: storedOrder,
             paymentId: razorpay_payment_id,
             capturedPaise,
             source: 'checkout'
+        }, {
+            getActiveGoldRates,
+            isValidPhone,
+            findAccount
         });
         if (!credit.ok) {
             return res.status(credit.status || 500).json({ error: credit.error });
@@ -3396,29 +2501,11 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
        delivery was not authentic", nothing else.
    ========================================================================== */
 
-const PAYMENT_EVENTS_FILE = () => path.join(DATA_DIR, 'payment_events.json');
-const PAYMENT_EVENT_MAX_ROWS = 5000;
-
-/**
- * Records that a gateway event id has been seen, and reports whether it had
- * been seen already.
- *
- * Read-modify-write in one synchronous pass, like every other ledger writer
- * here — Node's run-to-completion semantics are what make that safe against
- * two concurrent retries of the same delivery (see the note in db.js).
- *
- * @returns {{alreadySeen: boolean, previous?: object}}
- */
-function claimPaymentEvent(eventId, eventType) {
-    const file = PAYMENT_EVENTS_FILE();
-    const events = readJSON(file, []);
-    const previous = events.find(e => e && e.eventId === eventId);
-    if (previous) return { alreadySeen: true, previous };
-
-    events.push({ eventId, eventType, receivedAt: Date.now() });
-    writeJSONTransaction([{ filepath: file, data: events.slice(-PAYMENT_EVENT_MAX_ROWS) }]);
-    return { alreadySeen: false };
-}
+/* The seen-event ledger lives in payment_events behind paymentService, where
+   the idempotency guarantee is a UNIQUE index on the gateway's own event id
+   rather than a read-modify-write that happened to be safe because Node runs
+   a request to completion. The table also holds the OUTCOME of each delivery,
+   so a redelivery can be answered with what was decided the first time. */
 
 /**
  * POST /api/payment/webhook
@@ -3472,7 +2559,7 @@ app.post('/api/payment/webhook', async (req, res) => {
             'sha-' + crypto.createHash('sha256').update(rawBody).digest('hex').slice(0, 32);
         const eventType = String(event.event || 'unknown');
 
-        const claim = claimPaymentEvent(eventId, eventType);
+        const claim = paymentService.claimWebhookEvent(eventId, eventType);
         if (claim.alreadySeen) {
             logTelemetry('WEBHOOK_REPLAYED', 0, `Event: ${eventId}, type: ${eventType}`);
             return res.json({ success: true, duplicate: true });
@@ -3485,7 +2572,7 @@ app.post('/api/payment/webhook', async (req, res) => {
         // non-2xx would have Razorpay redeliver them for hours.
         if (eventType !== 'payment.captured') {
             if (eventType === 'payment.failed' && entity && entity.order_id) {
-                settlePaymentOrder(entity.order_id, 'failed', {
+                paymentService.settleOrder(entity.order_id, 'failed', {
                     paymentId: entity.id,
                     note: (entity.error_description || 'payment.failed').slice(0, 200)
                 });
@@ -3499,7 +2586,7 @@ app.post('/api/payment/webhook', async (req, res) => {
             return res.json({ success: true, ignored: 'malformed-entity' });
         }
 
-        const storedOrder = findPaymentOrder(entity.order_id);
+        const storedOrder = paymentService.findOrder(entity.order_id);
         if (!storedOrder) {
             // Not necessarily an attack: an order older than the retention
             // window prunes away, and this store may share a Razorpay account
@@ -3509,11 +2596,15 @@ app.post('/api/payment/webhook', async (req, res) => {
             return res.json({ success: true, ignored: 'unknown-order' });
         }
 
-        const credit = creditCapturedPayment({
+        const credit = paymentService.creditCapturedPayment({
             order: storedOrder,
             paymentId: entity.id,
             capturedPaise: Number(entity.amount),
             source: 'webhook'
+        }, {
+            getActiveGoldRates,
+            isValidPhone,
+            findAccount
         });
 
         if (!credit.ok) {
@@ -3521,7 +2612,7 @@ app.post('/api/payment/webhook', async (req, res) => {
             // we failed to apply it, so we want Razorpay's retry. The event id
             // claim is released so that retry is not swallowed as a duplicate.
             if (credit.status === 500) {
-                releasePaymentEvent(eventId);
+                paymentService.releaseWebhookEvent(eventId);
                 return res.status(500).json({ error: 'Could not record the captured payment; please retry.' });
             }
             // An amount mismatch is a decision, not a failure — retrying it
@@ -3538,13 +2629,6 @@ app.post('/api/payment/webhook', async (req, res) => {
         res.status(500).json({ error: 'Webhook processing failed.' });
     }
 });
-
-/** Undoes a claimPaymentEvent, so a delivery we failed to apply can be retried. */
-function releasePaymentEvent(eventId) {
-    const file = PAYMENT_EVENTS_FILE();
-    const events = readJSON(file, []).filter(e => !e || e.eventId !== eventId);
-    writeJSONTransaction([{ filepath: file, data: events }]);
-}
 
 /* ==========================================================================
    API Routes: Backups & Business Summary Reports
@@ -3753,24 +2837,24 @@ app.get('/api/diagnostics/telemetry', requireAdminSession, (req, res) => {
 app.get('/api/diagnostics/export', requireAdminSession, (req, res) => {
     try {
         const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const advancesFile = path.join(DATA_DIR, 'advances.json');
+        const context = repo.dataStoreContext();
 
-        // Retrieve transaction sales files
-        const salesFiles = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('sales_') && f.endsWith('.json'));
-        const salesData = {};
-        salesFiles.forEach(f => {
-            salesData[f] = readJSON(path.join(DATA_DIR, f), []);
-        });
+        /* BOUNDED, and that is a change worth being explicit about. This bundle
+           used to read every sales_YYYY.json and returns_YYYY.json off disk and
+           encrypt the store's ENTIRE trading history into one payload — which
+           grew without limit, and on a store a few years in produced an export
+           too large to be usefully emailed to support. It is a diagnostic
+           sample, not an archive: `npm run seed`-scale recent history is what
+           actually explains a discrepancy, and a full extract is a backup
+           (backupEngine.js), which is a different job with different handling.
 
-        // Returns travel with the sales they reverse. A support bundle holding
-        // only the sales side shows a ledger that overstates what the store
-        // actually took, which is precisely the sort of discrepancy these
-        // exports get pulled to explain.
-        const returnsFiles = fs.readdirSync(DATA_DIR).filter(f => f.startsWith('returns_') && f.endsWith('.json'));
-        const returnsData = {};
-        returnsFiles.forEach(f => {
-            returnsData[f] = readJSON(path.join(DATA_DIR, f), []);
-        });
+           Returns travel with the sales they reverse. A bundle holding only the
+           sales side shows a ledger that overstates what the store took, which
+           is precisely the sort of discrepancy these exports get pulled to
+           explain. */
+        const EXPORT_SAMPLE_ROWS = 500;
+        const sales = saleService.listSales({ limit: EXPORT_SAMPLE_ROWS }).results;
+        const returns = returnService.listReturns({ limit: EXPORT_SAMPLE_ROWS }).results;
 
         // Pack sensitive databases together. Settings are masked even here:
         // diagnosing a tenant needs to know whether SMTP/Razorpay are
@@ -3780,9 +2864,17 @@ app.get('/api/diagnostics/export', requireAdminSession, (req, res) => {
         const bundle = {
             timestamp: Date.now(),
             settings: redactSettings(readJSON(settingsFile, {})),
-            advances: readJSON(advancesFile, []),
-            sales: salesData,
-            returns: returnsData
+            advances: advanceService.listLedger({ limit: EXPORT_SAMPLE_ROWS }).results,
+            sales,
+            returns,
+            // So a reader can tell a sampled bundle from a complete one rather
+            // than assuming the store only ever made this many sales.
+            sample: {
+                rowsPerLedger: EXPORT_SAMPLE_ROWS,
+                totalInvoices: repo.invoices.countInvoices(context.tenantId),
+                totalCreditNotes: repo.creditNotes.countCreditNotes(context.tenantId),
+                totalAdvanceEntries: repo.advances.countEntries(context.tenantId)
+            }
         };
 
         // Encrypt the bundle using asymmetric envelope
@@ -3838,6 +2930,70 @@ export function startServer(port = PORT, host = '127.0.0.1') {
     return server;
 }
 
+/**
+ * Migrates the schema, seeds the organisation, and carries a JSON-era tenant
+ * across on the first boot after the cutover.
+ *
+ * THE IMPORT RUNS ONCE AND ONLY INTO AN EMPTY LEDGER. `importLegacyJson()` is
+ * idempotent by construction — every row it writes carries an `import:` prefixed
+ * idempotency key and a second run is a no-op — but the guard is here as well,
+ * because "the database already has invoices" is the honest test for "this
+ * tenant has already been cut over" and it costs one COUNT.
+ *
+ * THE JSON FILES ARE NOT DELETED. They are the fallback if an operator has to
+ * roll back to the previous release, and `backupEngine` already carries them.
+ * Retiring them is a separate, deliberate step once a tenant has traded on SQL
+ * for a while — not something a boot should do to a live ledger unasked.
+ */
+function initialiseLedger() {
+    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const context = repo.initialiseDataStore({
+        name: settings.storeName,
+        gstNumber: settings.gstNumber,
+        address: settings.storeAddress,
+        phone: settings.storePhone
+    }, { log: message => console.log(`[DataStore] ${message}`) });
+
+    const existing = repo.invoices.countInvoices(context.tenantId);
+    if (existing > 0) return;
+
+    const legacy = collectLegacySource();
+    if (!legacy.hasAnything) return;
+
+    console.log('[DataStore] Legacy JSON ledger found and the database is empty — importing.');
+    const result = importLegacyJson({ log: message => console.log(`[Import] ${message}`) });
+    if (!result.ok) {
+        // Loud, and non-fatal. A tenant whose history will not import must not
+        // be locked out of trading today, but nobody may be allowed to believe
+        // the history came across when it did not.
+        logError('Legacy ledger import FAILED — the store is running on an empty database. '
+            + 'The JSON files are untouched. ' + (result.error || ''));
+        console.error(formatReport(result));
+        return;
+    }
+    logTelemetry('LEDGER_IMPORTED', 0,
+        `invoices: ${result.counts.invoices}, advances: ${result.counts.advanceEntries}`);
+    console.log(formatReport(result));
+}
+
+/** Whether this tenant has any legacy ledger JSON worth importing. */
+function collectLegacySource() {
+    try {
+        const source = collectSource(DATA_DIR);
+        return {
+            hasAnything: Boolean(
+                (source.sales && source.sales.length)
+                || (source.advances && source.advances.length)
+                || (source.returns && source.returns.length)
+            ),
+            source
+        };
+    } catch (err) {
+        logError('Could not read the legacy ledger to decide on an import: ' + err.message);
+        return { hasAnything: false, source: null };
+    }
+}
+
 function bootstrapServer() {
     /* Before the guard, because the guard asks "is the master PIN still the
        default?" and can only answer that against the canonical stored form. This
@@ -3845,6 +3001,10 @@ function bootstrapServer() {
        plaintext has them hashed and the plaintext deleted — once, on the first
        boot after the upgrade, with nobody having to retype anything. */
     migrateStoredPins();
+
+    // Then the ledger, because every route below reads and writes through it
+    // and a pending migration must be applied before the port is bound.
+    initialiseLedger();
 
     // Then, before any scheduler starts, any backup is written, or the port
     // is bound: refuse to run a production process that is configured to take

@@ -139,7 +139,7 @@ try {
                 financialYear: fy, sequenceValue,
                 customerId: null, customerName: 'Crash', customerPhone: '',
                 state: 'issued', rateSnapshotId: null, rateSource: 'auto',
-                metalValuePaise: 687500, makingChargePaise: 0, discountPaise: 0,
+                metalValuePaise: 687500, makingChargePaise: 0, discountBp: 0, discountPaise: 0,
                 taxableAmountPaise: 687500, taxAmountPaise: 20625,
                 appliedAdvancePaise: 0, totalAmountPaise: 708125,
                 taxPercentBp: 300, taxMode: 'Exclusive', idempotencyKey: null,
@@ -151,7 +151,7 @@ try {
             repo.invoices.insertLine({
                 id: 'ILN-CRASHTEST' + arg, invoiceId, lineNumber: 1,
                 description: '22K gold', purity: '22K', weightMg: 1000,
-                ratePaisePerG: 687500, metalValuePaise: 687500,
+                ratePaisePerG: 687500, rateSource: 'auto', metalValuePaise: 687500,
                 makingChargeBp: 0, makingChargePaise: 0, discountBp: 0, discountPaise: 0,
                 taxableAmountPaise: 687500, taxAmountPaise: 20625, lineTotalPaise: 708125
             });

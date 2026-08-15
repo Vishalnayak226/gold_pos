@@ -100,21 +100,21 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-company-name">Company Name</label>
-                    <input type="text" id="set-company-name" class="form-control" value="${s.companyName || ''}">
+                    <input type="text" id="set-company-name" class="form-control" value="${escapeHtmlAttr(s.companyName || '')}">
                 </div>
                 <div class="form-group">
                     <label for="set-phone">Phone</label>
-                    <input type="text" id="set-phone" class="form-control" value="${s.phone || ''}">
+                    <input type="text" id="set-phone" class="form-control" value="${escapeHtmlAttr(s.phone || '')}">
                 </div>
             </div>
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-address">Address</label>
-                    <input type="text" id="set-address" class="form-control" value="${s.address || ''}">
+                    <input type="text" id="set-address" class="form-control" value="${escapeHtmlAttr(s.address || '')}">
                 </div>
                 <div class="form-group">
                     <label for="set-gst">GST Number</label>
-                    <input type="text" id="set-gst" class="form-control" value="${s.gstNumber || ''}">
+                    <input type="text" id="set-gst" class="form-control" value="${escapeHtmlAttr(s.gstNumber || '')}">
                 </div>
             </div>
             <div class="form-group" style="max-width:150px;">
@@ -215,17 +215,17 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="price-override-24k">24K Price / g</label>
-                    <input type="number" id="price-override-24k" class="form-control" value="${override.price24K || ''}">
+                    <input type="number" id="price-override-24k" class="form-control" value="${Number(override.price24K) || ''}">
                     <span id="raw-internet-24k" class="text-muted-small"></span>
                 </div>
                 <div class="form-group">
                     <label for="price-override-22k">22K Price / g</label>
-                    <input type="number" id="price-override-22k" class="form-control" value="${override.price22K || ''}">
+                    <input type="number" id="price-override-22k" class="form-control" value="${Number(override.price22K) || ''}">
                     <span id="raw-internet-22k" class="text-muted-small"></span>
                 </div>
                 <div class="form-group">
                     <label for="price-override-18k">18K Price / g</label>
-                    <input type="number" id="price-override-18k" class="form-control" value="${override.price18K || ''}">
+                    <input type="number" id="price-override-18k" class="form-control" value="${Number(override.price18K) || ''}">
                     <span id="raw-internet-18k" class="text-muted-small"></span>
                 </div>
             </div>
@@ -317,7 +317,7 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-default-discount">Default Discount (%)</label>
-                    <input type="number" id="set-default-discount" class="form-control" value="${s.defaultDiscountPercent ?? 0}" step="1" min="0" max="99">
+                    <input type="number" id="set-default-discount" class="form-control" value="${Number(s.defaultDiscountPercent) || 0}" step="1" min="0" max="99">
                 </div>
                 <div class="form-group">
                     <label for="set-admin-pin">Admin PIN</label>
@@ -328,11 +328,11 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-invoice-prefix">Invoice Prefix</label>
-                    <input type="text" id="set-invoice-prefix" class="form-control" value="${s.invoicePrefix || 'GOLD'}">
+                    <input type="text" id="set-invoice-prefix" class="form-control" value="${escapeHtmlAttr(s.invoicePrefix || 'GOLD')}">
                 </div>
                 <div class="form-group">
                     <label for="set-invoice-seq">Next Invoice Sequence Number</label>
-                    <input type="number" id="set-invoice-seq" class="form-control" value="${s.invoiceSeqStart ?? 1}" min="1">
+                    <input type="number" id="set-invoice-seq" class="form-control" value="${Number(s.invoiceSeqStart) || 1}" min="1">
                     <span class="text-muted-small">Lowering this is a destructive action and requires confirmation — it can create duplicate invoice numbers.</span>
                 </div>
             </div>
@@ -394,7 +394,7 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-rzp-key">Key ID</label>
-                    <input type="text" id="set-rzp-key" class="form-control" value="${s.razorpayKeyId || ''}">
+                    <input type="text" id="set-rzp-key" class="form-control" value="${escapeHtmlAttr(s.razorpayKeyId || '')}">
                 </div>
                 <div class="form-group">
                     <label for="set-rzp-secret">Key Secret</label>
@@ -411,7 +411,7 @@ export class SettingsManager {
                 </div>
                 <div class="form-group">
                     <label for="set-public-url">Public URL</label>
-                    <input type="text" id="set-public-url" class="form-control" value="${s.publicUrl || ''}" placeholder="https://pos.yourstore.com">
+                    <input type="text" id="set-public-url" class="form-control" value="${escapeHtmlAttr(s.publicUrl || '')}" placeholder="https://pos.yourstore.com">
                 </div>
             </div>
             <p class="text-muted-small">
@@ -430,7 +430,7 @@ export class SettingsManager {
             <h3 class="settings-section-title" style="margin-top:24px;">Manual UPI Fallback</h3>
             <div class="form-group" style="max-width:300px;">
                 <label for="set-upi-id">UPI ID (VPA)</label>
-                <input type="text" id="set-upi-id" class="form-control" value="${s.upiId || ''}" placeholder="yourstore@upi">
+                <input type="text" id="set-upi-id" class="form-control" value="${escapeHtmlAttr(s.upiId || '')}" placeholder="yourstore@upi">
             </div>
             <p class="text-muted-small">Used to build the real <code>upi://pay</code> QR code shown to customers when Razorpay isn't used.</p>
 
@@ -490,7 +490,7 @@ export class SettingsManager {
             <h3 class="settings-section-title">Report Recipient</h3>
             <div class="form-group" style="max-width:320px;">
                 <label for="set-report-email">Report Email Address</label>
-                <input type="email" id="set-report-email" class="form-control" value="${s.reportEmail || ''}">
+                <input type="email" id="set-report-email" class="form-control" value="${escapeHtmlAttr(s.reportEmail || '')}">
             </div>
 
             <h3 class="settings-section-title" style="margin-top:24px;">SMTP Configuration</h3>
@@ -498,11 +498,11 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-smtp-host">SMTP Host</label>
-                    <input type="text" id="set-smtp-host" class="form-control" value="${smtp.host || ''}" placeholder="smtp.example.com">
+                    <input type="text" id="set-smtp-host" class="form-control" value="${escapeHtmlAttr(smtp.host || '')}" placeholder="smtp.example.com">
                 </div>
                 <div class="form-group">
                     <label for="set-smtp-port">Port</label>
-                    <input type="number" id="set-smtp-port" class="form-control" value="${smtp.port || 587}">
+                    <input type="number" id="set-smtp-port" class="form-control" value="${Number(smtp.port) || 587}">
                 </div>
                 <div class="form-group">
                     <label style="display:flex; align-items:center; gap:8px; margin-top:22px;">
@@ -513,7 +513,7 @@ export class SettingsManager {
             <div class="form-group-row">
                 <div class="form-group">
                     <label for="set-smtp-user">SMTP Username</label>
-                    <input type="text" id="set-smtp-user" class="form-control" value="${smtp.user || ''}">
+                    <input type="text" id="set-smtp-user" class="form-control" value="${escapeHtmlAttr(smtp.user || '')}">
                 </div>
                 <div class="form-group">
                     <label for="set-smtp-pass">SMTP Password</label>
@@ -521,7 +521,7 @@ export class SettingsManager {
                 </div>
                 <div class="form-group">
                     <label for="set-smtp-fromname">"From" Display Name</label>
-                    <input type="text" id="set-smtp-fromname" class="form-control" value="${smtp.fromName || ''}">
+                    <input type="text" id="set-smtp-fromname" class="form-control" value="${escapeHtmlAttr(smtp.fromName || '')}">
                 </div>
             </div>
             <p class="text-muted-small">A saved SMTP Password is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>

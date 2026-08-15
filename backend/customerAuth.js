@@ -26,10 +26,10 @@
  */
 
 import crypto from 'crypto';
-import path from 'path';
-import { readJSON, writeJSON, DATA_DIR, logError, logTelemetry } from './db.js';
+import { logError, logTelemetry } from './db.js';
+import * as repo from './repositories/index.js';
 
-const AUTH_FILE = path.join(DATA_DIR, 'customer_auth.json');
+
 
 // 30 days: long enough that a customer checking a passbook once a month is
 // not re-authenticating every visit, short enough to bound a stolen token.
@@ -66,13 +66,29 @@ const RESET_TOKEN_TTL_MS = 30 * 60 * 1000; // 30 minutes
    Storage
    ========================================================================== */
 
+/* THE ONE PAIR EVERY ACCOUNT OPERATION IN THIS FILE GOES THROUGH.
+ *
+ * Twenty-odd call sites below read the whole account set, change one thing in
+ * it, and write it back. That shape came from `customer_auth.json` being a
+ * single document, and it is exactly why the cutover is two functions rather
+ * than twenty: the repository speaks the same legacy account shape — including
+ * `sessions[]` — so everything above this line is unchanged.
+ *
+ * What DID change is the guarantee underneath. `writeJSON` rewrote the entire
+ * file on every session issue and every failed-login counter bump;
+ * `saveAccounts` upserts inside one transaction. The all-or-nothing property
+ * the callers rely on is the same, without the rewrite-the-world cost being
+ * load-bearing.
+ */
 function readAccounts() {
-    const accounts = readJSON(AUTH_FILE, []);
+    const context = repo.dataStoreContext();
+    const accounts = repo.customers.loadAccounts(context.tenantId);
     return Array.isArray(accounts) ? accounts : [];
 }
 
 function writeAccounts(accounts) {
-    return writeJSON(AUTH_FILE, accounts);
+    const context = repo.dataStoreContext();
+    return repo.customers.saveAccounts(context.tenantId, accounts);
 }
 
 /** Phone masked for logs — telemetry should never carry a full number. */
@@ -593,5 +609,4 @@ export function requireEstablishedCustomer(req, res, next) {
     });
 }
 
-export const CUSTOMER_AUTH_FILE = AUTH_FILE;
 export const CUSTOMER_PASSWORD_MIN_LENGTH = MIN_PASSWORD_LENGTH;

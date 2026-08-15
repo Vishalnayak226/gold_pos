@@ -27,7 +27,7 @@ import {
     dataStoreContext, businessDate, financialYear, documentNumber
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
-import { computeReturnRefund, round2, toPaise } from '../../frontend/js/lib/billingMath.js';
+import { computeReturnRefund, round2, round3, toPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
 
 export const REFUND_MODES = ['cash', 'gold'];
@@ -44,9 +44,16 @@ export const CREDIT_NOTE_PREFIX = 'CN';
  * @param {'cash'|'gold'} input.refundMode
  * @param {string} [input.note]
  * @param {string} [input.idempotencyKey]
+ * @param {number} [input.lineNumber] which item is coming back; required when the
+ *        invoice has more than one, refused rather than guessed
  * @param {object} deps
  * @param {() => object} deps.getActiveGoldRates
  * @param {(phone: string) => boolean} deps.isValidPhone
+ * @param {(refundAmount: number) => ({ok: true}|{ok: false, status?: number, error: string, message?: string})}
+ *        [deps.authorizeRefund] the store's approval threshold, applied to the
+ *        SERVER's priced refund rather than to any figure the client proposed.
+ *        Called inside the transaction, so a refusal unwinds rather than
+ *        leaving a credit note behind.
  * @returns {{ok: true, returnId: string, return: object, advanceCredit: object|null,
  *            remainingWeightGrams: number, duplicate?: boolean}
  *         |{ok: false, status: number, error: string}}
@@ -100,16 +107,69 @@ export function createReturn(input, deps) {
             const sale = invoices.toLegacySale(header, lines);
             const prior = creditNotes.summarizeForInvoice(header.id);
 
+            /* WHICH ITEM IS COMING BACK. On a one-line invoice the caller need
+               not say, and every invoice filed before multi-line is one line.
+               On a multi-line invoice they must: computeReturnRefund() refuses
+               to guess, because pricing a 22K return at an 18K line's rate
+               would refund the wrong money — and it would do so quietly. */
+            const requestedLine = input.lineNumber === undefined || input.lineNumber === null
+                ? null
+                : Number(input.lineNumber);
+            let originalLine;
+            if (requestedLine === null) {
+                if (lines.length > 1) {
+                    throw new DomainRefusal(400,
+                        'This invoice has several items on it. Choose which line is being returned.');
+                }
+                originalLine = lines[0];
+            } else {
+                originalLine = lines.find(row => row.line_number === requestedLine);
+                if (!originalLine) {
+                    throw new DomainRefusal(400, `This invoice has no line ${input.lineNumber}.`);
+                }
+            }
+            if (!originalLine) {
+                throw new DomainRefusal(422,
+                    `Invoice ${invoiceNumber} has no lines to return against; it cannot be refunded automatically.`);
+            }
+
+            /* Measured against THIS LINE's history, not the invoice's. The
+               running counter lives on the line precisely so returning the
+               chain does not consume the bangles' returnable weight — an
+               invoice-wide figure would let a second line be over-returned
+               while the CHECK on the first one still passed. */
             const refund = computeReturnRefund({
                 sale,
                 returnWeightGrams: weightGrams,
-                alreadyReturnedGrams: prior.returnedWeightGrams,
+                lineNumber: originalLine.line_number,
+                alreadyReturnedGrams: (originalLine.returned_weight_mg || 0) / 1000,
+                invoiceRemainingGrams: round3(
+                    lines.reduce((total, row) => total + (row.weight_mg - (row.returned_weight_mg || 0)), 0) / 1000
+                ),
                 alreadyRefundedAmount: prior.refundedAmount
             });
             if (!refund.ok) throw new DomainRefusal(400, refund.error);
             if (!(refund.refundAmount > 0)) {
                 throw new DomainRefusal(400,
                     'This return prices to a zero refund, so there is nothing to pay back. Check the weight entered.');
+            }
+
+            /* APPROVAL THRESHOLD. A refund is the one counter action that takes
+               money out of the till on the cashier's own say-so, and it is the
+               obvious insider-fraud gap once roles exist.
+
+               Applied HERE, after the server has priced the refund, because the
+               amount that matters is the one about to be filed — not one the
+               client proposed. Thrown rather than returned so a refusal unwinds
+               the credit-note number that was just allocated. */
+            if (deps.authorizeRefund) {
+                const permitted = deps.authorizeRefund(refund.refundAmount);
+                if (!permitted.ok) {
+                    throw new DomainRefusal(
+                        permitted.status || 403, permitted.error, permitted.code || undefined,
+                        permitted.message
+                    );
+                }
             }
 
             const now = Date.now();
@@ -146,12 +206,6 @@ export function createReturn(input, deps) {
                 issuedAt: now,
                 businessDate: businessDate(now)
             });
-
-            const originalLine = lines[0];
-            if (!originalLine) {
-                throw new DomainRefusal(422,
-                    `Invoice ${invoiceNumber} has no lines to return against; it cannot be refunded automatically.`);
-            }
 
             creditNotes.insertCreditNoteLine({
                 id: newId('CLN'),
@@ -247,21 +301,41 @@ export function createReturn(input, deps) {
             });
 
             const stored = creditNotes.findById(creditNoteId);
+            /* Re-read the lines AFTER applyReturnToLine. `lines` above was
+               fetched to price the refund and still carries the pre-return
+               counters, so projecting from it would report `closesLine: false`
+               on the very return that just closed the line — the desk would
+               then offer another return against an item with nothing left. */
+            const linesAfter = invoices.linesFor(header.id);
             return {
                 ok: true,
                 returnId: creditNoteNumber,
                 return: creditNotes.toLegacyReturn(stored, {
                     invoice: invoices.findById(header.id),
-                    invoiceLines: lines,
+                    invoiceLines: linesAfter,
                     advanceEntry: creditEntry
                 }),
                 advanceCredit: creditEntry ? advances.toLegacyAdvance(creditEntry) : null,
-                remainingWeightGrams: refund.remainingWeightAfter
+                // What is left on the LINE just returned against…
+                remainingWeightGrams: refund.remainingWeightAfter,
+                /* …and on the invoice as a whole. Read back from the lines
+                   AFTER `applyReturnToLine` has run, so it reflects what was
+                   actually committed rather than a figure computed alongside
+                   it — which is the difference between the desk offering a
+                   further return that will be refused and one that will not. */
+                invoiceRemainingWeightGrams: round3(
+                    linesAfter.reduce((total, row) => total + (row.weight_mg - (row.returned_weight_mg || 0)), 0) / 1000
+                )
             };
         });
     } catch (err) {
         if (err instanceof DomainRefusal) {
-            return { ok: false, status: err.status, error: err.message };
+            return {
+                ok: false, status: err.status, error: err.message,
+                // Present only on a coded refusal (the approval threshold), where
+                // the desk shows the prose and branches on the code.
+                ...(err.detail ? { message: err.detail } : {})
+            };
         }
         if (input.idempotencyKey && isUniqueViolation(err)) {
             const existing = creditNotes.findByIdempotencyKey(context.tenantId, input.idempotencyKey);

@@ -12,13 +12,39 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `82d8b3e` — "Add SQLite repository seam, MFA/session security, and multi-line
-  invoices" (2026-08-13), on branch **`phase-21-payment-verification-and-production-guard`**.
-- **The working tree is CLEAN as of 2026-08-13.** Phases 24, 25, 26 and 27 — which this section
-  previously described as four separate uncommitted units — are all in `82d8b3e`. They went in as
-  one commit because their `CLAUDE.md`, `backend/package.json` and `docs/` changes interleaved and
-  could not be split at file granularity. `npm test` was green across all eight suites (403 checks)
-  immediately before the commit.
+- **Latest commit:** `25127e1` — "docs: correct stale \"desk captures no tender\" note"
+  (2026-08-13), on branch **`phase-21-payment-verification-and-production-guard`**.
+- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-15 — Phases 28 AND 29 are UNCOMMITTED.**
+  Phase 29 is the route cut-over (see `docs/LEDGER.md`); Phase 28 was the adversarial
+  "try to break it" pass that preceded it. Nothing is staged.
+  - **Phase 29 (2026-08-15) — the ledger is SQLite now.** `server.js` reaches persistence only
+    through `repositories/` and `services/`; every ledger `readJSON`/`writeJSON` call site is
+    gone, and so are the ~500 lines of read-modify-write around them. `settings.json` and
+    `license.json` stay JSON on purpose (§0). Also touched: `db.js` (ledger seeds retired),
+    `customerAuth.js` (two storage functions), `importLegacyJson.js` (multi-line + tenders),
+    migration `004`, and five repositories/two services for the multi-line widening.
+  - **Phase 28 (2026-08-13)** — six files, all reviewed:
+  - `backend/defaultSettings.js` — new `SETTINGS_FIELD_RULES` + `validateSettingsPatch()`;
+    `SUPPORTED_GOLD_PROVIDERS` moved above them (it is referenced at module-evaluation time).
+  - `backend/server.js` — calls the validator at the top of `POST /api/settings` and merges its
+    canonicalised values; invoice-prefix/sequence and GST-slab reads in `POST /api/sales` now
+    coerce and repair a poisoned settings.json instead of propagating it.
+  - `frontend/js/lib/billingMath.js` — advance and per-line values floored at zero.
+  - `frontend/js/components/SettingsManager.js` — 18 unescaped/uncoerced form fields fixed.
+  - `backend/test_billing_math.js` (+5 checks), `backend/test_http.js` (+7 checks).
+  - Plus `CLAUDE.md` §0/§8 and `docs/LEDGER.md`.
+- **`npm test` is green across all eight suites — 426 checks, exit 0** (145 + 43 + 82 + 16 + 9 +
+  28 + 87 + 16). Verified 2026-08-15 after the cut-over. **Playwright has NOT been re-run since
+  Phase 29** — it needs an installed browser binary; the 43 journeys were last green on 2026-08-12.
+- **What the hardening pass established, and what it did NOT find.** The transactional core held
+  under every attack: concurrent sales produced unique invoice numbers with no lost writes,
+  concurrent returns refunded exactly once, concurrent advance redemption double-spent nothing,
+  no prototype pollution, no path traversal, no IDOR or privilege escalation across the
+  customer/admin/cashier boundaries, payment and webhook signatures fail closed. **Every defect
+  found was above that core** — in settings type-handling, in the money module's tolerance of
+  negative inputs, and in Settings-screen escaping. Treat the concurrency and auth boundaries as
+  genuinely covered; do not re-derive them.
+- **Phases 24–27 are in `82d8b3e`.** `npm test` was green (403 checks) immediately before it.
   - **Phase 24** — ADR-001 plus the transactional-schema foundation: `docs/adr/`,
     `backend/repositories/{connection,migrate}.js`, `migrations/001_initial_schema.sql`,
     `backend/test_schema.js`. Node floor moved to 24.
@@ -29,14 +55,22 @@ This document contains key architectural details, non-negotiable design guidelin
     `test_repositories.js`, `test_concurrency.js`.
   - **Phase 27** — scrypt-hashed PINs, TOTP enrolment with recovery codes, session revocation,
     secret masking on `GET /api/settings` and the support export.
-- **⚠️ THE NEXT UNIT OF WORK IS THE ROUTE CUT-OVER, and it is the one thing still outstanding
-  from the above.** `server.js` imports nothing from `repositories/` or `services/`, so the whole
-  SQLite seam is tested but dormant: every route still reads and writes `backend/data/*.json`.
-  Phase 25 extended the **JSON** sale and return paths; Phase 26 built the **SQLite** service layer
-  that replaces them and deliberately stopped short of `server.js` so the two would not collide
-  mid-write. Phase 25 was built to the SQL schema's own vocabulary, so the mapping is one-for-one
-  rather than a redesign: `actor` → `invoices.created_by_user_id`, `reviewedBy` →
-  `advance_entries.approved_by_user_id`, `lines[]` → `invoice_lines`, `tenders[]` → `tenders`.
+- **✅ THE ROUTE CUT-OVER IS DONE (Phase 29, 2026-08-15).** The seam is live, not dormant.
+  **It was not the one-for-one mapping this section used to predict**, and the difference is worth
+  knowing before trusting any similar estimate: Phase 26 built the repositories when an invoice
+  held one gold item, while Phase 25 had already taught the Billing Desk to file multi-line carts.
+  So the seam was *behind* the routes on the invoice path — `toLegacySale()` flattened to
+  `lines[0]` and emitted no `lines[]`/`tenders[]`/`actor`, `createSale()` took one item,
+  `returnService` refunded against `lines[0]`, and the importer rejected a MIXED invoice outright.
+  Widening it was a prerequisite, and it is most of what Phase 29 actually was. Advances, payments
+  and customer accounts *were* one-for-one, as predicted.
+  - **A security bug the cut-over would have introduced, caught before it landed.** Operators live
+    in `settings.json` while the ledger's accountability columns are foreign keys into `users`,
+    which held two bootstrap rows. The services default `actorUserId` to the owner, and
+    `advanceService` gates posting on `users.isApprover()` — where `owner` passes. Every cashier
+    would have passed the approver check that exists to stop a cashier releasing money to
+    themselves. Closed by `users.ensureActorUser()`, which maps the session's actor onto a real
+    `users` row and keeps role/active state in step with the roster.
   - **Per-line sums equal the header** — asserted in `test_concurrency.js` ("every concurrently
     written invoice is complete, with its line") and structurally in `saleService`, which derives
     both from one `computeInvoiceTotals()` call.
@@ -48,18 +82,28 @@ This document contains key architectural details, non-negotiable design guidelin
     has none and must stay readable — an absent tender means unknown, not zero, and a speculative
     "cash" row for the balance would record a fact about how the customer paid that nobody
     established. Covered by `test_http.js` §"Tenders".
-  - **Beyond the routes themselves**, the cut-over also needs `customerAuth.js`'s
-    `readAccounts`/`writeAccounts` pair (a two-function change — `customerRepository.loadAccounts`
-    / `saveAccounts` already speak the exact legacy account shape), plus retiring the ledger seeds
-    in `db.js#initDatabaseFiles`.
+  - **`customerAuth.js` moved on its two storage functions alone**, exactly as predicted —
+    `customerRepository.loadAccounts`/`saveAccounts` already spoke the legacy account shape, so
+    the twenty-odd call sites above them are untouched. The ledger seeds in
+    `db.js#initDatabaseFiles` are retired: `readJSON(file, default)` WRITES its default, so
+    leaving them would recreate empty ledger files on every boot that look like an intact ledger
+    and would be imported as one.
+  - **First boot after this migrates a tenant automatically.** `initialiseLedger()` in
+    `server.js` runs migrations, seeds the organisation, and — only when the database is empty
+    and legacy JSON exists — runs `importLegacyJson` once, loudly, taking a checkpointed backup
+    first. **The JSON files are left exactly where they are**, as the rollback path. Verified
+    against a copy of this tenant's own `backend/data`: 4 invoices, 4 advance entries, 1 payment
+    order, reconciled `ok` on all nine measures. **This repo's own `backend/data/` has NOT been
+    cut over** — it still holds only JSON, and will migrate on the next `Restart_Server.bat`.
 - **Two owner decisions were taken on 2026-08-11 and are now binding:** ADR-001 accepted as the
   **SQLite bridge** (not PostgreSQL — `docs/adr/ADR-001-transactional-datastore.md` has the
   argument and the four revisit triggers), and the manual-UPI approver is a **distinct named
   role**, with the identity slice pulled forward into Phase 1. Also: **there is no SKU concept** —
   roadmap §4's whole Catalogue domain is struck.
-- **The data store is mid-migration.** The SQLite schema and migration runner exist and are
-  tested, but **no route has been cut over yet** — `server.js` still reads and writes
-  `backend/data/*.json` for every domain. Do not add a new JSON ledger document or a new
+- **The data store migration is COMPLETE for every ledger domain.** Invoices, lines, tenders,
+  credit notes, advances, payment orders/events and customer accounts are all SQL. What remains
+  JSON is configuration only — `settings.json`, `license.json`, `rates.json` — and stays that
+  way by design. Do not add a new JSON ledger document or a new
   `readJSON`/`writeJSON` caller; see CLAUDE.md §0. `settings.json` and `license.json` are
   configuration, not ledger, and stay JSON deliberately.
 - **Node floor is now 24**, not 20 — `node:sqlite` is only stable and flag-free from 24.

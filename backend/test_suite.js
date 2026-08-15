@@ -359,10 +359,15 @@ async function testPasswordResetLifecycle() {
 
         // --- An expired code is refused ---
         const third = issueResetToken(phone);
-        const accountsFile = path.join(dataDir, 'customer_auth.json');
-        const accounts = JSON.parse(fs.readFileSync(accountsFile, 'utf8'));
+        /* Age the code past its window. Accounts live in the `customers` table
+           now rather than in customer_auth.json, but the seam speaks the same
+           legacy account shape — so this reaches in the same way it always did,
+           through `loadAccounts`/`saveAccounts` instead of through the file. */
+        const repo = await import('./repositories/index.js');
+        const tenantId = repo.dataStoreContext().tenantId;
+        const accounts = repo.customers.loadAccounts(tenantId);
         accounts.find(a => a.phone === phone).resetExpires = Date.now() - 1000;
-        fs.writeFileSync(accountsFile, JSON.stringify(accounts, null, 2));
+        repo.customers.saveAccounts(tenantId, accounts);
         const expired = consumeResetToken(phone, third.code, 'TooLate!5');
         assert.strictEqual(expired.success, false, 'An expired code must be refused.');
         assert.ok(/expired/i.test(expired.error), 'And must say so, so the customer requests another.');
@@ -530,5 +535,19 @@ try {
     // failing run.
     process.exitCode = 1;
 } finally {
-    fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+    /* CLOSE THE DATABASE BEFORE REMOVING ITS DIRECTORY. Windows refuses to
+       unlink a file that still has an open handle, so an unclosed connection
+       turns teardown into an EPERM — thrown from this `finally`, which MASKS
+       whatever real failure sent us here. */
+    try {
+        const repo = await import('./repositories/index.js');
+        repo.closeDb();
+    } catch (_) {
+        // The suite may have failed before the store was ever opened.
+    }
+    try {
+        fs.rmSync(TEST_ROOT, { recursive: true, force: true });
+    } catch (err) {
+        console.warn(`[cleanup] could not remove ${TEST_ROOT}: ${err.message}`);
+    }
 }

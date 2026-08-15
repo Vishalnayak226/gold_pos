@@ -20,6 +20,7 @@
 import { getDb, inTransactionNow } from './connection.js';
 import { newId } from '../db.js';
 import { fromPaise, toPaise, ADVANCE_STATUS } from '../../frontend/js/lib/billingMath.js';
+import { actorForUserId, actorsByUserId } from './userRepository.js';
 
 /* --------------------------------------------------------------------------
    Vocabulary translation
@@ -315,14 +316,9 @@ export function historyForPhone({ tenantId, customerPhone, limit = 50, offset = 
  * A page of the whole ledger, newest first, optionally narrowed by status.
  * @returns {{rows: object[], total: number}}
  */
-export function search({ tenantId, status = null, entryType = null, limit = 50, offset = 0 }) {
-    // Filters only — see the note in invoiceRepository.search().
-    const where = ['tenant_id = @tenantId'];
-    const params = { tenantId };
-    if (status) { where.push('status = @status'); params.status = status; }
-    if (entryType) { where.push('entry_type = @entryType'); params.entryType = entryType; }
-
-    const whereSql = where.join(' AND ');
+export function search({ tenantId, status = null, entryType = null,
+                         fromAt = null, toAt = null, limit = 50, offset = 0 }) {
+    const { whereSql, params } = buildEntryFilter({ tenantId, status, entryType, fromAt, toAt });
     const db = getDb();
     const total = db.prepare(`SELECT COUNT(*) AS n FROM advance_entries WHERE ${whereSql}`).get(params).n;
     const rows = db.prepare(`
@@ -349,6 +345,151 @@ export function listPending({ tenantId, limit = 50, offset = 0 }) {
     `).all(tenantId, clampLimit(limit), Math.max(0, Math.trunc(offset) || 0));
 
     return { rows, total };
+}
+
+/**
+ * The WHERE clause shared by `search()` and `periodTotals()`, so a page and the
+ * figures printed above it always describe the same rows.
+ */
+function buildEntryFilter({ tenantId, status = null, entryType = null, fromAt = null, toAt = null }) {
+    const where = ['tenant_id = @tenantId'];
+    const params = { tenantId };
+    if (status) { where.push('status = @status'); params.status = status; }
+    if (entryType) { where.push('entry_type = @entryType'); params.entryType = entryType; }
+    if (fromAt !== null && fromAt !== undefined) { where.push('created_at >= @fromAt'); params.fromAt = fromAt; }
+    if (toAt !== null && toAt !== undefined) { where.push('created_at <= @toAt'); params.toAt = toAt; }
+    return { whereSql: where.join(' AND '), params };
+}
+
+/**
+ * Deposited and redeemed value across a filtered period.
+ *
+ * Both figures are reported as POSITIVE amounts, which is what the ledger
+ * screen shows — `amount_paise` is signed (a redemption is negative, so that
+ * balances are a plain SUM), and surfacing that sign here would print the day's
+ * redemptions as a negative number under a heading that says "Redeemed".
+ */
+export function periodTotals({ tenantId, status = null, entryType = null, fromAt = null, toAt = null }) {
+    const { whereSql, params } = buildEntryFilter({ tenantId, status, entryType, fromAt, toAt });
+    const row = getDb().prepare(`
+        SELECT COUNT(*) AS count,
+               COALESCE(SUM(CASE WHEN entry_type = 'deposit' THEN ABS(amount_paise) ELSE 0 END), 0) AS deposit_paise,
+               COALESCE(SUM(CASE WHEN entry_type = 'redeem'  THEN ABS(amount_paise) ELSE 0 END), 0) AS redeemed_paise
+          FROM advance_entries WHERE ${whereSql}
+    `).get(params);
+
+    return {
+        count: row.count,
+        depositAmount: fromPaise(row.deposit_paise),
+        redeemedAmount: fromPaise(row.redeemed_paise)
+    };
+}
+
+/**
+ * The store's outstanding advance liability, and what is still awaiting review.
+ *
+ * Mirrors `summarizeAdvanceLiability()` in billingMath.js exactly — one rule for
+ * what counts as money the store owes its customers, so the Dashboard tile, the
+ * Advances tab and the portal can never disagree about it. Only POSTED entries
+ * are liability: a pending claim is a customer's assertion that they sent a
+ * transfer, not money the store has.
+ */
+export function liabilitySummary(tenantId) {
+    const db = getDb();
+    const posted = db.prepare(`
+        SELECT COALESCE(SUM(amount_paise), 0) AS total FROM advance_entries
+         WHERE tenant_id = ? AND status = 'posted'
+    `).get(tenantId).total;
+    const pending = db.prepare(`
+        SELECT COUNT(*) AS count, COALESCE(SUM(amount_paise), 0) AS total FROM advance_entries
+         WHERE tenant_id = ? AND status = 'pending' AND entry_type = 'deposit'
+    `).get(tenantId);
+    const customers = db.prepare(`
+        SELECT COUNT(*) AS n FROM (
+            SELECT account_id FROM advance_entries
+             WHERE tenant_id = ? AND status = 'posted'
+             GROUP BY account_id HAVING SUM(amount_paise) > 0
+        )
+    `).get(tenantId).n;
+
+    // Field-for-field what `summarizeAdvanceLiability()` returns, because the
+    // Dashboard tile and the Advances tab read this shape and the two must not
+    // be able to disagree about what the store owes.
+    return {
+        // Floored for the same reason every other balance is: a negative
+        // liability is not a debt this system tracks.
+        outstandingTotal: fromPaise(Math.max(0, posted)),
+        outstandingCustomers: customers,
+        pendingTotal: fromPaise(pending.total),
+        pendingCount: pending.count
+    };
+}
+
+/**
+ * One running-balance row per customer who has ever had an advance.
+ *
+ * THE ROLLUP HAPPENS IN SQL, and that is the whole point. The Advances tab used
+ * to download the entire ledger and collapse it per customer in the browser,
+ * which meant the tab could not be paged without silently reporting wrong
+ * balances — a customer's spendable credit is every row they have ever had, so
+ * a page of recent rows cannot compute it. Grouped here, the browser receives a
+ * bounded list of CORRECT balances instead of unbounded history.
+ *
+ * Search is applied after the rollup (in the HAVING-free outer WHERE), so a
+ * cashier searching a phone number matches the customer rather than whichever
+ * of their rows happened to land in the page.
+ */
+export function customerRollup({ tenantId, q = '', limit = 50, offset = 0 }) {
+    const params = { tenantId };
+    let searchSql = '';
+    const term = String(q || '').trim();
+    if (term) {
+        const digits = term.replace(/\D/g, '');
+        params.like = `%${term.toLowerCase()}%`;
+        const clauses = ['LOWER(a.customer_name) LIKE @like'];
+        if (digits) {
+            params.phoneLike = `%${digits}%`;
+            clauses.push('a.customer_phone LIKE @phoneLike');
+        }
+        searchSql = ` AND (${clauses.join(' OR ')})`;
+    }
+
+    const from = `
+        FROM advance_accounts a
+        JOIN advance_entries e ON e.account_id = a.id
+       WHERE a.tenant_id = @tenantId${searchSql}
+       GROUP BY a.id
+    `;
+
+    const db = getDb();
+    const total = db.prepare(`SELECT COUNT(*) AS n FROM (SELECT a.id ${from})`).get(params).n;
+    const rows = db.prepare(`
+        SELECT a.customer_phone AS phone,
+               a.customer_name  AS name,
+               COALESCE(SUM(CASE WHEN e.status = 'posted' THEN e.amount_paise ELSE 0 END), 0) AS posted_paise,
+               COALESCE(SUM(CASE WHEN e.status = 'pending' AND e.entry_type = 'deposit'
+                                 THEN e.amount_paise ELSE 0 END), 0) AS pending_paise,
+               COALESCE(SUM(CASE WHEN e.status = 'pending' AND e.entry_type = 'deposit'
+                                 THEN 1 ELSE 0 END), 0) AS pending_count,
+               COUNT(e.id) AS entry_count,
+               MAX(e.created_at) AS last_activity
+        ${from}
+        ORDER BY last_activity DESC
+        LIMIT @limit OFFSET @offset
+    `).all({ ...params, limit: clampLimit(limit), offset: Math.max(0, Math.trunc(offset) || 0) });
+
+    return {
+        rows: rows.map(row => ({
+            phone: row.phone,
+            name: row.name || '',
+            balance: fromPaise(Math.max(0, row.posted_paise)),
+            pendingTotal: fromPaise(row.pending_paise),
+            pendingCount: row.pending_count,
+            entryCount: row.entry_count,
+            lastActivity: row.last_activity
+        })),
+        total
+    };
 }
 
 export function countEntries(tenantId) {
@@ -446,7 +587,18 @@ export function toLegacyAdvance(entry, context = {}) {
             ? fromPaise(entry.locked_rate_22k_paise_per_g)
             : null,
         timestamp: entry.created_at,
+        /* WHO CREATED THE ROW, and — separately — WHO RELEASED THE MONEY.
+           Both matter and they are not the same person: a customer's portal
+           claim is created by the portal and approved by a cashier, and the
+           whole point of the pending state is that the approval names someone.
+           Resolved from the user ids the ledger stores, never from a payload. */
+        actor: context.actor !== undefined ? context.actor : actorForUserId(entry.created_by_user_id),
         ...(reviewedAt ? { reviewedAt } : {}),
+        ...(entry.approved_by_user_id ? {
+            reviewedBy: context.reviewedBy !== undefined
+                ? context.reviewedBy
+                : actorForUserId(entry.approved_by_user_id)
+        } : {}),
         ...(entry.review_note ? { reviewNote: entry.review_note } : {})
     };
 }
@@ -495,10 +647,19 @@ export function toLegacyAdvances(entries) {
         for (const row of rows) reviewed.set(row.entry_id, row.occurred_at);
     }
 
+    // Both identity columns in one lookup — the creator and the approver are
+    // usually the same small set of people, so resolving them together keeps
+    // this at one query for the page rather than two per row.
+    const actors = actorsByUserId(
+        entries.flatMap(e => [e.created_by_user_id, e.approved_by_user_id])
+    );
+
     return entries.map(entry => toLegacyAdvance(entry, {
         account: accounts.get(entry.account_id) || null,
         invoiceNumber: entry.invoice_id ? invoices.get(entry.invoice_id) || null : null,
         creditNoteNumber: entry.credit_note_id ? notes.get(entry.credit_note_id) || null : null,
+        actor: actors.get(entry.created_by_user_id) || null,
+        reviewedBy: actors.get(entry.approved_by_user_id) || null,
         reviewedAt: entry.status === SQL_STATUS.PENDING
             ? null
             : reviewed.get(entry.id) || entry.approved_at || null

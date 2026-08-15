@@ -359,8 +359,14 @@ export function computeInvoiceTotals({
         : [{ metalValue, makingChargeAmount, discountPercent }];
 
     const normalizedLines = inputLines.map(line => {
-        const lineMetal = round2((line && line.metalValue) ?? 0);
-        const lineMaking = round2((line && line.makingChargeAmount) ?? 0);
+        /* Floored at zero. A negative metal value or making charge is not a
+         * discount — there is a discount field for that — and it silently broke
+         * the invariant this whole allocation exists to hold: the header summed
+         * the negative, while allocateLines() clamps its weights at zero and so
+         * allocated nothing, leaving the printed rows disagreeing with the total
+         * beneath them. Refusing the sign keeps the two halves reconciled. */
+        const lineMetal = Math.max(0, round2((line && line.metalValue) ?? 0));
+        const lineMaking = Math.max(0, round2((line && line.makingChargeAmount) ?? 0));
         // A line without its own discount inherits the invoice's, so passing a
         // bare list of items behaves exactly like the single-line form did.
         const linePct = Math.min(100, Math.max(0,
@@ -396,14 +402,30 @@ export function computeInvoiceTotals({
 
     const totalBeforeAdvance = round2(taxableAmount + taxAmount);
 
-    // An applied advance always redeems as much as it can: the cashier's
-    // "Apply Advance" button is all-or-nothing, and the amount is re-clamped
-    // on every recalculation so editing the cart never leaves a stale advance
-    // larger than the bill it is being redeemed against.
-    let resolvedAdvance = num(appliedAdvance);
+    /* An applied advance always redeems as much as it can: the cashier's
+     * "Apply Advance" button is all-or-nothing, and the amount is re-clamped on
+     * every recalculation so editing the cart never leaves a stale advance
+     * larger than the bill it is being redeemed against.
+     *
+     * FLOORED AT ZERO, and that floor is load-bearing rather than defensive
+     * decoration. An advance is subtracted from the bill, so a NEGATIVE one adds
+     * to it — the two ways that used to happen both produced a total ABOVE
+     * `totalBeforeAdvance`, i.e. a customer overcharged by a figure that never
+     * appeared on any line:
+     *   - a negative `customerAdvanceBalance` passed the Math.min and became the
+     *     resolved advance directly;
+     *   - a negative `appliedAdvance` failed the `> 0` test, skipped the clamp
+     *     entirely, and survived to the subtraction unchanged.
+     * Neither is reachable through POST /api/sales, which rejects both — but
+     * this module is the one place the arithmetic is defined, every other caller
+     * (the desk preview, the reprint, a stored record with a bad figure on it)
+     * runs through it, and "the route happens to check" is not a property the
+     * math should depend on. */
+    const availableBalance = Math.max(0, num(customerAdvanceBalance));
+    let resolvedAdvance = Math.max(0, num(appliedAdvance));
     if (resolvedAdvance > 0) {
         resolvedAdvance = round2(
-            Math.min(num(customerAdvanceBalance), Math.max(0, totalBeforeAdvance))
+            Math.min(availableBalance, Math.max(0, totalBeforeAdvance))
         );
     }
 

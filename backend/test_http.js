@@ -74,16 +74,6 @@ fs.writeFileSync(path.join(dataDir, 'license.json'), JSON.stringify({
     expiryDate: new Date(Date.now() + 86400000).toISOString(),
     lastHandshakeTime: Date.now()
 }, null, 2));
-fs.writeFileSync(path.join(dataDir, 'advances.json'), JSON.stringify([{
-    id: 'ADV-HTTP-1',
-    customerPhone: phone,
-    customerName: 'HTTP Customer',
-    type: 'deposit',
-    status: 'approved',
-    amount: 100,
-    timestamp: Date.now()
-}], null, 2));
-
 let server;
 let passed = 0;
 
@@ -142,6 +132,103 @@ console.log('===================================================================
 
 // Safe now: GOLD_POS_DATA_DIR is set, so db.js resolves to the temp directory.
 const { verifyPinHash, currentTotpCode } = await import('./adminAuth.js');
+const repo = await import('./repositories/index.js');
+const advanceService = await import('./services/advanceService.js');
+const saleServiceModule = await import('./services/saleService.js');
+const returnServiceModule = await import('./services/returnService.js');
+const paymentServiceModule = await import('./services/paymentService.js');
+
+/* ==========================================================================
+   Reading the ledger back
+
+   The ledger is SQL now, so these replace the `ledger.advances()`
+   calls the assertions below used to make. They deliberately return the SAME
+   legacy wire shapes the JSON files held — `toLegacyAdvances`, `listSales`
+   and friends are the projections the routes themselves answer with — so each
+   assertion still says what it always said about the row it is checking,
+   rather than being rewritten around column names.
+
+   Reading through the repositories rather than by opening the database file
+   also keeps the suite honest about the seam: if a projection stops emitting a
+   field, these fail in the same way the browser would break.
+   ========================================================================== */
+const ledger = {
+    advances: () => repo.advances.toLegacyAdvances(
+        repo.advances.search({ tenantId: repo.dataStoreContext().tenantId, limit: 500 }).rows
+    ),
+    /* The invoices AS FILED — the stored header and its lines, with no return
+       state attached. Deliberately not `listSales()`: that projection merges in
+       what has since come back, which is exactly the thing the "a return never
+       rewrites an invoice" check needs to be able to distinguish. Return state
+       is asserted through /api/sales/lookup, where it belongs. */
+    sales: () => repo.invoices
+        .search({ tenantId: repo.dataStoreContext().tenantId, limit: 500 }).rows
+        .map(row => repo.invoices.toLegacySale(row)),
+    returns: () => returnServiceModule.listReturns({ limit: 500 }).results,
+    order: (providerOrderId) => paymentServiceModule.findOrder(providerOrderId)
+        || paymentServiceModule.findOrder(providerOrderId, 'mock')
+};
+
+/** The gold rates and phone validator the advance service needs from a caller. */
+const SERVICE_DEPS = {
+    getActiveGoldRates: () => ({
+        price24K: FIXTURE_RATE * 24 / 22,
+        price22K: FIXTURE_RATE,
+        price18K: FIXTURE_RATE * 18 / 22,
+        sources: { price24K: 'auto', price22K: 'auto', price18K: 'auto' }
+    }),
+    isValidPhone: (value) => /^\d{10}$/.test(String(value || ''))
+};
+
+/**
+ * A customer's unverified claim, sitting pending — the fixture the approval
+ * checks act on.
+ *
+ * Seeded through the service rather than by writing a row with a chosen id,
+ * because the id is the database's to mint now. Returns it, so the assertions
+ * name the row that actually exists instead of one the fixture invented.
+ */
+function seedPendingDeposit({ amount, referenceId }) {
+    const result = advanceService.recordDeposit({
+        customerPhone: phone,
+        customerName: 'HTTP Customer',
+        amount,
+        paymentMethod: 'UPI',
+        referenceId,
+        status: 'pending',
+        source: 'portal'
+    }, SERVICE_DEPS);
+    if (!result.success) throw new Error('Could not seed a pending deposit: ' + result.error);
+    return result.deposit.id;
+}
+
+/* The opening balance the redemption checks below spend against.
+   Seeded through the SERVICE rather than by inserting a row, so the fixture
+   goes through the same validation, the same account creation and the same
+   locked-rate snapshot a real counter deposit would. */
+repo.initialiseDataStore({ name: 'HTTP Test Store' });
+{
+    const seeded = advanceService.recordDeposit({
+        customerPhone: phone,
+        customerName: 'HTTP Customer',
+        amount: 100,
+        paymentMethod: 'UPI',
+        referenceId: 'seed-http-opening-balance',
+        status: 'approved',
+        source: 'counter'
+    }, {
+        getActiveGoldRates: () => ({
+            price24K: FIXTURE_RATE * 24 / 22,
+            price22K: FIXTURE_RATE,
+            price18K: FIXTURE_RATE * 18 / 22,
+            sources: { price24K: 'auto', price22K: 'auto', price18K: 'auto' }
+        }),
+        isValidPhone: (value) => /^\d{10}$/.test(String(value || ''))
+    });
+    if (!seeded.success) {
+        throw new Error('Could not seed the opening advance balance: ' + seeded.error);
+    }
+}
 
 /**
  * The code an authenticator app would be showing now.
@@ -271,7 +358,7 @@ try {
 
     await check('over-redemption is rejected without consuming an invoice or changing a ledger', async () => {
         const settingsBefore = fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8');
-        const advancesBefore = fs.readFileSync(path.join(dataDir, 'advances.json'), 'utf8');
+        const advancesBefore = ledger.advances();
         const response = await request('/api/sales', {
             method: 'POST',
             headers: { ...adminHeaders, 'Content-Type': 'application/json' },
@@ -280,8 +367,10 @@ try {
         assert.equal(response.status, 400);
         assert.match((await response.json()).error, /exceeds.*available balance/i);
         assert.equal(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8'), settingsBefore);
-        assert.equal(fs.readFileSync(path.join(dataDir, 'advances.json'), 'utf8'), advancesBefore);
-        assert.equal(fs.existsSync(path.join(dataDir, `sales_${new Date().getFullYear()}.json`)), false);
+        // The refusal happens INSIDE the transaction, so nothing it had already
+        // written survives: no redemption row, and no invoice.
+        assert.deepEqual(ledger.advances(), advancesBefore);
+        assert.equal(ledger.sales().length, 0, 'no invoice may be filed by a refused sale');
     });
 
     await check('a valid sale commits invoice, sale, and redemption together over HTTP', async () => {
@@ -293,12 +382,20 @@ try {
         assert.equal(response.status, 200);
         const body = await response.json();
         assert.equal(body.invoiceId, `HTTP-000010-${new Date().getFullYear().toString().slice(-2)}`);
-        assert.equal(readData('settings.json').invoiceSeqStart, 11);
-        assert.equal(readData(`sales_${new Date().getFullYear()}.json`).length, 1);
-        const advances = readData('advances.json');
+        assert.equal(ledger.sales().length, 1);
+
+        /* The invoice number now comes from the `document_sequences` table,
+           seeded once from settings.invoiceSeqStart. The JSON counter is no
+           longer incremented per sale — it is the SEED, not the sequence — so
+           what matters is that the series continued from 10, asserted above,
+           rather than that a settings key moved. */
+        const advances = ledger.advances();
         assert.equal(advances.length, 2);
-        assert.equal(advances[1].type, 'redeem');
-        assert.equal(advances[1].amount, 100);
+        const redemption = advances.find(a => a.type === 'redeem');
+        assert.ok(redemption, 'the redemption must be filed alongside the invoice');
+        assert.equal(redemption.amount, 100);
+        assert.equal(redemption.invoiceId, body.invoiceId,
+            'the redemption names the invoice that spent it');
     });
 
     /* ======================================================================
@@ -362,6 +459,136 @@ try {
             assert.equal(body.rateCorrected, false);
         } finally {
             fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
+        }
+    });
+
+    /* ======================================================================
+       Settings TYPE validation.
+
+       POST /api/settings spreads the request body over settings.json, and the
+       billing pipeline reads those keys with plain JS coercion — so a wrong
+       TYPE did not fail loudly, it produced a wrong invoice. Each case below is
+       a real defect that reached the permanent ledger.
+       ====================================================================== */
+
+    const postSettings = (body) => request('/api/settings', {
+        method: 'POST',
+        headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    const postSale = () => request('/api/sales', {
+        method: 'POST',
+        headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            purity: '22K', weightGrams: 1, makingChargeAmount: 0,
+            discountPercent: 0, totalAmount: 1030
+        })
+    });
+
+    await check('a stringified invoice sequence is stored as a NUMBER, not concatenated', async () => {
+        // "10" + 1 === "101". The sequence used to run 10 → 101 → 1011 → 10111,
+        // destroying a strictly-sequential, legally-relevant invoice series.
+        const saved = readData('settings.json');
+        try {
+            assert.equal((await postSettings({ invoiceSeqStart: '4000' })).status, 200);
+            assert.equal(typeof readData('settings.json').invoiceSeqStart, 'number',
+                'the stored sequence must be a number');
+
+            const first = await (await postSale()).json();
+            assert.match(first.invoiceId, /-004000-/, 'first invoice uses the sequence as given');
+
+            /* The counter lives in `document_sequences` now, not in
+               settings.json — that key is the SEED a financial year opens at,
+               and POST /api/settings pushes an edit through to the sequence.
+               So the concatenation bug is asserted where the number actually
+               comes from: the next allocation, not a JSON field. */
+            const second = await (await postSale()).json();
+            assert.match(second.invoiceId, /-004001-/,
+                'the sequence increments by one, not by concatenation');
+
+            const third = await (await postSale()).json();
+            assert.match(third.invoiceId, /-004002-/, 'and keeps incrementing by one');
+        } finally {
+            fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify(saved, null, 2));
+        }
+    });
+
+    await check('a non-numeric invoice sequence is refused rather than stamped into an invoice', async () => {
+        // parseInt('abc') is NaN, which used to skip the lower-the-sequence
+        // guard entirely and file invoice "HTTP-000abc-26".
+        const response = await postSettings({ invoiceSeqStart: 'abc' });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /invoiceSeqStart/);
+        assert.notEqual(readData('settings.json').invoiceSeqStart, 'abc');
+    });
+
+    await check('a non-numeric GST slab is refused rather than silently billing 0%', async () => {
+        // Number('abc') || 0 === 0. The store stopped charging GST while every
+        // screen still looked normal.
+        const response = await postSettings({ goldTaxSlab: 'abc' });
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /goldTaxSlab/);
+        assert.equal(readData('settings.json').goldTaxSlab, 3, 'the working slab is untouched');
+    });
+
+    await check('an out-of-range GST slab is refused', async () => {
+        for (const slab of [-50, 101, 1e9]) {
+            const response = await postSettings({ goldTaxSlab: slab });
+            assert.equal(response.status, 400, `slab ${slab} must be refused`);
+        }
+        assert.equal(readData('settings.json').goldTaxSlab, 3);
+    });
+
+    await check('an object invoice prefix cannot reach a permanent invoice number', async () => {
+        // {} stamped "[object Object]-000011-26" into the ledger; an object with
+        // a non-callable toString threw on EVERY sale until settings were
+        // hand-edited.
+        for (const prefix of [{ evil: 1 }, { toString: 'not-a-function' }, ['A'], 42]) {
+            const response = await postSettings({ invoicePrefix: prefix });
+            assert.equal(response.status, 400, `prefix ${JSON.stringify(prefix)} must be refused`);
+        }
+        const sale = await (await postSale()).json();
+        assert.ok(!String(sale.invoiceId).includes('[object'), 'no invoice carries [object Object]');
+    });
+
+    await check('a poisoned settings.json is repaired rather than propagated', async () => {
+        // A restored backup or hand edit never passes through the route
+        // validator, so the invoice-numbering choke point coerces too.
+        const saved = readData('settings.json');
+        try {
+            fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({
+                ...saved, invoicePrefix: { evil: 1 }, invoiceSeqStart: '77'
+            }, null, 2));
+
+            const sale = await (await postSale()).json();
+            // A well-formed number under a usable prefix — never
+            // "[object Object]-…", and never a concatenated sequence. The
+            // number itself continues this financial year's series (the
+            // allocator is `document_sequences`, and invoiceSeqStart only seeds
+            // a year that has issued nothing), so the assertion is on the SHAPE
+            // rather than on a specific value.
+            assert.match(sale.invoiceId, /^GOLD-\d{6}-\d{2}$/,
+                'falls back to a usable prefix and a well-formed sequence');
+
+            const after = readData('settings.json');
+            assert.equal(after.invoicePrefix, 'GOLD', 'the unusable prefix is corrected on disk');
+            assert.equal(after.invoiceSeqStart, 77,
+                'the stringified sequence is corrected to a number on disk');
+        } finally {
+            fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify(saved, null, 2));
+        }
+    });
+
+    await check('a valid settings patch is still accepted and canonicalised', async () => {
+        const saved = readData('settings.json');
+        try {
+            assert.equal((await postSettings({ taxMode: '  inclusive  ', goldTaxSlab: '5' })).status, 200);
+            const after = readData('settings.json');
+            assert.equal(after.taxMode, 'Inclusive', 'casing and padding are canonicalised');
+            assert.equal(after.goldTaxSlab, 5, 'a numeric string is stored as a number');
+            assert.equal(typeof after.goldTaxSlab, 'number');
+        } finally {
+            fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify(saved, null, 2));
         }
     });
 
@@ -460,7 +687,7 @@ try {
             body: JSON.stringify({ invoiceId: returnableInvoiceId, weightGrams: 1, refundMode: 'cash' })
         });
         assert.equal(response.status, 401);
-        assert.equal(fs.existsSync(path.join(dataDir, returnsFileName)), false,
+        assert.equal(ledger.returns().length, 0,
             'a rejected return must not create a returns ledger');
     });
 
@@ -495,13 +722,13 @@ try {
             body: JSON.stringify({ invoiceId: returnableInvoiceId, weightGrams: 10.001, refundMode: 'cash' })
         });
         assert.equal(response.status, 400);
-        assert.equal(fs.existsSync(path.join(dataDir, returnsFileName)), false);
+        assert.equal(ledger.returns().length, 0);
     });
 
     await check('a partial cash return refunds ₹4,532 for 4 g and touches no advance', async () => {
         // 4 g @ 1,000 = 4,000 metal; making 1,000 × 0.4 = 400; gross 4,400;
         // 3% = 132. Refund 4,532.
-        const advancesBefore = readData('advances.json').length;
+        const advancesBefore = ledger.advances().length;
         const response = await request('/api/returns', {
             method: 'POST',
             headers: { ...adminHeaders, 'Content-Type': 'application/json' },
@@ -518,19 +745,19 @@ try {
         assert.equal(body.remainingWeightGrams, 6);
         assert.equal(body.advanceCredit, null);
 
-        const rows = readData(returnsFileName);
+        const rows = ledger.returns();
         assert.equal(rows.length, 1);
         assert.equal(rows[0].originalInvoiceId, returnableInvoiceId);
         assert.equal(rows[0].taxAmount, 132);
         assert.equal(rows[0].note, 'size exchange');
         // A cash refund is handed over the counter — it must not quietly
         // become store credit as well.
-        assert.equal(readData('advances.json').length, advancesBefore,
+        assert.equal(ledger.advances().length, advancesBefore,
             'a cash refund must not write to the advances ledger');
     });
 
     await check('the sale stays exactly as filed — returns never rewrite an invoice', async () => {
-        const sale = readData(`sales_${new Date().getFullYear()}.json`)
+        const sale = ledger.sales()
             .find(s => s.id === returnableInvoiceId);
         assert.equal(sale.totalAmount, 11330);
         assert.equal(sale.weightGrams, 10);
@@ -567,7 +794,11 @@ try {
         // 1 g: 1,000 metal + 100 making = 1,100; 3% = 33. Refund 1,133.
         assert.equal(record.refundAmount, 1133);
         assert.equal(record.taxAmount, 33);
-        assert.match(record.id, /^RET-[0-9A-F]{12}$/);
+        // A return is a NUMBERED CREDIT NOTE now, allocated from the same
+        // transactional sequence an invoice is — so the client's proposed
+        // 'FORGED-RETURN' is not merely ignored, it is unrepresentable.
+        assert.match(record.id, /^CN-\d{6}-\d{2}$/);
+        assert.notEqual(record.id, 'FORGED-RETURN');
         assert.equal(record.customerPhone, phone, 'the phone must come off the invoice');
         assert.ok(record.timestamp > Date.UTC(2001, 0, 1));
         assert.equal(record.arbitraryJunk, undefined);
@@ -589,7 +820,7 @@ try {
         assert.equal(body.return.closesInvoice, true);
         assert.equal(body.remainingWeightGrams, 0);
 
-        const credit = readData('advances.json').find(a => a.id === body.return.advanceCreditId);
+        const credit = ledger.advances().find(a => a.id === body.return.advanceCreditId);
         assert.ok(credit, 'the gold refund must have written its credit row');
         assert.equal(credit.type, 'deposit');
         assert.equal(credit.amount, 5665);
@@ -611,7 +842,7 @@ try {
     });
 
     await check('every refund against one invoice sums to exactly what it charged', async () => {
-        const rows = readData(returnsFileName).filter(r => r.originalInvoiceId === returnableInvoiceId);
+        const rows = ledger.returns().filter(r => r.originalInvoiceId === returnableInvoiceId);
         const total = rows.reduce((sum, r) => sum + r.refundAmount, 0);
         assert.equal(Math.round(total * 100) / 100, 11330);
         assert.equal(rows.reduce((sum, r) => sum + r.weightGrams, 0), 10);
@@ -625,7 +856,7 @@ try {
         });
         assert.equal(response.status, 400);
         assert.match((await response.json()).error, /returned in full/i);
-        assert.equal(readData(returnsFileName).length, 3, 'no fourth row may be written');
+        assert.equal(ledger.returns().length, 3, 'no fourth row may be written');
     });
 
     await check('lookup marks the invoice closed once everything has come back', async () => {
@@ -666,9 +897,22 @@ try {
     });
 
     await check('a mid-commit failure rolls a gold return back completely', async () => {
-        // A crash between the two writes would otherwise leave either a refund
-        // nobody was credited for, or credit against a return that never
-        // happened — the reason both share one transaction.
+        /* A failure between the credit note and the advance credit would
+           otherwise leave either a refund nobody was credited for, or credit
+           against a return that never happened — the reason both share one
+           transaction.
+
+           The failure is injected where one can genuinely occur over HTTP: the
+           approval threshold. `authorizeRefund` runs INSIDE the transaction, on
+           the server's own priced refund — by which point the credit-note
+           number has been allocated and the note itself inserted. Refusing
+           there is a true mid-transaction failure, and everything before it
+           must unwind.
+
+           (The JSON version injected an fs.renameSync error to break a
+           multi-file write. There is no multi-file write to break any more; the
+           equivalent guarantee is the database's, and test_schema.js asserts
+           the primitive directly.) */
         const sale = await request('/api/sales', {
             method: 'POST',
             headers: { ...adminHeaders, 'Content-Type': 'application/json' },
@@ -680,24 +924,15 @@ try {
         });
         const rollbackInvoiceId = (await sale.json()).sale.id;
 
-        const filenames = [returnsFileName, 'advances.json'];
-        const before = Object.fromEntries(filenames.map(name =>
-            [name, fs.readFileSync(path.join(dataDir, name), 'utf8')]));
+        const returnsBefore = ledger.returns();
+        const advancesBefore = ledger.advances();
 
-        const originalRename = fs.renameSync;
-        const originalConsoleError = console.error;
-        const expectedErrors = [];
-        let renameCount = 0;
-        fs.renameSync = (...args) => {
-            renameCount++;
-            if (renameCount === 3) {
-                const error = new Error('injected return transaction failure');
-                error.code = 'EIO';
-                throw error;
-            }
-            return originalRename(...args);
-        };
-        console.error = message => expectedErrors.push(String(message));
+        // The master PIN is an owner — it may approve — but it carries no
+        // second factor and cannot enrol one, so this refuses from inside the
+        // transaction rather than at the door.
+        assert.equal((await postSettings({
+            refundApprovalThreshold: 1, requireMfaForApprovers: true
+        })).status, 200);
 
         let response;
         try {
@@ -709,17 +944,33 @@ try {
                 })
             });
         } finally {
-            fs.renameSync = originalRename;
-            console.error = originalConsoleError;
+            await postSettings({ refundApprovalThreshold: 0, requireMfaForApprovers: false });
         }
 
-        assert.equal(response.status, 500);
-        assert.equal(expectedErrors.some(m => m.includes('injected return transaction failure')), true);
-        for (const name of filenames) {
-            assert.equal(fs.readFileSync(path.join(dataDir, name), 'utf8'), before[name],
-                `${name} changed after rollback`);
-        }
-        assert.equal(fs.existsSync(path.join(dataDir, '.json-transaction.json')), false);
+        assert.equal(response.status, 403);
+        assert.equal((await response.json()).error, 'MFA_REQUIRED');
+
+        // Nothing the transaction had already written survives.
+        assert.deepEqual(ledger.returns(), returnsBefore, 'no credit note may survive the rollback');
+        assert.deepEqual(ledger.advances(), advancesBefore, 'no advance credit may survive the rollback');
+
+        // And the credit-note number it allocated was rolled back rather than
+        // burned: the next successful return takes the number this one would
+        // have had, leaving no gap in a legally-sequential series.
+        const next = await request('/api/returns', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                invoiceId: rollbackInvoiceId, weightGrams: 2, refundMode: 'gold'
+            })
+        });
+        assert.equal(next.status, 200);
+        const filed = (await next.json()).return;
+        const highestBefore = returnsBefore
+            .map(r => Number(String(r.id).split('-')[1]))
+            .reduce((a, b) => Math.max(a, b), 0);
+        assert.equal(Number(String(filed.id).split('-')[1]), highestBefore + 1,
+            'the rolled-back allocation left no gap in the credit-note series');
     });
 
     /* ----------------------------------------------------------------------
@@ -767,7 +1018,11 @@ try {
         assert.equal(response.status, 200);
         const rows = (await response.json()).returns;
 
-        assert.equal(rows.length, 3, 'the three returns filed against this phone');
+        // Every return filed against this phone so far — counted from the
+        // ledger rather than pinned to a literal, so adding a return check
+        // above does not fail an assertion that is really about SCOPING.
+        assert.equal(rows.length, ledger.returns().filter(r => r.customerPhone === phone).length);
+        assert.ok(rows.length >= 3, 'the returns filed against this phone are all visible');
         assert.equal(rows.every(r => r.refundAmount > 0), true);
         assert.equal(rows.some(r => r.refundMode === 'gold'), true);
         assert.equal(rows.some(r => r.refundMode === 'cash'), true);
@@ -776,14 +1031,18 @@ try {
         assert.equal(rows.every(r => r.customerPhone === undefined), true);
 
         // And the gold refund is visible as spendable credit on the same screen.
-        const ledger = await request('/api/customer/advances', {
+        const advancesResponse = await request('/api/customer/advances', {
             headers: { Authorization: `Bearer ${token}` }
         });
-        assert.equal(ledger.status, 200);
-        const advances = await ledger.json();
-        const creditRow = advances.history.find(a => a.source === 'return');
-        assert.ok(creditRow, 'the gold refund must appear in the customer’s own ledger');
-        assert.equal(creditRow.amount, 5665);
+        assert.equal(advancesResponse.status, 200);
+        const advances = await advancesResponse.json();
+        const creditRows = advances.history.filter(a => a.source === 'return');
+        assert.ok(creditRows.length > 0, 'the gold refund must appear in the customer’s own ledger');
+        // The closing return trued up to the unrefunded balance — matched by
+        // value rather than by position, since more than one gold refund is
+        // credited to this phone over the course of the suite.
+        assert.ok(creditRows.some(a => a.amount === 5665),
+            'the closing gold refund is credited at its trued-up value');
     });
 
     /* ======================================================================
@@ -791,16 +1050,15 @@ try {
        ====================================================================== */
 
     const webhookOrder = 'order_webhook_test_1';
-    fs.writeFileSync(path.join(dataDir, 'payment_orders.json'), JSON.stringify([{
-        orderId: webhookOrder,
+    // The order intent the gateway will claim to have captured against.
+    // Recorded through the service, so it is the same row a real checkout
+    // would have created.
+    assert.equal(paymentServiceModule.recordOrder({
+        providerOrderId: webhookOrder,
         customerPhone: phone,
         amountPaise: 250000,
-        amount: 2500,
-        currency: 'INR',
-        status: 'created',
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 86400000
-    }], null, 2));
+        currency: 'INR'
+    }), true, 'the webhook fixture order must be recorded');
 
     const capturedEvent = (paymentId, orderId, amountPaise) => JSON.stringify({
         event: 'payment.captured',
@@ -820,10 +1078,10 @@ try {
     });
 
     await check('an unsigned webhook delivery is rejected and credits nothing', async () => {
-        const advancesBefore = fs.readFileSync(path.join(dataDir, 'advances.json'), 'utf8');
+        const advancesBefore = ledger.advances();
         const response = await postWebhook(capturedEvent('pay_unsigned', webhookOrder, 250000), { signature: '' });
         assert.equal(response.status, 400);
-        assert.equal(fs.readFileSync(path.join(dataDir, 'advances.json'), 'utf8'), advancesBefore);
+        assert.deepEqual(ledger.advances(), advancesBefore);
     });
 
     await check('a webhook signed with the wrong secret is rejected', async () => {
@@ -852,27 +1110,27 @@ try {
         assert.equal(response.status, 200);
         assert.equal((await response.json()).success, true);
 
-        const deposit = readData('advances.json').find(a => a.referenceId === 'pay_captured_ok');
+        const deposit = ledger.advances().find(a => a.referenceId === 'pay_captured_ok');
         assert.ok(deposit, 'the captured payment should have produced a deposit row');
         assert.equal(deposit.amount, 2500);
         assert.equal(deposit.status, 'approved');
         assert.equal(deposit.customerPhone, phone, 'credit goes to the order’s customer, not the webhook body’s');
         assert.match(deposit.id, /^ADV-[0-9A-F]{12}$/, 'ledger ids must be cryptographically strong');
 
-        const order = readData('payment_orders.json').find(o => o.orderId === webhookOrder);
+        const order = ledger.order(webhookOrder);
         assert.equal(order.status, 'paid');
         assert.equal(order.depositId, deposit.id);
     });
 
     await check('a redelivered webhook is acknowledged without crediting twice', async () => {
-        const depositsBefore = readData('advances.json').filter(a => a.referenceId === 'pay_captured_ok').length;
+        const depositsBefore = ledger.advances().filter(a => a.referenceId === 'pay_captured_ok').length;
         const response = await postWebhook(
             capturedEvent('pay_captured_ok', webhookOrder, 250000),
             { eventId: 'evt_capture_1' }
         );
         assert.equal(response.status, 200);
         assert.equal((await response.json()).duplicate, true);
-        assert.equal(readData('advances.json').filter(a => a.referenceId === 'pay_captured_ok').length, depositsBefore);
+        assert.equal(ledger.advances().filter(a => a.referenceId === 'pay_captured_ok').length, depositsBefore);
     });
 
     await check('the same payment under a NEW event id still credits only once', async () => {
@@ -884,17 +1142,14 @@ try {
             { eventId: 'evt_capture_2_different' }
         );
         assert.equal(response.status, 200);
-        assert.equal(readData('advances.json').filter(a => a.referenceId === 'pay_captured_ok').length, 1);
+        assert.equal(ledger.advances().filter(a => a.referenceId === 'pay_captured_ok').length, 1);
     });
 
     await check('a capture for the wrong amount is refused, not credited', async () => {
         const mismatchOrder = 'order_webhook_mismatch';
-        const orders = readData('payment_orders.json');
-        orders.push({
-            orderId: mismatchOrder, customerPhone: phone, amountPaise: 100000, amount: 1000,
-            currency: 'INR', status: 'created', createdAt: Date.now(), expiresAt: Date.now() + 86400000
+        paymentServiceModule.recordOrder({
+            providerOrderId: mismatchOrder, customerPhone: phone, amountPaise: 100000, currency: 'INR'
         });
-        fs.writeFileSync(path.join(dataDir, 'payment_orders.json'), JSON.stringify(orders, null, 2));
 
         const response = await postWebhook(
             capturedEvent('pay_mismatch', mismatchOrder, 5000), // ₹50 against a ₹1000 order
@@ -902,8 +1157,8 @@ try {
         );
         assert.equal(response.status, 200); // acknowledged, so it stops being retried
         assert.equal((await response.json()).ignored, 'amount-mismatch');
-        assert.equal(readData('advances.json').some(a => a.referenceId === 'pay_mismatch'), false);
-        assert.equal(readData('payment_orders.json').find(o => o.orderId === mismatchOrder).status, 'mismatched');
+        assert.equal(ledger.advances().some(a => a.referenceId === 'pay_mismatch'), false);
+        assert.equal(ledger.order(mismatchOrder).status, 'mismatched');
     });
 
     await check('an EXPIRED order whose payment the gateway captured is still credited', async () => {
@@ -911,20 +1166,22 @@ try {
         // money that actually moved. Refusing here would strand a customer who
         // paid on a slow connection, and no amount of retrying would fix it.
         const staleOrder = 'order_webhook_expired';
-        const longAgo = Date.now() - (48 * 60 * 60 * 1000);
-        const orders = readData('payment_orders.json');
-        orders.push({
-            orderId: staleOrder, customerPhone: phone, amountPaise: 77700, amount: 777,
-            currency: 'INR', status: 'created', createdAt: longAgo, expiresAt: longAgo + 86400000
+        paymentServiceModule.recordOrder({
+            providerOrderId: staleOrder, customerPhone: phone, amountPaise: 77700, currency: 'INR'
         });
-        fs.writeFileSync(path.join(dataDir, 'payment_orders.json'), JSON.stringify(orders, null, 2));
+        // Aged past any expiry window. An order intent is no longer pruned, but
+        // the property under test is unchanged: expiry bounds how long an
+        // UNPAID intent is kept and must never refuse money that actually moved.
+        repo.unsafeDatabaseHandle()
+            .prepare('UPDATE payment_orders SET created_at = ? WHERE provider_order_id = ?')
+            .run(Date.now() - (48 * 60 * 60 * 1000), staleOrder);
 
         const response = await postWebhook(
             capturedEvent('pay_expired_but_real', staleOrder, 77700),
             { eventId: 'evt_expired_1' }
         );
         assert.equal(response.status, 200);
-        const deposit = readData('advances.json').find(a => a.referenceId === 'pay_expired_but_real');
+        const deposit = ledger.advances().find(a => a.referenceId === 'pay_expired_but_real');
         assert.ok(deposit, 'a captured payment against an expired order must still be credited');
         assert.equal(deposit.amount, 777);
     });
@@ -936,17 +1193,14 @@ try {
         );
         assert.equal(response.status, 200);
         assert.equal((await response.json()).ignored, 'unknown-order');
-        assert.equal(readData('advances.json').some(a => a.referenceId === 'pay_orphan'), false);
+        assert.equal(ledger.advances().some(a => a.referenceId === 'pay_orphan'), false);
     });
 
     await check('payment.failed marks the order failed without touching the ledger', async () => {
         const failOrder = 'order_webhook_failed';
-        const orders = readData('payment_orders.json');
-        orders.push({
-            orderId: failOrder, customerPhone: phone, amountPaise: 100000, amount: 1000,
-            currency: 'INR', status: 'created', createdAt: Date.now(), expiresAt: Date.now() + 86400000
+        paymentServiceModule.recordOrder({
+            providerOrderId: failOrder, customerPhone: phone, amountPaise: 100000, currency: 'INR'
         });
-        fs.writeFileSync(path.join(dataDir, 'payment_orders.json'), JSON.stringify(orders, null, 2));
 
         const raw = JSON.stringify({
             event: 'payment.failed',
@@ -954,8 +1208,8 @@ try {
         });
         const response = await postWebhook(raw, { eventId: 'evt_failed_1' });
         assert.equal(response.status, 200);
-        assert.equal(readData('advances.json').some(a => a.referenceId === 'pay_failed_1'), false);
-        assert.equal(readData('payment_orders.json').find(o => o.orderId === failOrder).status, 'failed');
+        assert.equal(ledger.advances().some(a => a.referenceId === 'pay_failed_1'), false);
+        assert.equal(ledger.order(failOrder).status, 'failed');
     });
 
     await check('an unrelated signed event is acknowledged and ignored', async () => {
@@ -973,7 +1227,7 @@ try {
             const raw = capturedEvent('pay_nosecret', webhookOrder, 250000);
             const response = await postWebhook(raw, { eventId: 'evt_nosecret_1' });
             assert.equal(response.status, 503);
-            assert.equal(readData('advances.json').some(a => a.referenceId === 'pay_nosecret'), false);
+            assert.equal(ledger.advances().some(a => a.referenceId === 'pay_nosecret'), false);
         } finally {
             fs.writeFileSync(settingsFile, JSON.stringify(saved, null, 2));
         }
@@ -987,45 +1241,55 @@ try {
         assert.doesNotMatch(JSON.stringify(settings), new RegExp(WEBHOOK_SECRET));
     });
 
-    await check('a mid-commit filesystem failure rolls the entire HTTP sale back', async () => {
-        const filenames = ['settings.json', 'advances.json', `sales_${new Date().getFullYear()}.json`];
-        const before = Object.fromEntries(filenames.map(name => [name, fs.readFileSync(path.join(dataDir, name), 'utf8')]));
-        const originalRename = fs.renameSync;
-        const originalConsoleError = console.error;
-        let renameCount = 0;
-        const expectedErrors = [];
-        fs.renameSync = (...args) => {
-            renameCount++;
-            // Journal rename, settings replacement, then fail the sale file.
-            if (renameCount === 3) {
-                const error = new Error('injected HTTP transaction failure');
-                error.code = 'EIO';
-                throw error;
-            }
-            return originalRename(...args);
-        };
-        console.error = message => expectedErrors.push(String(message));
+    await check('a mid-commit failure rolls the entire HTTP sale back', async () => {
+        /* The sale is ONE transaction: the number, the header, its lines, its
+           tenders and any advance redemption commit together or not at all.
+           The failure is injected where one can genuinely occur over HTTP — a
+           tender split that does not add up, which `recordSuppliedTenders`
+           refuses AFTER the sequence has been allocated and the invoice, its
+           lines and the redemption have all been written.
 
-        let response;
-        try {
-            response = await request('/api/sales', {
-                method: 'POST',
-                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
-                body: JSON.stringify(salePayload(0))
-            });
-        } finally {
-            fs.renameSync = originalRename;
-            console.error = originalConsoleError;
-        }
+           (The JSON version injected an fs.renameSync error to break a
+           multi-file write. There is no multi-file write to break any more;
+           test_schema.js asserts the database primitive directly.) */
+        const salesBefore = ledger.sales();
+        const advancesBefore = ledger.advances();
 
-        assert.equal(response.status, 500);
-        assert.equal(expectedErrors.some(message => message.includes('injected HTTP transaction failure')), true);
-        for (const name of filenames) {
-            assert.equal(fs.readFileSync(path.join(dataDir, name), 'utf8'), before[name], `${name} changed after rollback`);
-        }
-        assert.equal(fs.existsSync(path.join(dataDir, '.json-transaction.json')), false);
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ...salePayload(0),
+                // ₹1,030 is payable; ₹500 is tendered. The invoice must not be
+                // filed with a payment record that disagrees with its total.
+                tenders: [
+                    { method: 'cash', amount: 300 },
+                    { method: 'card', amount: 200 }
+                ]
+            })
+        });
+
+        assert.equal(response.status, 400);
+        assert.match((await response.json()).error, /do not add up|payable/i);
+
+        assert.deepEqual(ledger.sales(), salesBefore, 'no invoice may survive the rollback');
+        assert.deepEqual(ledger.advances(), advancesBefore, 'no redemption may survive the rollback');
+
+        // The invoice number it allocated rolled back rather than being burned:
+        // the next sale takes the number this one would have had.
+        const highestBefore = salesBefore
+            .map(s => Number(String(s.id).split('-')[1]))
+            .reduce((a, b) => Math.max(a, b), 0);
+        const next = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(salePayload(0))
+        });
+        assert.equal(next.status, 200);
+        const filed = (await next.json()).invoiceId;
+        assert.equal(Number(String(filed).split('-')[1]), highestBefore + 1,
+            'a rolled-back sale leaves no gap in the invoice series');
     });
-
     /* ==================================================================
        Multi-line invoices over HTTP
        ================================================================== */
@@ -1050,9 +1314,14 @@ try {
         assert.equal(sale.lines.length, 2);
         assert.equal(sale.lines[0].lineNumber, 1);
         assert.equal(sale.lines[1].purity, '18K');
-        // Each line priced at ITS OWN purity's store rate, never the request's.
+        /* Each line priced at ITS OWN purity's store rate, never the request's.
+           Stored at the schema's scale for a metal rate — integer paise per
+           gram — so an 18K rate of ₹818.1818…/g reads back as ₹818.18. The
+           money is unaffected: the line's metal value is computed from the
+           full-precision rate at pricing time and stored as its own figure,
+           rather than being re-derived from the rounded rate on read. */
         assert.equal(sale.lines[0].goldPricePerGram, FIXTURE_RATE);
-        assert.equal(sale.lines[1].goldPricePerGram, FIXTURE_RATE * 18 / 22);
+        assert.equal(sale.lines[1].goldPricePerGram, Math.round(FIXTURE_RATE * 18 / 22 * 100) / 100);
 
         // The rollup describes the whole document, not line 1.
         assert.equal(sale.purity, 'MIXED');
@@ -1455,18 +1724,7 @@ try {
 
     await check('a cashier cannot approve a deposit, a manager can', async () => {
         // A customer's unverified claim, sitting pending.
-        const advances = readData('advances.json');
-        advances.push({
-            id: 'ADV-PENDING-ROLE',
-            customerPhone: phone,
-            customerName: 'HTTP Customer',
-            type: 'deposit',
-            status: 'pending',
-            amount: 250,
-            referenceId: 'UTR-ROLE-TEST',
-            timestamp: Date.now()
-        });
-        fs.writeFileSync(path.join(dataDir, 'advances.json'), JSON.stringify(advances, null, 2));
+        const pendingId = seedPendingDeposit({ amount: 250, referenceId: 'UTR-ROLE-TEST' });
 
         const asCashier = await request('/api/admin/login', {
             method: 'POST',
@@ -1475,7 +1733,7 @@ try {
         });
         const cashierToken = (await asCashier.json()).token;
 
-        const refused = await request('/api/advances/ADV-PENDING-ROLE/approve', {
+        const refused = await request(`/api/advances/${pendingId}/approve`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({})
@@ -1484,7 +1742,7 @@ try {
         assert.equal((await refused.json()).error, 'APPROVER_REQUIRED');
         // Still pending — the refusal changed nothing.
         assert.equal(
-            readData('advances.json').find(a => a.id === 'ADV-PENDING-ROLE').status,
+            ledger.advances().find(a => a.id === pendingId).status,
             'pending'
         );
 
@@ -1495,13 +1753,13 @@ try {
         });
         const managerToken = (await asManager.json()).token;
 
-        const allowed = await request('/api/advances/ADV-PENDING-ROLE/approve', {
+        const allowed = await request(`/api/advances/${pendingId}/approve`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${managerToken}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ note: 'seen on the bank statement' })
         });
         assert.equal(allowed.status, 200);
-        const stored = readData('advances.json').find(a => a.id === 'ADV-PENDING-ROLE');
+        const stored = ledger.advances().find(a => a.id === pendingId);
         assert.equal(stored.status, 'approved');
         // The approval names the person who gave it — the whole point of the
         // pending state.
@@ -1760,32 +2018,26 @@ try {
             body: JSON.stringify({ requireMfaForApprovers: true })
         });
 
-        const advances = readData('advances.json');
-        advances.push({
-            id: 'ADV-MFA-GATE', customerPhone: phone, customerName: 'HTTP Customer',
-            type: 'deposit', status: 'pending', amount: 300,
-            referenceId: 'UTR-MFA-GATE', timestamp: Date.now()
-        });
-        fs.writeFileSync(path.join(dataDir, 'advances.json'), JSON.stringify(advances, null, 2));
+        const mfaGateId = seedPendingDeposit({ amount: 300, referenceId: 'UTR-MFA-GATE' });
 
         // The master PIN is an owner, but it carries no second factor — and
         // cannot, since there is no person to enrol. That refusal is the point.
-        const refused = await request('/api/advances/ADV-MFA-GATE/approve', {
+        const refused = await request(`/api/advances/${mfaGateId}/approve`, {
             method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
             body: JSON.stringify({})
         });
         assert.equal(refused.status, 403);
         assert.equal((await refused.json()).error, 'MFA_REQUIRED');
-        assert.equal(readData('advances.json').find(a => a.id === 'ADV-MFA-GATE').status, 'pending');
+        assert.equal(ledger.advances().find(a => a.id === mfaGateId).status, 'pending');
 
         // The manager who signed in WITH a code may approve.
-        const allowed = await request('/api/advances/ADV-MFA-GATE/approve', {
+        const allowed = await request(`/api/advances/${mfaGateId}/approve`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${mfaManagerToken}`, 'Content-Type': 'application/json' },
             body: JSON.stringify({ note: 'verified' })
         });
         assert.equal(allowed.status, 200);
-        assert.equal(readData('advances.json').find(a => a.id === 'ADV-MFA-GATE').reviewedBy.name, 'Manager Two');
+        assert.equal(ledger.advances().find(a => a.id === mfaGateId).reviewedBy.name, 'Manager Two');
 
         // Put it back so the remaining checks are not all MFA-gated.
         await request('/api/settings', {
@@ -1826,8 +2078,7 @@ try {
         assert.match(body.message, /500/, 'the message should name the store limit');
         // Nothing was filed.
         assert.equal(
-            readData('returns_' + new Date().getFullYear() + '.json')
-                .filter(r => r.originalInvoiceId === sale.id).length,
+            ledger.returns().filter(r => r.originalInvoiceId === sale.id).length,
             0, 'a refused refund must not be written'
         );
 
@@ -1949,9 +2200,28 @@ try {
     console.log('======================================================================');
 } finally {
     if (server) await new Promise(resolve => server.close(resolve));
+
+    /* CLOSE THE DATABASE BEFORE REMOVING ITS DIRECTORY. Windows refuses to
+       unlink a file that still has an open handle, so an unclosed connection
+       turns teardown into an EPERM — which is thrown from this `finally` and
+       MASKS whatever real failure sent us here, reporting a permissions
+       problem in place of the assertion that actually broke. */
+    try {
+        const repo = await import('./repositories/index.js');
+        repo.closeDb();
+    } catch (_) {
+        // The suite may have failed before the store was ever opened.
+    }
+
     const resolvedTemp = path.resolve(tempRoot);
     const resolvedSystemTemp = path.resolve(os.tmpdir());
     if (resolvedTemp.startsWith(resolvedSystemTemp + path.sep) && path.basename(resolvedTemp).startsWith('gold-pos-http-')) {
-        fs.rmSync(resolvedTemp, { recursive: true, force: true });
+        // Best-effort: a teardown failure must never be the error the operator
+        // sees instead of the test result.
+        try {
+            fs.rmSync(resolvedTemp, { recursive: true, force: true });
+        } catch (err) {
+            console.warn(`[cleanup] could not remove ${resolvedTemp}: ${err.message}`);
+        }
     }
 }

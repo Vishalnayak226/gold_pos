@@ -1622,6 +1622,85 @@ check('a multi-line refund still itemises into a printable breakdown', () => {
 });
 
 /* ==========================================================================
+   §17 Hostile inputs — a bad figure must never INFLATE a bill
+
+   Found by fuzzing computeInvoiceTotals against its own documented invariants.
+   Every case below used to produce a total ABOVE `totalBeforeAdvance`, or rows
+   that did not sum to the header — an overcharge with nothing on the invoice to
+   explain it. POST /api/sales rejects all of these on the way in, but this
+   module is where the arithmetic is DEFINED and every other caller (the desk
+   preview, the reprint, a stored record carrying a bad figure) runs through it,
+   so the floor belongs here rather than in whichever route happens to check.
+   ========================================================================== */
+
+check('a negative advance balance cannot inflate the bill', () => {
+    const t = computeInvoiceTotals({
+        metalValue: 10000, taxSlab: 3,
+        appliedAdvance: 1, customerAdvanceBalance: -5000
+    });
+    near(t.totalBeforeAdvance, 10300, 'bill before any advance');
+    exact(t.appliedAdvance, 0, 'a negative balance redeems nothing');
+    near(t.totalAmount, 10300, 'the total is NOT 15300 — a negative balance is not a surcharge');
+});
+
+check('a negative applied advance cannot inflate the bill', () => {
+    const t = computeInvoiceTotals({
+        metalValue: 10000, taxSlab: 3,
+        appliedAdvance: -500, customerAdvanceBalance: 5000
+    });
+    exact(t.appliedAdvance, 0, 'a negative advance redeems nothing');
+    near(t.totalAmount, 10300, 'the total is NOT 10800');
+});
+
+check('the grand total can never exceed the pre-advance total', () => {
+    // The property the two cases above are instances of, over a spread of
+    // hostile advance/balance pairs.
+    for (const appliedAdvance of [-1e6, -500, -0.01, 0, 1, 1e6]) {
+        for (const customerAdvanceBalance of [-1e6, -500, 0, 250, 1e6]) {
+            const t = computeInvoiceTotals({
+                metalValue: 10000, makingChargeAmount: 500, taxSlab: 3,
+                appliedAdvance, customerAdvanceBalance
+            });
+            if (t.totalAmount > t.totalBeforeAdvance + 0.001) {
+                throw new Error(
+                    `advance ${appliedAdvance} / balance ${customerAdvanceBalance} inflated `
+                    + `${t.totalBeforeAdvance} to ${t.totalAmount}`
+                );
+            }
+            if (t.appliedAdvance < 0) {
+                throw new Error(`negative appliedAdvance ${t.appliedAdvance} would be persisted`);
+            }
+        }
+    }
+});
+
+check('a negative line value cannot break the rows-sum-to-header invariant', () => {
+    // A negative metal value is not a discount — there is a discount field for
+    // that. It used to be summed into the header while allocateLines() clamped
+    // its weight to zero, so the printed rows disagreed with the total beneath.
+    const t = computeInvoiceTotals({
+        lines: [
+            { metalValue: -1000, makingChargeAmount: 0 },
+            { metalValue: 5000, makingChargeAmount: 200 }
+        ],
+        taxSlab: 3
+    });
+    near(t.components.grossMetalValue, 5000, 'the negative line contributes nothing');
+    near(round2(t.lines.reduce((s, l) => s + l.taxableAmount, 0)), t.taxableAmount,
+        'line taxable values sum to the header');
+    near(round2(t.lines.reduce((s, l) => s + l.taxAmount, 0)), t.taxAmount,
+        'line tax values sum to the header');
+    near(round2(t.lines.reduce((s, l) => s + l.lineTotal, 0)), t.totalBeforeAdvance,
+        'line totals sum to the header');
+});
+
+check('a negative making charge is floored rather than credited', () => {
+    const t = computeInvoiceTotals({ metalValue: 1000, makingChargeAmount: -400, taxSlab: 0 });
+    near(t.preTaxTotal, 1000, 'the negative making charge does not reduce the bill');
+    near(t.totalAmount, 1000, 'total');
+});
+
+/* ==========================================================================
    Summary
    ========================================================================== */
 console.log('\n======================================================================');

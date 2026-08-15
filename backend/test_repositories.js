@@ -35,6 +35,7 @@ const assert = (await import('assert')).default;
 const repo = await import('./repositories/index.js');
 const saleService = await import('./services/saleService.js');
 const returnService = await import('./services/returnService.js');
+const { round2, toPaise } = await import('../frontend/js/lib/billingMath.js');
 const advanceService = await import('./services/advanceService.js');
 const paymentService = await import('./services/paymentService.js');
 const importer = await import('./importLegacyJson.js');
@@ -213,15 +214,35 @@ check('a sale is created and numbered', () => {
 
 check('the persisted sale carries every legacy field, in rupees', () => {
     const sale = CASH_SALE.sale;
-    // The exact key set sales_YYYY.json held. Asserted as a set, not field by
+    // The exact key set sales_YYYY.json holds. Asserted as a set, not field by
     // field, so a field silently DROPPED fails as loudly as one renamed.
+    // `lines`, `tenders` and `actor` are part of that set: a sale record is
+    // BOTH shapes at once (CLAUDE.md §0), and a projection that returns only
+    // the rollup is the regression this assertion exists to catch.
     const expected = [
-        'appliedAdvance', 'customerName', 'customerPhone', 'discount', 'discountPercent',
-        'goldPricePerGram', 'goldRateSource', 'id', 'makingChargeAmount', 'makingChargePercent',
+        'actor', 'appliedAdvance', 'customerName', 'customerPhone', 'discount', 'discountPercent',
+        'goldPricePerGram', 'goldRateSource', 'id', 'lines', 'makingChargeAmount', 'makingChargePercent',
         'metalValue', 'purity', 'taxAmount', 'taxMode', 'taxPercent', 'taxableAmount',
-        'timestamp', 'totalAmount', 'weightGrams'
+        'tenders', 'timestamp', 'totalAmount', 'weightGrams'
     ];
     assert.deepEqual(Object.keys(sale).sort(), expected);
+});
+
+check('a one-line invoice’s lines sum exactly to its header', () => {
+    const sale = CASH_SALE.sale;
+    assert.equal(sale.lines.length, 1, 'a single-item sale is a one-line invoice');
+    const line = sale.lines[0];
+    assert.equal(line.lineNumber, 1);
+    assert.equal(line.purity, '22K');
+    assert.equal(line.weightGrams, 10);
+    assert.equal(line.goldPricePerGram, 6875);
+    assert.equal(line.grossMetalValue, sale.metalValue);
+    assert.equal(line.grossMakingCharge, sale.makingChargeAmount);
+    assert.equal(line.taxableAmount, sale.taxableAmount);
+    assert.equal(line.taxAmount, sale.taxAmount);
+    // The rollup states a single line's own purity and rate, not 'MIXED'/0.
+    assert.equal(sale.purity, '22K');
+    assert.equal(sale.goldPricePerGram, 6875);
 });
 
 check('the money is the server’s own arithmetic, to the paise', () => {
@@ -263,6 +284,160 @@ check('the sale wrote exactly one invoice, one line and an audit row', () => {
     const trail = repo.audit.historyFor(context.tenantId, 'invoice', header.id);
     assert.equal(trail.length, 1);
     assert.equal(trail[0].action, 'SALE_ISSUED');
+});
+
+
+/* ==========================================================================
+   4b. The multi-line invoice
+
+   The seam was built when an invoice held one gold item, while the Billing
+   Desk had already started filing carts. Everything below is the gap that
+   left: a projection that returned only the rollup, a rollup that reported
+   line 1's purity for a mixed cart, and a return that refunded whichever line
+   happened to be first.
+   ========================================================================== */
+
+console.log('\n4b. Multi-line invoices');
+
+const MULTI_SALE = saleService.createSale({
+    customerName: 'Cart Customer',
+    customerPhone: '9876500011',
+    lines: [
+        { description: 'Bangles', purity: '22K', weightGrams: 4, makingChargeAmount: 400, makingChargePercent: 8 },
+        { description: 'Chain', purity: '18K', weightGrams: 2, makingChargeAmount: 150, makingChargePercent: 6 },
+        { description: 'Coin', purity: '24K', weightGrams: 1, makingChargeAmount: 0 }
+    ]
+}, DEPS);
+
+check('a cart of three items files as one invoice with three lines', () => {
+    assert.equal(MULTI_SALE.ok, true, MULTI_SALE.error);
+    assert.equal(MULTI_SALE.sale.lines.length, 3);
+    assert.deepEqual(MULTI_SALE.sale.lines.map(l => l.lineNumber), [1, 2, 3]);
+    assert.deepEqual(MULTI_SALE.sale.lines.map(l => l.purity), ['22K', '18K', '24K']);
+    assert.deepEqual(MULTI_SALE.sale.lines.map(l => l.description), ['Bangles', 'Chain', 'Coin']);
+});
+
+check('each line is priced at ITS OWN purity’s store rate', () => {
+    const [bangles, chain, coin] = MULTI_SALE.sale.lines;
+    assert.equal(bangles.goldPricePerGram, RATES.price22K);
+    assert.equal(chain.goldPricePerGram, RATES.price18K);
+    assert.equal(coin.goldPricePerGram, RATES.price24K);
+    // …and the metal value follows the line's own rate and weight.
+    assert.equal(bangles.grossMetalValue, round2(4 * RATES.price22K));
+    assert.equal(coin.grossMetalValue, round2(1 * RATES.price24K));
+});
+
+check('the rollup answers honestly rather than reporting line 1', () => {
+    const sale = MULTI_SALE.sale;
+    // 'MIXED' and 0 are what an honest rollup says when the lines disagree —
+    // not sentinels, and not to be "fixed" to the first line's value (§0).
+    assert.equal(sale.purity, 'MIXED');
+    assert.equal(sale.goldPricePerGram, 0, 'a mixed-rate invoice states no single rate');
+    assert.equal(sale.weightGrams, 7, 'the rollup weight is the whole cart');
+    assert.equal(sale.makingChargeAmount, 550, '400 + 150 + 0');
+    assert.equal(sale.makingChargePercent, 0, 'no single making-charge rate to state');
+});
+
+check('the per-line figures sum EXACTLY to the header, in paise', () => {
+    const sale = MULTI_SALE.sale;
+    const sum = (pick) => sale.lines.reduce((total, line) => total + toPaise(pick(line)), 0);
+    assert.equal(sum(l => l.taxableAmount), toPaise(sale.taxableAmount));
+    assert.equal(sum(l => l.taxAmount), toPaise(sale.taxAmount));
+    assert.equal(sum(l => l.grossMetalValue), toPaise(sale.metalValue));
+    assert.equal(sum(l => l.grossMakingCharge), toPaise(sale.makingChargeAmount));
+    // And the rows add up to what the customer actually pays.
+    assert.equal(sum(l => l.lineTotal), toPaise(sale.totalAmount) + toPaise(sale.appliedAdvance));
+});
+
+check('a reprint reads back every line, unchanged', () => {
+    const reread = saleService.findSale(MULTI_SALE.invoiceId);
+    assert.equal(reread.lines.length, 3);
+    assert.deepEqual(
+        reread.lines.map(l => [l.purity, l.weightGrams, l.goldPricePerGram]),
+        MULTI_SALE.sale.lines.map(l => [l.purity, l.weightGrams, l.goldPricePerGram])
+    );
+    assert.equal(reread.purity, 'MIXED');
+});
+
+check('a multi-line invoice refuses a return that does not name its line', () => {
+    const refused = returnService.createReturn({
+        invoiceId: MULTI_SALE.invoiceId, weightGrams: 1, refundMode: 'cash'
+    }, DEPS);
+    assert.equal(refused.ok, false);
+    assert.equal(refused.status, 400);
+    assert.match(refused.error, /several items|which line/i);
+});
+
+check('returning line 3 prices it at the 24K rate, not line 1’s', () => {
+    const filed = returnService.createReturn({
+        invoiceId: MULTI_SALE.invoiceId, lineNumber: 3, weightGrams: 1, refundMode: 'cash'
+    }, DEPS);
+    assert.equal(filed.ok, true, filed.error);
+    assert.equal(filed.return.lineNumber, 3);
+    assert.equal(filed.return.purity, '24K');
+    assert.equal(filed.return.goldPricePerGram, round2(RATES.price24K));
+    // The coin is gone; the bangles and the chain are untouched.
+    assert.equal(filed.return.closesLine, true);
+    assert.equal(filed.return.closesInvoice, false);
+    assert.equal(filed.invoiceRemainingWeightGrams, 6);
+});
+
+check('a line’s returnable weight is its own, not the invoice’s', () => {
+    // Line 3 is exhausted. Asking for more of it is refused even though the
+    // invoice as a whole still has 6 g on it — the counter lives on the line.
+    const overReturn = returnService.createReturn({
+        invoiceId: MULTI_SALE.invoiceId, lineNumber: 3, weightGrams: 1, refundMode: 'cash'
+    }, DEPS);
+    assert.equal(overReturn.ok, false);
+
+    // And line 1 is still fully returnable.
+    const line1 = returnService.createReturn({
+        invoiceId: MULTI_SALE.invoiceId, lineNumber: 1, weightGrams: 4, refundMode: 'cash'
+    }, DEPS);
+    assert.equal(line1.ok, true, line1.error);
+    assert.equal(line1.return.purity, '22K');
+    assert.equal(line1.return.weightGrams, 4);
+});
+
+check('a one-line invoice still prices to the paise exactly as before', () => {
+    // The invariant that makes the whole widening safe: passing a single item
+    // through the multi-line path must not move a single paise.
+    const flat = saleService.createSale({
+        purity: '22K', weightGrams: 10, customerName: 'Flat Form',
+        makingChargeAmount: 5000, makingChargePercent: 7.27, discountPercent: 0
+    }, DEPS);
+    const carted = saleService.createSale({
+        customerName: 'Cart Form',
+        lines: [{ purity: '22K', weightGrams: 10, makingChargeAmount: 5000, makingChargePercent: 7.27, discountPercent: 0 }]
+    }, DEPS);
+
+    assert.equal(flat.ok && carted.ok, true);
+    for (const field of ['metalValue', 'makingChargeAmount', 'taxableAmount', 'taxAmount', 'totalAmount']) {
+        assert.equal(flat.sale[field], carted.sale[field], `${field} must match between the two request shapes`);
+    }
+    assert.equal(flat.sale.purity, '22K', 'a single-purity invoice states its purity');
+    assert.equal(flat.sale.lines.length, 1);
+});
+
+check('tenders are stored and read back, and must add up', () => {
+    const paid = saleService.createSale({
+        purity: '22K', weightGrams: 1, customerName: 'Split Payer',
+        makingChargeAmount: 0, discountPercent: 0,
+        tenders: [{ method: 'cash', amount: 1000 }, { method: 'upi', amount: 1000 }]
+    }, DEPS);
+    // Deliberately wrong on purpose: the split does not equal the bill.
+    assert.equal(paid.ok, false, 'a tender split that does not reconcile must be refused');
+    assert.match(paid.error, /do not add up|payable/i);
+
+    const priced = saleService.createSale({
+        purity: '22K', weightGrams: 1, customerName: 'Whole Bill',
+        makingChargeAmount: 0, discountPercent: 0,
+        tenders: [{ method: 'cash' }]   // no amount = "the whole bill, in cash"
+    }, DEPS);
+    assert.equal(priced.ok, true, priced.error);
+    assert.equal(priced.sale.tenders.length, 1);
+    assert.equal(priced.sale.tenders[0].method, 'cash');
+    assert.equal(priced.sale.tenders[0].amount, priced.sale.totalAmount);
 });
 
 check('every stored quantity is a scaled integer, never a float', () => {
@@ -758,14 +933,14 @@ writeLegacy('customer_auth.json', [{
     createdAt: 1750000000000, updatedAt: 1750000000000
 }]);
 writeLegacy('sales_2026.json', [{
-    id: 'GOLD-000010-26', timestamp: 1770000000000, customerName: 'Imported', customerPhone: '9111111111',
+    id: 'GOLD-009010-26', timestamp: 1770000000000, customerName: 'Imported', customerPhone: '9111111111',
     purity: '22K', weightGrams: 8, goldPricePerGram: 6800, goldRateSource: 'auto',
     metalValue: 54400, makingChargePercent: 5, makingChargeAmount: 2720,
     taxPercent: 3, taxMode: 'Exclusive', taxableAmount: 57120, taxAmount: 1713.6,
     discountPercent: 0, discount: 0, appliedAdvance: 0, totalAmount: 58833.6
 }]);
 writeLegacy('returns_2026.json', [{
-    id: 'RET-LEGACY000001', timestamp: 1770200000000, originalInvoiceId: 'GOLD-000010-26',
+    id: 'RET-LEGACY000001', timestamp: 1770200000000, originalInvoiceId: 'GOLD-009010-26',
     customerName: 'Imported', customerPhone: '9111111111', purity: '22K', weightGrams: 2,
     originalWeightGrams: 8, goldPricePerGram: 6800, makingChargePercent: 5, discountPercent: 0,
     taxPercent: 3, taxMode: 'Exclusive', metalValue: 13600, makingChargeAmount: 680,
@@ -792,7 +967,10 @@ writeLegacy('payment_events.json', []);
 check('a dry run reports what would happen and keeps nothing', () => {
     const before = repo.invoices.countInvoices(context.tenantId);
     const result = importer.importLegacyJson({ dryRun: true, dir: LEGACY_DIR });
-    assert.equal(result.ok, true, JSON.stringify(result.problems));
+    // The reconciliation lines are the message, because "ok was false" alone
+    // does not say WHICH measure failed to balance.
+    assert.equal(result.ok, true,
+        result.error || JSON.stringify(result.reconciliation && result.reconciliation.lines));
     assert.equal(result.counts.invoices, 1);
     assert.equal(result.counts.creditNotes, 1);
     assert.equal(result.counts.advanceEntries, 2);
@@ -817,7 +995,7 @@ check('a status-less legacy deposit reads as approved money', () => {
 });
 
 check('the imported invoice keeps its number and its filed figures', () => {
-    const sale = saleService.findSale('GOLD-000010-26');
+    const sale = saleService.findSale('GOLD-009010-26');
     assert.ok(sale);
     assert.equal(sale.totalAmount, 58833.6);
     assert.equal(sale.weightGrams, 8);
@@ -828,7 +1006,7 @@ check('the imported return became a numbered credit note that names its origin',
     const returns = returnService.listReturns({ customerPhone: '9111111111' });
     assert.equal(returns.total, 1);
     assert.match(returns.results[0].id, /^CN-\d{6}-\d{2}$/);
-    assert.equal(returns.results[0].originalInvoiceId, 'GOLD-000010-26');
+    assert.equal(returns.results[0].originalInvoiceId, 'GOLD-009010-26');
     assert.equal(returns.results[0].refundAmount, 14708.4);
     assert.match(returns.results[0].note, /RET-LEGACY000001/,
         'the old slip number must remain findable');
@@ -844,7 +1022,7 @@ check('a second import is a clean no-op', () => {
 
 check('the next live invoice continues past the imported series', () => {
     const next = saleService.createSale({ purity: '22K', weightGrams: 1 }, DEPS);
-    assert.notEqual(next.invoiceId, 'GOLD-000010-26');
+    assert.notEqual(next.invoiceId, 'GOLD-009010-26');
     const sequence = Number(/-(\d+)-/.exec(next.invoiceId)[1]);
     assert.ok(sequence > 10, `next invoice was ${next.invoiceId}, which collides with imported history`);
 });
@@ -894,7 +1072,7 @@ check('rollback restores the database as it was before the import', () => {
     repo.resetDataStoreContext();
     assert.equal(saleService.findSale('GOLD-777777-26'), null,
         'rollback must remove what the import added');
-    assert.ok(saleService.findSale('GOLD-000010-26'),
+    assert.ok(saleService.findSale('GOLD-009010-26'),
         'rollback must keep what was there before the import');
 });
 

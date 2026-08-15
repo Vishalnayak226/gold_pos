@@ -133,10 +133,161 @@ export const DEFAULT_SETTINGS = {
  */
 export const RETIRED_SETTINGS_KEYS = ['goldApiKey'];
 
+/* Declared here rather than beside NESTED_SETTINGS_KEYS below because
+   SETTINGS_FIELD_RULES needs it at module-evaluation time. */
+export const SUPPORTED_GOLD_PROVIDERS = ['public', 'mock'];
+
+/* ==========================================================================
+   Settings TYPES — what each key is allowed to be
+
+   POST /api/settings spreads the request body over the stored document. That
+   spread used to be unguarded, and the settings that feed the billing pipeline
+   are read with plain JS coercion downstream, so a wrong TYPE did not fail —
+   it silently produced a wrong invoice:
+
+     - `invoiceSeqStart: "10"` (a STRING, which is what a hand-edited file, an
+       older client, or a restored backup can easily contain) made
+       `settings.invoiceSeqStart = startSeq + 1` a string CONCATENATION.
+       The sequence then ran 10 → 101 → 1011 → 10111, so the invoice numbers on
+       a legally-relevant, strictly-sequential ledger grew exponentially and
+       never repeated a real increment.
+     - `invoiceSeqStart: "abc"` produced invoice `GOLD-000abc-26`, and slipped
+       past the lower-the-sequence confirmation guard because that guard tests
+       `!isNaN(parseInt(...))` and NaN simply skipped it.
+     - `goldTaxSlab: "abc"` read back as `Number(...) || 0` — the store silently
+       stopped charging GST while every screen still looked normal.
+     - `goldTaxSlab: -50` was stored on each sale as `taxPercent: -50`, which is
+       what a later return re-prices itself from.
+     - `invoicePrefix: {}` stamped `[object Object]-000011-26` into the permanent
+       ledger; an object with a non-callable `toString` made every single sale
+       fail with a 500 until somebody hand-edited settings.json.
+
+   So the types are declared HERE, beside the template that declares the keys —
+   this module is already "the ONE definition of every settings key the platform
+   reads", and a key's type is part of that definition. Validation runs at the
+   one write choke point (POST /api/settings) rather than at each downstream
+   read, so every present and future reader inherits it.
+
+   Only keys with a MEANINGFUL type constraint are listed. Free-text fields the
+   platform merely echoes (companyName, address, …) are coerced to strings and
+   length-capped rather than pattern-matched; anything absent from this table is
+   passed through unchanged, exactly as before.
+   ========================================================================== */
+
+const MAX_SETTINGS_TEXT = 500;
+
+/**
+ * Upper bound on the invoice sequence. Well beyond any real store's lifetime
+ * output while still refusing a value that would overflow the 6-digit pad or
+ * arrive from a typo like 1e21.
+ */
+const MAX_INVOICE_SEQ = 1000000000;
+
+export const SETTINGS_FIELD_RULES = {
+    // Money/tax pipeline — the ones that silently produced wrong invoices.
+    goldTaxSlab: { type: 'number', min: 0, max: 100 },
+    defaultDiscountPercent: { type: 'number', min: 0, max: 99 },
+    invoiceSeqStart: { type: 'integer', min: 1, max: MAX_INVOICE_SEQ },
+    // Identity stamped into the permanent invoice number.
+    invoicePrefix: { type: 'string', maxLength: 16, pattern: /^[A-Za-z0-9_-]*$/, patternHint: 'letters, digits, hyphen and underscore only' },
+    taxMode: { type: 'enum', values: ['Inclusive', 'Exclusive'], caseInsensitive: true },
+    goldApiProvider: { type: 'enum', values: SUPPORTED_GOLD_PROVIDERS },
+    currency: { type: 'string', maxLength: 8 },
+    // Free text that is echoed onto invoices, emails and the portal.
+    companyName: { type: 'string', maxLength: MAX_SETTINGS_TEXT },
+    address: { type: 'string', maxLength: MAX_SETTINGS_TEXT },
+    phone: { type: 'string', maxLength: 40 },
+    gstNumber: { type: 'string', maxLength: 40 },
+    reportEmail: { type: 'string', maxLength: 200 },
+    upiId: { type: 'string', maxLength: 120 },
+    publicUrl: { type: 'string', maxLength: 300 },
+    razorpayKeyId: { type: 'string', maxLength: 200 }
+};
+
+/** Human label for an expected type, used in the refusal message. */
+function describeRule(rule) {
+    if (rule.type === 'enum') return `one of ${rule.values.join(', ')}`;
+    if (rule.type === 'integer') return `a whole number between ${rule.min} and ${rule.max}`;
+    if (rule.type === 'number') return `a number between ${rule.min} and ${rule.max}`;
+    if (rule.patternHint) return `text (${rule.patternHint}), at most ${rule.maxLength} characters`;
+    return `text of at most ${rule.maxLength} characters`;
+}
+
+/**
+ * Type/range-check a settings patch before it is merged into settings.json.
+ *
+ * Returns the CANONICAL value for every key it validated — `"10"` comes back as
+ * the number 10, `" inclusive "` as `'Exclusive'`-style canonical casing — so the
+ * document on disk holds the right type rather than merely a checked one. That
+ * is the half that actually fixes the string-concatenation bug: rejecting the
+ * bad values is not enough while a *stringified* good value still gets stored.
+ *
+ * @param {object} patch the request body
+ * @returns {{ok: true, values: object}|{ok: false, error: string}}
+ */
+export function validateSettingsPatch(patch) {
+    const source = patch && typeof patch === 'object' ? patch : {};
+    const values = {};
+
+    for (const [key, rule] of Object.entries(SETTINGS_FIELD_RULES)) {
+        if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
+        const raw = source[key];
+        // An explicit null/undefined means "leave it alone", which is how a
+        // partial patch from the Settings screen already behaves.
+        if (raw === null || raw === undefined) continue;
+
+        if (rule.type === 'number' || rule.type === 'integer') {
+            // Deliberately NOT Number(raw): that turns [], '' and true into
+            // numbers, which is the coercion that caused this whole class of
+            // bug. Only a real number, or a string that is entirely a number,
+            // is accepted.
+            const isNumericString = typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(Number(raw));
+            if (typeof raw !== 'number' && !isNumericString) {
+                return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+            }
+            const n = Number(raw);
+            if (!Number.isFinite(n)) return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+            if (rule.type === 'integer' && !Number.isInteger(n)) {
+                return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+            }
+            if (n < rule.min || n > rule.max) {
+                return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+            }
+            values[key] = n;
+            continue;
+        }
+
+        if (rule.type === 'enum') {
+            if (typeof raw !== 'string') return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+            const needle = raw.trim().toLowerCase();
+            const match = rule.values.find(v =>
+                rule.caseInsensitive ? v.toLowerCase() === needle : v === raw.trim());
+            if (!match) return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+            values[key] = match;
+            continue;
+        }
+
+        // Strings. An object, array or number here is a client bug, not a value
+        // to stringify — `[object Object]` in an invoice number is exactly what
+        // this refuses.
+        if (typeof raw !== 'string') {
+            return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+        }
+        const text = raw.trim();
+        if (text.length > rule.maxLength) {
+            return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+        }
+        if (rule.pattern && !rule.pattern.test(text)) {
+            return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
+        }
+        values[key] = text;
+    }
+
+    return { ok: true, values };
+}
+
 /** Settings objects that are merged key-by-key rather than replaced wholesale. */
 export const NESTED_SETTINGS_KEYS = ['smtp', 'overrideGoldPrice'];
-
-export const SUPPORTED_GOLD_PROVIDERS = ['public', 'mock'];
 
 /** Fresh deep copy, so callers can never mutate the shared template. */
 export function getDefaultSettings() {

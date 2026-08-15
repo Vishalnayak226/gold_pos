@@ -157,7 +157,7 @@ export function importLegacyJson({ dryRun = false, dir = DATA_DIR, log = () => {
     }, { log });
 
     log(`Source: ${dir}`);
-    log(`  customer logins ${expected.customers}, sales ${expected.sales}, returns ${expected.returns}, ` +
+    log(`  customer logins ${expected.customerLogins}, sales ${expected.sales}, returns ${expected.returns}, ` +
         `advances ${expected.advanceEntries}, payment orders ${expected.paymentOrders}, events ${expected.paymentEvents}`);
 
     // Copied BEFORE the first write. The import is one transaction so a failure
@@ -322,16 +322,53 @@ function importInvoices(source, context, counts, note, invoiceIdByNumber) {
                 'Invoice number does not follow PREFIX-NNNNNN-YY; a synthetic sequence slot was allocated instead.');
         }
 
-        const weightGrams = Number(sale.weightGrams) || 0;
-        const rate = Number(sale.goldPricePerGram) || 0;
-        if (weightGrams <= 0 || rate <= 0) {
-            note(SEVERITY.FATAL, 'sale', sale.id,
-                `Weight (${sale.weightGrams}) and rate (${sale.goldPricePerGram}) must both be positive; the schema refuses a zero-weight or zero-rate line.`);
-            continue;
+        /* THE ITEMS, from whichever shape this record was filed in.
+           A sale filed after multi-line landed carries `lines[]`; one filed
+           before it carries only the flat rollup, which is exactly a one-line
+           cart. Normalising here means the validation and the insert below have
+           a single path — and it is what lets a MIXED invoice import at all.
+           Read off the rollup, a mixed cart looks like a fatal record: its
+           `purity` is the string 'MIXED' and its `goldPricePerGram` is 0,
+           because those are the honest answers when the lines disagree (§0).
+           Both would have been rejected as corrupt. */
+        const sourceLines = Array.isArray(sale.lines) && sale.lines.length > 0
+            ? sale.lines
+            : [{
+                lineNumber: 1,
+                description: '',
+                purity: sale.purity,
+                weightGrams: sale.weightGrams,
+                goldPricePerGram: sale.goldPricePerGram,
+                goldRateSource: sale.goldRateSource,
+                makingChargePercent: sale.makingChargePercent,
+                grossMakingCharge: sale.makingChargeAmount,
+                grossMetalValue: sale.metalValue,
+                discountPercent: sale.discountPercent,
+                discountAmount: sale.discount,
+                taxableAmount: sale.taxableAmount,
+                taxAmount: sale.taxAmount,
+                lineTotal: round2(Number(sale.totalAmount || 0) + Number(sale.appliedAdvance || 0))
+            }];
+
+        const preparedLines = [];
+        let lineFault = null;
+        for (const [index, line] of sourceLines.entries()) {
+            const weightGrams = Number(line.weightGrams) || 0;
+            const rate = Number(line.goldPricePerGram) || 0;
+            if (weightGrams <= 0 || rate <= 0) {
+                lineFault = `Line ${index + 1}: weight (${line.weightGrams}) and rate (${line.goldPricePerGram}) `
+                    + 'must both be positive; the schema refuses a zero-weight or zero-rate line.';
+                break;
+            }
+            const linePurity = ['24K', '22K', '18K'].includes(line.purity) ? line.purity : null;
+            if (!linePurity) {
+                lineFault = `Line ${index + 1}: unknown purity "${line.purity}".`;
+                break;
+            }
+            preparedLines.push({ raw: line, index, weightGrams, rate, purity: linePurity });
         }
-        const purity = ['24K', '22K', '18K'].includes(sale.purity) ? sale.purity : null;
-        if (!purity) {
-            note(SEVERITY.FATAL, 'sale', sale.id, `Unknown purity "${sale.purity}".`);
+        if (lineFault) {
+            note(SEVERITY.FATAL, 'sale', sale.id, lineFault);
             continue;
         }
 
@@ -359,6 +396,7 @@ function importInvoices(source, context, counts, note, invoiceIdByNumber) {
             rateSource: sale.goldRateSource || 'auto',
             metalValuePaise: toPaise(sale.metalValue || 0),
             makingChargePaise: toPaise(sale.makingChargeAmount || 0),
+            discountBp: Math.round((Number(sale.discountPercent) || 0) * 100),
             discountPaise: toPaise(sale.discount || 0),
             taxableAmountPaise: toPaise(sale.taxableAmount || 0),
             taxAmountPaise: toPaise(sale.taxAmount || 0),
@@ -372,27 +410,61 @@ function importInvoices(source, context, counts, note, invoiceIdByNumber) {
             businessDate: businessDate(issuedAt)
         });
 
-        invoices.insertLine({
-            id: newId('ILN'),
-            invoiceId,
-            lineNumber: 1,
-            description: `${purity} gold`,
-            purity,
-            weightMg: Math.round(weightGrams * 1000),
-            ratePaisePerG: Math.round(rate * 100),
-            metalValuePaise: toPaise(sale.metalValue || 0),
-            makingChargeBp: Math.round((Number(sale.makingChargePercent) || 0) * 100),
-            makingChargePaise: toPaise(sale.makingChargeAmount || 0),
-            discountBp: Math.round((Number(sale.discountPercent) || 0) * 100),
-            discountPaise: toPaise(sale.discount || 0),
-            taxableAmountPaise: toPaise(sale.taxableAmount || 0),
-            taxAmountPaise: toPaise(sale.taxAmount || 0),
-            lineTotalPaise: toPaise(sale.totalAmount || 0) + toPaise(sale.appliedAdvance || 0)
-        });
+        for (const prepared of preparedLines) {
+            const line = prepared.raw;
+            /* The GROSS figures, matching what the sale service files. A record
+               written before multi-line has only the rollup's gross values;
+               one written after carries `grossMetalValue`/`grossMakingCharge`
+               beside the net-of-tax restatements, and the gross pair is what
+               belongs in these columns. */
+            const grossMetal = Number(line.grossMetalValue ?? line.metalValue) || 0;
+            const grossMaking = Number(line.grossMakingCharge ?? line.makingChargeAmount) || 0;
+            invoices.insertLine({
+                id: newId('ILN'),
+                invoiceId,
+                lineNumber: Number(line.lineNumber) || prepared.index + 1,
+                description: String(line.description || `${prepared.purity} gold`).slice(0, 120),
+                purity: prepared.purity,
+                weightMg: Math.round(prepared.weightGrams * 1000),
+                ratePaisePerG: Math.round(prepared.rate * 100),
+                rateSource: line.goldRateSource || sale.goldRateSource || 'auto',
+                metalValuePaise: toPaise(grossMetal),
+                makingChargeBp: Math.round((Number(line.makingChargePercent) || 0) * 100),
+                makingChargePaise: toPaise(grossMaking),
+                discountBp: Math.round((Number(line.discountPercent) || 0) * 100),
+                discountPaise: toPaise(Number(line.discountAmount ?? sale.discount) || 0),
+                taxableAmountPaise: toPaise(Number(line.taxableAmount) || 0),
+                taxAmountPaise: toPaise(Number(line.taxAmount) || 0),
+                lineTotalPaise: toPaise(Number(line.lineTotal) || 0)
+            });
+            counts.invoiceLines += 1;
+        }
+
+        /* HOW IT WAS PAID. Absent on every invoice filed before tenders
+           existed, which is why this is conditional rather than defaulted — an
+           invented 'cash' tender would be a fact about the customer nobody
+           recorded. */
+        if (Array.isArray(sale.tenders)) {
+            for (const tender of sale.tenders) {
+                const amountPaise = toPaise(Number(tender && tender.amount) || 0);
+                if (amountPaise <= 0) continue;
+                invoices.insertTender({
+                    id: newId('TND'),
+                    invoiceId,
+                    method: tender.method,
+                    amountPaise,
+                    reference: tender.reference || null,
+                    paymentOrderId: null,
+                    advanceEntryId: null,
+                    capturedAt: issuedAt,
+                    createdByUserId: context.systemUserId
+                });
+                counts.tenders = (counts.tenders || 0) + 1;
+            }
+        }
 
         invoiceIdByNumber.set(sale.id, invoiceId);
         counts.invoices += 1;
-        counts.invoiceLines += 1;
     }
 }
 

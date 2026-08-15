@@ -15,6 +15,7 @@
 
 import { getDb, inTransactionNow } from './connection.js';
 import { fromPaise, round2, round3 } from '../../frontend/js/lib/billingMath.js';
+import { actorForUserId, actorsByUserId } from './userRepository.js';
 
 /* --------------------------------------------------------------------------
    Writes
@@ -172,16 +173,7 @@ export function summarizeForInvoices(ids) {
  */
 export function search({ tenantId, customerPhone = null, invoiceId = null,
                          fromAt = null, toAt = null, limit = 50, offset = 0 }) {
-    // Filters only — see the note in invoiceRepository.search().
-    const where = ['tenant_id = @tenantId'];
-    const params = { tenantId };
-
-    if (customerPhone) { where.push('customer_phone = @customerPhone'); params.customerPhone = customerPhone; }
-    if (invoiceId) { where.push('invoice_id = @invoiceId'); params.invoiceId = invoiceId; }
-    if (fromAt !== null && fromAt !== undefined) { where.push('issued_at >= @fromAt'); params.fromAt = fromAt; }
-    if (toAt !== null && toAt !== undefined) { where.push('issued_at <= @toAt'); params.toAt = toAt; }
-
-    const whereSql = where.join(' AND ');
+    const { whereSql, params } = buildNoteFilter({ tenantId, customerPhone, invoiceId, fromAt, toAt });
     const db = getDb();
     const total = db.prepare(`SELECT COUNT(*) AS n FROM credit_notes WHERE ${whereSql}`).get(params).n;
     const rows = db.prepare(`
@@ -191,6 +183,50 @@ export function search({ tenantId, customerPhone = null, invoiceId = null,
     `).all({ ...params, limit: clampLimit(limit), offset: Math.max(0, Math.trunc(offset) || 0) });
 
     return { rows, total };
+}
+
+/**
+ * The WHERE clause shared by `search()` and `periodTotals()` — one builder, so
+ * a page of returns and the refund total printed above it always describe the
+ * same set of credit notes. Filters only; see the note in invoiceRepository.
+ */
+function buildNoteFilter({ tenantId, customerPhone = null, invoiceId = null, fromAt = null, toAt = null }) {
+    const where = ['tenant_id = @tenantId'];
+    const params = { tenantId };
+
+    if (customerPhone) { where.push('customer_phone = @customerPhone'); params.customerPhone = customerPhone; }
+    if (invoiceId) { where.push('invoice_id = @invoiceId'); params.invoiceId = invoiceId; }
+    if (fromAt !== null && fromAt !== undefined) { where.push('issued_at >= @fromAt'); params.fromAt = fromAt; }
+    if (toAt !== null && toAt !== undefined) { where.push('issued_at <= @toAt'); params.toAt = toAt; }
+
+    return { whereSql: where.join(' AND '), params };
+}
+
+/**
+ * Refunded value and returned weight across a filtered period, summed by the
+ * database over the whole matched set rather than over the page on screen.
+ *
+ * The weight comes from the credit note's LINES, because that is where returned
+ * gold is recorded — a credit note header carries the money, not the metal.
+ */
+export function periodTotals({ tenantId, customerPhone = null, invoiceId = null,
+                               fromAt = null, toAt = null }) {
+    const { whereSql, params } = buildNoteFilter({ tenantId, customerPhone, invoiceId, fromAt, toAt });
+    const row = getDb().prepare(`
+        SELECT COUNT(*)                                AS count,
+               COALESCE(SUM(refund_amount_paise), 0)   AS refund_paise,
+               COALESCE((
+                   SELECT SUM(weight_mg) FROM credit_note_lines
+                    WHERE credit_note_id IN (SELECT id FROM credit_notes WHERE ${whereSql})
+               ), 0)                                   AS weight_mg
+          FROM credit_notes WHERE ${whereSql}
+    `).get(params);
+
+    return {
+        count: row.count,
+        refundAmount: fromPaise(row.refund_paise),
+        weightGrams: round3(row.weight_mg / 1000)
+    };
 }
 
 export function countCreditNotes(tenantId) {
@@ -244,7 +280,16 @@ export function toLegacyReturn(note, context = {}) {
         : getDb().prepare('SELECT * FROM invoices WHERE id = ?').get(note.invoice_id) || null;
     const invoiceLines = context.invoiceLines
         || (invoice ? getDb().prepare('SELECT * FROM invoice_lines WHERE invoice_id = ? ORDER BY line_number').all(invoice.id) : []);
-    const originalLine = invoiceLines[0] || {};
+
+    /* THE LINE THIS CREDIT NOTE ACTUALLY REVERSES, resolved by the foreign key
+       rather than assumed to be the first one. On a multi-line invoice
+       `invoiceLines[0]` is simply the wrong row: returning the 24K pendant
+       would report the 22K ring's making-charge and discount percentages on the
+       credit note, and `originalWeightGrams` — which is what "how much of this
+       line is left" is measured against — would be the ring's weight. */
+    const originalLine = invoiceLines.find(row => row.id === first.invoice_line_id)
+        || invoiceLines[0]
+        || {};
     const advanceEntry = context.advanceEntry !== undefined
         ? context.advanceEntry
         : (note.advance_entry_id
@@ -260,9 +305,21 @@ export function toLegacyReturn(note, context = {}) {
         originalTimestamp: invoice ? invoice.issued_at : null,
         customerName: note.customer_name,
         customerPhone: note.customer_phone || '',
+        /* WHICH ITEM came back. Load-bearing on a multi-line invoice: it is what
+           limits further returns against that line and what lets the refund be
+           re-priced at the right rate. Absent on a credit note whose invoice
+           line cannot be resolved, which reads as line 1 — correct for every
+           invoice filed before lines existed. */
+        lineNumber: originalLine.line_number || 1,
+        description: originalLine.description || '',
         purity: first.purity || null,
         weightGrams: first.weight_mg ? round3(first.weight_mg / 1000) : 0,
+        // The weight of the LINE being returned, not of the whole invoice — it
+        // is what this return's share was computed against.
         originalWeightGrams: originalLine.weight_mg ? round3(originalLine.weight_mg / 1000) : 0,
+        invoiceWeightGrams: round3(
+            invoiceLines.reduce((total, row) => total + (row.weight_mg || 0), 0) / 1000
+        ),
         goldPricePerGram: first.rate_paise_per_g ? fromPaise(first.rate_paise_per_g) : 0,
         makingChargePercent: originalLine.making_charge_bp ? round2(originalLine.making_charge_bp / 100) : 0,
         discountPercent: originalLine.discount_bp ? round2(originalLine.discount_bp / 100) : 0,
@@ -276,8 +333,20 @@ export function toLegacyReturn(note, context = {}) {
         taxableAmount: itemised ? fromPaise(first.taxable_amount_paise) : null,
         taxAmount: itemised ? fromPaise(first.tax_amount_paise) : null,
         itemised,
+        /* WHO AUTHORISED THE REFUND. A cash refund moves money out of the till,
+           which makes it the most fraud-sensitive write in the system and the
+           one that least tolerated being anonymous. Resolved from
+           `created_by_user_id`, never copied from a request body. */
+        actor: context.actor !== undefined ? context.actor : actorForUserId(note.created_by_user_id),
         refundAmount: fromPaise(note.refund_amount_paise),
         refundMode: note.refund_mode,
+        /* Whether this return exhausted the LINE, as distinct from the invoice.
+           Derived from the line's own running counter rather than stored: it is
+           a statement about where the line stands now, and the counter is the
+           thing that actually decides whether another return is possible. */
+        closesLine: originalLine.weight_mg
+            ? (originalLine.returned_weight_mg || 0) >= originalLine.weight_mg
+            : note.closes_invoice === 1,
         closesInvoice: note.closes_invoice === 1,
         note: note.note || '',
         ...(advanceEntry ? {

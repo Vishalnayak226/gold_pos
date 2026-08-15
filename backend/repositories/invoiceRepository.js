@@ -2,13 +2,14 @@
  * ==========================================================================
  * Invoices, their lines and their tenders.
  *
- * SHAPE NOTE. The JSON ledger held one gold item per invoice — purity and
- * weight sat on the sale record itself. The schema has proper lines, because
- * a jewellery invoice with a chain and two bangles is Phase 5's problem and a
- * table that cannot express it would have to be rebuilt. A sale filed today is
- * therefore an invoice with exactly one line, and `toLegacySale()` flattens it
- * back to the shape the Billing Desk, the Reprint Desk and every existing test
- * already speak. The wire contract does not change; only the storage does.
+ * SHAPE NOTE. The JSON ledger began with one gold item per invoice — purity and
+ * weight sat on the sale record itself — and the schema was built with proper
+ * lines because a jewellery invoice with a chain and two bangles could not be
+ * expressed otherwise. The Billing Desk then started filing genuinely
+ * multi-line invoices, so `toLegacySale()` no longer flattens: it returns
+ * `lines[]`, `tenders[]` and the flat scalar rollup together, which is what a
+ * sale record has been on disk since multi-line landed. The wire contract does
+ * not change; only the storage does.
  *
  * READS RETURN STORED FACTS. Nothing here recomputes money. A reprint must
  * reproduce the paper that was handed over, so the figures that were printed
@@ -36,7 +37,7 @@ export function insertInvoice(invoice) {
             id, tenant_id, branch_id, invoice_number, financial_year, sequence_value,
             customer_id, customer_name, customer_phone, state,
             rate_snapshot_id, rate_source,
-            metal_value_paise, making_charge_paise, discount_paise, taxable_amount_paise,
+            metal_value_paise, making_charge_paise, discount_bp, discount_paise, taxable_amount_paise,
             tax_amount_paise, applied_advance_paise, total_amount_paise,
             tax_percent_bp, tax_mode, idempotency_key, created_by_user_id,
             issued_at, business_date
@@ -44,7 +45,7 @@ export function insertInvoice(invoice) {
             @id, @tenantId, @branchId, @invoiceNumber, @financialYear, @sequenceValue,
             @customerId, @customerName, @customerPhone, @state,
             @rateSnapshotId, @rateSource,
-            @metalValuePaise, @makingChargePaise, @discountPaise, @taxableAmountPaise,
+            @metalValuePaise, @makingChargePaise, @discountBp, @discountPaise, @taxableAmountPaise,
             @taxAmountPaise, @appliedAdvancePaise, @totalAmountPaise,
             @taxPercentBp, @taxMode, @idempotencyKey, @createdByUserId,
             @issuedAt, @businessDate
@@ -58,11 +59,11 @@ export function insertLine(line) {
     assertInTransaction('insertLine');
     getDb().prepare(`
         INSERT INTO invoice_lines (
-            id, invoice_id, line_number, description, purity, weight_mg, rate_paise_per_g,
+            id, invoice_id, line_number, description, purity, weight_mg, rate_paise_per_g, rate_source,
             metal_value_paise, making_charge_bp, making_charge_paise, discount_bp, discount_paise,
             taxable_amount_paise, tax_amount_paise, line_total_paise
         ) VALUES (
-            @id, @invoiceId, @lineNumber, @description, @purity, @weightMg, @ratePaisePerG,
+            @id, @invoiceId, @lineNumber, @description, @purity, @weightMg, @ratePaisePerG, @rateSource,
             @metalValuePaise, @makingChargeBp, @makingChargePaise, @discountBp, @discountPaise,
             @taxableAmountPaise, @taxAmountPaise, @lineTotalPaise
         )
@@ -172,6 +173,19 @@ export function tendersFor(invoiceId) {
 }
 
 /**
+ * Every tender against several invoices. Batched for the same reason
+ * `linesForMany` is: a page of 50 invoices must cost one query per child table,
+ * not fifty.
+ */
+export function tendersForMany(invoiceIds) {
+    if (!invoiceIds || invoiceIds.length === 0) return [];
+    const placeholders = invoiceIds.map(() => '?').join(', ');
+    return getDb().prepare(
+        `SELECT * FROM tenders WHERE invoice_id IN (${placeholders}) ORDER BY invoice_id, captured_at`
+    ).all(...invoiceIds);
+}
+
+/**
  * A page of invoices, newest first, with optional text and date filters.
  *
  * PAGINATION IS THE POINT. The route this replaces read every sales partition
@@ -185,35 +199,7 @@ export function tendersFor(invoiceId) {
  */
 export function search({ tenantId, q = '', fromAt = null, toAt = null, state = null,
                          limit = 50, offset = 0 }) {
-    // Filter parameters only. node:sqlite rejects a named parameter the
-    // statement does not reference, so the COUNT query must not be handed the
-    // page's limit/offset — they are added for the SELECT alone, below.
-    const where = ['tenant_id = @tenantId'];
-    const params = { tenantId };
-
-    if (fromAt !== null && fromAt !== undefined) { where.push('issued_at >= @fromAt'); params.fromAt = fromAt; }
-    if (toAt !== null && toAt !== undefined) { where.push('issued_at <= @toAt'); params.toAt = toAt; }
-    if (state) { where.push('state = @state'); params.state = state; }
-
-    const term = String(q || '').trim();
-    if (term) {
-        // Three fields because the cashier has whichever one the customer can
-        // produce: the number on the slip, the name, or the phone. Digits-only
-        // for the phone so '98765 43210' and '9876543210' both match.
-        const digits = term.replace(/\D/g, '');
-        params.like = `%${term.toLowerCase()}%`;
-        const clauses = [
-            'LOWER(invoice_number) LIKE @like',
-            'LOWER(customer_name) LIKE @like'
-        ];
-        if (digits) {
-            params.phoneLike = `%${digits}%`;
-            clauses.push('customer_phone LIKE @phoneLike');
-        }
-        where.push(`(${clauses.join(' OR ')})`);
-    }
-
-    const whereSql = where.join(' AND ');
+    const { whereSql, params } = buildInvoiceFilter({ tenantId, q, fromAt, toAt, state });
     const db = getDb();
     const total = db.prepare(`SELECT COUNT(*) AS n FROM invoices WHERE ${whereSql}`).get(params).n;
     const rows = db.prepare(`
@@ -223,6 +209,41 @@ export function search({ tenantId, q = '', fromAt = null, toAt = null, state = n
     `).all({ ...params, limit: clampLimit(limit), offset: Math.max(0, Math.trunc(offset) || 0) });
 
     return { rows, total };
+}
+
+/**
+ * The period's aggregates, summed by the database over the whole matched set.
+ *
+ * SEPARATE FROM THE PAGE, DELIBERATELY. The figures a cashier reads at the top
+ * of the ledger — "412 invoices, ₹38,60,240, 5,204.310g" — describe everything
+ * the filter matched, not the fifty rows currently on screen. Summing the page
+ * would silently report a fraction of the day's takings as the day's takings.
+ * Doing it in SQL is also the whole point of the cutover: the route this
+ * replaces summed in JavaScript, which required reading every invoice in the
+ * range into memory to produce four numbers.
+ *
+ * Shares its filter construction with `search()` so a query and its totals can
+ * never describe different sets of rows.
+ */
+export function periodTotals({ tenantId, q = '', fromAt = null, toAt = null, state = null }) {
+    const { whereSql, params } = buildInvoiceFilter({ tenantId, q, fromAt, toAt, state });
+    const row = getDb().prepare(`
+        SELECT COUNT(*)                                AS count,
+               COALESCE(SUM(total_amount_paise), 0)    AS total_amount_paise,
+               COALESCE(SUM(applied_advance_paise), 0) AS applied_advance_paise,
+               COALESCE((
+                   SELECT SUM(weight_mg) FROM invoice_lines
+                    WHERE invoice_id IN (SELECT id FROM invoices WHERE ${whereSql})
+               ), 0)                                   AS weight_mg
+          FROM invoices WHERE ${whereSql}
+    `).get(params);
+
+    return {
+        count: row.count,
+        totalAmount: fromPaise(row.total_amount_paise),
+        appliedAdvance: fromPaise(row.applied_advance_paise),
+        weightGrams: round3(row.weight_mg / 1000)
+    };
 }
 
 /** Invoice count for a tenant. */
@@ -270,42 +291,163 @@ export function highestSequences(tenantId) {
  * consumer — Billing Desk, Reprint Desk, Return Desk, the customer portal, the
  * diagnostics export and both HTTP test suites — keeps working unchanged.
  *
+ * BOTH SHAPES AT ONCE, ON PURPOSE (CLAUDE.md §0). The record carries `lines[]`
+ * — per item: purity, weight, rate, making charge, discount, and that line's
+ * allocated share of the taxable value and GST — *and* the flat scalar rollup
+ * it always had. The rollup keeps every pre-multi-line reader working; `lines`
+ * is what the invoice actually is. Both are emitted here because this is the
+ * one place every read path passes through, so a caller can never see half of
+ * the contract.
+ *
+ * `purity: 'MIXED'` and `goldPricePerGram: 0` are not sentinels. They are what
+ * an honest rollup says when the lines disagree, and they must not be
+ * "corrected" to line 1's value — a mixed cart has no single purity, and
+ * reporting one would be a wrong answer rather than a missing one.
+ *
  * @param {object} invoice header row
  * @param {object[]} [lines] its lines; fetched if omitted
+ * @param {{tenders?: object[], actor?: {id: string, name: string, role: string}}} [extra]
+ *        `tenders` fetched if omitted; `actor` resolved by the caller, which
+ *        can batch one users lookup across a whole page instead of one per row.
  */
-export function toLegacySale(invoice, lines) {
+export function toLegacySale(invoice, lines, extra = {}) {
     if (!invoice) return null;
     const rows = lines || linesFor(invoice.id);
-    // One line per invoice today (see the shape note at the top). The header
-    // fields the JSON ledger kept — purity, weight, rate — come from the first
-    // line; a future multi-line invoice will need a richer wire shape, and
-    // that is a deliberate Phase 5 decision rather than a silent widening here.
-    const first = rows[0] || {};
+    const tenderRows = extra.tenders || tendersFor(invoice.id);
+
+    // A distinct value if every line agrees on one, otherwise null — the single
+    // test behind every rollup field below.
+    const agreed = (pick) => {
+        const values = [...new Set(rows.map(pick))];
+        return values.length === 1 ? values[0] : null;
+    };
+
+    const agreedPurity = agreed(row => row.purity);
+    const agreedRate = agreed(row => row.rate_paise_per_g);
+    const agreedMakingBp = agreed(row => row.making_charge_bp);
 
     return {
         id: invoice.invoice_number,
         timestamp: invoice.issued_at,
         customerName: invoice.customer_name,
         customerPhone: invoice.customer_phone || '',
-        purity: first.purity || null,
-        weightGrams: first.weight_mg ? round3(first.weight_mg / 1000) : 0,
-        goldPricePerGram: first.rate_paise_per_g ? fromPaise(first.rate_paise_per_g) : 0,
+
+        /* THE ITEMS, in printed order. Field-for-field what the JSON ledger
+           filed, so `saleLines()` reads this without branching. The money here
+           is stored, never recomputed: `metalValue`/`makingChargeAmount` are
+           the gross figures the cashier was quoted (which is what `saleLines()`
+           prefers and what a per-line return re-prices from), and
+           `taxableAmount`/`taxAmount`/`lineTotal` are the shares allocated out
+           of the header at issue time — so the rows still sum exactly to the
+           total at the bottom, years later, at whatever the slab is today. */
+        lines: rows.map(row => ({
+            lineNumber: row.line_number,
+            description: row.description || '',
+            purity: row.purity,
+            weightGrams: round3(row.weight_mg / 1000),
+            goldPricePerGram: fromPaise(row.rate_paise_per_g),
+            goldRateSource: row.rate_source,
+            metalValue: fromPaise(row.metal_value_paise),
+            grossMetalValue: fromPaise(row.metal_value_paise),
+            makingChargePercent: round2(row.making_charge_bp / 100),
+            makingChargeAmount: fromPaise(row.making_charge_paise),
+            grossMakingCharge: fromPaise(row.making_charge_paise),
+            discountPercent: round2(row.discount_bp / 100),
+            discountAmount: fromPaise(row.discount_paise),
+            taxableAmount: fromPaise(row.taxable_amount_paise),
+            taxAmount: fromPaise(row.tax_amount_paise),
+            lineTotal: fromPaise(row.line_total_paise),
+            returnedWeightGrams: round3((row.returned_weight_mg || 0) / 1000)
+        })),
+
+        /* THE ROLLUP. Redundant with `lines` above, and that is the point. */
+        purity: rows.length === 0 ? null : (agreedPurity || 'MIXED'),
+        weightGrams: round3(rows.reduce((total, row) => total + row.weight_mg, 0) / 1000),
+        goldPricePerGram: agreedRate === null ? 0 : fromPaise(agreedRate),
         goldRateSource: invoice.rate_source,
         metalValue: fromPaise(invoice.metal_value_paise),
-        makingChargePercent: first.making_charge_bp ? round2(first.making_charge_bp / 100) : 0,
+        makingChargePercent: agreedMakingBp === null ? 0 : round2(agreedMakingBp / 100),
         makingChargeAmount: fromPaise(invoice.making_charge_paise),
         taxPercent: round2(invoice.tax_percent_bp / 100),
         taxMode: invoice.tax_mode,
         taxableAmount: fromPaise(invoice.taxable_amount_paise),
         taxAmount: fromPaise(invoice.tax_amount_paise),
-        discountPercent: first.discount_bp ? round2(first.discount_bp / 100) : 0,
+        discountPercent: round2(invoice.discount_bp / 100),
         discount: fromPaise(invoice.discount_paise),
         appliedAdvance: fromPaise(invoice.applied_advance_paise),
-        totalAmount: fromPaise(invoice.total_amount_paise)
+        totalAmount: fromPaise(invoice.total_amount_paise),
+
+        /* HOW IT WAS PAID AT THE COUNTER. Empty means "not recorded", never
+           "paid nothing" — every invoice filed before tenders existed has none.
+
+           A REDEEMED ADVANCE IS EXCLUDED, deliberately. The schema records it as
+           a tender row (linked to the advance entry it spent, which is what
+           makes a drawer close reconcilable), but on this record it is already
+           `appliedAdvance` above — and the contract for this array is that a
+           non-empty one sums to `totalAmount`, which is the figure AFTER the
+           advance came off. Listing it here would double-count the customer's
+           credit and break exactly the reconciliation the array exists for. */
+        tenders: tenderRows
+            .filter(row => !row.advance_entry_id)
+            .map(row => ({
+                method: row.method,
+                amount: fromPaise(row.amount_paise),
+                reference: row.reference || ''
+            })),
+
+        /* WHO BILLED IT. Resolved from created_by_user_id back to the
+           `{id, name, role}` an admin session carries, so the wire shape is the
+           one the desk has always read. */
+        actor: extra.actor || null
     };
 }
 
+// Re-exported so a caller holding invoices does not need a second import to
+// name who filed them. The implementation lives beside the users table.
+export { actorsByUserId } from './userRepository.js';
+
 /* -------------------------------------------------------------------------- */
+
+/**
+ * The WHERE clause and its parameters, shared by `search()` and `periodTotals()`.
+ *
+ * ONE BUILDER, so a page and the totals printed above it can never describe
+ * different sets of rows — a filter added to one and forgotten in the other
+ * would show a cashier fifty invoices under a heading that counted a different
+ * four hundred.
+ *
+ * Filter parameters only: node:sqlite rejects a named parameter the statement
+ * does not reference, so the page's limit/offset are added by the caller for
+ * the SELECT alone.
+ */
+function buildInvoiceFilter({ tenantId, q = '', fromAt = null, toAt = null, state = null }) {
+    const where = ['tenant_id = @tenantId'];
+    const params = { tenantId };
+
+    if (fromAt !== null && fromAt !== undefined) { where.push('issued_at >= @fromAt'); params.fromAt = fromAt; }
+    if (toAt !== null && toAt !== undefined) { where.push('issued_at <= @toAt'); params.toAt = toAt; }
+    if (state) { where.push('state = @state'); params.state = state; }
+
+    const term = String(q || '').trim();
+    if (term) {
+        // Three fields because the cashier has whichever one the customer can
+        // produce: the number on the slip, the name, or the phone. Digits-only
+        // for the phone so '98765 43210' and '9876543210' both match.
+        const digits = term.replace(/\D/g, '');
+        params.like = `%${term.toLowerCase()}%`;
+        const clauses = [
+            'LOWER(invoice_number) LIKE @like',
+            'LOWER(customer_name) LIKE @like'
+        ];
+        if (digits) {
+            params.phoneLike = `%${digits}%`;
+            clauses.push('customer_phone LIKE @phoneLike');
+        }
+        where.push(`(${clauses.join(' OR ')})`);
+    }
+
+    return { whereSql: where.join(' AND '), params };
+}
 
 const MAX_PAGE = 200;
 

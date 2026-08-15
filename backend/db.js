@@ -388,23 +388,27 @@ export function initDatabaseFiles() {
 
     migrateSettings();
     readJSON(path.join(DATA_DIR, 'license.json'), defaultLicense);
-    readJSON(path.join(DATA_DIR, 'advances.json'), []);
-    // Customer portal logins (scrypt hashes + hashed session/reset tokens —
-    // never plaintext). Deliberately excluded from the Level-2 diagnostics
-    // export bundle in server.js: a support export should never carry
-    // credential material off the tenant's machine, even encrypted.
-    readJSON(path.join(DATA_DIR, 'customer_auth.json'), []);
-    // Razorpay order intents, keyed to the customer and amount each order was
-    // created for. /api/payment/verify reads the amount to credit from here
-    // rather than from the request body, which the gateway signature cannot
-    // police. Short-lived — pruned on write, not permanent history.
-    readJSON(path.join(DATA_DIR, 'payment_orders.json'), []);
-    // Razorpay webhook deliveries, keyed by the gateway's own event id. This is
-    // the idempotency record for server-to-server callbacks: the gateway
-    // retries a delivery until it gets a 2xx, and retries are expected, not
-    // exceptional. Without a durable record of which event ids have been
-    // applied, every retry of a payment.captured would credit the ledger again.
-    readJSON(path.join(DATA_DIR, 'payment_events.json'), []);
+
+    /* CONFIG ONLY, FROM HERE ON.
+     *
+     * `settings.json` and `license.json` are configuration, not ledger, and
+     * keep this mechanism deliberately (§0). The five ledger documents that
+     * used to be seeded alongside them — advances, customer_auth,
+     * payment_orders, payment_events, and the sales_YYYY partitions — are gone:
+     * they live in SQL now, where the schema is created by
+     * `repositories/migrate.js` at boot and an empty table needs no seeding.
+     *
+     * Seeding them here after the cutover would be actively harmful, not
+     * merely redundant. `readJSON(file, default)` WRITES the default when the
+     * file is missing, so this function would recreate an empty
+     * `advances.json` on every boot — leaving a tenant's data directory
+     * littered with empty files that look like an intact ledger and would be
+     * imported as one if the boot-time importer ever saw them.
+     *
+     * The real files a JSON-era tenant already has are untouched: the importer
+     * in server.js reads them once on the first boot after the cutover and
+     * leaves them exactly where they are, as the rollback path.
+     */
 }
 
 // Auto run initialization on import

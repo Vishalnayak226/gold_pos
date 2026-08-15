@@ -30,11 +30,25 @@ import {
 import { newId, logError, logTelemetry } from '../db.js';
 import {
     computeInvoiceTotals, computeMetalValue, normalizeTaxMode,
-    round2, toPaise
+    fromPaise, round2, round3, toPaise
 } from '../../frontend/js/lib/billingMath.js';
 
 const VALID_PURITIES = ['24K', '22K', '18K'];
 const PURITY_RATE_KEY = { '24K': 'price24K', '22K': 'price22K', '18K': 'price18K' };
+
+/* The sanity limits, and the tender vocabulary, live HERE rather than in the
+   route — they are properties of what a sale may be, not of how one arrives
+   over HTTP, and a second copy at the boundary is a second thing to keep in
+   step (§1). A test, an offline-sync job and the route all get the same
+   answer because there is only one implementation to get it from.
+
+   `tenders.method` matches the SQL CHECK exactly, so a tender is a copy rather
+   than a translation. */
+export const MAX_INVOICE_LINES = 50;
+export const MAX_SANE_WEIGHT_GRAMS = 100000;
+export const MAX_SANE_AMOUNT = 100000000;
+export const TENDER_METHODS = ['cash', 'card', 'upi', 'razorpay', 'advance', 'bank_transfer', 'other'];
+export const MAX_TENDERS = 10;
 
 /** Rupees-per-gram → paise-per-gram, the schema's scale for a metal rate. */
 function ratePaisePerGram(rupeesPerGram) {
@@ -52,25 +66,108 @@ function basisPoints(percent) {
 }
 
 /**
+ * Prices one requested item against the store's own rate.
+ *
+ * THE RATE IS THE STORE'S, NOT THE BROWSER'S. A tampered payload could
+ * otherwise bill 50g of 22K at ₹1/g and file an invoice that is internally
+ * consistent and completely wrong. `clientRate` is kept only long enough to
+ * notice a disagreement and is never persisted as money.
+ *
+ * @returns {{ok: true, line: object}|{ok: false, status?: number, error: string}}
+ */
+function priceLine(raw, index, activeRates) {
+    const where = `Line ${index + 1}`;
+    if (!raw || typeof raw !== 'object') {
+        return { ok: false, status: 400, error: `${where} is not a valid item.` };
+    }
+    if (!VALID_PURITIES.includes(raw.purity)) {
+        return { ok: false, status: 400, error: `${where} needs a valid purity (24K, 22K, or 18K).` };
+    }
+
+    const weightGrams = Number(raw.weightGrams);
+    if (!Number.isFinite(weightGrams) || weightGrams <= 0) {
+        return { ok: false, status: 400, error: `${where} needs a positive gold weight.` };
+    }
+    if (weightGrams > MAX_SANE_WEIGHT_GRAMS) {
+        return { ok: false, status: 400, error: `${where} exceeds the ${MAX_SANE_WEIGHT_GRAMS}g limit.` };
+    }
+
+    const makingChargeAmount = raw.makingChargeAmount === undefined ? 0 : Number(raw.makingChargeAmount);
+    if (!Number.isFinite(makingChargeAmount) || makingChargeAmount < 0) {
+        return { ok: false, status: 400, error: `${where} has an invalid making charge.` };
+    }
+    const makingChargePercent = raw.makingChargePercent === undefined ? 0 : Number(raw.makingChargePercent);
+    if (!Number.isFinite(makingChargePercent) || makingChargePercent < 0 || makingChargePercent > 100) {
+        return { ok: false, status: 400, error: `${where} has an invalid making charge percent.` };
+    }
+    const discountPercent = raw.discountPercent === undefined ? 0 : Number(raw.discountPercent);
+    if (!Number.isFinite(discountPercent) || discountPercent < 0 || discountPercent > 100) {
+        return { ok: false, status: 400, error: `${where} has a discount outside 0–100%.` };
+    }
+
+    const rateKey = PURITY_RATE_KEY[raw.purity];
+    const ratePerGram = Number(activeRates[rateKey]);
+    if (!Number.isFinite(ratePerGram) || ratePerGram <= 0) {
+        logError(`Refusing to bill ${raw.purity}: the active gold rate is unusable (${activeRates[rateKey]}).`);
+        return {
+            ok: false, status: 503,
+            error: 'The current gold rate is unavailable, so this invoice cannot be priced. Check the gold rate in Settings and retry.'
+        };
+    }
+
+    return {
+        ok: true,
+        line: {
+            lineNumber: index + 1,
+            description: String(raw.description || '').trim().slice(0, 120),
+            purity: raw.purity,
+            weightGrams,
+            goldPricePerGram: ratePerGram,
+            goldRateSource: activeRates.sources[rateKey],
+            metalValue: computeMetalValue(weightGrams, ratePerGram),
+            makingChargePercent,
+            makingChargeAmount: round2(makingChargeAmount),
+            discountPercent,
+            /* What the cashier's screen quoted for this line, kept only to
+               detect and log a disagreement — never persisted as money. The
+               Billing Desk sends it as `goldPricePerGram` (the rate it printed
+               on the cart row); a direct service caller names it `clientRate`.
+               Both are the same claim, so both are read. */
+            clientRate: raw.goldPricePerGram === undefined
+                ? Number(raw.clientRate)
+                : Number(raw.goldPricePerGram)
+        }
+    };
+}
+
+/**
  * Creates a sale.
  *
+ * ONE OR MANY ITEMS, ONE CODE PATH. `input.lines` is the multi-item form; the
+ * flat `purity`/`weightGrams` form is normalised into a one-line cart before
+ * anything else happens, so a single-item sale prices to the paise exactly as
+ * it did before lines existed (asserted in `test_billing_math.js` §16) and
+ * there is no second arithmetic path to keep in step.
+ *
  * @param {object} input
- * @param {'24K'|'22K'|'18K'} input.purity
- * @param {number} input.weightGrams
+ * @param {Array<object>} [input.lines] per item: purity, weightGrams, makingChargeAmount,
+ *        makingChargePercent, discountPercent, description
+ * @param {'24K'|'22K'|'18K'} [input.purity]      single-item form
+ * @param {number} [input.weightGrams]            single-item form
  * @param {string} [input.customerName]
  * @param {string} [input.customerPhone]
  * @param {number} [input.makingChargeAmount]
  * @param {number} [input.makingChargePercent] descriptive; printed, not charged
- * @param {number} [input.discountPercent]
+ * @param {number} [input.discountPercent] invoice-level; a line without its own inherits it
  * @param {number} [input.appliedAdvance]
  * @param {number} [input.clientTotal]  what the browser thought, for the mismatch log
- * @param {number} [input.clientRate]   what the browser quoted, for the mismatch log
  * @param {string} [input.idempotencyKey]
  * @param {Array<{method: string, amount: number, reference?: string}>} [input.tenders]
  * @param {object} deps
  * @param {() => object} deps.getActiveGoldRates
  * @param {() => object} deps.getSettings
  * @param {string} [deps.actorUserId]
+ * @param {{id: string, name: string, role: string}} [deps.actor] echoed onto the record
  * @param {string} [deps.actorLabel]
  * @param {string} [deps.ipAddress]
  * @returns {{ok: true, sale: object, invoiceId: string, totalCorrected: boolean,
@@ -82,45 +179,74 @@ export function createSale(input, deps) {
     const context = dataStoreContext();
     const actorUserId = deps.actorUserId || context.ownerUserId;
 
-    if (!VALID_PURITIES.includes(input.purity)) {
-        return { ok: false, status: 400, error: 'A valid purity (24K, 22K, or 18K) is required.' };
-    }
-
     // An idempotency key that has already produced an invoice returns THAT
     // invoice rather than making a second one. The unique index is the actual
     // guarantee (see the catch below); this is the fast path.
     if (input.idempotencyKey) {
         const existing = invoices.findByIdempotencyKey(context.tenantId, input.idempotencyKey);
-        if (existing) {
-            return {
-                ok: true, duplicate: true,
-                invoiceId: existing.invoice_number,
-                sale: invoices.toLegacySale(existing),
-                totalCorrected: false, rateCorrected: false
-            };
-        }
+        if (existing) return duplicateResult(existing);
     }
 
     const settings = getSettings();
-    const taxSlab = Number(settings.goldTaxSlab) || 0;
+
+    /* `Number(x) || 0` on its own read a non-numeric slab as 0 and SILENTLY
+       STOPPED CHARGING GST, and passed a negative or absurd one straight
+       through to be stamped on the record as `taxPercent` — which is what a
+       later return re-prices itself from. Clamped to the 0–100 a slab can
+       actually be. POST /api/settings refuses these on the way in, but a
+       restored backup or a hand-edited file has no such gate, and this is the
+       last point before the figure becomes a permanent ledger fact. */
+    const rawSlab = Number(settings.goldTaxSlab);
+    const taxSlab = Number.isFinite(rawSlab) ? Math.min(100, Math.max(0, rawSlab)) : 0;
+    if (Number.isFinite(rawSlab) ? rawSlab !== taxSlab : settings.goldTaxSlab !== undefined) {
+        logError(
+            `Configured GST slab ${JSON.stringify(settings.goldTaxSlab)} is not a usable percentage; `
+            + `billing this invoice at ${taxSlab}%. Correct it in Settings.`
+        );
+    }
+    // Canonicalised through the shared helper, so a settings.json written by an
+    // older build, edited by hand, or restored from a backup with 'inclusive'
+    // in it cannot leave the server billing Exclusive while the browser bills
+    // Inclusive.
     const taxMode = normalizeTaxMode(settings.taxMode);
 
-    // The rate is the store's, not the browser's. A tampered payload could
-    // otherwise bill 50g of 22K at ₹1/g and file an invoice that is internally
-    // consistent and completely wrong.
+    /* The cart. Fetched once for the whole invoice so every line on one
+       document is priced against the same rate snapshot, rather than a midnight
+       sync landing between line 2 and line 3. */
     const activeRates = getActiveGoldRates();
-    const rateKey = PURITY_RATE_KEY[input.purity];
-    const rate = Number(activeRates[rateKey]);
-    if (!Number.isFinite(rate) || rate <= 0) {
-        logError(`Refusing to bill ${input.purity}: the active gold rate is unusable (${activeRates[rateKey]}).`);
+    const requested = Array.isArray(input.lines) && input.lines.length > 0
+        ? input.lines
+        : [{
+            purity: input.purity,
+            weightGrams: input.weightGrams,
+            goldPricePerGram: input.goldPricePerGram,
+            clientRate: input.clientRate,
+            makingChargeAmount: input.makingChargeAmount,
+            makingChargePercent: input.makingChargePercent,
+            discountPercent: input.discountPercent,
+            description: input.description
+        }];
+
+    if (requested.length > MAX_INVOICE_LINES) {
+        return { ok: false, status: 400, error: `An invoice may hold at most ${MAX_INVOICE_LINES} items.` };
+    }
+
+    const saleLineItems = [];
+    for (const [i, raw] of requested.entries()) {
+        const priced = priceLine(raw, i, activeRates);
+        if (!priced.ok) return { ok: false, status: priced.status || 400, error: priced.error };
+        saleLineItems.push(priced.line);
+    }
+
+    const totalWeight = round3(saleLineItems.reduce((total, l) => total + l.weightGrams, 0));
+    if (totalWeight > MAX_SANE_WEIGHT_GRAMS) {
         return {
-            ok: false, status: 503,
-            error: 'The current gold rate is unavailable, so this invoice cannot be priced. Check the gold rate in Settings and retry.'
+            ok: false, status: 400,
+            error: `The invoice totals ${totalWeight}g, over the ${MAX_SANE_WEIGHT_GRAMS}g per-invoice limit.`
         };
     }
 
-    const weightGrams = Number(input.weightGrams);
-    const metalValue = computeMetalValue(weightGrams, rate);
+    const invoiceDiscountPercent = Number(input.discountPercent) || 0;
     const appliedAdvanceRequested = Number(input.appliedAdvance) || 0;
     const customerPhone = input.customerPhone || '';
 
@@ -128,15 +254,25 @@ export function createSale(input, deps) {
         return { ok: false, status: 400, error: 'Customer phone is required when redeeming an advance.' };
     }
 
-    const clientRate = Number(input.clientRate);
-    const rateCorrected = Number.isFinite(clientRate) && Math.abs(clientRate - rate) > 0.01;
+    // The cashier quoted a rate on screen, per line. If any of them moved
+    // between then and Save, the server's figure is what gets filed and the
+    // desk is told, so it can reprint rather than hand over a slip that
+    // disagrees with the ledger.
+    const rateCorrected = saleLineItems.some(l =>
+        Number.isFinite(l.clientRate) && Math.abs(l.clientRate - l.goldPricePerGram) > 0.01
+    );
     if (rateCorrected) {
-        logError(
-            `Sale rate mismatch — client billed ${input.purity} at ${clientRate}/g, server's active rate is ` +
-            `${rate}/g (source: ${activeRates.sources[rateKey]}). Persisting the server rate.`
-        );
-        logTelemetry('SALE_RATE_MISMATCH', 0, `client: ${clientRate}, server: ${rate}`);
+        for (const l of saleLineItems) {
+            if (!Number.isFinite(l.clientRate) || Math.abs(l.clientRate - l.goldPricePerGram) <= 0.01) continue;
+            logError(
+                `Sale rate mismatch — client billed line ${l.lineNumber} (${l.purity}) at ${l.clientRate}/g, ` +
+                `server's active rate is ${l.goldPricePerGram}/g (source: ${l.goldRateSource}). Persisting the server rate.`
+            );
+            logTelemetry('SALE_RATE_MISMATCH', 0, `client: ${l.clientRate}, server: ${l.goldPricePerGram}`);
+        }
     }
+    // Only ever needed for that comparison — not a money field, never stored.
+    saleLineItems.forEach(l => { delete l.clientRate; });
 
     try {
         return inTransaction(() => {
@@ -161,9 +297,12 @@ export function createSale(input, deps) {
             }
 
             const totals = computeInvoiceTotals({
-                metalValue,
-                makingChargeAmount: Number(input.makingChargeAmount) || 0,
-                discountPercent: Number(input.discountPercent) || 0,
+                lines: saleLineItems.map(l => ({
+                    metalValue: l.metalValue,
+                    makingChargeAmount: l.makingChargeAmount,
+                    discountPercent: l.discountPercent
+                })),
+                discountPercent: invoiceDiscountPercent,
                 taxSlab,
                 taxMode,
                 appliedAdvance: appliedAdvanceRequested,
@@ -183,7 +322,29 @@ export function createSale(input, deps) {
 
             const now = Date.now();
             const fy = financialYear(now);
-            const prefix = settings.invoicePrefix || 'GOLD';
+
+            /* The last point before a number is stamped into a permanent,
+               legally-relevant ledger. POST /api/settings type-checks both of
+               these on the way in, but a settings.json can also arrive from a
+               restored backup, a hand edit, or an older build:
+                 - a string sequence made `startSeq + 1` a string
+                   CONCATENATION, so the series ran 10 → 101 → 1011;
+                 - a non-numeric one produced invoice "GOLD-000abc-26";
+                 - an object prefix produced "[object Object]-000011-26", and
+                   one with a non-callable toString threw on every sale. */
+            const rawPrefix = settings.invoicePrefix;
+            const prefix = typeof rawPrefix === 'string' && /^[A-Za-z0-9_-]+$/.test(rawPrefix.trim())
+                ? rawPrefix.trim()
+                : 'GOLD';
+            const rawSeq = Number(settings.invoiceSeqStart);
+            const startSeq = Number.isInteger(rawSeq) && rawSeq >= 1 ? rawSeq : 1;
+            if (prefix !== rawPrefix || startSeq !== settings.invoiceSeqStart) {
+                logError(
+                    `Invoice numbering settings were unusable and have been corrected — `
+                    + `prefix ${JSON.stringify(rawPrefix)} → ${JSON.stringify(prefix)}, `
+                    + `sequence ${JSON.stringify(settings.invoiceSeqStart)} → ${startSeq}.`
+                );
+            }
 
             // Seeded from settings.invoiceSeqStart only when this financial year
             // has never issued an invoice, so an install upgrading from the JSON
@@ -194,15 +355,22 @@ export function createSale(input, deps) {
                 documentType: 'invoice',
                 financialYear: fy,
                 prefix,
-                startAt: Number(settings.invoiceSeqStart) || 1
+                startAt: startSeq
             });
 
             const invoiceNumber = documentNumber(prefix, sequenceValue, fy);
             const invoiceId = newId('INV');
 
+            // Provenance of the rates this invoice was priced at. A single
+            // source when every line agrees, 'auto+manual' when they do not —
+            // enough for an audit to notice a mixed invoice, with the per-line
+            // truth stored on each line itself.
+            const rateSources = [...new Set(saleLineItems.map(l => l.goldRateSource))];
+            const invoiceRateSource = rateSources.join('+');
+
             const rateSnapshotId = rates.snapshotFor({
                 tenantId: context.tenantId,
-                source: activeRates.sources[rateKey] === 'manual' ? 'override' : 'auto',
+                source: rateSources.includes('manual') ? 'override' : 'auto',
                 provider: settings.goldApiProvider || null,
                 price24K: activeRates.price24K,
                 price22K: activeRates.price22K,
@@ -227,7 +395,7 @@ export function createSale(input, deps) {
                 customerPhone,
                 state: 'issued',
                 rateSnapshotId,
-                rateSource: activeRates.sources[rateKey],
+                rateSource: invoiceRateSource,
                 /* GROSS figures, exactly as the JSON ledger filed them.
                    `totals.components` restates these NET of tax for printing an
                    inclusive-mode invoice whose rows add up; it is a presentation
@@ -235,8 +403,9 @@ export function createSale(input, deps) {
                    these stored fields back and re-prices a refund from them, so
                    storing the net values here would quietly change what every
                    future return pays out. */
-                metalValuePaise: toPaise(metalValue),
-                makingChargePaise: toPaise(Number(input.makingChargeAmount) || 0),
+                metalValuePaise: toPaise(totals.components.grossMetalValue),
+                makingChargePaise: toPaise(totals.components.grossMakingCharge),
+                discountBp: basisPoints(invoiceDiscountPercent),
                 discountPaise: toPaise(totals.discountAmount),
                 taxableAmountPaise: toPaise(totals.taxableAmount),
                 taxAmountPaise: toPaise(totals.taxAmount),
@@ -250,22 +419,37 @@ export function createSale(input, deps) {
                 businessDate: businessDate(now)
             });
 
-            invoices.insertLine({
-                id: newId('ILN'),
-                invoiceId,
-                lineNumber: 1,
-                description: `${input.purity} gold`,
-                purity: input.purity,
-                weightMg: weightMilligrams(weightGrams),
-                ratePaisePerG: ratePaisePerGram(rate),
-                metalValuePaise: toPaise(metalValue),
-                makingChargeBp: basisPoints(input.makingChargePercent),
-                makingChargePaise: toPaise(Number(input.makingChargeAmount) || 0),
-                discountBp: basisPoints(input.discountPercent),
-                discountPaise: toPaise(totals.discountAmount),
-                taxableAmountPaise: toPaise(totals.taxableAmount),
-                taxAmountPaise: toPaise(totals.taxAmount),
-                lineTotalPaise: toPaise(totals.totalBeforeAdvance)
+            /* THE ITEMS. Each line stores the GROSS figures the cashier was
+               quoted plus its allocated share of the invoice's taxable value
+               and GST — `totals.lines[i]`, which `allocateLines()` guarantees
+               sums back to the header exactly, at any slab and in either tax
+               mode. That identity is what makes the printed rows add up to the
+               total at the bottom, and it is asserted in
+               `test_billing_math.js` §16. */
+            saleLineItems.forEach((line, i) => {
+                const allocated = totals.lines[i];
+                invoices.insertLine({
+                    id: newId('ILN'),
+                    invoiceId,
+                    lineNumber: line.lineNumber,
+                    description: line.description || `${line.purity} gold`,
+                    purity: line.purity,
+                    weightMg: weightMilligrams(line.weightGrams),
+                    ratePaisePerG: ratePaisePerGram(line.goldPricePerGram),
+                    rateSource: line.goldRateSource,
+                    metalValuePaise: toPaise(allocated.grossMetalValue),
+                    makingChargeBp: basisPoints(line.makingChargePercent),
+                    makingChargePaise: toPaise(allocated.grossMakingCharge),
+                    discountBp: basisPoints(allocated.discountPercent),
+                    // The line's gross discount, matching the gross metal and
+                    // making figures beside it. `allocated.discountAmount` is
+                    // the net-of-tax restatement and would not reconcile with
+                    // them.
+                    discountPaise: toPaise(round2(allocated.preTaxTotal * (allocated.discountPercent / 100))),
+                    taxableAmountPaise: toPaise(allocated.taxableAmount),
+                    taxAmountPaise: toPaise(allocated.taxAmount),
+                    lineTotalPaise: toPaise(allocated.lineTotal)
+                });
             });
 
             /* The advance redemption, in the same transaction as the invoice it
@@ -347,10 +531,16 @@ export function createSale(input, deps) {
                     invoiceNumber,
                     totalAmount: serverTotal,
                     appliedAdvance: totals.appliedAdvance,
-                    purity: input.purity,
-                    weightGrams,
-                    ratePerGram: rate,
-                    rateSource: activeRates.sources[rateKey],
+                    lineCount: saleLineItems.length,
+                    // The rollup an audit reads at a glance — 'MIXED' and a 0
+                    // rate where the lines genuinely disagree, per-line detail
+                    // on the lines themselves.
+                    purity: [...new Set(saleLineItems.map(l => l.purity))].length === 1
+                        ? saleLineItems[0].purity : 'MIXED',
+                    weightGrams: round2(saleLineItems.reduce((t, l) => t + l.weightGrams, 0)),
+                    ratePerGram: [...new Set(saleLineItems.map(l => l.goldPricePerGram))].length === 1
+                        ? saleLineItems[0].goldPricePerGram : 0,
+                    rateSource: invoiceRateSource,
                     totalCorrected,
                     rateCorrected
                 },
@@ -362,7 +552,10 @@ export function createSale(input, deps) {
             return {
                 ok: true,
                 invoiceId: invoiceNumber,
-                sale: invoices.toLegacySale(header),
+                sale: invoices.toLegacySale(header, invoices.linesFor(invoiceId), {
+                    tenders: invoices.tendersFor(invoiceId),
+                    actor: deps.actor || null
+                }),
                 totalCorrected,
                 rateCorrected
             };
@@ -376,17 +569,28 @@ export function createSale(input, deps) {
         // safely — return the invoice the winner created.
         if (input.idempotencyKey && isUniqueViolation(err)) {
             const existing = invoices.findByIdempotencyKey(context.tenantId, input.idempotencyKey);
-            if (existing) {
-                return {
-                    ok: true, duplicate: true,
-                    invoiceId: existing.invoice_number,
-                    sale: invoices.toLegacySale(existing),
-                    totalCorrected: false, rateCorrected: false
-                };
-            }
+            if (existing) return duplicateResult(existing);
         }
         logError('Sale transaction failed and was rolled back: ' + err.message, err.stack);
         return { ok: false, status: 500, error: 'Failed to process sale transaction: ' + err.message };
+    }
+
+    /**
+     * The answer a duplicate request gets: the invoice the first one filed,
+     * projected exactly as a fresh sale would be. Nested so both the fast-path
+     * read and the unique-violation catch return an identical shape — they are
+     * the same answer reached two ways, and a caller must not be able to tell.
+     */
+    function duplicateResult(existing) {
+        return {
+            ok: true, duplicate: true,
+            invoiceId: existing.invoice_number,
+            sale: invoices.toLegacySale(existing, invoices.linesFor(existing.id), {
+                tenders: invoices.tendersFor(existing.id),
+                actor: invoices.actorsByUserId([existing.created_by_user_id]).get(existing.created_by_user_id) || null
+            }),
+            totalCorrected: false, rateCorrected: false
+        };
     }
 }
 
@@ -398,32 +602,78 @@ export function createSale(input, deps) {
  * that does not balance is a bug in the caller and rolls the sale back rather
  * than filing an invoice whose payment record disagrees with its total.
  */
-function recordSuppliedTenders(tenders, { invoiceId, actorUserId, now, payablePaise }) {
-    if (!Array.isArray(tenders) || tenders.length === 0) return;
+function recordSuppliedTenders(raw, { invoiceId, actorUserId, now, payablePaise }) {
+    if (raw === undefined || raw === null) return;
+    if (!Array.isArray(raw)) throw new DomainRefusal(400, 'Tenders must be a list.');
+    if (raw.length === 0) return;
+    if (raw.length > MAX_TENDERS) {
+        throw new DomainRefusal(400,
+            `An invoice may be split across at most ${MAX_TENDERS} tenders.`);
+    }
+    /* Nothing left to pay — an invoice fully settled by a redeemed advance has
+       no counter tender, and recording a ₹0 one would be a row that means
+       nothing. The advance's own tender row was written above. */
+    if (payablePaise <= 0) return;
 
     let sum = 0;
-    for (const tender of tenders) {
-        const amountPaise = toPaise(tender.amount);
-        if (!Number.isInteger(amountPaise) || amountPaise <= 0) {
-            throw new DomainRefusal(400, 'Every tender needs a positive amount.');
+    for (const [i, entry] of raw.entries()) {
+        if (!entry || typeof entry !== 'object') {
+            throw new DomainRefusal(400, `Tender ${i + 1} is not a valid payment.`);
         }
+        const method = String(entry.method || '').trim().toLowerCase();
+        if (!TENDER_METHODS.includes(method)) {
+            throw new DomainRefusal(400,
+                `Tender ${i + 1} has an unknown method. Use one of: ${TENDER_METHODS.join(', ')}.`);
+        }
+
+        /* A LONE TENDER WITH NO AMOUNT means "the whole bill, by this method".
+           The desk sends that for the ordinary unsplit sale, and it matters
+           because the server may legitimately price the invoice differently
+           from the browser — a rate synced overnight, a tax slab edited
+           mid-shift. The cashier's intent was "the customer is paying the whole
+           bill in cash", not "the customer is paying ₹4,532", so pinning the
+           amount to the browser's stale total would refuse a sale the store
+           genuinely wants to make.
+
+           A cashier who has actually split the payment sends explicit amounts,
+           and those must reconcile exactly — see the check below. */
+        const amountOmitted = raw.length === 1
+            && (entry.amount === undefined || entry.amount === null || entry.amount === '');
+        const amount = amountOmitted ? fromPaise(payablePaise) : Number(entry.amount);
+        if (!Number.isFinite(amount) || amount <= 0) {
+            throw new DomainRefusal(400, `Tender ${i + 1} needs a positive amount.`);
+        }
+        if (amount > MAX_SANE_AMOUNT) {
+            throw new DomainRefusal(400, `Tender ${i + 1} exceeds the per-payment limit.`);
+        }
+
+        const amountPaise = toPaise(round2(amount));
         sum += amountPaise;
         invoices.insertTender({
             id: newId('TND'),
             invoiceId,
-            method: tender.method,
+            method,
             amountPaise,
-            reference: tender.reference || null,
-            paymentOrderId: tender.paymentOrderId || null,
+            // A card slip number, a UPI UTR, a cheque number — whatever the
+            // reconciliation will be done against. Free text by necessity;
+            // clamped, and never used as an identifier by this system.
+            reference: String(entry.reference || '').trim().slice(0, 100) || null,
+            paymentOrderId: entry.paymentOrderId || null,
             advanceEntryId: null,
             capturedAt: now,
             createdByUserId: actorUserId
         });
     }
 
+    /* Compared in integer paise, not rupees. Two rupee floats that both look
+       like the same amount need not be equal, and this is precisely the
+       comparison that must not be approximate. Thrown, not returned, so the
+       whole invoice unwinds rather than committing a payment record that
+       disagrees with the total above it. */
     if (sum !== payablePaise) {
         throw new DomainRefusal(400,
-            `Tenders total ${sum / 100} but the invoice is payable at ${payablePaise / 100}.`);
+            `The payments recorded (₹${fromPaise(sum)}) do not add up to the amount due (₹${fromPaise(payablePaise)}). `
+            + 'Adjust the split so the two match.');
     }
 }
 
@@ -477,15 +727,16 @@ export function projectSalesPage(rows) {
     if (!rows || rows.length === 0) return [];
 
     const ids = rows.map(row => row.id);
-    const linesByInvoice = new Map();
-    for (const line of invoices.linesForMany(ids)) {
-        if (!linesByInvoice.has(line.invoice_id)) linesByInvoice.set(line.invoice_id, []);
-        linesByInvoice.get(line.invoice_id).push(line);
-    }
+    const linesByInvoice = groupByInvoice(invoices.linesForMany(ids));
+    const tendersByInvoice = groupByInvoice(invoices.tendersForMany(ids));
+    const actorsByUser = invoices.actorsByUserId(rows.map(row => row.created_by_user_id));
     const returnSummaries = creditNotes.summarizeForInvoices(ids);
 
     return rows.map(row => {
-        const sale = invoices.toLegacySale(row, linesByInvoice.get(row.id) || []);
+        const sale = invoices.toLegacySale(row, linesByInvoice.get(row.id) || [], {
+            tenders: tendersByInvoice.get(row.id) || [],
+            actor: actorsByUser.get(row.created_by_user_id) || null
+        });
         const summary = returnSummaries.get(row.id)
             || { count: 0, returnedWeightGrams: 0, refundedAmount: 0 };
         const returnableWeightGrams = Math.max(0,
@@ -500,6 +751,16 @@ export function projectSalesPage(rows) {
             fullyReturned: summary.count > 0 && returnableWeightGrams <= 0
         };
     });
+}
+
+/** Child rows keyed by their invoice, preserving the order they arrived in. */
+function groupByInvoice(rows) {
+    const grouped = new Map();
+    for (const row of rows) {
+        if (!grouped.has(row.invoice_id)) grouped.set(row.invoice_id, []);
+        grouped.get(row.invoice_id).push(row);
+    }
+    return grouped;
 }
 
 /** One filed invoice by its printed number, with return state, or null. */
@@ -518,11 +779,20 @@ export function findSale(invoiceNumber) {
  * considered successful. Throwing is what makes a refusal atomic.
  */
 export class DomainRefusal extends Error {
-    constructor(status, message, code) {
+    /**
+     * @param {number} status  HTTP status the route should answer with
+     * @param {string} message the `error` field — usually prose, but a machine
+     *        code such as 'APPROVER_REQUIRED' where the client branches on it
+     * @param {string} [code]  a secondary code for callers that need both
+     * @param {string} [detail] human-readable text accompanying a coded refusal,
+     *        surfaced as `message` so the desk can show something specific
+     */
+    constructor(status, message, code, detail) {
         super(message);
         this.name = 'DomainRefusal';
         this.status = status;
         this.code = code;
+        this.detail = detail;
     }
 }
 

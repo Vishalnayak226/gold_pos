@@ -19,6 +19,14 @@ not every turn. This file is auto-loaded on every request, so it stays tight.
   - **Config stays JSON on purpose.** `settings.json` and `license.json` are configuration, not
     ledger, and keep their existing mechanism — `defaultSettings.js` + `migrateSettings()`, the
     additive migration path §1 already mandates. Do not move them into SQL.
+    - **A settings key that the billing pipeline reads MUST declare its type** in
+      `SETTINGS_FIELD_RULES` (`defaultSettings.js`), which `POST /api/settings` enforces and
+      canonicalises through `validateSettingsPatch()`. These keys are read downstream with plain JS
+      coercion, so a wrong *type* does not fail — it bills wrongly: a stringified `invoiceSeqStart`
+      made `startSeq + 1` a string **concatenation** (10 → 101 → 1011, destroying the sequential
+      invoice series), a non-numeric `goldTaxSlab` read as `Number(x) || 0` and silently charged
+      **0% GST**, and an object `invoicePrefix` stamped `[object Object]` into permanent invoice
+      numbers. Fixed 2026-08-13; regression-tested in `test_http.js` §"Settings TYPE validation".
   - **NO CREDENTIAL MAY EVER SIT IN `DEFAULT_SETTINGS`.** `getDefaultSettings()` is merged over a
     tenant's `settings.json` on *every* boot, so a secret in the template is re-added immediately
     after anything deletes it — which is exactly how a plaintext `adminPin: "1234"` silently
@@ -31,11 +39,20 @@ not every turn. This file is auto-loaded on every request, so it stays tight.
     no username to look a per-user salt up by, so a per-operator salt would mean one scrypt call
     per operator per attempt. The consequence (equal PINs hash equally) is safe *only because*
     duplicate PINs are refused outright; do not relax that check.
-  - **Ledger JSON is legacy and mid-migration.** `advances`, `sales_*`, `customer_auth`,
-    `payment_orders` and `payment_events` still live in `backend/data/*.json` and `server.js` still
-    reads them — the SQLite schema exists but the routes have not been cut over yet. Add **no new**
-    JSON ledger document and **no new** `readJSON`/`writeJSON` caller: that path is being deleted,
-    and anything added to it now is work that has to be migrated twice.
+  - **THE LEDGER IS SQL. The JSON ledger is gone** (cut over 2026-08-15). `advances`, `sales_*`,
+    `returns_*`, `customer_auth`, `payment_orders` and `payment_events` are tables now, and
+    `server.js` reaches them only through `backend/repositories/` and `backend/services/`. The
+    files may still sit in a tenant's `backend/data/` — they are the rollback path, and
+    `initialiseLedger()` in `server.js` imports them once on the first boot after the upgrade —
+    but **nothing reads them at runtime.** Add **no new** JSON ledger document and **no new**
+    `readJSON`/`writeJSON` caller for ledger data; the only legitimate `readJSON` callers left are
+    `settings.json` and `license.json`, which are configuration.
+  - **Two identity systems meet at `users.ensureActorUser()`.** Operators are configuration
+    (`settings.json`), while every accountability column is a foreign key into `users`. A route
+    resolves one to the other via `resolveActorUserId(req.actor)` before writing. **Never default
+    a ledger write to the owner user id to make a foreign key resolve** — `advanceService` gates
+    posting a claim on `users.isApprover()`, and `owner` passes it, so that shortcut silently
+    grants every cashier the approval right the control exists to withhold.
   - **A sale record is BOTH shapes at once, on purpose.** It carries `lines[]` (per item: purity,
     weight, rate, making charge, discount, and that line's allocated share of the taxable value and
     GST) *and* the flat scalar rollup it always had. The rollup is what keeps every pre-multi-line
@@ -249,12 +266,17 @@ wrong answers.
   (helper-level integration) → `test_routes.js` (routes + auth boundary) → `test_http.js` (money
   paths, Razorpay webhook, returns/refunds, multi-line invoices, tenders, actor identity, paged
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
-  `test_production_guard.js` (fail-closed startup). **403 checks as of 2026-08-13**
-  (140 + 43 + 71 + 16 + 9 + 28 + 80 + 16, in run order — `test_suite.js` is counted by the nine
+  `test_production_guard.js` (fail-closed startup). **426 checks as of 2026-08-15**
+  (145 + 43 + 82 + 16 + 9 + 28 + 87 + 16, in run order — `test_suite.js` is counted by the nine
   numbered tests it prints, not by an older tally that no longer matched anything).
   - `test_concurrency.js` spawns child processes and is the slowest suite by far (~1–2 min). It is
     in `npm test` anyway, because the properties it asserts — one balance cannot be spent twice, a
     kill mid-sale leaves nothing behind — are not observable any other way.
+  - **A suite that opens the database must `closeDb()` before removing its temp directory.**
+    Windows refuses to unlink a file with an open handle, so the `rmSync` in a `finally` throws
+    EPERM — and that EPERM replaces whatever assertion actually failed, so the run reports a
+    permissions problem and hides the real bug. `test_http.js` and `test_suite.js` both do this,
+    and both treat the removal itself as best-effort for the same reason.
 - **No suite touches `backend/data/`.** Each one that needs a database makes its own temp
   directory via `GOLD_POS_DATA_DIR`, so all of them are safe to run alongside a dev server on
   :5000. Keep it that way — fixture debris in a real ledger looks exactly like a real bug.
