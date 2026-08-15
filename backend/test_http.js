@@ -2195,6 +2195,73 @@ try {
         assert.equal(searched.results[0].phone, phone);
     });
 
+    /* ==================================================================
+       THE AUDIT TRAIL'S READ PATH.
+
+       The table has been append-only since Phase 24 and written on every
+       money path since Phase 29, but nothing exposed it until Phase 31 —
+       an append-only table nobody can read is evidence in principle and
+       not in practice. These assert the reading, not the writing:
+       test_schema.js already proves the triggers refuse an UPDATE.
+       ================================================================== */
+
+    await check('the audit trail records the sales this suite filed, newest first', async () => {
+        const res = await request('/api/audit?entityType=invoice&limit=200', { headers: adminHeaders });
+        assert.equal(res.status, 200);
+        const body = await res.json();
+
+        const issued = body.results.filter(e => e.action === 'SALE_ISSUED');
+        assert.ok(issued.length > 0, 'every sale this suite filed should have left a trail row');
+        assert.ok(issued.every(e => e.entityType === 'invoice'), 'the entityType filter must be applied server-side');
+
+        // Newest first, like every other ledger route.
+        const times = body.results.map(e => e.occurredAt);
+        assert.deepEqual(times, [...times].sort((a, b) => b - a), 'the trail must come back newest first');
+
+        // The detail column is parsed for the browser, not shipped as a string.
+        const withDetail = issued.find(e => e.detail);
+        assert.ok(withDetail, 'a SALE_ISSUED row should carry its detail');
+        assert.equal(typeof withDetail.detail, 'object');
+        assert.ok(withDetail.summary.length > 0, 'a trail row must say what happened in words');
+    });
+
+    await check('a cashier cannot read the audit trail', async () => {
+        /* '43219', not the '4321' Cashier One starts with: the session-
+           revocation check earlier in this suite rotates their PIN to prove
+           that changing it ends their sessions, and this runs after it. */
+        const asCashier = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: '43219' })
+        });
+        assert.equal(asCashier.status, 200, 'the cashier must be able to sign in for this to test anything');
+        const cashierToken = (await asCashier.json()).token;
+
+        /* The trail names who released money, which makes it the record a
+           cashier under suspicion most wants to read and has least business
+           reading. Same gate as approving a deposit, deliberately. */
+        const refused = await request('/api/audit', {
+            headers: { Authorization: `Bearer ${cashierToken}` }
+        });
+        assert.equal(refused.status, 403);
+        assert.equal((await refused.json()).error, 'APPROVER_REQUIRED');
+    });
+
+    await check('the audit trail is not readable without a session at all', async () => {
+        const anonymous = await request('/api/audit');
+        assert.equal(anonymous.status, 401);
+        assert.equal((await anonymous.json()).error, 'ADMIN_SESSION_REQUIRED');
+    });
+
+    await check('a malformed audit date is refused rather than silently ignored', async () => {
+        const bad = await request('/api/audit?from=not-a-date', { headers: adminHeaders });
+        assert.equal(bad.status, 400);
+        assert.match((await bad.json()).error, /YYYY-MM-DD/);
+
+        const backwards = await request('/api/audit?from=2026-08-10&to=2026-08-01', { headers: adminHeaders });
+        assert.equal(backwards.status, 400);
+    });
+
     console.log('======================================================================');
     console.log(`🎉 ALL ${passed} HTTP ROUTE CHECKS PASSED.`);
     console.log('======================================================================');

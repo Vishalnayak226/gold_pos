@@ -237,7 +237,25 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 - [ ] OTP or audited store-assisted customer phone verification.
 - [ ] Secrets outside settings responses/exports; redaction, encryption and key-rotation runbook.
 - [ ] Same-origin policy, CSP/security headers, runtime schemas, upload/request limits, rate/abuse limits and safe errors.
+  *(Audited 2026-08-16, because this line read as untouched and mostly is not. **Already in place:**
+  the same-origin/CORS allowlist and a full helmet CSP directive set (`server.js`, asserted by
+  "security headers and explicit CORS allowlist are emitted over HTTP" in `test_http.js`); request
+  limits (5 MB JSON, 1 MB on the raw webhook body); and login rate limiting on both the admin and
+  customer paths, with the 429 lockout asserted in `test_routes.js`. **Genuinely still open:**
+  rate/abuse limits on anything that is not a login, and runtime schemas beyond
+  `validateSettingsPatch()` — which covers `POST /api/settings` only and is the pattern the rest
+  should follow rather than a second mechanism.)*
 - [ ] Structured audit/security logs with PII classification, retention, clock sync, access control, alerts and tamper-evident export.
+  *(Partly done 2026-08-16 — **the trail is now readable**, which was the gap this strand kept
+  hitting. `audit_events` has been append-only by trigger since Phase 24 and written on every money
+  path since Phase 29, but nothing exposed it, so it was evidence in principle and not in practice.
+  `GET /api/audit` and an Audit Trail screen close that: approver-only, on the same
+  `requireApprover` gate as releasing a claim, because the trail names who released money and is
+  therefore what a cashier under suspicion most wants to read. Filterable by record type, actor and
+  date; four checks in `test_http.js` cover the read, the cashier's 403, the anonymous 401 and date
+  validation. **Still open on this line:** PII classification, a retention policy, clock sync,
+  alerting, and tamper-evident export — the trail cannot be edited, but nothing yet proves to a
+  third party that it has not been.)*
 - [ ] Threat-model payments, account takeover, tenant isolation, updates, insider/cashier fraud, extensions, backups and support exports.
   *(Not started. Note for whoever picks it up: the **insider/cashier fraud** strand was previously
   unanswerable rather than merely unanalysed — no financial record named who created it, so there
@@ -248,6 +266,12 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   releasing money, and a refund threshold above which a cashier is refused. **What is still missing
   for it:** a 4-digit PIN keyspace that does not survive file theft, and no dual control — one
   manager can still both authorise and take a large refund alone.
+  **Both are `[needs design decision: ...]` as of 2026-08-16, deliberately unstarted.** Neither is
+  a code question. Raising the PIN to six digits with a secret pepper from the environment changes
+  every operator's muscle memory at the counter and needs a migration path for the PINs already in
+  use; a dual-control threshold is a business rule about how much money one manager may move alone,
+  and picking a number here would be inventing store policy. Asked and held open — §4 says guessing
+  here produces work that gets thrown away.
   **Corrected 2026-08-15:** this note previously said the audit trail was unwritten. That was true
   when it was written on 2026-08-13, and Phase 29 (2026-08-15) changed it — moving the routes onto
   the service seam wired `audit.record()` into `saleService`, `returnService`, `advanceService` and

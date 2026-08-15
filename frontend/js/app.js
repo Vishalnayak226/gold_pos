@@ -10,6 +10,7 @@ import { ReturnDesk } from './components/ReturnDesk.js';
 import { Dashboard } from './components/Dashboard.js';
 import { AdvancesManager } from './components/AdvancesManager.js';
 import { CustomerAccountsManager } from './components/CustomerAccountsManager.js';
+import { AuditTrail } from './components/AuditTrail.js';
 import { SettingsManager } from './components/SettingsManager.js';
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -24,6 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.dashboard = new Dashboard();
     window.advancesManager = new AdvancesManager();
     window.customerAccountsManager = new CustomerAccountsManager();
+    window.auditTrail = new AuditTrail();
     window.settingsManager = new SettingsManager();
     if (sessionStorage.getItem('adminToken')) {
         window.dashboard.refresh();
@@ -332,6 +334,9 @@ function initNavigation() {
             }
             if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && sessionStorage.getItem('adminToken')) {
                 window.customerAccountsManager.refresh();
+            }
+            if (targetId === 'audit-tab' && window.auditTrail && sessionStorage.getItem('adminToken')) {
+                window.auditTrail.refresh();
             }
             if (targetId === 'settings-tab' && window.settingsManager && sessionStorage.getItem('adminToken')) {
                 window.settingsManager.refresh();

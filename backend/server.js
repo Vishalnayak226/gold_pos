@@ -1897,6 +1897,67 @@ app.get('/api/advances', requireAdminSession, (req, res) => {
 });
 
 /**
+ * GET /api/audit?entityType=&entityId=&actorUserId=&action=&from=&to=&limit=
+ * A page of the append-only audit trail, newest first.
+ *
+ * APPROVER-ONLY, deliberately. The trail names who released money and when, so
+ * it is the record a cashier under suspicion has the strongest motive to read
+ * and the least business reading. `requireApprover` is the same gate that
+ * governs releasing a claim, which keeps "who may see the evidence" and "who
+ * may create the thing being evidenced" answered by one rule rather than two.
+ *
+ * The table has been written on every money path since Phase 29 — saleService,
+ * returnService, advanceService and paymentService all call `audit.record()` —
+ * but nothing exposed it until now. An append-only table that cannot be read
+ * is evidence in principle and not in practice: the trigger stops it being
+ * edited, and the absence of a route stopped it being used.
+ *
+ * `detail_json` is parsed here rather than shipped as a string, so the browser
+ * never has to JSON.parse a field that might be null.
+ */
+app.get('/api/audit', requireAdminSession, requireApprover, (req, res) => {
+    try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+
+        const context = repo.dataStoreContext();
+        const { rows, total } = repo.audit.search({
+            tenantId: context.tenantId,
+            entityType: String(req.query.entityType || '').trim() || null,
+            entityId: String(req.query.entityId || '').trim() || null,
+            actorUserId: String(req.query.actorUserId || '').trim() || null,
+            action: String(req.query.action || '').trim() || null,
+            fromAt: q.from,
+            toAt: q.to,
+            limit: q.limit,
+            offset: 0
+        });
+
+        res.json({
+            results: rows.map(row => ({
+                id: row.id,
+                action: row.action,
+                entityType: row.entity_type,
+                entityId: row.entity_id,
+                summary: row.summary,
+                actorLabel: row.actor_label,
+                actorUserId: row.actor_user_id,
+                ipAddress: row.ip_address,
+                occurredAt: row.occurred_at,
+                businessDate: row.business_date,
+                detail: row.detail_json ? JSON.parse(row.detail_json) : null
+            })),
+            total,
+            truncated: total > rows.length,
+            limit: q.limit
+        });
+    } catch (err) {
+        logError('Error retrieving audit trail: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to retrieve audit trail' });
+    }
+});
+
+/**
  * GET /api/advances/customers?q=&limit=
  * One running-balance row per customer who has ever had an advance, newest
  * activity first. Admin-only — this is what the Advances tab lists.
