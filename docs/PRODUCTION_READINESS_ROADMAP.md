@@ -246,9 +246,14 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   now has data to reason about. As of 2026-08-13 the four controls that strand needed are in place:
   hashed PINs, session revocation on any roster change, optional per-operator TOTP required for
   releasing money, and a refund threshold above which a cashier is refused. **What is still missing
-  for it:** an append-only audit trail (the `audit_events` table exists and is unwritten by
-  `server.js`), a 4-digit PIN keyspace that does not survive file theft, and no dual control — one
-  manager can still both authorise and take a large refund alone.)*
+  for it:** a 4-digit PIN keyspace that does not survive file theft, and no dual control — one
+  manager can still both authorise and take a large refund alone.
+  **Corrected 2026-08-15:** this note previously said the audit trail was unwritten. That was true
+  when it was written on 2026-08-13, and Phase 29 (2026-08-15) changed it — moving the routes onto
+  the service seam wired `audit.record()` into `saleService`, `returnService`, `advanceService` and
+  `paymentService`, so the trail is written on every money path. What was still missing on
+  2026-08-15 was the **read** path: nothing exposed the trail, so an append-only table nobody can
+  read is evidence in principle and not in practice.)*
 - [ ] Independent security review; SAST, secret scanning, dependency review, SBOM and host/image scans where applicable.
 - [ ] Privacy notice, purposes/consents, rights workflow, retention/deletion, vendor register, incident response and export policy reviewed by Indian counsel.
 - [ ] GST invoice, credit-note, records and applicable e-invoice/e-way configuration reviewed by a practising CA for the pilot merchant.

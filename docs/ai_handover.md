@@ -12,11 +12,20 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `25127e1` — "docs: correct stale \"desk captures no tender\" note"
-  (2026-08-13), on branch **`phase-21-payment-verification-and-production-guard`**.
-- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-15 — Phases 28 AND 29 are UNCOMMITTED.**
-  Phase 29 is the route cut-over (see `docs/LEDGER.md`); Phase 28 was the adversarial
-  "try to break it" pass that preceded it. Nothing is staged.
+- **Latest commit:** `49fcbb8` — "Point the e2e journeys at the SQLite ledger"
+  (2026-08-16), on branch **`phase-21-payment-verification-and-production-guard`**.
+- **✅ THE WORKING TREE IS CLEAN as of 2026-08-16. Phases 28, 29 and 30 are all committed.**
+  Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`. Migration
+  `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout migrates.
+  - *This section said the opposite until 2026-08-16, claiming 25 uncommitted files. It was
+    describing a state that two commits had already resolved. If you are reading a handover claim
+    about the tree, run `git status` before acting on it.*
+- **Phase 30 (2026-08-16) — the e2e journeys caught up with the ledger.** 23 of the 43 Playwright
+  journeys were failing after the Phase 29 cut-over, because every spec still asserted against the
+  retired JSON ledger — files the importer reads once on first boot and nothing writes again. They
+  were therefore comparing each journey's work against the frozen seed, and doing it *quietly*:
+  stale JSON parses fine, so the failures looked like arithmetic bugs. Specs read SQLite through a
+  new `readLedger()` fixture helper now. **43/43 green.** See `docs/LEDGER.md` Phase 30.
   - **Phase 29 (2026-08-15) — the ledger is SQLite now.** `server.js` reaches persistence only
     through `repositories/` and `services/`; every ledger `readJSON`/`writeJSON` call site is
     gone, and so are the ~500 lines of read-modify-write around them. `settings.json` and
@@ -34,8 +43,9 @@ This document contains key architectural details, non-negotiable design guidelin
   - `backend/test_billing_math.js` (+5 checks), `backend/test_http.js` (+7 checks).
   - Plus `CLAUDE.md` §0/§8 and `docs/LEDGER.md`.
 - **`npm test` is green across all eight suites — 426 checks, exit 0** (145 + 43 + 82 + 16 + 9 +
-  28 + 87 + 16). Verified 2026-08-15 after the cut-over. **Playwright has NOT been re-run since
-  Phase 29** — it needs an installed browser binary; the 43 journeys were last green on 2026-08-12.
+  28 + 87 + 16). Re-verified 2026-08-16. **Playwright is green too — 43/43, 4.5m, verified
+  2026-08-16**, the first full run since Phase 29. One-off setup if the binary is missing:
+  `cd backend && npm install && npx playwright install chromium`.
 - **What the hardening pass established, and what it did NOT find.** The transactional core held
   under every attack: concurrent sales produced unique invoice numbers with no lost writes,
   concurrent returns refunded exactly once, concurrent advance redemption double-spent nothing,

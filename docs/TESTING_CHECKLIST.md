@@ -54,11 +54,11 @@ logic behind it is asserted in `npm test` but the screen is not.
 
 ## 0. Setup
 
-- [x] `cd backend && npm test` is green — **157 checks, verified 2026-08-09**. Five suites run in order: `test_billing_math.js` (pricing/rounding), `test_suite.js` (helper-level integration), `test_routes.js` (HTTP routes + auth boundary), `test_http.js` (money paths + webhook), `test_production_guard.js` (fail-closed startup). Each of the last three boots a real server on an ephemeral port against a temp data directory, so all are safe to run with a dev server already up on :5000.
-  Result: PASS  Notes: 83 billing + 6 integration + 27 route + 25 HTTP + 16 guard.
+- [x] `cd backend && npm test` is green — **426 checks, verified 2026-08-16**. Eight suites run in order: `test_billing_math.js` (pricing/rounding), `test_schema.js` (migrations + SQL constraints), `test_repositories.js` (the repository seam + legacy projections), `test_concurrency.js` (real OS processes), `test_suite.js` (helper-level integration), `test_routes.js` (HTTP routes + auth boundary), `test_http.js` (money paths + webhook), `test_production_guard.js` (fail-closed startup). Every suite that needs a database makes its own temp directory via `GOLD_POS_DATA_DIR`, so all are safe to run with a dev server already up on :5000.
+  Result: PASS  Notes: 145 + 43 + 82 + 16 + 9 + 28 + 87 + 16, in run order.
 
-- [x] `npm run test:e2e` is green — **16/16, verified 2026-08-09** (Desktop Chrome + 390px Pixel 7). Needs `npm install && npx playwright install chromium` first.
-  Result: PASS  Notes: cashier billing/redemption/stale-rate/over-redemption; customer balance/login/deposit/pending-UPI/duplicate-reference/logout.
+- [x] `npm run test:e2e` is green — **43/43, verified 2026-08-16** (Desktop Chrome + 390px Pixel 7). Needs `npm install && npx playwright install chromium` first.
+  Result: PASS  Notes: 4.5m. First green run since the Phase 29 cut-over — 23 of the 43 were failing because the specs still read the retired JSON ledger and so asserted against the frozen seed rather than their own work. They read the SQLite ledger through `readLedger()` now; see LEDGER Phase 30.
 
 - [ ] Server starts cleanly (`Restart_Server.bat` or `node backend/server.js`), no red errors in console except the expected "Licensing sync connection failed" if licensing_server isn't running.
   Result: _____  Notes: ______________________________________________
