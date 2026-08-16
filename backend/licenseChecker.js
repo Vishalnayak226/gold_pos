@@ -191,9 +191,11 @@ export function checkLicenseGate(req, res, next) {
         return next();
     }
 
-    // Exempt the health check — deploy smoke tests and uptime monitoring need
-    // to confirm the process itself is up independent of license state.
-    if (req.path === '/api/health') {
+    // Exempt the health and readiness probes — deploy smoke tests, the load
+    // balancer and uptime monitoring need to confirm the process is up and able
+    // to serve independent of license state. A lapsed licence must stop selling,
+    // not make the fleet look like it is down.
+    if (req.path === '/api/health' || req.path === '/api/ready') {
         return next();
     }
 

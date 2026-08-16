@@ -2262,6 +2262,108 @@ try {
         assert.equal(backwards.status, 400);
     });
 
+    /* ------------------------------------------------------------------
+       §"The operational boundary" — request identity, readiness vs
+       liveness, safe errors, and draining. Everything here is what an
+       operator sees, so it is asserted the way an operator would see it.
+       ------------------------------------------------------------------ */
+
+    await check('every response carries a request id, and a well-formed inbound one is reused', async () => {
+        const generated = await request('/api/health');
+        assert.match(generated.headers.get('x-request-id') || '', /^REQ-[0-9A-F]{12}$/);
+
+        // Reuse is what lets one id span the proxy hop and this process.
+        const reused = await request('/api/health', { headers: { 'X-Request-Id': 'edge-7f3a_9.1' } });
+        assert.equal(reused.headers.get('x-request-id'), 'edge-7f3a_9.1');
+    });
+
+    await check('a request id that could forge a log entry is replaced, not sanitised', async () => {
+        /* This value reaches error.log and telemetry.log. Spaces and quotes are
+           the cheap end of the same problem newlines are, and a partially
+           scrubbed id correlates to nothing anyway — so it is discarded. */
+        const hostile = await request('/api/health', { headers: { 'X-Request-Id': 'abc" , "action":"forged' } });
+        assert.match(hostile.headers.get('x-request-id') || '', /^REQ-[0-9A-F]{12}$/);
+
+        const overlong = await request('/api/health', { headers: { 'X-Request-Id': 'a'.repeat(65) } });
+        assert.match(overlong.headers.get('x-request-id') || '', /^REQ-[0-9A-F]{12}$/);
+    });
+
+    await check('GET /api/ready reports the ledger open and fully migrated', async () => {
+        const response = await request('/api/ready');
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.status, 'ready');
+        assert.equal(body.draining, false);
+        assert.equal(body.checks.database, 'ok');
+        assert.equal(body.checks.migrations, 'current');
+        assert.match(body.requestId, /^REQ-/);
+    });
+
+    await check('GET /api/health stays liveness-only and never probes the ledger', async () => {
+        /* If these two ever merge, a database blip starts killing processes
+           that a restart cannot fix. The absence of `checks` is the assertion. */
+        const body = await (await request('/api/health')).json();
+        assert.equal(body.status, 'ok');
+        assert.equal(body.checks, undefined);
+        assert.ok(body.version);
+    });
+
+    await check('an unknown /api route answers JSON rather than an HTML 404', async () => {
+        const response = await request('/api/does-not-exist');
+        assert.equal(response.status, 404);
+        assert.match(response.headers.get('content-type') || '', /application\/json/);
+        const body = await response.json();
+        assert.equal(body.error, 'NOT_FOUND');
+        assert.match(body.requestId, /^REQ-/);
+        /* The FULL path, not the mount-stripped one. Mounting this handler at
+           '/api' rewrote req.url and never restored it, so both this body and
+           every 404 telemetry line named a path that does not exist. */
+        assert.equal(body.path, '/api/does-not-exist');
+    });
+
+    await check('a body the parser rejects returns a safe JSON error with no stack trace', async () => {
+        /* Reaches the terminal error handler, which is the only thing standing
+           between a thrown error and Express's default handler rendering the
+           stack trace into the response body. */
+        const response = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{"pin": '
+        });
+        assert.equal(response.status, 400);
+        const raw = await response.text();
+        assert.doesNotMatch(raw, /at .+\(.*server\.js/);
+        assert.doesNotMatch(raw, /<!DOCTYPE|<html/i);
+        const body = JSON.parse(raw);
+        assert.equal(body.error, 'BAD_REQUEST');
+        assert.match(body.requestId, /^REQ-/);
+    });
+
+    /* LAST. Draining is process-wide, so once this runs every readiness answer
+       below it would be 503 and the ledger handle is closed. */
+    await check('a draining process reports 503 before it stops listening, then drains', async () => {
+        const { startServer: start, shutdown } = await import('./server.js');
+        const second = start(0);
+        if (!second.listening) await once(second, 'listening');
+
+        /* Drain the second listener and ask the FIRST one — still open — what
+           readiness now says. That is the ordering the whole design rests on:
+           the proxy must see 503 while requests in flight can still finish. */
+        const drained = shutdown(second, 'suite');
+
+        const response = await request('/api/ready');
+        assert.equal(response.status, 503);
+        const body = await response.json();
+        assert.equal(body.status, 'not_ready');
+        assert.equal(body.draining, true);
+        assert.equal(body.detail, 'shutting down');
+
+        await drained;
+        assert.equal(second.listening, false);
+        // Idempotent: a second signal joins the drain already running.
+        assert.equal(shutdown(second, 'suite-again'), drained);
+    });
+
     console.log('======================================================================');
     console.log(`🎉 ALL ${passed} HTTP ROUTE CHECKS PASSED.`);
     console.log('======================================================================');

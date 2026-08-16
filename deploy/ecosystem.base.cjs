@@ -15,11 +15,16 @@ function backendApp(envName, nodeEnv) {
         name: `gold-pos-${envName}`,
         script: './backend/server.js',
         cwd: __dirname + '/..',
-        instances: 1, // single instance only — the JSON-file DB layer is not multi-writer safe
+        instances: 1, // single instance only — one SQLite file per tenant, one writer
         exec_mode: 'fork',
         autorestart: true,
         watch: false,
         max_memory_restart: '300M',
+        /* PM2 sends SIGINT and then SIGKILLs after kill_timeout, which defaults
+           to 1600ms. server.js drains for up to SHUTDOWN_GRACE_MS (10s), so the
+           default would kill the process mid-sale and make the drain decorative.
+           This must stay comfortably above that grace period. */
+        kill_timeout: 15000,
         env: { NODE_ENV: nodeEnv, ENV_NAME: envName },
         out_file: './backend/logs/pm2-out.log',
         error_file: './backend/logs/pm2-error.log',

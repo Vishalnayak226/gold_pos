@@ -82,14 +82,56 @@ export function resetDataStoreContext() {
     context = null;
 }
 
+/**
+ * Why the ledger is or is not usable, in enough detail to act on.
+ *
+ * `GET /api/ready` needs to distinguish "the database file will not open" from
+ * "it opens but this build ships a migration nobody has applied" — the first is
+ * an outage, the second is a half-finished deploy, and an operator paged at
+ * 2 a.m. should not have to guess which. `isDataStoreReady()` below is the same
+ * probe collapsed to a boolean, so there is one implementation, not two.
+ *
+ * The database check is a real query (`getTenant()` reads a row) rather than a
+ * handle null-check: a handle whose file has been deleted underneath it, or
+ * whose disk has filled, still looks open.
+ *
+ * @returns {{ok: boolean, database: string, migrations: string, detail?: string}}
+ */
+export function dataStoreHealth() {
+    let tenant;
+    try {
+        tenant = getTenant();
+    } catch (err) {
+        return { ok: false, database: 'unreachable', migrations: 'unknown', detail: err.message };
+    }
+    if (!tenant) {
+        return { ok: false, database: 'ok', migrations: 'unknown', detail: 'no organisation row — the store has never been initialised' };
+    }
+
+    try {
+        const { pending, drifted } = migrationStatus();
+        if (drifted.length > 0) {
+            return {
+                ok: false, database: 'ok', migrations: 'drifted',
+                detail: `${drifted.length} applied migration(s) no longer match the files on disk`
+            };
+        }
+        if (pending.length > 0) {
+            return {
+                ok: false, database: 'ok', migrations: 'pending',
+                detail: `${pending.length} migration(s) not applied: ${pending.map(m => m.filename).join(', ')}`
+            };
+        }
+    } catch (err) {
+        return { ok: false, database: 'ok', migrations: 'unknown', detail: err.message };
+    }
+
+    return { ok: true, database: 'ok', migrations: 'current' };
+}
+
 /** Whether the schema has been migrated and an organisation exists. */
 export function isDataStoreReady() {
-    try {
-        const tenant = getTenant();
-        return Boolean(tenant) && migrationStatus().pending.length === 0;
-    } catch (_) {
-        return false;
-    }
+    return dataStoreHealth().ok;
 }
 
 export { getDb as unsafeDatabaseHandle, getTenant, listBranches, BOOTSTRAP_USERNAMES };

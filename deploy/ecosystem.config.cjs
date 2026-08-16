@@ -9,11 +9,15 @@ module.exports = {
             name: 'gold-pos-backend',
             script: './backend/server.js',
             cwd: __dirname + '/..',
-            instances: 1, // single instance only — the JSON-file DB layer is not multi-writer safe
+            instances: 1, // single instance only — one SQLite file per tenant, one writer
             exec_mode: 'fork',
             autorestart: true,
             watch: false,
             max_memory_restart: '300M',
+            /* PM2 SIGKILLs 1600ms after SIGINT by default; server.js drains for
+               up to SHUTDOWN_GRACE_MS (10s). Without this the drain is
+               decorative and a restart can land mid-sale. */
+            kill_timeout: 15000,
             env: {
                 NODE_ENV: 'production'
             },

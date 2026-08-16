@@ -61,14 +61,23 @@ export function newId(prefix) {
 /**
  * Standardized Error Logging Engine
  * Writes exceptions, stack traces, and warnings to flat log files.
+ *
+ * `context` is appended as one JSON object on the message line — the request id
+ * above all, so a 500 a user reports by its id can be found here without
+ * grepping by timestamp. It is a suffix rather than a reformat on purpose: this
+ * file is read by humans and the leading `[timestamp] ERROR: message` shape is
+ * what they already know.
+ *
  * @param {string} message
  * @param {string} [stack]
+ * @param {Record<string, unknown>} [context]
  */
-export function logError(message, stack = '') {
+export function logError(message, stack = '', context = {}) {
     try {
         const logFile = path.join(LOGS_DIR, 'error.log');
         const timestamp = new Date().toISOString();
-        const logEntry = `[${timestamp}] ERROR: ${message}\n${stack ? stack + '\n' : ''}----------------------------------------\n`;
+        const suffix = context && Object.keys(context).length ? ` ${JSON.stringify(context)}` : '';
+        const logEntry = `[${timestamp}] ERROR: ${message}${suffix}\n${stack ? stack + '\n' : ''}----------------------------------------\n`;
         fs.appendFileSync(logFile, logEntry, 'utf8');
         console.error(`[System Error] ${message}`);
     } catch (err) {
@@ -79,23 +88,31 @@ export function logError(message, stack = '') {
 /**
  * Technical Level-1 Telemetry Logger
  * Logs system performance profile details without customer data.
+ * Already one JSON object per line. `fields` is merged into that object so a
+ * caller can add machine-readable dimensions — `requestId`, `method`, `path`,
+ * `statusCode` — instead of packing them into the free-text `details` string,
+ * which nothing can filter on. Existing callers pass no fields and their lines
+ * are byte-identical to before.
+ *
  * @param {string} action - e.g., "GET_GOLD_PRICE", "SAVE_BILL"
  * @param {number} durationMs - execution latency
  * @param {string} [details] - CPU, memory, database query, or server logs
+ * @param {Record<string, unknown>} [fields] - structured dimensions to merge in
  */
-export function logTelemetry(action, durationMs, details = '') {
+export function logTelemetry(action, durationMs, details = '', fields = {}) {
     try {
         const telemetryFile = path.join(LOGS_DIR, 'telemetry.log');
         const timestamp = new Date().toISOString();
         const mem = process.memoryUsage();
         const heapUsedMB = Math.round((mem.heapUsed / 1024 / 1024) * 100) / 100;
-        
+
         const logEntry = JSON.stringify({
             timestamp,
             action,
             durationMs,
             heapUsedMB,
-            details: details || undefined
+            details: details || undefined,
+            ...fields
         }) + '\n';
         
         fs.appendFileSync(telemetryFile, logEntry, 'utf8');

@@ -11,6 +11,17 @@ tracked separately in `docs/GO_LIVE_CHECKLIST.md`.
 ## Done — code-side
 
 - [x] `GET /api/health` on `backend/` and `licensing_server/`
+- [x] **`GET /api/ready` on `backend/`, and the three `cd-*.yml` smoke tests poll it**
+      (2026-08-16, Phase 32). Verified by `test_http.js` §"The operational boundary" and by
+      curling a live server: ready → `{"status":"ready","checks":{"database":"ok",
+      "migrations":"current"}}`, draining → 503. Replaces `sleep 3 && curl /api/health`, which
+      passed a half-migrated deploy. **`licensing_server/` still has liveness only** — it is a
+      separate process with its own store, and splitting its probes is unstarted.
+- [x] **Restarts drain instead of dropping requests** (2026-08-16, Phase 32) — SIGTERM/SIGINT
+      flips readiness to 503, closes the listener, then the ledger; `kill_timeout: 15000` in both
+      PM2 configs keeps PM2 from SIGKILLing at its 1600ms default mid-drain. Drain logic asserted
+      in `test_http.js`; **signal delivery itself is unverified on Windows** and will first be
+      exercised for real on the VPS.
 - [x] Per-env PM2 configs (`deploy/ecosystem.{dev,sandbox,live,licensing-nonprod,licensing-live}.config.cjs`)
 - [x] `deploy/remote-deploy.sh` shared deploy script
 - [x] `cd-dev.yml` / `cd-sandbox.yml` / `cd-live.yml` GitHub Actions workflows

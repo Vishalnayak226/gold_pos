@@ -78,6 +78,30 @@ const PURITY_RATE_KEY = { '24K': 'price24K', '22K': 'price22K', '18K': 'price18K
 // to key lockouts per real caller instead of globally locking every user.
 app.set('trust proxy', 'loopback');
 
+/* --------------------------------------------------------------------------
+   Request identity
+
+   Every request carries one id, echoed on the response and stamped on every log
+   line it produces. It is what turns "the till showed an error this morning"
+   into a single grep, and it is the only thing a 500 hands back to the user —
+   see the terminal error handler at the bottom of this file.
+
+   AN INBOUND ID IS HONOURED BUT NEVER TRUSTED VERBATIM. A proxy or the mobile
+   wrapper may already have one, and reusing it is what makes a trace span both
+   hops. But the value goes straight into a log file, so an unvalidated header
+   could inject newlines and forge whole log entries. The pattern below admits
+   only characters that cannot break a line or a JSON string; anything else is
+   discarded and a fresh id issued rather than sanitised, because a half-scrubbed
+   id correlates to nothing anyway.
+   -------------------------------------------------------------------------- */
+const REQUEST_ID_HEADER = 'X-Request-Id';
+const SAFE_REQUEST_ID = /^[A-Za-z0-9._-]{1,64}$/;
+
+function resolveRequestId(req) {
+    const supplied = req.headers['x-request-id'];
+    return typeof supplied === 'string' && SAFE_REQUEST_ID.test(supplied) ? supplied : newId('REQ');
+}
+
 // Browser hardening. This frontend is normally same-origin; deployments that
 // intentionally split it onto another origin must list that exact origin (or
 // origins, comma-separated) in CORS_ORIGINS.
@@ -89,7 +113,11 @@ app.use(cors({
         callback(null, !origin || allowedCorsOrigins.has(origin));
     },
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', REQUEST_ID_HEADER],
+    // Without this a split-origin frontend cannot read the id back off the
+    // response, which is the whole point of returning it — the browser hides
+    // every header but a short safelist unless the server names it here.
+    exposedHeaders: [REQUEST_ID_HEADER],
     maxAge: 600
 }));
 app.use(helmet({
@@ -116,21 +144,29 @@ app.use(helmet({
         }
     }
 }));
-// The Razorpay webhook signature is an HMAC over the EXACT bytes the gateway
-// sent. JSON.parse + re-serialise does not round-trip those bytes (key order,
-// number formatting, unicode escapes all shift), so a parsed body can never be
-// verified. This must therefore sit BEFORE express.json(): body-parser marks
-// the request as already-read, and the JSON parser below then skips it, leaving
-// req.body as the raw Buffer the signature check needs.
-app.use('/api/payment/webhook', express.raw({ type: '*/*', limit: '1mb' }));
-app.use(express.json({ limit: '5mb' }));
+/* Request identity and response-time telemetry. One middleware because both are
+   per-request bookkeeping, and this is the choke point every route runs through.
 
-// Track simple API response time telemetry
+   IT SITS ABOVE THE BODY PARSERS DELIBERATELY. express.json() rejects malformed
+   and oversized bodies by throwing, and that throw goes straight to the terminal
+   error handler — so an id assigned after the parser is not yet assigned for
+   exactly the requests most worth tracing. Caught by the suite: the 400 came
+   back with `requestId: "unassigned"`. Parse time is inside the measured
+   duration for the same reason. */
 app.use((req, res, next) => {
     const startTime = Date.now();
+    req.id = resolveRequestId(req);
+    res.setHeader(REQUEST_ID_HEADER, req.id);
     res.on('finish', () => {
         const duration = Date.now() - startTime;
-        logTelemetry(`${req.method}_${req.originalUrl}`, duration, `Status: ${res.statusCode}`);
+        logTelemetry(`${req.method}_${req.originalUrl}`, duration, `Status: ${res.statusCode}`, {
+            requestId: req.id,
+            method: req.method,
+            // req.path, not originalUrl: the query string can carry a phone
+            // number, and this field is the one meant to be aggregated on.
+            path: req.path,
+            statusCode: res.statusCode
+        });
         // Black-box flight recorder: same request shape, technical fields only
         // (no query string, no body) so error frequency, slow endpoints, and
         // memory trends can be aggregated offline without ever seeing PII.
@@ -145,12 +181,24 @@ app.use((req, res, next) => {
     next();
 });
 
+// The Razorpay webhook signature is an HMAC over the EXACT bytes the gateway
+// sent. JSON.parse + re-serialise does not round-trip those bytes (key order,
+// number formatting, unicode escapes all shift), so a parsed body can never be
+// verified. This must therefore sit BEFORE express.json(): body-parser marks
+// the request as already-read, and the JSON parser below then skips it, leaving
+// req.body as the raw Buffer the signature check needs.
+app.use('/api/payment/webhook', express.raw({ type: '*/*', limit: '1mb' }));
+app.use(express.json({ limit: '5mb' }));
+
 /**
  * GET /api/health
- * Public, unauthenticated liveness check — used by CI post-deploy smoke
- * tests and uptime monitoring to confirm this specific environment's
- * process is up and serving the expected commit, independent of license
- * state (exempted in checkLicenseGate).
+ * LIVENESS. Public and unauthenticated: is this process alive and serving the
+ * commit we think it is? Nothing more — it deliberately touches no dependency,
+ * so a restart supervisor reading it never kills a process for a fault that
+ * restarting cannot fix (a pending migration, a full disk). "Should this
+ * process be replaced?" is this endpoint; "should traffic be sent to it?" is
+ * /api/ready below. Conflating them is how a database blip becomes a restart
+ * loop. Exempt from checkLicenseGate.
  */
 app.get('/api/health', (req, res) => {
     const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'));
@@ -158,6 +206,37 @@ app.get('/api/health', (req, res) => {
         status: 'ok',
         version: pkg.version,
         env: process.env.ENV_NAME || process.env.NODE_ENV || 'unknown'
+    });
+});
+
+/* True from the moment a shutdown starts. Readiness flips first and the
+   listener closes second, so a proxy stops sending new work while in-flight
+   requests are still being finished — see shutdown() at the bottom. */
+let draining = false;
+
+/**
+ * GET /api/ready
+ * READINESS. Can this process serve a request end to end right now? 200 when
+ * the ledger opens, answers a query and is fully migrated; 503 with the reason
+ * otherwise, including while draining.
+ *
+ * A load balancer polls this to decide routing, and a deploy polls it to decide
+ * whether the new build actually came up — which is why the failure body names
+ * which check failed rather than just refusing. Public and unauthenticated for
+ * the same reason /api/health is: the prober has no credentials. It reports
+ * only check names and never a value from the ledger.
+ */
+app.get('/api/ready', (req, res) => {
+    const health = draining
+        ? { ok: false, database: 'ok', migrations: 'ok', detail: 'shutting down' }
+        : repo.dataStoreHealth();
+
+    res.status(health.ok ? 200 : 503).json({
+        status: health.ok ? 'ready' : 'not_ready',
+        draining,
+        checks: { database: health.database, migrations: health.migrations },
+        detail: health.detail,
+        requestId: req.id
     });
 });
 
@@ -2975,10 +3054,137 @@ app.get('/api/diagnostics/blackbox-export', requireAdminSession, (req, res) => {
 });
 
 /* ==========================================================================
+   Terminal handlers
+
+   Registered after every route, because Express matches in order and these two
+   are the "nothing above me claimed this" cases.
+   ========================================================================== */
+
+/**
+ * An unmatched /api/* path is a client bug, and it should read as one. Without
+ * this it falls through to the static handler and comes back as Express's HTML
+ * 404, which a fetch() then fails to parse — turning "you called the wrong URL"
+ * into an unexplained JSON syntax error in the browser console. Anything that is
+ * not an API path falls through, so a missing front-end asset still 404s as a
+ * page rather than as JSON.
+ *
+ * TESTED BY PREDICATE, NOT MOUNTED AT '/api'. `app.use('/api', …)` strips the
+ * mount prefix off `req.url` for the duration of the handler, and because this
+ * one never calls next(), Express never restores it — so the body reported
+ * `path: "/nope"` and, worse, the telemetry middleware's `finish` listener
+ * logged every 404 under a path that does not exist. Caught by curling a bad
+ * URL and reading telemetry.log, 2026-08-16.
+ */
+app.use((req, res, next) => {
+    if (!req.path.startsWith('/api/')) return next();
+    res.status(404).json({ error: 'NOT_FOUND', path: req.path, requestId: req.id });
+});
+
+/**
+ * The one place an unhandled throw becomes a response.
+ *
+ * Until this existed, anything thrown outside a route's own try/catch reached
+ * Express's default handler, which renders the **stack trace** into the response
+ * body outside NODE_ENV=production — leaking absolute paths and internal
+ * structure to whoever provoked it. This replies with a fixed message and the
+ * request id, and puts the stack where it belongs: in error.log, findable by
+ * that id.
+ *
+ * `next` is unused and must still be declared — Express identifies an error
+ * handler by arity, and a three-argument version is silently treated as
+ * ordinary middleware that never runs.
+ */
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+    const requestId = req.id || 'unassigned';
+    /* body-parser rejects malformed JSON and oversized bodies with a status of
+       its own. Honour it: those are the caller's fault, and reporting them as
+       500 would both mislead the caller and bury real crashes in noise. */
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+
+    logError(`Unhandled error on ${req.method} ${req.path}: ${err.message}`, err.stack, { requestId, status });
+
+    // Streaming responses have already committed a status line; the only honest
+    // move left is to let Express destroy the socket.
+    if (res.headersSent) return next(err);
+
+    res.status(status).json(status === 500
+        ? { error: 'INTERNAL_ERROR', message: 'Something went wrong. Quote this request id when reporting it.', requestId }
+        : { error: 'BAD_REQUEST', message: err.message, requestId });
+});
+
+/* ==========================================================================
    Server Bootstrap & Scheduler Init
    ========================================================================== */
 
 export { app };
+
+/* How long a shutdown waits for in-flight requests before forcing the remaining
+   sockets closed. Comfortably longer than any request this app serves, and
+   comfortably shorter than the 30s a process manager or container runtime
+   typically allows between SIGTERM and SIGKILL — miss that window and the
+   supervisor kills the process mid-sale, which is the exact thing draining
+   exists to prevent. */
+const SHUTDOWN_GRACE_MS = Number(process.env.SHUTDOWN_GRACE_MS) || 10000;
+
+/* Keyed by listener, not a single module-level promise. A process has one
+   listener in production, but the suite starts a second one — and with a shared
+   promise, draining that second listener would hand back the first one's
+   promise and never actually close it. `draining` stays process-wide on
+   purpose: readiness describes the process, not a socket. */
+const shutdownsInFlight = new WeakMap();
+
+/**
+ * Stops serving without dropping work in progress.
+ *
+ * ORDER IS THE WHOLE POINT. Readiness flips to 503 first, so the proxy stops
+ * sending new requests to a process that is about to disappear; only then does
+ * the listener close, letting the sale already being posted finish and reply.
+ * Reversing those two turns every deploy into a handful of failed requests.
+ *
+ * The database closes last, after the final response, because a repository
+ * write that outlives its handle throws where a cashier can see it.
+ *
+ * Idempotent: two signals in quick succession get the same promise.
+ *
+ * @param {import('node:http').Server} server
+ * @param {string} [reason] what triggered it, recorded in telemetry
+ */
+export function shutdown(server, reason = 'manual') {
+    const already = shutdownsInFlight.get(server);
+    if (already) return already;
+
+    draining = true;
+    console.log(`[Server] Draining (${reason}); waiting up to ${SHUTDOWN_GRACE_MS}ms for in-flight requests.`);
+    logTelemetry('SERVER_SHUTDOWN', 0, reason, { reason, graceMs: SHUTDOWN_GRACE_MS });
+
+    const drained = new Promise(resolve => {
+        const forceTimer = setTimeout(() => {
+            logError(`Shutdown still had open connections after ${SHUTDOWN_GRACE_MS}ms — forcing them closed.`);
+            server.closeAllConnections?.();
+        }, SHUTDOWN_GRACE_MS);
+        forceTimer.unref?.();
+
+        server.close(() => {
+            clearTimeout(forceTimer);
+            try {
+                repo.closeDb();
+            } catch (err) {
+                logError('Failed to close the ledger during shutdown: ' + err.message, err.stack);
+            }
+            console.log('[Server] Drained; ledger closed.');
+            resolve();
+        });
+
+        /* A keep-alive socket with no request on it holds the listener open for
+           its full idle timeout and has nothing to finish, so close those now.
+           Without this, `server.close()` routinely waits the entire grace period
+           on a browser that is simply sitting there. */
+        server.closeIdleConnections?.();
+    });
+
+    shutdownsInFlight.set(server, drained);
+    return drained;
+}
 
 /** Starts the HTTP listener. Exported so route tests can use an ephemeral port. */
 export function startServer(port = PORT, host = '127.0.0.1') {
@@ -2988,6 +3194,18 @@ export function startServer(port = PORT, host = '127.0.0.1') {
         console.log(`[Server] Gold POS backend running on port ${listeningPort}`);
         logTelemetry('SERVER_BOOTSTRAP', 0, `Listening on port ${listeningPort}`);
     });
+
+    /* `once`, so a second SIGTERM is not swallowed by an already-draining
+       process — the operator sending it wants out, and the default handler
+       exits immediately. process.exit() is explicit because the schedulers
+       (node-cron) hold the event loop open indefinitely; closing the listener
+       alone would leave the process running with nothing listening. */
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+        process.once(signal, () => {
+            shutdown(server, signal).then(() => process.exit(0));
+        });
+    }
+
     return server;
 }
 

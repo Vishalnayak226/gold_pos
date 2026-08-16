@@ -257,7 +257,23 @@ already runs) passing before deploying:
 
 - `cd-dev.yml` — push to `develop` → deploy to `dev-backend` (+
   `nonprod-licensing` if `licensing_server/` changed) → smoke-test
-  `GET https://dev.<domain>/api/health`.
+  `GET https://dev.<domain>/api/ready`, polled for up to 60s, then
+  `/api/health`.
+
+> **Two probes, two questions** (added 2026-08-16). `GET /api/health` is
+> **liveness**: is the process alive and on the expected commit? It touches no
+> dependency on purpose, so a restart supervisor never kills a process for a
+> fault restarting cannot fix. `GET /api/ready` is **readiness**: can it serve a
+> request end to end right now? It answers 503, naming the failing check, until
+> the ledger opens and every migration the build ships is applied — and while
+> the process is draining. Point the load balancer and the deploy gate at
+> `/api/ready`; point the process supervisor at `/api/health`.
+>
+> **Restarts drain.** SIGTERM/SIGINT flips readiness to 503 first, closes the
+> listener second, and closes the ledger last, so a sale already posting still
+> finishes. `SHUTDOWN_GRACE_MS` (default 10000) caps the wait. **`kill_timeout:
+> 15000` in the PM2 configs must stay above it** — PM2's default is 1600ms and
+> would SIGKILL mid-drain.
 - `cd-sandbox.yml` — push to `staging` → same, targeting `sandbox-backend`.
   This is where the platform owner does manual UAT before promoting further.
 - `cd-live.yml` — push to `main` → deploy job declares
@@ -338,6 +354,10 @@ the same port. This is the single easiest thing to get wrong here.
 5. `curl https://app.<domain>/api/health` → `{"status":"ok","env":"live"}`.
    A clean boot here means the guard found nothing; that is the real
    go-live gate.
+6. `curl https://app.<domain>/api/ready` → `{"status":"ready",…,"checks":
+   {"database":"ok","migrations":"current"}}`. Liveness only proves the process
+   started; this proves it can actually serve. A 503 here names which check
+   failed — a pending migration is the usual one on a first boot.
 
 Re-deploys after this point are ordinary — the settings persist in
 `backend/data/`, which no deploy touches.

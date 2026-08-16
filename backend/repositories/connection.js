@@ -193,7 +193,11 @@ export function checkpointAndCopy(destination) {
     return destination;
 }
 
-/** Closes the handle. Tests call this between fixtures; the server does not. */
+/**
+ * Closes the handle. Tests call this between fixtures; the server calls it once,
+ * at the end of `shutdown()` in `server.js`, after the last response has been
+ * written — never while it is still serving.
+ */
 export function closeDb() {
     if (!handle) return;
     try {

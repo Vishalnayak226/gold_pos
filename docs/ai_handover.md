@@ -12,14 +12,29 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `49fcbb8` — "Point the e2e journeys at the SQLite ledger"
-  (2026-08-16), on branch **`phase-21-payment-verification-and-production-guard`**.
-- **✅ THE WORKING TREE IS CLEAN as of 2026-08-16. Phases 28, 29 and 30 are all committed.**
-  Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`. Migration
-  `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout migrates.
-  - *This section said the opposite until 2026-08-16, claiming 25 uncommitted files. It was
-    describing a state that two commits had already resolved. If you are reading a handover claim
-    about the tree, run `git status` before acting on it.*
+- **Latest commit:** `2c1bf50` — "Make the audit trail readable" (2026-08-16, Phase 31), on branch
+  **`phase-21-payment-verification-and-production-guard`**.
+- **⚠️ THE WORKING TREE IS NOT CLEAN as of 2026-08-16: Phase 32 is finished and UNCOMMITTED.**
+  Ten files — `backend/server.js`, `backend/db.js`, `backend/repositories/{index,connection}.js`,
+  `backend/licenseChecker.js`, `backend/test_http.js`, `deploy/ecosystem.{base.cjs,config.cjs}`,
+  and the three `.github/workflows/cd-*.yml` — plus the docs below. `npm test` is green on it
+  (437 checks) and it was curl-verified against a live server. See `docs/LEDGER.md` Phase 32.
+  Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`, Phase 31 in `2c1bf50`.
+  Migration `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout
+  migrates.
+  - *This section has twice described a tree state that was already wrong. Run `git status`
+    before acting on any claim here.*
+- **Phase 32 (2026-08-16) — the operational boundary.** `GET /api/ready` (readiness) split from
+  `GET /api/health` (liveness, dependency-free on purpose); graceful SIGTERM/SIGINT drain that
+  flips readiness to 503 *before* closing the listener and closes the ledger *last*; one
+  `X-Request-Id` per request, reused from an inbound header only when it matches
+  `[A-Za-z0-9._-]{1,64}` because the value reaches a log file; structured fields on
+  `logTelemetry()`/`logError()`; and **the first terminal error handler this app has had** — until
+  now an unhandled throw reached Express's default handler, which renders the stack trace into the
+  response body outside `NODE_ENV=production`. `kill_timeout: 15000` in both PM2 configs is
+  load-bearing (PM2's 1600ms default would SIGKILL mid-drain). The three `cd-*.yml` smoke tests
+  poll `/api/ready` instead of sleeping 3s. **Not covered:** signal delivery itself — Windows
+  cannot emulate it, so the drain is tested by calling `shutdown()` directly.
 - **Phase 30 (2026-08-16) — the e2e journeys caught up with the ledger.** 23 of the 43 Playwright
   journeys were failing after the Phase 29 cut-over, because every spec still asserted against the
   retired JSON ledger — files the importer reads once on first boot and nothing writes again. They
@@ -42,9 +57,9 @@ This document contains key architectural details, non-negotiable design guidelin
   - `frontend/js/components/SettingsManager.js` — 18 unescaped/uncoerced form fields fixed.
   - `backend/test_billing_math.js` (+5 checks), `backend/test_http.js` (+7 checks).
   - Plus `CLAUDE.md` §0/§8 and `docs/LEDGER.md`.
-- **`npm test` is green across all eight suites — 426 checks, exit 0** (145 + 43 + 82 + 16 + 9 +
-  28 + 87 + 16). Re-verified 2026-08-16. **Playwright is green too — 43/43, 4.5m, verified
-  2026-08-16**, the first full run since Phase 29. One-off setup if the binary is missing:
+- **`npm test` is green across all eight suites — 437 checks, exit 0** (145 + 43 + 82 + 16 + 9 +
+  28 + 98 + 16). Re-verified 2026-08-16 after Phase 32. **Playwright is green too — 43/43, 3.3m,
+  re-run 2026-08-16 against the Phase 32 working tree.** One-off setup if the binary is missing:
   `cd backend && npm install && npx playwright install chromium`.
 - **What the hardening pass established, and what it did NOT find.** The transactional core held
   under every attack: concurrent sales produced unique invoice numbers with no lost writes,

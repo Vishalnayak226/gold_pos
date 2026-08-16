@@ -244,7 +244,14 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   customer paths, with the 429 lockout asserted in `test_routes.js`. **Genuinely still open:**
   rate/abuse limits on anything that is not a login, and runtime schemas beyond
   `validateSettingsPatch()` — which covers `POST /api/settings` only and is the pattern the rest
-  should follow rather than a second mechanism.)*
+  should follow rather than a second mechanism.*
+  ***Safe errors closed 2026-08-16, Phase 32.** Until then there was no terminal error handler at
+  all, so anything thrown outside a route's own try/catch reached Express's default handler — which
+  renders the **stack trace into the response body** outside `NODE_ENV=production`, leaking absolute
+  paths and internal structure to whoever provoked it. There is now one handler at the bottom of
+  `server.js`: a fixed message plus the request id for a 500, the parser's own status honoured for a
+  malformed or oversized body, and the stack in `error.log` where it belongs. An unmatched `/api/*`
+  path answers a JSON 404 rather than the HTML one a `fetch()` cannot parse.)*
 - [ ] Structured audit/security logs with PII classification, retention, clock sync, access control, alerts and tamper-evident export.
   *(Partly done 2026-08-16 — **the trail is now readable**, which was the gap this strand kept
   hitting. `audit_events` has been append-only by trigger since Phase 24 and written on every money
@@ -289,7 +296,23 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 **Goal:** prove the software can be operated and recovered, not merely started.
 
 - [ ] Reproducible dev/sandbox/live provisioning; pin runtimes/dependencies.
-- [ ] Separate readiness from liveness; graceful shutdown, request IDs, structured logs, metrics and critical-flow traces.
+- [~] Separate readiness from liveness; graceful shutdown, request IDs, structured logs, metrics and critical-flow traces.
+  *(Four of the six landed 2026-08-16, Phase 32 — verified by seven checks in `test_http.js`
+  §"The operational boundary" and by curling a live server. **Readiness/liveness split:**
+  `GET /api/health` stays a dependency-free liveness answer, so a database blip can no longer make
+  a restart supervisor kill a process that restarting cannot fix; new `GET /api/ready` answers 503
+  with the failing check named until the ledger opens and every migration this build ships is
+  applied. The three `cd-*.yml` smoke tests now poll it instead of sleeping 3s and curling
+  liveness, so a half-migrated deploy fails the gate. **Graceful shutdown:** SIGTERM/SIGINT flip
+  readiness to 503 first and close the listener second, so the proxy stops sending work while the
+  sale already in flight still finishes; the ledger handle closes last. `kill_timeout: 15000` in
+  both PM2 configs is load-bearing — PM2's 1600ms default would SIGKILL mid-drain and make the
+  whole thing decorative. **Request IDs:** one id per request, echoed as `X-Request-Id`, honoured
+  from an inbound header but only when it matches `[A-Za-z0-9._-]{1,64}` — the value reaches a log
+  file, and an unvalidated one could forge entries. **Structured logs:** `logTelemetry()` takes
+  merged structured fields (`requestId`, `method`, `path`, `statusCode`) and `logError()` takes a
+  context object, so a reported error id is one grep. **Still open on this line:** metrics and
+  critical-flow traces.)*
 - [ ] Alert on payment/webhook failures, ledger imbalance, backup failure, stale rates, error/latency, capacity, TLS expiry and control-plane failure.
 - [ ] Encrypted off-site backup and point-in-time recovery; automated isolated restore; monthly restore drill.
 - [ ] Migration compatibility gates, canary/pilot release, rollback and post-deploy synthetic checks.

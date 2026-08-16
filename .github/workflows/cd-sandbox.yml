@@ -80,6 +80,20 @@ jobs:
               deploy/ecosystem.licensing-nonprod.config.cjs
 
       - name: Smoke test
+        env:
+          BASE: https://sandbox.${{ vars.PIPELINE_DOMAIN }}
         run: |
-          sleep 3
-          curl -fsS "https://sandbox.${{ vars.PIPELINE_DOMAIN }}/api/health"
+          # Poll readiness instead of sleeping a fixed 3s and hoping. /api/ready
+          # answers 503 until the ledger opens and every migration this build
+          # ships has been applied, so a half-deployed process fails the gate
+          # here rather than passing it and serving errors to the counter.
+          for _ in $(seq 1 20); do
+            if curl -fsS --max-time 5 "$BASE/api/ready"; then READY=1; break; fi
+            sleep 3
+          done
+          if [ "${READY:-0}" != "1" ]; then
+            echo "::error::$BASE/api/ready never became ready within 60s"
+            curl -sS --max-time 5 "$BASE/api/ready" || true
+            exit 1
+          fi
+          curl -fsS "$BASE/api/health"

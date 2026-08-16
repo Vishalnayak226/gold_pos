@@ -266,9 +266,12 @@ wrong answers.
   (helper-level integration) → `test_routes.js` (routes + auth boundary) → `test_http.js` (money
   paths, Razorpay webhook, returns/refunds, multi-line invoices, tenders, actor identity, paged
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
-  `test_production_guard.js` (fail-closed startup). **430 checks as of 2026-08-16**
-  (145 + 43 + 82 + 16 + 9 + 28 + 91 + 16, in run order — `test_suite.js` is counted by the nine
+  `test_production_guard.js` (fail-closed startup). **437 checks as of 2026-08-16**
+  (145 + 43 + 82 + 16 + 9 + 28 + 98 + 16, in run order — `test_suite.js` is counted by the nine
   numbered tests it prints, not by an older tally that no longer matched anything).
+  - **`test_http.js` §"The operational boundary" must stay LAST in that file.** Its final check
+    drains the app: `shutdown()` sets a process-wide flag and closes the ledger handle, so every
+    readiness answer after it is 503. Add new checks above that section, not below it.
   - `test_concurrency.js` spawns child processes and is the slowest suite by far (~1–2 min). It is
     in `npm test` anyway, because the properties it asserts — one balance cannot be spent twice, a
     kill mid-sale leaves nothing behind — are not observable any other way.
