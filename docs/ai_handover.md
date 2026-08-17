@@ -12,16 +12,24 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `05f97c4` — "Phase 33: put a boundary on the request itself" (2026-08-17), on
-  branch **`phase-21-payment-verification-and-production-guard`**.
-- **The working tree is CLEAN as of 2026-08-17.** Phase 33 is committed in `05f97c4` (16 files:
-  the two new `backend/rateLimit.js` and `backend/validation.js`, plus `server.js`,
-  `defaultSettings.js`, `adminAuth.js`, `customerAuth.js`, `test_http.js`, `test_suite.js`,
-  `CLAUDE.md`, `brain.map.json` and the docs). `npm test` is green on it (443 checks) and
-  `npm run test:e2e` is green (43/43). See `docs/LEDGER.md` Phase 33.
-  **`05f97c4` is NOT pushed yet** — `origin/` has this branch only as far as `752b925`.
+- **Latest commit:** `1c218f6` — "Phase 34: move sessions into cookies, and put the ledger in the
+  backups" (2026-08-17), on branch **`phase-21-payment-verification-and-production-guard`**.
+- **The working tree is CLEAN as of 2026-08-17.** Phase 34's first unit is committed in `1c218f6`
+  (19 files: new `backend/cookies.js`, plus `adminAuth.js`, `customerAuth.js`, `server.js`,
+  `backupEngine.js`, `test_http.js`, `test_routes.js`, four `tests/e2e/*.spec.js`,
+  `frontend/js/app.js`, `frontend/customer.html`, `BillingDesk.js`, and the docs/brain).
+  Verified on the committed tree: `npm test` 443/443 and `npm run test:e2e` 43/43 — the e2e run
+  is load-bearing here, not a formality, because this replaced both login transports.
+  See `docs/LEDGER.md` Phase 34.
+  - **Phase 34 is NOT finished.** Four units remain on the same plan
+    (`.claude/plans/luminous-munching-eich.md`): secrets-at-rest encryption + key rotation,
+    audit-trail hardening (retention / PII doc / tamper-evident export),
+    backup/PITR/restore-drill/runbooks, and CI security scanning (SAST, secret-scan,
+    dependency-review, SBOM). The LEDGER row for Phase 34 says "in progress" for that reason.
+  **Nothing on this branch is pushed** — `origin/` has it only as far as `752b925`, so `05f97c4`
+  and `1c218f6` are local-only.
   Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`, Phase 31 in `2c1bf50`,
-  Phase 32 in `752b925`, Phase 33 in `05f97c4`. Migration
+  Phase 32 in `752b925`, Phase 33 in `05f97c4`, Phase 34's first unit in `1c218f6`. Migration
   `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout migrates.
   - **The CI gate has still never run.** `daily-checks.yml` triggers on `pull_request:
     branches: ['**']` and on push to main/develop/staging only — so pushing this feature branch
