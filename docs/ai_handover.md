@@ -12,16 +12,17 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `2c1bf50` — "Make the audit trail readable" (2026-08-16, Phase 31), on branch
-  **`phase-21-payment-verification-and-production-guard`**.
-- **Phase 32 is committed and PUSHED** as `752b925`; `origin/` has it on this branch.
-  **⚠️ Phase 33 is finished and UNCOMMITTED** as of 2026-08-17 — two new files
-  (`backend/rateLimit.js`, `backend/validation.js`) plus `server.js`, `defaultSettings.js`,
-  `adminAuth.js`, `customerAuth.js`, `test_http.js`, `test_suite.js`, `brain.map.json` and the
-  docs. `npm test` is green on it (443 checks). See `docs/LEDGER.md` Phase 33.
+- **Latest commit:** `05f97c4` — "Phase 33: put a boundary on the request itself" (2026-08-17), on
+  branch **`phase-21-payment-verification-and-production-guard`**.
+- **The working tree is CLEAN as of 2026-08-17.** Phase 33 is committed in `05f97c4` (16 files:
+  the two new `backend/rateLimit.js` and `backend/validation.js`, plus `server.js`,
+  `defaultSettings.js`, `adminAuth.js`, `customerAuth.js`, `test_http.js`, `test_suite.js`,
+  `CLAUDE.md`, `brain.map.json` and the docs). `npm test` is green on it (443 checks) and
+  `npm run test:e2e` is green (43/43). See `docs/LEDGER.md` Phase 33.
+  **`05f97c4` is NOT pushed yet** — `origin/` has this branch only as far as `752b925`.
   Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`, Phase 31 in `2c1bf50`,
-  Phase 32 in `752b925`. Migration `004_multi_line_invoice_fidelity.sql` is tracked, in
-  `c26800f` — a fresh checkout migrates.
+  Phase 32 in `752b925`, Phase 33 in `05f97c4`. Migration
+  `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout migrates.
   - **The CI gate has still never run.** `daily-checks.yml` triggers on `pull_request:
     branches: ['**']` and on push to main/develop/staging only — so pushing this feature branch
     does *not* fire it. Opening a PR does. `gh` is not installed on the dev machine; the PR has to
