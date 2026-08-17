@@ -191,16 +191,15 @@ test.describe('Customer portal journey', () => {
     test('the portal offers the customer no way to raise a return themselves', async ({ page, posServer }) => {
         // Returns are the store's to issue (POST /api/returns is admin-gated).
         // The portal is read-only on them, and the API agrees: a live customer
-        // session is not an admin session, however valid it is.
+        // session cookie is not an admin session cookie, however valid it is —
+        // the browser sends whatever cookies it holds automatically, so no
+        // header needs to be built here.
         await signInPastForcedChange(page, posServer);
 
         const status = await page.evaluate(async () => {
             const res = await fetch('/api/returns', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${localStorage.getItem('customerToken') || ''}`
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ invoiceId: 'SEED-000002-26', weightGrams: 1, refundMode: 'gold' })
             });
             return res.status;
@@ -209,9 +208,7 @@ test.describe('Customer portal journey', () => {
 
         // Reading their own is fine — that is what the portal is for.
         const readable = await page.evaluate(async () => {
-            const res = await fetch('/api/customer/returns', {
-                headers: { 'Authorization': `Bearer ${localStorage.getItem('customerToken') || ''}` }
-            });
+            const res = await fetch('/api/customer/returns');
             return { status: res.status, body: await res.json() };
         });
         expect(readable.status).toBe(200);
@@ -285,15 +282,19 @@ test.describe('Customer self-service password reset', () => {
         // Counter-issued logins are the population that predates the required
         // email at signup, and the one that cannot self-reset today.
         const issued = await page.evaluate(async ({ baseUrl, pin }) => {
-            const login = await fetch(`${baseUrl}/api/admin/login`, {
+            // The login response sets the session cookie; this same page
+            // context carries it automatically on the next fetch, same as a
+            // real browser. Only the CSRF header has to be built by hand.
+            await fetch(`${baseUrl}/api/admin/login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ pin })
-            }).then(r => r.json());
+            });
+            const csrf = document.cookie.match(/(?:^|; )gp_admin_csrf=([^;]*)/);
 
             const res = await fetch(`${baseUrl}/api/customer-accounts/issue-login`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${login.token}` },
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf ? decodeURIComponent(csrf[1]) : '' },
                 body: JSON.stringify({ phone: '9000000088', name: 'Counter Issued' })
             });
             return res.json();

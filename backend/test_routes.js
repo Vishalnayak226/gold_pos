@@ -187,10 +187,17 @@ async function stopServer() {
     }
 }
 
-/** GET/POST helper returning status, parsed body, and the raw text. */
-async function call(method, route, { token, body } = {}) {
-    const headers = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
+/**
+ * GET/POST helper returning status, parsed body, and the raw text.
+ *
+ * `session` is a {headers, cookie} object from loginAdmin() below — session
+ * auth is a cookie now, not a bearer token, so this attaches whatever it was
+ * given as-is rather than building an Authorization header. A garbage/empty
+ * credential for the auth-boundary checks below is passed as
+ * `{ headers: { Cookie: 'gp_admin_sess=not-a-real-token' } }`.
+ */
+async function call(method, route, { session, body } = {}) {
+    const headers = { ...(session && session.headers || {}) };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const res = await fetch(`${BASE}${route}`, {
         method,
@@ -200,7 +207,26 @@ async function call(method, route, { token, body } = {}) {
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch (_) { /* non-JSON is a valid outcome */ }
-    return { status: res.status, json, text };
+    return { status: res.status, json, text, setCookies: res.headers.getSetCookie ? res.headers.getSetCookie() : [] };
+}
+
+/** Logs in as admin and returns a {headers} object ready for call()'s `session` option. */
+async function loginAdmin(pin, extra = {}) {
+    const res = await call('POST', '/api/admin/login', { body: { pin, ...extra } });
+    const jar = {};
+    (res.setCookies || []).forEach(line => {
+        const pair = line.split(';')[0];
+        const idx = pair.indexOf('=');
+        if (idx === -1) return;
+        jar[pair.slice(0, idx).trim()] = decodeURIComponent(pair.slice(idx + 1).trim());
+    });
+    const csrfToken = jar.gp_admin_csrf || '';
+    return {
+        response: res,
+        token: jar.gp_admin_sess || '',
+        csrfToken,
+        headers: { Cookie: `gp_admin_sess=${jar.gp_admin_sess || ''}; gp_admin_csrf=${csrfToken}`, 'X-CSRF-Token': csrfToken }
+    };
 }
 
 function check(label, fn) {
@@ -264,9 +290,9 @@ try {
     console.log('\nGroup 2: Admin auth boundary');
 
     for (const [label, opts] of [
-        ['no Authorization header', {}],
-        ['a garbage bearer token', { token: 'not-a-real-token' }],
-        ['an empty bearer token', { token: '' }]
+        ['no session cookie', {}],
+        ['a garbage session cookie', { session: { headers: { Cookie: 'gp_admin_sess=not-a-real-token' } } }],
+        ['an empty session cookie', { session: { headers: { Cookie: 'gp_admin_sess=' } } }]
     ]) {
         const res = await call('GET', '/api/settings', opts);
         check(`GET /api/settings is rejected with ${label}`, () => {
@@ -288,14 +314,13 @@ try {
         assertNoSecretsIn(badLogin.text, 'the failed-login response');
     });
 
-    const login = await call('POST', '/api/admin/login', { body: { pin: REAL.adminPin } });
-    check('POST /api/admin/login issues a token for the correct PIN', () => {
-        assert.strictEqual(login.status, 200);
-        assert.ok(login.json.token && login.json.token.length >= 32, 'expected a session token');
+    const admin = await loginAdmin(REAL.adminPin);
+    check('POST /api/admin/login issues a session cookie for the correct PIN', () => {
+        assert.strictEqual(admin.response.status, 200);
+        assert.ok(admin.token && admin.token.length >= 32, 'expected a session token in Set-Cookie');
     });
-    const token = login.json.token;
 
-    const authed = await call('GET', '/api/settings', { token });
+    const authed = await call('GET', '/api/settings', { session: admin });
     check('GET /api/settings succeeds with a valid session', () => {
         assert.strictEqual(authed.status, 200);
         assert.strictEqual(authed.json.companyName, 'Route Suite Jewellers');
@@ -332,7 +357,7 @@ try {
     // Exactly what the Settings screen does: post back the object it was
     // given, with one unrelated field edited.
     const echoed = { ...authed.json, companyName: 'Renamed Jewellers' };
-    const save = await call('POST', '/api/settings', { token, body: echoed });
+    const save = await call('POST', '/api/settings', { session: admin, body: echoed });
     check('POST /api/settings accepts null write-only fields echoed by the UI', () => {
         assert.strictEqual(save.status, 200);
         assert.strictEqual(save.json.success, true);
@@ -370,7 +395,7 @@ try {
     });
 
     const rotate = await call('POST', '/api/settings', {
-        token,
+        session: admin,
         body: { razorpayKeySecret: 'rzp_live_ROTATED_secret', smtp: { ...authed.json.smtp, pass: 'rotated-pw' } }
     });
     check('A genuinely retyped secret is saved (null only protects untouched fields)', () => {
@@ -380,7 +405,7 @@ try {
         assert.strictEqual(disk.smtp.pass, 'rotated-pw');
     });
 
-    const cleared = await call('POST', '/api/settings', { token, body: { razorpayKeySecret: '' } });
+    const cleared = await call('POST', '/api/settings', { session: admin, body: { razorpayKeySecret: '' } });
     check('An explicitly cleared secret reads back as unconfigured', () => {
         assert.strictEqual(cleared.status, 200);
         assert.strictEqual(cleared.json.settings.razorpayKeySecret, null);
@@ -398,7 +423,7 @@ try {
     fs.mkdirSync(stagingPath, { recursive: true });
     let failWrite;
     try {
-        failWrite = await call('POST', '/api/settings', { token, body: { companyName: 'Should Not Persist' } });
+        failWrite = await call('POST', '/api/settings', { session: admin, body: { companyName: 'Should Not Persist' } });
     } finally {
         fs.rmSync(stagingPath, { recursive: true, force: true });
     }
@@ -423,14 +448,14 @@ try {
     /* ---------- Group 6: destructive-action guard ---------- */
     console.log('\nGroup 6: Invoice sequence guard');
 
-    const lower = await call('POST', '/api/settings', { token, body: { invoiceSeqStart: 2 } });
+    const lower = await call('POST', '/api/settings', { session: admin, body: { invoiceSeqStart: 2 } });
     check('Lowering the invoice sequence is refused with 409 unless confirmed', () => {
         assert.strictEqual(lower.status, 409, `expected 409, got ${lower.status}`);
         assert.strictEqual(lower.json.error, 'CONFIRMATION_REQUIRED');
         assert.strictEqual(readDiskSettings(dataDir).invoiceSeqStart, 500, 'the sequence must not have moved');
     });
 
-    const lowerOk = await call('POST', '/api/settings', { token, body: { invoiceSeqStart: 2, confirmDestructive: true } });
+    const lowerOk = await call('POST', '/api/settings', { session: admin, body: { invoiceSeqStart: 2, confirmDestructive: true } });
     check('Lowering succeeds once explicitly confirmed, and the flag is not persisted', () => {
         assert.strictEqual(lowerOk.status, 200);
         const disk = readDiskSettings(dataDir);
@@ -441,13 +466,13 @@ try {
     /* ---------- Group 7: session invalidation ---------- */
     console.log('\nGroup 7: Session lifecycle');
 
-    const logout = await call('POST', '/api/admin/logout', { token });
+    const logout = await call('POST', '/api/admin/logout', { session: admin });
     check('POST /api/admin/logout succeeds', () => {
         assert.strictEqual(logout.status, 200);
     });
 
-    const afterLogout = await call('GET', '/api/settings', { token });
-    check('The token is dead immediately after logout', () => {
+    const afterLogout = await call('GET', '/api/settings', { session: admin });
+    check('The session is dead immediately after logout', () => {
         assert.strictEqual(afterLogout.status, 401, 'a logged-out token must not still work');
         assert.strictEqual(afterLogout.json.error, 'ADMIN_SESSION_REQUIRED');
     });

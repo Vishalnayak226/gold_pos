@@ -29,12 +29,16 @@ import crypto from 'crypto';
 import { logError, logTelemetry } from './db.js';
 import * as repo from './repositories/index.js';
 import { createBoundedMap } from './rateLimit.js';
+import { parseCookies } from './cookies.js';
 
-
+/** Cookie names for the customer session transport. Exported for server.js. */
+export const CUSTOMER_SESSION_COOKIE = 'gp_cust_sess';
+export const CUSTOMER_CSRF_COOKIE = 'gp_cust_csrf';
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 // 30 days: long enough that a customer checking a passbook once a month is
 // not re-authenticating every visit, short enough to bound a stolen token.
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 // Multi-device is normal (phone + a family member's tablet); past this the
 // oldest session is dropped, so a token list can never grow without bound.
 const MAX_SESSIONS_PER_ACCOUNT = 5;
@@ -225,7 +229,7 @@ function ensureSessionIndex() {
         readAccounts().forEach(account => {
             (account.sessions || []).forEach(session => {
                 if (!isSessionExpired(session)) {
-                    sessionIndex.set(session.tokenHash, { phone: account.phone, createdAt: session.createdAt });
+                    sessionIndex.set(session.tokenHash, { phone: account.phone, createdAt: session.createdAt, csrfToken: session.csrfToken });
                 }
             });
         });
@@ -242,6 +246,12 @@ export function createCustomerSession(phone) {
     ensureSessionIndex();
     const token = crypto.randomBytes(32).toString('hex');
     const tokenHash = hashToken(token);
+    // JS-readable double-submit value for CSRF (see requireCustomerSession).
+    // Persisted alongside the session, not just held in memory, so a customer
+    // signed in before a server restart keeps working rather than failing
+    // every mutating request until they log in again — the 30-day TTL exists
+    // precisely so a restart shouldn't force a re-login.
+    const csrfToken = crypto.randomBytes(32).toString('hex');
     const createdAt = Date.now();
 
     const accounts = readAccounts();
@@ -249,7 +259,7 @@ export function createCustomerSession(phone) {
     if (!account) return null;
 
     const live = (account.sessions || []).filter(s => !isSessionExpired(s));
-    live.push({ tokenHash, createdAt });
+    live.push({ tokenHash, createdAt, csrfToken });
     // Drop the oldest beyond the cap, and forget them in the index too.
     const kept = live.slice(-MAX_SESSIONS_PER_ACCOUNT);
     live.filter(s => !kept.includes(s)).forEach(s => sessionIndex.delete(s.tokenHash));
@@ -260,8 +270,8 @@ export function createCustomerSession(phone) {
         return null;
     }
 
-    sessionIndex.set(tokenHash, { phone, createdAt });
-    return token;
+    sessionIndex.set(tokenHash, { phone, createdAt, csrfToken });
+    return { token, csrfToken };
 }
 
 /** Logout. Best-effort: an unknown/expired token is simply a no-op. */
@@ -289,19 +299,6 @@ export function destroyAllCustomerSessions(phone) {
     (account.sessions || []).forEach(s => sessionIndex.delete(s.tokenHash));
     account.sessions = [];
     writeAccounts(accounts);
-}
-
-/** Resolves a raw bearer token to its owning phone, or null. */
-export function resolveCustomerSession(token) {
-    ensureSessionIndex();
-    if (!token) return null;
-    const entry = sessionIndex.get(hashToken(token));
-    if (!entry) return null;
-    if (isSessionExpired(entry)) {
-        destroyCustomerSession(token);
-        return null;
-    }
-    return entry.phone;
 }
 
 /* ==========================================================================
@@ -447,7 +444,7 @@ export function customerLoginRateLimiter(req, res, next) {
 
 /**
  * Authenticates a phone + password pair.
- * @returns {{success: boolean, error?: string, code?: string, token?: string, account?: object}}
+ * @returns {{success: boolean, error?: string, code?: string, token?: string, csrfToken?: string, account?: object}}
  */
 export function loginCustomer(phone, password, ip = 'unknown') {
     if (!isValidPhone(phone)) {
@@ -496,12 +493,12 @@ export function loginCustomer(phone, password, ip = 'unknown') {
     }
     clearIpFailures(ip);
 
-    const token = createCustomerSession(phone);
-    if (!token) {
+    const session = createCustomerSession(phone);
+    if (!session) {
         return { success: false, code: 'SESSION_FAILED', error: 'Could not start a session. Please retry.' };
     }
     logTelemetry('CUSTOMER_LOGIN_SUCCESS', 0, `Phone: ${maskPhone(phone)}`);
-    return { success: true, token, account: findAccount(phone) };
+    return { success: true, token: session.token, csrfToken: session.csrfToken, account: findAccount(phone) };
 }
 
 /**
@@ -578,9 +575,9 @@ export function consumeResetToken(phone, code, newPassword) {
    Middleware
    ========================================================================== */
 
-function bearerToken(req) {
-    const header = req.headers.authorization || '';
-    return header.startsWith('Bearer ') ? header.slice(7) : null;
+function sessionCookieToken(req) {
+    const cookies = req.cookies || parseCookies(req.headers.cookie);
+    return cookies[CUSTOMER_SESSION_COOKIE] || null;
 }
 
 /**
@@ -589,16 +586,32 @@ function bearerToken(req) {
  * the phone from here and never from the body or query string.
  */
 export function requireCustomerSession(req, res, next) {
-    const phone = resolveCustomerSession(bearerToken(req));
-    if (!phone) {
+    ensureSessionIndex();
+    const token = sessionCookieToken(req);
+    const entry = token ? sessionIndex.get(hashToken(token)) : null;
+    if (!entry || isSessionExpired(entry)) {
+        if (entry) destroyCustomerSession(token);
         logTelemetry('CUSTOMER_SESSION_REJECTED', 0, `Path: ${req.path}`);
         return res.status(401).json({
             error: 'CUSTOMER_SESSION_REQUIRED',
             message: 'Please sign in to continue.'
         });
     }
-    req.customerPhone = phone;
-    req.customerAccount = findAccount(phone);
+
+    // CSRF: same double-submit reasoning as the admin session — see
+    // adminAuth.js's requireAdminSession. Safe methods are exempt.
+    if (!SAFE_METHODS.has(req.method)) {
+        const cookies = req.cookies || parseCookies(req.headers.cookie);
+        const csrfCookie = cookies[CUSTOMER_CSRF_COOKIE];
+        const csrfHeader = req.headers['x-csrf-token'];
+        if (!csrfHeader || csrfHeader !== csrfCookie || csrfHeader !== entry.csrfToken) {
+            logTelemetry('CUSTOMER_CSRF_REJECTED', 0, `Path: ${req.path}`);
+            return res.status(403).json({ error: 'CSRF_TOKEN_INVALID', message: 'Your session needs to be refreshed. Please reload the page.' });
+        }
+    }
+
+    req.customerPhone = entry.phone;
+    req.customerAccount = findAccount(entry.phone);
     next();
 }
 

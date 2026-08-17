@@ -186,11 +186,11 @@ test.describe('Return desk', () => {
         // Move the store underneath the invoice. A desk that re-priced the
         // return against live settings would now refund a different number —
         // ₹9,999/g at 18% inclusive rather than ₹6,875/g at 3% exclusive.
-        const token = await page.evaluate(() => sessionStorage.getItem('adminToken'));
-        const patch = await page.evaluate(async ({ token }) => {
+        const patch = await page.evaluate(async () => {
+            const csrf = document.cookie.match(/(?:^|; )gp_admin_csrf=([^;]*)/);
             const res = await fetch('/api/settings', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf ? decodeURIComponent(csrf[1]) : '' },
                 body: JSON.stringify({
                     goldTaxSlab: 18,
                     taxMode: 'Inclusive',
@@ -198,7 +198,7 @@ test.describe('Return desk', () => {
                 })
             });
             return res.status;
-        }, { token });
+        });
         expect(patch).toBe(200);
 
         // Reloaded so the desk starts from the CHANGED settings, with no

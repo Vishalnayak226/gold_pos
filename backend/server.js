@@ -20,7 +20,8 @@ import {
     loginRateLimiter, recordLoginResult, roleCanApprove, listOperators, OWNER_ACTOR,
     ensureAuthSalt, hashPin, migrateStoredPins,
     generateTotpSecret, verifyTotp, totpEnrolmentUri, generateRecoveryCodes, consumeRecoveryCode,
-    listAdminSessions, revokeAdminSessionByHandle, revokeSessionsForActor, revokeSessionsForRosterChange
+    listAdminSessions, revokeAdminSessionByHandle, revokeSessionsForActor, revokeSessionsForRosterChange,
+    ADMIN_SESSION_COOKIE, ADMIN_CSRF_COOKIE, SESSION_TTL_MS as ADMIN_SESSION_TTL_MS
 } from './adminAuth.js';
 import {
     requireCustomerSession, requireEstablishedCustomer, customerLoginRateLimiter,
@@ -28,8 +29,10 @@ import {
     createCustomerAccount, setCustomerPassword, updateCustomerProfile,
     issueResetToken, consumeResetToken, findAccount, accountExists,
     publicAccountView, verifyPassword, validatePasswordStrength,
-    generateTemporaryPassword, isValidPhone, CUSTOMER_PASSWORD_MIN_LENGTH
+    generateTemporaryPassword, isValidPhone, CUSTOMER_PASSWORD_MIN_LENGTH,
+    CUSTOMER_SESSION_COOKIE, CUSTOMER_CSRF_COOKIE, SESSION_TTL_MS as CUSTOMER_SESSION_TTL_MS
 } from './customerAuth.js';
+import { parseCookies, serializeCookie, clearCookie } from './cookies.js';
 import { initReportScheduler, sendSummaryReport, sendMailIfConfigured } from './emailReporter.js';
 import { logBlackBoxEvent, exportBlackBoxEnvelope } from './blackBoxLogger.js';
 import { createRateLimiter } from './rateLimit.js';
@@ -237,14 +240,66 @@ app.use(cors({
     origin(origin, callback) {
         callback(null, !origin || allowedCorsOrigins.has(origin));
     },
+    // Session auth is a cookie now, not a bearer header — the browser only
+    // attaches it to a cross-origin fetch when the request opts in AND the
+    // server echoes this back. Safe alongside an exact-origin allowlist
+    // (never '*', which credentials:true forbids anyway).
+    credentials: true,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', REQUEST_ID_HEADER],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', REQUEST_ID_HEADER],
     // Without this a split-origin frontend cannot read the id back off the
     // response, which is the whole point of returning it — the browser hides
     // every header but a short safelist unless the server names it here.
     exposedHeaders: [REQUEST_ID_HEADER],
     maxAge: 600
 }));
+// Populates req.cookies for every route — the single place a Cookie header is
+// parsed, mirroring how CORS/helmet are set up once here rather than per-route.
+app.use((req, res, next) => {
+    req.cookies = parseCookies(req.headers.cookie);
+    next();
+});
+
+/**
+ * Session-cookie attributes shared by both the admin and customer transports.
+ *
+ * `secure` is NOT hardcoded true: a browser silently drops a Secure cookie
+ * over plain HTTP, which would break every local `http://localhost` dev
+ * session outright. `req.secure` covers a real HTTPS request (including
+ * behind a trust-proxy'd load balancer); IS_PRODUCTION covers the case where
+ * that detection is wrong but the environment is known to be production.
+ */
+function cookieOpts(req, maxAgeMs, httpOnly) {
+    return { maxAgeMs, httpOnly, sameSite: 'Lax', secure: IS_PRODUCTION || req.secure };
+}
+
+function setAdminSessionCookies(res, req, token, csrfToken) {
+    res.setHeader('Set-Cookie', [
+        serializeCookie(ADMIN_SESSION_COOKIE, token, cookieOpts(req, ADMIN_SESSION_TTL_MS, true)),
+        serializeCookie(ADMIN_CSRF_COOKIE, csrfToken, cookieOpts(req, ADMIN_SESSION_TTL_MS, false))
+    ]);
+}
+
+function clearAdminSessionCookies(res, req) {
+    res.setHeader('Set-Cookie', [
+        clearCookie(ADMIN_SESSION_COOKIE, cookieOpts(req, 0, true)),
+        clearCookie(ADMIN_CSRF_COOKIE, cookieOpts(req, 0, false))
+    ]);
+}
+
+function setCustomerSessionCookies(res, req, token, csrfToken) {
+    res.setHeader('Set-Cookie', [
+        serializeCookie(CUSTOMER_SESSION_COOKIE, token, cookieOpts(req, CUSTOMER_SESSION_TTL_MS, true)),
+        serializeCookie(CUSTOMER_CSRF_COOKIE, csrfToken, cookieOpts(req, CUSTOMER_SESSION_TTL_MS, false))
+    ]);
+}
+
+function clearCustomerSessionCookies(res, req) {
+    res.setHeader('Set-Cookie', [
+        clearCookie(CUSTOMER_SESSION_COOKIE, cookieOpts(req, 0, true)),
+        clearCookie(CUSTOMER_CSRF_COOKIE, cookieOpts(req, 0, false))
+    ]);
+}
 app.use(helmet({
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: {
@@ -460,18 +515,19 @@ app.post('/api/admin/login', loginRateLimiter, validateBody(ADMIN_LOGIN_SCHEMA),
     }
 
     recordLoginResult(req, true);
-    const token = createAdminSession(actor, {
+    const { token, csrfToken } = createAdminSession(actor, {
         ip: req.ip,
         userAgent: req.headers['user-agent'],
         mfaUsed
     });
     logTelemetry('ADMIN_LOGIN_SUCCESS', 0, `${actor.name} (${actor.role})${mfaUsed ? ' +MFA' : ''}`);
+    setAdminSessionCookies(res, req, token, csrfToken);
     // The desk shows who is signed in and hides controls their role cannot
-    // use, so the identity goes back with the token rather than the browser
-    // having to ask a second time.
+    // use, so the identity goes back with it rather than the browser having
+    // to ask a second time. The session credential itself now lives only in
+    // the HttpOnly cookie just set above, never in this JSON body.
     res.json({
         success: true,
-        token,
         actor,
         canApprove: roleCanApprove(actor.role),
         mfaUsed
@@ -698,9 +754,9 @@ function currentSessionHandle(req) {
  * Invalidates the given session token.
  */
 app.post('/api/admin/logout', (req, res) => {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const token = (req.cookies || parseCookies(req.headers.cookie))[ADMIN_SESSION_COOKIE] || null;
     destroyAdminSession(token);
+    clearAdminSessionCookies(res, req);
     res.json({ success: true });
 });
 
@@ -764,7 +820,8 @@ app.post('/api/customer/register', customerLoginRateLimiter, registerLimiter, va
         const login = loginCustomer(phone, password, req.ip);
         if (!login.success) return res.status(500).json({ error: login.error });
 
-        res.json({ success: true, token: login.token, customer: publicAccountView(login.account) });
+        setCustomerSessionCookies(res, req, login.token, login.csrfToken);
+        res.json({ success: true, customer: publicAccountView(login.account) });
     } catch (err) {
         logError('Customer registration failed: ' + err.message, err.stack);
         res.status(500).json({ error: 'Could not create your account. Please retry.' });
@@ -785,7 +842,8 @@ app.post('/api/customer/login', customerLoginRateLimiter, validateBody(CUSTOMER_
             const status = result.code === 'ACCOUNT_LOCKED' ? 429 : 401;
             return res.status(status).json({ error: result.code || 'INVALID_CREDENTIALS', message: result.error });
         }
-        res.json({ success: true, token: result.token, customer: publicAccountView(result.account) });
+        setCustomerSessionCookies(res, req, result.token, result.csrfToken);
+        res.json({ success: true, customer: publicAccountView(result.account) });
     } catch (err) {
         logError('Customer login failed: ' + err.message, err.stack);
         res.status(500).json({ error: 'Sign-in failed. Please retry.' });
@@ -794,9 +852,9 @@ app.post('/api/customer/login', customerLoginRateLimiter, validateBody(CUSTOMER_
 
 /** POST /api/customer/logout — invalidates just this device's session. */
 app.post('/api/customer/logout', (req, res) => {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const token = (req.cookies || parseCookies(req.headers.cookie))[CUSTOMER_SESSION_COOKIE] || null;
     destroyCustomerSession(token);
+    clearCustomerSessionCookies(res, req);
     res.json({ success: true });
 });
 

@@ -90,11 +90,11 @@ test.describe('Reprint desk', () => {
         // Move the store underneath the invoice: a different rate, a different
         // slab, and the opposite tax mode. A desk that re-priced on open would
         // now show a materially different bill.
-        const token = await page.evaluate(() => sessionStorage.getItem('adminToken'));
-        const patch = await page.evaluate(async ({ token }) => {
+        const patch = await page.evaluate(async () => {
+            const csrf = document.cookie.match(/(?:^|; )gp_admin_csrf=([^;]*)/);
             const res = await fetch('/api/settings', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf ? decodeURIComponent(csrf[1]) : '' },
                 body: JSON.stringify({
                     goldTaxSlab: 18,
                     taxMode: 'Inclusive',
@@ -107,7 +107,7 @@ test.describe('Reprint desk', () => {
                 })
             });
             return res.status;
-        }, { token });
+        });
         expect(patch).toBe(200);
 
         // Reloaded so the desk starts from the CHANGED settings, with no

@@ -233,7 +233,7 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 **Goal:** accountable access and a defensible production baseline.
 
 - [ ] Named staff, RBAC/least privilege, strong password or passkey, MFA for owner/manager/control plane, device/session view, revocation and forced expiry.
-- [ ] HttpOnly/Secure/SameSite browser sessions (or documented threat-modeled native token design); CSRF protection where cookies apply.
+- [x] HttpOnly/Secure/SameSite browser sessions; CSRF protection where cookies apply. Verified 2026-08-17: `npm test` (443/443) + `npm run test:e2e` (43/43). See `docs/LEDGER.md` Phase 34.
 - [ ] OTP or audited store-assisted customer phone verification.
 - [ ] Secrets outside settings responses/exports; redaction, encryption and key-rotation runbook.
 - [ ] Same-origin policy, CSP/security headers, runtime schemas, upload/request limits, rate/abuse limits and safe errors.

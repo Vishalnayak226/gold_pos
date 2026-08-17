@@ -24,6 +24,12 @@ import path from 'path';
 import { readJSON, writeJSON, DATA_DIR, logTelemetry, logError } from './db.js';
 import { OPERATOR_ROLES, APPROVER_ROLES } from './defaultSettings.js';
 import { createBoundedMap } from './rateLimit.js';
+import { parseCookies } from './cookies.js';
+
+/** Cookie names for the admin session transport. Exported so server.js can set/clear them. */
+export const ADMIN_SESSION_COOKIE = 'gp_admin_sess';
+export const ADMIN_CSRF_COOKIE = 'gp_admin_csrf';
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /* ==========================================================================
    PIN HASHING
@@ -195,7 +201,7 @@ export function migrateStoredPins() {
     return true;
 }
 
-const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
+export const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const sessions = new Map(); // token -> { createdAt, actor }
 
 /**
@@ -539,6 +545,11 @@ export function recordLoginResult(req, success) {
  */
 export function createAdminSession(actor = OWNER_ACTOR, meta = {}) {
     const token = crypto.randomBytes(32).toString('hex');
+    // A separate, JS-readable value the browser echoes back as X-CSRF-Token on
+    // every mutating request. The session token itself lives in an HttpOnly
+    // cookie now and is never visible to page script, so it cannot serve this
+    // role — see requireAdminSession's CSRF check below.
+    const csrfToken = crypto.randomBytes(32).toString('hex');
     sessions.set(token, {
         createdAt: Date.now(),
         actor: { id: actor.id, name: actor.name, role: actor.role },
@@ -546,9 +557,10 @@ export function createAdminSession(actor = OWNER_ACTOR, meta = {}) {
         // A shop with one terminal per counter needs to tell them apart.
         ip: String(meta.ip || '').slice(0, 64),
         userAgent: String(meta.userAgent || '').slice(0, 200),
-        mfaUsed: meta.mfaUsed === true
+        mfaUsed: meta.mfaUsed === true,
+        csrfToken
     });
-    return token;
+    return { token, csrfToken };
 }
 
 /**
@@ -695,8 +707,9 @@ export function isValidAdminSession(token) {
 }
 
 /**
- * Express middleware: rejects the request unless a valid
- * "Authorization: Bearer <token>" admin session header is present.
+ * Express middleware: rejects the request unless the HttpOnly session cookie
+ * names a live session — and, on a mutating method, unless the double-submit
+ * CSRF token matches on all three of header, cookie and session.
  *
  * On success it attaches `req.actor` — the one place every admin route learns
  * who is making the request. Doing it here rather than per-route is what makes
@@ -704,14 +717,29 @@ export function isValidAdminSession(token) {
  * tomorrow gets the identity without anyone remembering to wire it up.
  */
 export function requireAdminSession(req, res, next) {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const cookies = req.cookies || parseCookies(req.headers.cookie);
+    const token = cookies[ADMIN_SESSION_COOKIE] || null;
 
     const session = getAdminSession(token);
     if (!session) {
         logTelemetry('ADMIN_SESSION_REJECTED', 0, `Path: ${req.path}`);
         return res.status(401).json({ error: 'ADMIN_SESSION_REQUIRED', message: 'Admin authentication required.' });
     }
+
+    // CSRF: the session cookie rides along automatically with a forged
+    // cross-site request, but the double-submit CSRF cookie does not — a
+    // third-party page cannot read it (same-origin policy), so it cannot
+    // reproduce this header. Safe methods are exempt; nothing they do mutates
+    // state.
+    if (!SAFE_METHODS.has(req.method)) {
+        const csrfCookie = cookies[ADMIN_CSRF_COOKIE];
+        const csrfHeader = req.headers['x-csrf-token'];
+        if (!csrfHeader || csrfHeader !== csrfCookie || csrfHeader !== session.csrfToken) {
+            logTelemetry('ADMIN_CSRF_REJECTED', 0, `Path: ${req.path}`);
+            return res.status(403).json({ error: 'CSRF_TOKEN_INVALID', message: 'Your session needs to be refreshed. Please reload the page.' });
+        }
+    }
+
     req.actor = session.actor;
     // The session itself, for the few checks that need more than the identity —
     // requireApprover asks whether a second factor was used at sign-in. Kept off

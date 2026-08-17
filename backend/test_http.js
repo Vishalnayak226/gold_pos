@@ -110,6 +110,63 @@ function operatorPinVerifies(operatorId, pin) {
         && verifyPinHash(pin, stored.authSalt, op.pinHash);
 }
 
+/**
+ * Session auth is a cookie now (Unit 1 of the production-readiness plan), not
+ * a bearer token — fetch() has no cookie jar of its own, so every check that
+ * needs an authenticated request captures Set-Cookie from a login response
+ * and replays it by hand. `getSetCookie()` (not `.get('set-cookie')`, which
+ * collapses multiple headers into one unusable comma-joined string) is the
+ * WHATWG extension Node's fetch implements for exactly this.
+ */
+function cookieJarFrom(res) {
+    const jar = {};
+    (res.headers.getSetCookie ? res.headers.getSetCookie() : []).forEach(line => {
+        const pair = line.split(';')[0];
+        const idx = pair.indexOf('=');
+        if (idx === -1) return;
+        jar[pair.slice(0, idx).trim()] = decodeURIComponent(pair.slice(idx + 1).trim());
+    });
+    return jar;
+}
+
+/** A ready-to-spread {Cookie, X-CSRF-Token} headers object from a cookie jar. */
+function sessionHeaders(jar, sessCookie, csrfCookie) {
+    const csrfToken = jar[csrfCookie] || '';
+    return { Cookie: `${sessCookie}=${jar[sessCookie] || ''}; ${csrfCookie}=${csrfToken}`, 'X-CSRF-Token': csrfToken };
+}
+
+/** Logs in as admin and returns the response plus ready-to-use auth headers. */
+async function loginAdmin(request, body) {
+    const response = await request('/api/admin/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    const jar = cookieJarFrom(response);
+    return {
+        response,
+        headers: sessionHeaders(jar, 'gp_admin_sess', 'gp_admin_csrf'),
+        token: jar.gp_admin_sess || '',
+        csrfToken: jar.gp_admin_csrf || ''
+    };
+}
+
+/** Logs in as a customer and returns the response plus ready-to-use auth headers. */
+async function loginCustomerHttp(request, body) {
+    const response = await request('/api/customer/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    const jar = cookieJarFrom(response);
+    return {
+        response,
+        headers: sessionHeaders(jar, 'gp_cust_sess', 'gp_cust_csrf'),
+        token: jar.gp_cust_sess || '',
+        csrfToken: jar.gp_cust_csrf || ''
+    };
+}
+
 function salePayload(appliedAdvance) {
     return {
         purity: '22K',
@@ -244,7 +301,7 @@ function currentTotp(secret) {
 // Populated by the enrolment check and used by the ones that follow it.
 let mfaSecret = '';
 let mfaRecoveryCodes = [];
-let mfaManagerToken = '';
+let mfaManagerHeaders = null;
 
 try {
     const { startServer } = await import('./server.js');
@@ -272,14 +329,9 @@ try {
         assert.equal((await response.json()).error, 'ADMIN_SESSION_REQUIRED');
     });
 
-    const login = await request('/api/admin/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin: initialSettings.adminPin })
-    });
-    assert.equal(login.status, 200);
-    const token = (await login.json()).token;
-    const adminHeaders = { Authorization: `Bearer ${token}` };
+    const adminSession = await loginAdmin(request, { pin: initialSettings.adminPin });
+    assert.equal(adminSession.response.status, 200);
+    const adminHeaders = adminSession.headers;
 
     await check('GET /api/settings redacts every write-only credential', async () => {
         const response = await request('/api/settings', { headers: adminHeaders });
@@ -992,28 +1044,24 @@ try {
         const tempPassword = (await issued.json()).tempPassword;
 
         const signIn = async (password) => {
-            const res = await request('/api/customer/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ phone, password })
-            });
-            assert.equal(res.status, 200);
-            return (await res.json()).token;
+            const session = await loginCustomerHttp(request, { phone, password });
+            assert.equal(session.response.status, 200);
+            return session.headers;
         };
 
         // A freshly issued login must set its own password before the portal
         // opens, so the test walks the same path a real customer does.
-        const tempToken = await signIn(tempPassword);
+        const tempHeaders = await signIn(tempPassword);
         const changed = await request('/api/customer/password/change', {
             method: 'POST',
-            headers: { Authorization: `Bearer ${tempToken}`, 'Content-Type': 'application/json' },
+            headers: { ...tempHeaders, 'Content-Type': 'application/json' },
             body: JSON.stringify({ currentPassword: tempPassword, newPassword: 'PortalPass!2026' })
         });
         assert.equal(changed.status, 200);
 
-        const token = await signIn('PortalPass!2026');
+        const customerHeaders = await signIn('PortalPass!2026');
         const response = await request('/api/customer/returns', {
-            headers: { Authorization: `Bearer ${token}` }
+            headers: customerHeaders
         });
         assert.equal(response.status, 200);
         const rows = (await response.json()).returns;
@@ -1032,7 +1080,7 @@ try {
 
         // And the gold refund is visible as spendable credit on the same screen.
         const advancesResponse = await request('/api/customer/advances', {
-            headers: { Authorization: `Bearer ${token}` }
+            headers: customerHeaders
         });
         assert.equal(advancesResponse.status, 200);
         const advances = await advancesResponse.json();
@@ -1660,20 +1708,16 @@ try {
         assert.doesNotMatch(JSON.stringify(body.settings.operators), /4321|5678/);
         assert.equal(body.settings.operators[0].pinConfigured, true);
 
-        const cashierLogin = await request('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '4321' })
-        });
-        assert.equal(cashierLogin.status, 200);
-        const cashier = await cashierLogin.json();
+        const cashierSession = await loginAdmin(request, { pin: '4321' });
+        assert.equal(cashierSession.response.status, 200);
+        const cashier = await cashierSession.response.json();
         assert.equal(cashier.actor.name, 'Cashier One');
         assert.equal(cashier.actor.role, 'cashier');
         assert.equal(cashier.canApprove, false);
 
         const sale = (await (await request('/api/sales', {
             method: 'POST',
-            headers: { Authorization: `Bearer ${cashier.token}`, 'Content-Type': 'application/json' },
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
             body: JSON.stringify(salePayload(0))
         })).json()).sale;
         assert.equal(sale.actor.name, 'Cashier One');
@@ -1682,7 +1726,7 @@ try {
         // …and their refunds do too.
         const refund = await request('/api/returns', {
             method: 'POST',
-            headers: { Authorization: `Bearer ${cashier.token}`, 'Content-Type': 'application/json' },
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
         });
         assert.equal(refund.status, 200);
@@ -1726,16 +1770,11 @@ try {
         // A customer's unverified claim, sitting pending.
         const pendingId = seedPendingDeposit({ amount: 250, referenceId: 'UTR-ROLE-TEST' });
 
-        const asCashier = await request('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '4321' })
-        });
-        const cashierToken = (await asCashier.json()).token;
+        const cashierSession = await loginAdmin(request, { pin: '4321' });
 
         const refused = await request(`/api/advances/${pendingId}/approve`, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({})
         });
         assert.equal(refused.status, 403);
@@ -1746,16 +1785,11 @@ try {
             'pending'
         );
 
-        const asManager = await request('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '5678' })
-        });
-        const managerToken = (await asManager.json()).token;
+        const managerSession = await loginAdmin(request, { pin: '5678' });
 
         const allowed = await request(`/api/advances/${pendingId}/approve`, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${managerToken}`, 'Content-Type': 'application/json' },
+            headers: { ...managerSession.headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ note: 'seen on the bank statement' })
         });
         assert.equal(allowed.status, 200);
@@ -1806,15 +1840,10 @@ try {
     });
 
     await check('changing an operator’s PIN ends their live sessions', async () => {
-        const before = await request('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '4321' })
-        });
-        const cashierToken = (await before.json()).token;
+        const before = await loginAdmin(request, { pin: '4321' });
         // The session works…
         assert.equal((await request('/api/admin/me', {
-            headers: { Authorization: `Bearer ${cashierToken}` }
+            headers: before.headers
         })).status, 200);
 
         const roster = readData('settings.json').operators.map(op => ({
@@ -1831,7 +1860,7 @@ try {
 
         // …and no longer does. The credential changed, so the access ends with it.
         assert.equal((await request('/api/admin/me', {
-            headers: { Authorization: `Bearer ${cashierToken}` }
+            headers: before.headers
         })).status, 401);
         // The new PIN works; the old one does not.
         assert.equal((await request('/api/admin/login', {
@@ -1845,11 +1874,7 @@ try {
     });
 
     await check('deactivating an operator ends their sessions and their login', async () => {
-        const login = await request('/api/admin/login', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
-        });
-        const token = (await login.json()).token;
+        const cashierSession = await loginAdmin(request, { pin: '43219' });
 
         const roster = readData('settings.json').operators.map(op => ({
             id: op.id, name: op.name, role: op.role,
@@ -1861,7 +1886,7 @@ try {
             body: JSON.stringify({ operators: roster })
         });
 
-        assert.equal((await request('/api/admin/me', { headers: { Authorization: `Bearer ${token}` } })).status, 401);
+        assert.equal((await request('/api/admin/me', { headers: cashierSession.headers })).status, 401);
         assert.equal((await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ pin: '43219' })
@@ -1880,15 +1905,11 @@ try {
     });
 
     await check('a live session can be listed and signed out by an approver', async () => {
-        const login = await request('/api/admin/login', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
-        });
-        const cashierToken = (await login.json()).token;
+        const cashierSession = await loginAdmin(request, { pin: '43219' });
 
         // A cashier may not enumerate who is signed in.
         assert.equal((await request('/api/admin/sessions', {
-            headers: { Authorization: `Bearer ${cashierToken}` }
+            headers: cashierSession.headers
         })).status, 403);
 
         const list = await request('/api/admin/sessions', { headers: adminHeaders });
@@ -1898,7 +1919,7 @@ try {
         assert.equal(Boolean(theirs), true, 'the cashier session should be listed');
         // No token may appear in the listing — that would be handing out a
         // credential from a read-only screen.
-        assert.doesNotMatch(JSON.stringify(page), new RegExp(cashierToken));
+        assert.doesNotMatch(JSON.stringify(page), new RegExp(cashierSession.token));
 
         const revoked = await request('/api/admin/sessions/revoke', {
             method: 'POST',
@@ -1907,7 +1928,7 @@ try {
         });
         assert.equal(revoked.status, 200);
         assert.equal((await request('/api/admin/me', {
-            headers: { Authorization: `Bearer ${cashierToken}` }
+            headers: cashierSession.headers
         })).status, 401);
 
         // And an approver cannot revoke their own session from that screen.
@@ -1981,14 +2002,11 @@ try {
         assert.equal(wrongCode.status, 401);
         assert.equal((await wrongCode.json()).error, 'MFA_CODE_INVALID');
 
-        const ok = await request('/api/admin/login', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '5678', totpCode: currentTotp(mfaSecret) })
-        });
-        assert.equal(ok.status, 200);
-        const session = await ok.json();
+        const okSession = await loginAdmin(request, { pin: '5678', totpCode: currentTotp(mfaSecret) });
+        assert.equal(okSession.response.status, 200);
+        const session = await okSession.response.json();
         assert.equal(session.mfaUsed, true);
-        mfaManagerToken = session.token;
+        mfaManagerHeaders = okSession.headers;
     });
 
     await check('a recovery code works once and only once', async () => {
@@ -2033,7 +2051,7 @@ try {
         // The manager who signed in WITH a code may approve.
         const allowed = await request(`/api/advances/${mfaGateId}/approve`, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${mfaManagerToken}`, 'Content-Type': 'application/json' },
+            headers: { ...mfaManagerHeaders, 'Content-Type': 'application/json' },
             body: JSON.stringify({ note: 'verified' })
         });
         assert.equal(allowed.status, 200);
@@ -2061,15 +2079,11 @@ try {
             body: JSON.stringify(salePayload(0))
         })).json()).sale;
 
-        const cashier = await request('/api/admin/login', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
-        });
-        const cashierToken = (await cashier.json()).token;
+        const cashierSession = await loginAdmin(request, { pin: '43219' });
 
         const refused = await request('/api/returns', {
             method: 'POST',
-            headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
         });
         assert.equal(refused.status, 403);
@@ -2104,15 +2118,11 @@ try {
             body: JSON.stringify(salePayload(0))
         })).json()).sale;
 
-        const cashier = await request('/api/admin/login', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
-        });
-        const cashierToken = (await cashier.json()).token;
+        const cashierSession = await loginAdmin(request, { pin: '43219' });
 
         const filed = await request('/api/returns', {
             method: 'POST',
-            headers: { Authorization: `Bearer ${cashierToken}`, 'Content-Type': 'application/json' },
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
             body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
         });
         assert.equal(filed.status, 200);
@@ -2229,19 +2239,14 @@ try {
         /* '43219', not the '4321' Cashier One starts with: the session-
            revocation check earlier in this suite rotates their PIN to prove
            that changing it ends their sessions, and this runs after it. */
-        const asCashier = await request('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
-        });
-        assert.equal(asCashier.status, 200, 'the cashier must be able to sign in for this to test anything');
-        const cashierToken = (await asCashier.json()).token;
+        const asCashier = await loginAdmin(request, { pin: '43219' });
+        assert.equal(asCashier.response.status, 200, 'the cashier must be able to sign in for this to test anything');
 
         /* The trail names who released money, which makes it the record a
            cashier under suspicion most wants to read and has least business
            reading. Same gate as approving a deposit, deliberately. */
         const refused = await request('/api/audit', {
-            headers: { Authorization: `Bearer ${cashierToken}` }
+            headers: asCashier.headers
         });
         assert.equal(refused.status, 403);
         assert.equal((await refused.json()).error, 'APPROVER_REQUIRED');
@@ -2313,7 +2318,7 @@ try {
             body: JSON.stringify({ pin: '8642', totpCode: '', recoveryCode: '' })
         });
         assert.equal(response.status, 200, 'the browser\'s own login shape must not be refused');
-        assert.ok((await response.json()).token);
+        assert.ok(cookieJarFrom(response).gp_admin_sess, 'a successful login must set the session cookie');
     });
 
     await check('a structurally wrong registration is refused before any account logic runs', async () => {

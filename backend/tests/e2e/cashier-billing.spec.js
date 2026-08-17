@@ -144,16 +144,18 @@ test.describe('Cashier billing journey', () => {
     test('refuses an advance larger than the customer’s real balance', async ({ page, posServer }) => {
         await loginAsAdmin(page, posServer);
 
-        // Posted from the page with the session token the real login just put
-        // in sessionStorage, so this asserts the server's guard rather than
-        // the Billing Desk's input validation — a tampered client is exactly
-        // the case the server-side check exists for.
+        // Posted from the page with the real session cookie the login just set
+        // (the browser attaches it automatically) plus its CSRF header, so
+        // this asserts the server's guard rather than the Billing Desk's
+        // input validation — a tampered client is exactly the case the
+        // server-side check exists for.
         const response = await page.evaluate(async () => {
+            const csrf = document.cookie.match(/(?:^|; )gp_admin_csrf=([^;]*)/);
             const res = await fetch('/api/sales', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${sessionStorage.getItem('adminToken') || ''}`
+                    'X-CSRF-Token': csrf ? decodeURIComponent(csrf[1]) : ''
                 },
                 body: JSON.stringify({
                     purity: '22K',

@@ -544,7 +544,7 @@
         // never show a customer a balance the counter disagrees with.
         import { ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus } from './js/lib/billingMath.js';
 
-        const TOKEN_KEY = 'customerToken';
+        const AUTH_FLAG_KEY = 'customerAuthenticated';
 
         let customerPhone = '';
         let customerName = '';
@@ -575,29 +575,40 @@
            Session plumbing
            ================================================================== */
 
-        function getToken() {
-            return localStorage.getItem(TOKEN_KEY) || '';
+        /** Reads one cookie by name from document.cookie, or '' if absent. */
+        function readCookie(name) {
+            const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+            return match ? decodeURIComponent(match[1]) : '';
         }
 
-        function setToken(token) {
-            if (token) localStorage.setItem(TOKEN_KEY, token);
-            else localStorage.removeItem(TOKEN_KEY);
+        function isCustomerAuthenticated() {
+            return localStorage.getItem(AUTH_FLAG_KEY) === '1';
         }
+
+        function setCustomerAuthenticated(authenticated) {
+            if (authenticated) localStorage.setItem(AUTH_FLAG_KEY, '1');
+            else localStorage.removeItem(AUTH_FLAG_KEY);
+        }
+
+        const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
         /**
-         * fetch() with the customer bearer session attached. A 401 means the
+         * fetch() with the customer session cookie and, for a mutating request,
+         * the CSRF header the cookie can't carry by itself (see
+         * requireCustomerSession in backend/customerAuth.js). A 401 means the
          * session expired or was revoked (password change, admin reissue) —
          * clear it and drop back to the sign-in screen rather than leaving a
          * half-loaded portal on screen.
          */
         async function customerFetch(url, options = {}) {
-            const headers = {
-                ...(options.headers || {}),
-                'Authorization': `Bearer ${getToken()}`
-            };
-            const res = await fetch(url, { ...options, headers });
+            const method = (options.method || 'GET').toUpperCase();
+            const headers = { ...(options.headers || {}) };
+            if (MUTATING_METHODS.has(method)) {
+                headers['X-CSRF-Token'] = readCookie('gp_cust_csrf');
+            }
+            const res = await fetch(url, { ...options, headers, credentials: 'include' });
             if (res.status === 401) {
-                setToken('');
+                setCustomerAuthenticated(false);
                 showAuthView();
             }
             return res;
@@ -630,11 +641,13 @@
         }
 
         /**
-         * Applies a successful authentication: stores the session, records
-         * who we are, and routes to the forced-change screen or the portal.
+         * Applies a successful authentication: the session itself now lives
+         * only in the HttpOnly cookie the server just set, so this just flags
+         * the tab as signed in, records who we are, and routes to the
+         * forced-change screen or the portal.
          */
-        async function onAuthenticated(token, customer, usedPassword = '') {
-            setToken(token);
+        async function onAuthenticated(customer, usedPassword = '') {
+            setCustomerAuthenticated(true);
             customerPhone = customer.phone;
             customerName = customer.name || '';
             if (customer.mustChangePassword) {
@@ -664,12 +677,12 @@
 
         /** Restores an existing session on load, if one is still valid. */
         (async function restoreSession() {
-            if (!getToken()) return;
+            if (!isCustomerAuthenticated()) return;
             try {
                 const res = await customerFetch('/api/customer/me');
                 if (!res.ok) return;
                 const data = await res.json();
-                await onAuthenticated(getToken(), data.customer);
+                await onAuthenticated(data.customer);
             } catch (err) {
                 // Offline or server down — the sign-in screen is already showing.
             }
@@ -739,7 +752,7 @@
                     return;
                 }
                 document.getElementById('login-password').value = '';
-                await onAuthenticated(data.token, data.customer, password);
+                await onAuthenticated(data.customer, password);
             } catch (err) {
                 errorEl.textContent = 'Could not reach the store server. Please try again.';
             } finally {
@@ -787,7 +800,7 @@
                 }
                 document.getElementById('reg-password').value = '';
                 document.getElementById('reg-password2').value = '';
-                await onAuthenticated(data.token, data.customer, password);
+                await onAuthenticated(data.customer, password);
             } catch (err) {
                 errorEl.textContent = 'Could not reach the store server. Please try again.';
             } finally {
@@ -906,9 +919,9 @@
                 document.getElementById('fc-password').value = '';
                 document.getElementById('fc-password2').value = '';
                 if (loginRes.ok) {
-                    await onAuthenticated(loginData.token, loginData.customer, newPassword);
+                    await onAuthenticated(loginData.customer, newPassword);
                 } else {
-                    setToken('');
+                    setCustomerAuthenticated(false);
                     showAuthView();
                     alert('Password set successfully! Please sign in.');
                 }
@@ -1112,8 +1125,7 @@
         }
 
         document.getElementById('logout-btn').addEventListener('click', async () => {
-            const token = getToken();
-            setToken('');
+            setCustomerAuthenticated(false);
             customerPhone = '';
             customerName = '';
             document.getElementById('login-phone').value = '';
@@ -1121,10 +1133,7 @@
             switchAuthPane('login');
             showAuthView();
             try {
-                await fetch('/api/customer/logout', {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${token}` }
-                });
+                await customerFetch('/api/customer/logout', { method: 'POST' });
             } catch (err) {
                 // Local session is already cleared either way.
             }
@@ -1183,7 +1192,7 @@
                     errorEl.textContent = data.error || 'Could not change your password.';
                     return;
                 }
-                setToken('');
+                setCustomerAuthenticated(false);
                 document.getElementById('cp-current').value = '';
                 document.getElementById('cp-new').value = '';
                 document.getElementById('cp-new2').value = '';

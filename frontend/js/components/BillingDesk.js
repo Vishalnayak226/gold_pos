@@ -87,7 +87,7 @@ export class BillingDesk {
     async init() {
         this.render();
         await this.fetchGoldRate();
-        if (sessionStorage.getItem('adminToken')) {
+        if (sessionStorage.getItem('adminAuthenticated') === '1') {
             await this.fetchSettings();
         }
         this.setupEventListeners();

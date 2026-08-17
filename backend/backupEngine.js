@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
 import { logError, logTelemetry, DATA_DIR } from './db.js';
+import { DB_FILE, checkpointAndCopy } from './repositories/connection.js';
 
 const BACKUPS_DIR = path.join(process.cwd(), 'backups');
 
@@ -39,6 +40,14 @@ export function createBackup() {
                 fs.copyFileSync(srcPath, destPath);
             }
         });
+
+        // The ledger itself: a plain copy of a WAL-mode database can miss
+        // recently-committed transactions still sitting in the -wal file, so
+        // this goes through the same checkpoint-then-copy path the importer's
+        // safety net uses (connection.js:checkpointAndCopy), not fs.copyFileSync.
+        if (fs.existsSync(DB_FILE)) {
+            checkpointAndCopy(path.join(targetBackupDir, path.basename(DB_FILE)));
+        }
 
         logTelemetry('BACKUP_CREATE_SUCCESS', Date.now() - startTime, `Dir: backup_${todayStr}`);
         console.log(`[Backup] Daily database snapshot created: backup_${todayStr}`);

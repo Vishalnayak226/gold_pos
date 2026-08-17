@@ -27,7 +27,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.customerAccountsManager = new CustomerAccountsManager();
     window.auditTrail = new AuditTrail();
     window.settingsManager = new SettingsManager();
-    if (sessionStorage.getItem('adminToken')) {
+    if (isAdminAuthenticated()) {
         window.dashboard.refresh();
         window.reprintDesk.refresh();
         window.returnDesk.refresh();
@@ -111,9 +111,9 @@ function setActor(actor, approver) {
 }
 
 /**
- * Re-establishes the identity behind a session token restored from
- * sessionStorage on reload. The token is the authority, not anything cached in
- * the browser, so the name is asked for rather than remembered.
+ * Re-establishes the identity behind the session cookie on reload. The
+ * cookie is the authority, not anything cached in the browser, so the name
+ * is asked for rather than remembered.
  */
 async function loadActor() {
     try {
@@ -127,19 +127,38 @@ async function loadActor() {
     }
 }
 
+/** Reads one cookie by name from document.cookie, or '' if absent. */
+function readCookie(name) {
+    const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+    return match ? decodeURIComponent(match[1]) : '';
+}
+
+/** Whether this tab has a live admin sign-in. A UI hint only — the server is
+ *  the one place that actually trusts the (HttpOnly, unreadable-by-JS)
+ *  session cookie on every request. */
+function isAdminAuthenticated() {
+    return sessionStorage.getItem('adminAuthenticated') === '1';
+}
+
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
 /**
- * Wraps fetch() with the admin bearer session token. Use for any endpoint
- * that requires requireAdminSession server-side (settings, sales, etc).
+ * Wraps fetch() with the admin session cookie and, for a mutating request,
+ * the CSRF header the cookie can't carry by itself (see requireAdminSession
+ * in backend/adminAuth.js). Use for any endpoint that requires
+ * requireAdminSession server-side (settings, sales, etc).
  * On a 401 (missing/expired session) it clears local state and forces the
  * lock screen back up rather than silently failing.
  */
 export async function adminFetch(url, options = {}) {
-    const token = sessionStorage.getItem('adminToken');
-    const headers = { ...(options.headers || {}), 'Authorization': `Bearer ${token || ''}` };
-    const res = await fetch(url, { ...options, headers });
+    const method = (options.method || 'GET').toUpperCase();
+    const headers = { ...(options.headers || {}) };
+    if (MUTATING_METHODS.has(method)) {
+        headers['X-CSRF-Token'] = readCookie('gp_admin_csrf');
+    }
+    const res = await fetch(url, { ...options, headers, credentials: 'include' });
 
     if (res.status === 401) {
-        sessionStorage.removeItem('adminToken');
         sessionStorage.removeItem('adminAuthenticated');
         setActor(null, false);
         const loginView = document.getElementById('admin-login-view');
@@ -164,10 +183,10 @@ function initAdminAuth() {
 
     if (!loginView || !appViewport) return;
 
-    // Check if already authenticated in this session (token may have expired
-    // server-side, e.g. after a restart — the first gated adminFetch call
-    // will catch that and bounce back to the lock screen)
-    if (sessionStorage.getItem('adminToken')) {
+    // Check if already authenticated in this session (the cookie may have
+    // expired server-side, e.g. after a restart — the first gated adminFetch
+    // call will catch that and bounce back to the lock screen)
+    if (isAdminAuthenticated()) {
         loginView.style.display = 'none';
         appViewport.style.display = 'grid';
         loadActor();
@@ -234,7 +253,7 @@ function initAdminAuth() {
 
             if (res.ok) {
                 const data = await res.json();
-                sessionStorage.setItem('adminToken', data.token);
+                sessionStorage.setItem('adminAuthenticated', '1');
                 // The PIN identified a person, not just "authenticated" — see
                 // resolveActor() in backend/adminAuth.js.
                 setActor(data.actor, data.canApprove);
@@ -275,8 +294,7 @@ function initAdminAuth() {
 
     if (logoutBtn) {
         logoutBtn.addEventListener('click', async () => {
-            const token = sessionStorage.getItem('adminToken');
-            sessionStorage.removeItem('adminToken');
+            sessionStorage.removeItem('adminAuthenticated');
             setActor(null, false);
             // Back to the plain PIN prompt — the next person at this terminal may
             // not be the one who just signed out.
@@ -287,10 +305,7 @@ function initAdminAuth() {
             appViewport.style.display = 'none';
             loginView.style.display = 'flex';
             try {
-                await fetch('/api/admin/logout', {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${token || ''}` }
-                });
+                await adminFetch('/api/admin/logout', { method: 'POST' });
             } catch (err) {
                 // best-effort — local session is already cleared either way
             }
@@ -320,25 +335,25 @@ function initNavigation() {
                 targetPanel.classList.add('active');
             }
 
-            if (targetId === 'dashboard-tab' && window.dashboard && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'dashboard-tab' && window.dashboard && isAdminAuthenticated()) {
                 window.dashboard.refresh();
             }
-            if (targetId === 'reprint-tab' && window.reprintDesk && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'reprint-tab' && window.reprintDesk && isAdminAuthenticated()) {
                 window.reprintDesk.refresh();
             }
-            if (targetId === 'returns-tab' && window.returnDesk && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'returns-tab' && window.returnDesk && isAdminAuthenticated()) {
                 window.returnDesk.refresh();
             }
-            if (targetId === 'advances-tab' && window.advancesManager && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'advances-tab' && window.advancesManager && isAdminAuthenticated()) {
                 window.advancesManager.refresh();
             }
-            if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && isAdminAuthenticated()) {
                 window.customerAccountsManager.refresh();
             }
-            if (targetId === 'audit-tab' && window.auditTrail && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'audit-tab' && window.auditTrail && isAdminAuthenticated()) {
                 window.auditTrail.refresh();
             }
-            if (targetId === 'settings-tab' && window.settingsManager && sessionStorage.getItem('adminToken')) {
+            if (targetId === 'settings-tab' && window.settingsManager && isAdminAuthenticated()) {
                 window.settingsManager.refresh();
             }
 
