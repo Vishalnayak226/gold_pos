@@ -23,6 +23,7 @@ import crypto from 'crypto';
 import path from 'path';
 import { readJSON, writeJSON, DATA_DIR, logTelemetry, logError } from './db.js';
 import { OPERATOR_ROLES, APPROVER_ROLES } from './defaultSettings.js';
+import { createBoundedMap } from './rateLimit.js';
 
 /* ==========================================================================
    PIN HASHING
@@ -302,7 +303,20 @@ export function resolveActor(pin, settings) {
 const MAX_FAILED_ATTEMPTS = 5;
 const BASE_LOCKOUT_MS = 30 * 1000; // 30s, doubles per additional failure past the threshold
 const MAX_LOCKOUT_MS = 15 * 60 * 1000; // capped at 15 minutes
-const failedAttempts = new Map(); // ip -> { count, lockedUntil }
+
+/* ip -> { count, lockedUntil }. Bounded, because a plain Map here only ever
+   shed an entry on a *successful* login: every address that failed once and
+   never returned stayed resident for the life of the process, so one request
+   per new IP grew it indefinitely. Entries expire a full max-lockout after
+   their last write, so the map drains on its own.
+
+   THE TTL IS A DAY, NOT THE 15-MINUTE LOCKOUT CAP, AND THAT MATTERS. Expiring
+   an entry resets its count, and the count is what makes the cooldown escalate.
+   At a 15-minute TTL an attacker who waits out one lockout gets the full five
+   free attempts back every time; at 24 hours the escalation stays effectively
+   permanent for any realistic attack while the memory still bounds. The
+   escalation policy below is unchanged — only the storage is shared. */
+const failedAttempts = createBoundedMap({ ttlMs: 24 * 60 * 60 * 1000, maxEntries: 10000 });
 
 /**
  * Checks whether a given source key is currently locked out from login attempts.

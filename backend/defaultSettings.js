@@ -13,8 +13,14 @@
  *
  * Adding a new key here is all that is required: fresh installs get it, and
  * existing tenants receive it on their next server start.
+ *
+ * `validation.js` is the only thing this imports, and it is pure — this module
+ * must stay free of any path to `db.js`, because it is the one module a test
+ * suite may import statically (CLAUDE.md §8).
  * ==========================================================================
  */
+
+import { validateAgainstRules } from './validation.js';
 
 export const DEFAULT_SETTINGS = {
     companyName: "Universal Gold POS Ltd",
@@ -204,15 +210,6 @@ export const SETTINGS_FIELD_RULES = {
     razorpayKeyId: { type: 'string', maxLength: 200 }
 };
 
-/** Human label for an expected type, used in the refusal message. */
-function describeRule(rule) {
-    if (rule.type === 'enum') return `one of ${rule.values.join(', ')}`;
-    if (rule.type === 'integer') return `a whole number between ${rule.min} and ${rule.max}`;
-    if (rule.type === 'number') return `a number between ${rule.min} and ${rule.max}`;
-    if (rule.patternHint) return `text (${rule.patternHint}), at most ${rule.maxLength} characters`;
-    return `text of at most ${rule.maxLength} characters`;
-}
-
 /**
  * Type/range-check a settings patch before it is merged into settings.json.
  *
@@ -222,68 +219,17 @@ function describeRule(rule) {
  * is the half that actually fixes the string-concatenation bug: rejecting the
  * bad values is not enough while a *stringified* good value still gets stored.
  *
+ * The engine moved to `validation.js` when request bodies needed the same
+ * checks; this stays the settings-shaped entry point, and the rules table above
+ * stays here beside the template that declares the keys. No rule in
+ * SETTINGS_FIELD_RULES is `required`, which is what keeps this a *patch*
+ * validator: an absent key means "leave it alone".
+ *
  * @param {object} patch the request body
  * @returns {{ok: true, values: object}|{ok: false, error: string}}
  */
 export function validateSettingsPatch(patch) {
-    const source = patch && typeof patch === 'object' ? patch : {};
-    const values = {};
-
-    for (const [key, rule] of Object.entries(SETTINGS_FIELD_RULES)) {
-        if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
-        const raw = source[key];
-        // An explicit null/undefined means "leave it alone", which is how a
-        // partial patch from the Settings screen already behaves.
-        if (raw === null || raw === undefined) continue;
-
-        if (rule.type === 'number' || rule.type === 'integer') {
-            // Deliberately NOT Number(raw): that turns [], '' and true into
-            // numbers, which is the coercion that caused this whole class of
-            // bug. Only a real number, or a string that is entirely a number,
-            // is accepted.
-            const isNumericString = typeof raw === 'string' && raw.trim() !== '' && Number.isFinite(Number(raw));
-            if (typeof raw !== 'number' && !isNumericString) {
-                return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-            }
-            const n = Number(raw);
-            if (!Number.isFinite(n)) return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-            if (rule.type === 'integer' && !Number.isInteger(n)) {
-                return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-            }
-            if (n < rule.min || n > rule.max) {
-                return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-            }
-            values[key] = n;
-            continue;
-        }
-
-        if (rule.type === 'enum') {
-            if (typeof raw !== 'string') return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-            const needle = raw.trim().toLowerCase();
-            const match = rule.values.find(v =>
-                rule.caseInsensitive ? v.toLowerCase() === needle : v === raw.trim());
-            if (!match) return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-            values[key] = match;
-            continue;
-        }
-
-        // Strings. An object, array or number here is a client bug, not a value
-        // to stringify — `[object Object]` in an invoice number is exactly what
-        // this refuses.
-        if (typeof raw !== 'string') {
-            return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-        }
-        const text = raw.trim();
-        if (text.length > rule.maxLength) {
-            return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-        }
-        if (rule.pattern && !rule.pattern.test(text)) {
-            return { ok: false, error: `"${key}" must be ${describeRule(rule)}.` };
-        }
-        values[key] = text;
-    }
-
-    return { ok: true, values };
+    return validateAgainstRules(patch, SETTINGS_FIELD_RULES);
 }
 
 /** Settings objects that are merged key-by-key rather than replaced wholesale. */

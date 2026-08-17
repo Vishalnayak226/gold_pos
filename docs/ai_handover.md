@@ -14,16 +14,29 @@ This document contains key architectural details, non-negotiable design guidelin
 
 - **Latest commit:** `2c1bf50` — "Make the audit trail readable" (2026-08-16, Phase 31), on branch
   **`phase-21-payment-verification-and-production-guard`**.
-- **⚠️ THE WORKING TREE IS NOT CLEAN as of 2026-08-16: Phase 32 is finished and UNCOMMITTED.**
-  Ten files — `backend/server.js`, `backend/db.js`, `backend/repositories/{index,connection}.js`,
-  `backend/licenseChecker.js`, `backend/test_http.js`, `deploy/ecosystem.{base.cjs,config.cjs}`,
-  and the three `.github/workflows/cd-*.yml` — plus the docs below. `npm test` is green on it
-  (437 checks) and it was curl-verified against a live server. See `docs/LEDGER.md` Phase 32.
-  Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`, Phase 31 in `2c1bf50`.
-  Migration `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout
-  migrates.
+- **Phase 32 is committed and PUSHED** as `752b925`; `origin/` has it on this branch.
+  **⚠️ Phase 33 is finished and UNCOMMITTED** as of 2026-08-17 — two new files
+  (`backend/rateLimit.js`, `backend/validation.js`) plus `server.js`, `defaultSettings.js`,
+  `adminAuth.js`, `customerAuth.js`, `test_http.js`, `test_suite.js`, `brain.map.json` and the
+  docs. `npm test` is green on it (443 checks). See `docs/LEDGER.md` Phase 33.
+  Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`, Phase 31 in `2c1bf50`,
+  Phase 32 in `752b925`. Migration `004_multi_line_invoice_fidelity.sql` is tracked, in
+  `c26800f` — a fresh checkout migrates.
+  - **The CI gate has still never run.** `daily-checks.yml` triggers on `pull_request:
+    branches: ['**']` and on push to main/develop/staging only — so pushing this feature branch
+    does *not* fire it. Opening a PR does. `gh` is not installed on the dev machine; the PR has to
+    be opened from the web UI. Do **not** push to `develop` to force it: `cd-dev.yml` deploys on
+    that branch and will fail at the SSH step, because no VPS is provisioned.
   - *This section has twice described a tree state that was already wrong. Run `git status`
     before acting on any claim here.*
+- **Phase 33 (2026-08-17) — the request boundary.** `backend/rateLimit.js` (one bounded keyed
+  counter; blanket 600/min per IP on `/api/*` with the probes and the Razorpay webhook exempt, plus
+  named limits on registration, password reset, deposit claims, payment orders and the expensive
+  admin operations) and `backend/validation.js` (`validateSettingsPatch()`'s engine lifted out —
+  `validateBody()` now shape-checks the credential surface, and the settings validator is a
+  two-line caller over the same code). **Fixed a real leak:** both credential lockouts used plain
+  Maps that only shed an entry on a *successful* login, so one request per new IP grew them
+  without bound. **No new dependency.**
 - **Phase 32 (2026-08-16) — the operational boundary.** `GET /api/ready` (readiness) split from
   `GET /api/health` (liveness, dependency-free on purpose); graceful SIGTERM/SIGINT drain that
   flips readiness to 503 *before* closing the listener and closes the ledger *last*; one
@@ -57,10 +70,16 @@ This document contains key architectural details, non-negotiable design guidelin
   - `frontend/js/components/SettingsManager.js` — 18 unescaped/uncoerced form fields fixed.
   - `backend/test_billing_math.js` (+5 checks), `backend/test_http.js` (+7 checks).
   - Plus `CLAUDE.md` §0/§8 and `docs/LEDGER.md`.
-- **`npm test` is green across all eight suites — 437 checks, exit 0** (145 + 43 + 82 + 16 + 9 +
-  28 + 98 + 16). Re-verified 2026-08-16 after Phase 32. **Playwright is green too — 43/43, 3.3m,
-  re-run 2026-08-16 against the Phase 32 working tree.** One-off setup if the binary is missing:
-  `cd backend && npm install && npx playwright install chromium`.
+- **`npm test` is green across all eight suites — 443 checks, exit 0** (145 + 43 + 82 + 16 + 10 +
+  28 + 103 + 16). Re-verified 2026-08-17 after Phase 33. **Playwright is green too — 43/43, 2.4m,
+  re-run 2026-08-17 on the Phase 33 tree**, after it caught the sign-in bug below. One-off setup if
+  the binary is missing: `cd backend && npm install && npx playwright install chromium`.
+  - **⚠️ READ THIS BEFORE TRUSTING A GREEN `npm test`.** On 2026-08-17 all eight suites passed
+    while **every admin sign-in was broken**: a Phase 33 body schema refused `totpCode: ""`, and
+    the HTTP suites post only `{pin}` where a browser posts every field its form owns. Playwright
+    caught it; nothing else did. `test_http.js` now carries a check that posts the browser's exact
+    login shape, but the general rule stands — **run `npm run test:e2e` before calling anything
+    that touches a request body, a form or an auth path done** (`CLAUDE.md` §8).
 - **What the hardening pass established, and what it did NOT find.** The transactional core held
   under every attack: concurrent sales produced unique invoice numbers with no lost writes,
   concurrent returns refunded exactly once, concurrent advance redemption double-spent nothing,

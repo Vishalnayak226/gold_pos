@@ -28,6 +28,7 @@
 import crypto from 'crypto';
 import { logError, logTelemetry } from './db.js';
 import * as repo from './repositories/index.js';
+import { createBoundedMap } from './rateLimit.js';
 
 
 
@@ -58,7 +59,12 @@ const MAX_LOCKOUT_MS = 15 * 60 * 1000;
 // — an attacker restarting our server to clear it has bigger levers already.
 const IP_MAX_FAILED = 20;
 const IP_LOCKOUT_MS = 15 * 60 * 1000;
-const ipFailures = new Map(); // ip -> { count, lockedUntil }
+/* Bounded, and for the same reason adminAuth's twin is: a plain Map only shed
+   an entry on a successful sign-in, so every address that failed once and never
+   returned stayed resident for the life of the process. A day's TTL keeps the
+   count meaningful across any realistic attack while letting the map drain —
+   expiring sooner would hand an attacker a fresh budget every lockout. */
+const ipFailures = createBoundedMap({ ttlMs: 24 * 60 * 60 * 1000, maxEntries: 10000 });
 
 const RESET_TOKEN_TTL_MS = 30 * 60 * 1000; // 30 minutes
 

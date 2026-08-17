@@ -245,6 +245,24 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   rate/abuse limits on anything that is not a login, and runtime schemas beyond
   `validateSettingsPatch()` — which covers `POST /api/settings` only and is the pattern the rest
   should follow rather than a second mechanism.*
+  ***Both closed 2026-08-17, Phase 33, and the pattern was followed rather than duplicated.**
+  `backend/rateLimit.js` holds one bounded keyed counter; the abuse limiters are built on it and
+  the two pre-existing credential lockouts now store their counts in it. A blanket 600/min per IP
+  covers `/api/*`, with the probes and the Razorpay webhook exempt (throttling a probe makes a
+  healthy process look down; 429-ing the webhook loses the record of money already taken), and
+  tighter named limits sit on the endpoints where every request succeeds and the abuse is the
+  volume — registration, password reset, deposit claims, payment orders, and the expensive admin
+  operations that send mail, call the price provider or encrypt the whole ledger.
+  `backend/validation.js` is `validateSettingsPatch()`'s engine lifted out, not a second one:
+  `validateSettingsPatch()` is now a two-line caller, and `validateBody()` applies the same rules
+  to the credential surface (admin login, customer register/login/profile/password change, forgot,
+  reset). It checks **shape only** — meaning stays in `customerAuth.js` and the services, so there
+  is no second source of truth. The money routes are deliberately NOT wrapped: their services
+  already validate exhaustively, and a thinner second check there would add risk, not coverage.
+  **A real defect fixed on the way:** both credential lockouts used plain Maps that only shed an
+  entry on a *successful* login, so every source that failed once and never returned stayed
+  resident for the life of the process — one request per new IP grew them without bound. Asserted
+  now by `test_suite.js` Test 10.*
   ***Safe errors closed 2026-08-16, Phase 32.** Until then there was no terminal error handler at
   all, so anything thrown outside a route's own try/catch reached Express's default handler — which
   renders the **stack trace into the response body** outside `NODE_ENV=production`, leaking absolute

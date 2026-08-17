@@ -2263,6 +2263,118 @@ try {
     });
 
     /* ------------------------------------------------------------------
+       §"Body schemas" — shape checked before the handler, so a handler can
+       trust `typeof`. Meaning is still checked where it always was.
+       ------------------------------------------------------------------ */
+
+    await check('a login PIN sent as a number is refused as a malformed body, not as a wrong PIN', async () => {
+        /* The PIN must stay a string all the way to scrypt: as a number,
+           "0421" is 421 and a leading-zero PIN stops matching its own hash. */
+        const response = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: 2468 })
+        });
+        assert.equal(response.status, 400);
+        const body = await response.json();
+        assert.equal(body.error, 'INVALID_BODY');
+        assert.equal(body.field, 'pin', 'the refusal must name the field so the UI can point at it');
+        assert.match(body.requestId, /^REQ-/);
+
+        /* AND A MALFORMED BODY MUST NOT SPEND THE LOCKOUT BUDGET. The schema
+           runs after `loginRateLimiter` but before the handler, so no failed
+           attempt is ever recorded — send more than the five-attempt threshold
+           and every one must still be a 400, never a 429. Otherwise anyone
+           could lock a store's own counter out with junk JSON. */
+        for (let attempt = 0; attempt < 8; attempt++) {
+            const junk = await request('/api/admin/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pin: { nested: true } })
+            });
+            assert.equal(junk.status, 400, 'a malformed login body must never escalate into a lockout');
+        }
+    });
+
+    await check('a login body shaped exactly as the browser sends it is accepted', async () => {
+        /* THE REGRESSION THIS EXISTS FOR. `frontend/js/app.js` posts every field
+           the form owns, so an operator with no second factor still sends
+           `totpCode: ""` and `recoveryCode: ""`. The first version of the schema
+           gave those a pattern requiring at least one character, which refused
+           the empty string and 400'd EVERY ordinary sign-in. The other checks
+           here post only `{pin}` and sailed straight past it — Playwright, which
+           drives the real form, is what caught it. Post the real shape. */
+        const response = await request('/api/admin/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            /* '8642', not initialSettings.adminPin: the secret-rotation check
+               far above this one replaces the master PIN, and '2468' has been
+               dead since. */
+            body: JSON.stringify({ pin: '8642', totpCode: '', recoveryCode: '' })
+        });
+        assert.equal(response.status, 200, 'the browser\'s own login shape must not be refused');
+        assert.ok((await response.json()).token);
+    });
+
+    await check('a structurally wrong registration is refused before any account logic runs', async () => {
+        for (const [label, payload] of [
+            ['an object where a phone belongs', { phone: { toString: 'nope' }, password: 'Str0ngPass!' }],
+            ['an array where a phone belongs', { phone: ['9000000001'], password: 'Str0ngPass!' }],
+            ['a missing password', { phone: '9000000002' }],
+            ['a null phone', { phone: null, password: 'Str0ngPass!' }]
+        ]) {
+            const response = await request('/api/customer/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            assert.equal(response.status, 400, `${label} should be refused`);
+            assert.equal((await response.json()).error, 'INVALID_BODY', `${label} should be refused as a bad body`);
+        }
+    });
+
+    /* ------------------------------------------------------------------
+       §"Abuse limits" — the limits that cover what a credential lockout
+       cannot: endpoints where every request succeeds and the abuse is the
+       volume.
+       ------------------------------------------------------------------ */
+
+    await check('a rate-limited response advertises the quota so a client can back off', async () => {
+        const response = await request('/api/health', { headers: adminHeaders });
+        /* /api/health is exempt, so it must carry NO limit headers at all —
+           monitoring polls it by design, and throttling a probe makes a healthy
+           process look down and can trigger a false failover. */
+        assert.equal(response.headers.get('ratelimit-limit'), null);
+
+        const limited = await request('/api/settings', { headers: adminHeaders });
+        assert.equal(limited.status, 200);
+        assert.ok(Number(limited.headers.get('ratelimit-limit')) > 0);
+        assert.ok(Number(limited.headers.get('ratelimit-remaining')) >= 0);
+    });
+
+    await check('the password-reset endpoint refuses a flood and says when to return', async () => {
+        /* Five per fifteen minutes. The cost of this endpoint is an email sent
+           to an address we do not control, which is why it is one of the
+           tightest. The route answers the same way for a known and an unknown
+           phone (anti-enumeration), so the 429 is the only observable change. */
+        let refused = null;
+        for (let attempt = 0; attempt < 6 && !refused; attempt++) {
+            const response = await request('/api/customer/password/forgot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phone: '9000000123' })
+            });
+            if (response.status === 429) refused = response;
+        }
+        assert.ok(refused, 'six reset requests in a row were never refused');
+        const body = await refused.json();
+        assert.equal(body.error, 'RATE_LIMITED');
+        assert.ok(body.retryAfterSeconds > 0);
+        assert.match(body.requestId, /^REQ-/);
+        assert.ok(Number(refused.headers.get('retry-after')) > 0);
+    });
+
+    /* ------------------------------------------------------------------
        §"The operational boundary" — request identity, readiness vs
        liveness, safe errors, and draining. Everything here is what an
        operator sees, so it is asserted the way an operator would see it.

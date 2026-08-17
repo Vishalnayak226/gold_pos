@@ -21,7 +21,11 @@ not every turn. This file is auto-loaded on every request, so it stays tight.
     additive migration path §1 already mandates. Do not move them into SQL.
     - **A settings key that the billing pipeline reads MUST declare its type** in
       `SETTINGS_FIELD_RULES` (`defaultSettings.js`), which `POST /api/settings` enforces and
-      canonicalises through `validateSettingsPatch()`. These keys are read downstream with plain JS
+      canonicalises through `validateSettingsPatch()`. **The rule engine moved to
+      `backend/validation.js` on 2026-08-17** and is shared with request-body schemas — one
+      implementation, two entry points. Add a *rule*, never a second validator, and keep
+      `validation.js` free of any path to `db.js` so `defaultSettings.js` stays statically
+      importable from a suite (§8). These keys are read downstream with plain JS
       coercion, so a wrong *type* does not fail — it bills wrongly: a stringified `invoiceSeqStart`
       made `startSeq + 1` a string **concatenation** (10 → 101 → 1011, destroying the sequential
       invoice series), a non-numeric `goldTaxSlab` read as `Number(x) || 0` and silently charged
@@ -266,9 +270,14 @@ wrong answers.
   (helper-level integration) → `test_routes.js` (routes + auth boundary) → `test_http.js` (money
   paths, Razorpay webhook, returns/refunds, multi-line invoices, tenders, actor identity, paged
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
-  `test_production_guard.js` (fail-closed startup). **437 checks as of 2026-08-16**
-  (145 + 43 + 82 + 16 + 9 + 28 + 98 + 16, in run order — `test_suite.js` is counted by the nine
+  `test_production_guard.js` (fail-closed startup). **443 checks as of 2026-08-17**
+  (145 + 43 + 82 + 16 + 10 + 28 + 103 + 16, in run order — `test_suite.js` is counted by the ten
   numbered tests it prints, not by an older tally that no longer matched anything).
+  - **A GREEN `npm test` IS NOT PROOF A FORM STILL WORKS.** The HTTP suites post minimal bodies;
+    a browser posts every field its form owns, including the empty ones. A body schema that
+    refused `totpCode: ""` broke every admin sign-in on 2026-08-17 with all eight suites green —
+    only Playwright, which drives the real form, caught it. **Run `npm run test:e2e` before
+    calling anything that touches a request body, a form, or an auth path done.**
   - **`test_http.js` §"The operational boundary" must stay LAST in that file.** Its final check
     drains the app: `shutdown()` sets a process-wide flag and closes the ledger handle, so every
     readiness answer after it is 503. Add new checks above that section, not below it.

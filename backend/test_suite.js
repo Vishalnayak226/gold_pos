@@ -514,6 +514,52 @@ async function testTotpAgainstRfcVectors() {
     console.log('✅ Test 9 Passed: TOTP matches the RFC vectors, tolerates one step of drift, and rejects stale codes.');
 }
 
+/* ==========================================================================
+   Test 10: the bounded counter under every attempt tracker
+
+   The two credential lockouts and the abuse limiters all keep counters in a
+   keyed map. Before this map existed they used plain Maps that only ever shed
+   an entry on a SUCCESSFUL login — so every source that failed once and never
+   came back stayed resident for the life of the process, and one request per
+   new IP grew them without bound. That is not observable over HTTP and it is
+   not visible in a code review that is looking at the escalation policy, which
+   is why it is asserted here.
+   ========================================================================== */
+async function testBoundedAttemptMap() {
+    console.log('Running Test 10: the bounded counter behind every rate limit...');
+    const { createBoundedMap } = await import('./rateLimit.js');
+
+    // An entry that is still inside its TTL reads back unchanged.
+    const live = createBoundedMap({ ttlMs: 60_000 });
+    live.set('1.2.3.4', { count: 3 });
+    assert.strictEqual(live.get('1.2.3.4').count, 3, 'a fresh entry must survive');
+    assert.strictEqual(live.get('unknown'), undefined, 'an absent key must read undefined');
+
+    live.delete('1.2.3.4');
+    assert.strictEqual(live.get('1.2.3.4'), undefined, 'delete must forget the entry');
+
+    /* Expiry is read-time as well as sweep-time. A caller that reads a stale
+       entry between sweeps must see it as gone, or a lockout would outlive its
+       own window. `set` takes an explicit `now`, so this needs no sleep. */
+    const expiring = createBoundedMap({ ttlMs: 50 });
+    expiring.set('stale', { count: 9 }, Date.now() - 1000);
+    assert.strictEqual(expiring.get('stale'), undefined,
+        'an entry past its TTL must read as absent even before a sweep runs');
+
+    /* THE BOUND ITSELF. Write far more distinct keys than the cap allows and
+       the map must not keep them all — this is the assertion that fails if
+       somebody swaps the storage back for a plain Map. */
+    const capped = createBoundedMap({ ttlMs: 60_000, maxEntries: 100 });
+    for (let i = 0; i < 1000; i++) capped.set(`ip-${i}`, { count: 1 });
+    assert.ok(capped.size <= 100,
+        `the map must stay within its cap under a flood of distinct keys, got ${capped.size}`);
+    // Eviction is oldest-first, so the most recent writer is still counted —
+    // an attacker must not be able to flush their own counter by flooding.
+    assert.strictEqual(capped.get('ip-999').count, 1, 'the newest entry must survive eviction');
+
+    console.log('✅ Test 10 Passed: the shared attempt map expires, forgets, and stays bounded under a flood.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -525,6 +571,7 @@ try {
     await testPasswordResetLifecycle();
     await testAdminPinHashing();
     await testTotpAgainstRfcVectors();
+    await testBoundedAttemptMap();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');

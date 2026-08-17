@@ -32,6 +32,10 @@ import {
 } from './customerAuth.js';
 import { initReportScheduler, sendSummaryReport, sendMailIfConfigured } from './emailReporter.js';
 import { logBlackBoxEvent, exportBlackBoxEnvelope } from './blackBoxLogger.js';
+import { createRateLimiter } from './rateLimit.js';
+import {
+    validateBody, PHONE_RULE, PASSWORD_RULE, CODE_RULE, NAME_RULE, EMAIL_RULE
+} from './validation.js';
 import { loadExtensions, fireHook } from './extensions/index.js';
 /* The ledger. Every route below reaches persistence through these two modules
    and never through a SQL string of its own — ADR-001 §3, and the reason the
@@ -101,6 +105,127 @@ function resolveRequestId(req) {
     const supplied = req.headers['x-request-id'];
     return typeof supplied === 'string' && SAFE_REQUEST_ID.test(supplied) ? supplied : newId('REQ');
 }
+
+/* --------------------------------------------------------------------------
+   Abuse limits
+
+   The login paths are NOT here. They already carry escalating credential
+   lockouts (`loginRateLimiter`, `customerLoginRateLimiter`), and stacking a
+   second policy on them would be the parallel mechanism §1 forbids. These
+   limits cover what those cannot: endpoints where every request *succeeds* and
+   the abuse is the volume — registering accounts, triggering emails, spending
+   a payment gateway's quota, or making the server encrypt its whole ledger.
+
+   The numbers are deliberately far above any real counter's usage and far
+   below what makes the endpoint a useful weapon. Each one names its cost.
+   -------------------------------------------------------------------------- */
+const HOUR_MS = 60 * 60 * 1000;
+
+/* The blanket ceiling. High, because a busy desk with several tabs open is
+   legitimately chatty and this must never be the reason a sale cannot be
+   filed — it is a stop on runaway automation, not a quota. */
+const apiRateLimiter = createRateLimiter({
+    name: 'api',
+    windowMs: Number(process.env.API_RATE_WINDOW_MS) || 60 * 1000,
+    max: Number(process.env.API_RATE_MAX) || 600,
+    message: 'Too many requests. Please slow down and try again shortly.'
+});
+
+/* Exempt from the blanket limit, each for a different reason:
+   - the probes, because monitoring polls them by design and rate-limiting them
+     would make a healthy process look down and trigger a false failover;
+   - the webhook, because Razorpay has ALREADY taken the customer's money by the
+     time it calls, and a 429 would only lose our record of the payment. It is
+     HMAC-signed, so leaving it unthrottled does not make it writable. */
+const RATE_LIMIT_EXEMPT_PATHS = new Set(['/api/health', '/api/ready', '/api/payment/webhook']);
+
+/* --------------------------------------------------------------------------
+   Body schemas for the unauthenticated surface
+
+   These check SHAPE only — types, lengths, character classes — and run before
+   the handler so it can trust `typeof`. What a value MEANS is still decided
+   where it always was: `isValidPhone()` decides what is dialable,
+   `validatePasswordStrength()` decides what is strong enough, the services
+   decide what is affordable. Putting those here would create the second source
+   of truth this mechanism exists to avoid (§1).
+
+   The unauthenticated routes are the ones that get schemas first because they
+   are the ones a stranger can reach. The money paths already validate
+   exhaustively inside their services and are deliberately left alone rather
+   than wrapped in a second, thinner check.
+   -------------------------------------------------------------------------- */
+const CUSTOMER_REGISTER_SCHEMA = {
+    phone: { ...PHONE_RULE, required: true },
+    password: { ...PASSWORD_RULE, required: true },
+    name: NAME_RULE,
+    email: EMAIL_RULE
+};
+const CUSTOMER_LOGIN_SCHEMA = {
+    phone: { ...PHONE_RULE, required: true },
+    password: { ...PASSWORD_RULE, required: true }
+};
+const CUSTOMER_FORGOT_SCHEMA = { phone: { ...PHONE_RULE, required: true } };
+const CUSTOMER_RESET_SCHEMA = {
+    phone: { ...PHONE_RULE, required: true },
+    code: { ...CODE_RULE, required: true },
+    newPassword: { ...PASSWORD_RULE, required: true }
+};
+const CUSTOMER_PROFILE_SCHEMA = {
+    name: NAME_RULE,
+    email: EMAIL_RULE,
+    notifyEmail: { type: 'boolean' },
+    notifyPush: { type: 'boolean' }
+};
+const CUSTOMER_PASSWORD_CHANGE_SCHEMA = {
+    currentPassword: { ...PASSWORD_RULE, required: true },
+    newPassword: { ...PASSWORD_RULE, required: true }
+};
+/* The PIN is a STRING and must stay one. Coerced to a number, "0421" becomes
+   421 and a leading-zero PIN silently stops matching its own hash — so the rule
+   is a string rule, and `preserveWhitespace` keeps it byte-for-byte what the
+   operator typed rather than something trimmed on its way to scrypt. */
+const ADMIN_LOGIN_SCHEMA = {
+    pin: { type: 'string', maxLength: 64, minLength: 1, required: true, preserveWhitespace: true },
+    totpCode: CODE_RULE,
+    recoveryCode: CODE_RULE
+};
+
+/** Self-registration: the cost is a junk account and a row per attempt. */
+const registerLimiter = createRateLimiter({
+    name: 'customer-register',
+    windowMs: HOUR_MS, max: 10,
+    message: 'Too many accounts created from this device. Please try again later.'
+});
+
+/** Password reset: the cost is an email sent to an address we do not control. */
+const passwordResetLimiter = createRateLimiter({
+    name: 'password-forgot',
+    windowMs: 15 * 60 * 1000, max: 5,
+    message: 'Too many reset requests. Please wait a few minutes and try again.'
+});
+
+/** Deposit claims: the cost is manual reconciliation work for the store. */
+const depositClaimLimiter = createRateLimiter({
+    name: 'customer-deposit',
+    windowMs: HOUR_MS, max: 20,
+    message: 'Too many deposit submissions. Please contact the store if you need help.'
+});
+
+/** Payment orders: the cost is the gateway's own rate quota, which we do not own. */
+const paymentOrderLimiter = createRateLimiter({
+    name: 'payment-order',
+    windowMs: HOUR_MS, max: 30,
+    message: 'Too many payment attempts. Please wait a few minutes.'
+});
+
+/* Admin-gated but externally costly: a live gold-price provider call, an SMTP
+   send, a full backup, and the encrypted exports that read the whole ledger.
+   A stolen session should not be able to turn any of them into a firehose. */
+const expensiveAdminLimiter = createRateLimiter({
+    name: 'expensive-admin',
+    windowMs: HOUR_MS, max: 12,
+    message: 'This operation is rate limited. Please wait before running it again.'
+});
 
 // Browser hardening. This frontend is normally same-origin; deployments that
 // intentionally split it onto another origin must list that exact origin (or
@@ -181,6 +306,16 @@ app.use((req, res, next) => {
     next();
 });
 
+/* The blanket limit, applied by predicate rather than mounted at '/api' —
+   mounting rewrites req.url for the duration of the handler, and the 404
+   handler at the bottom of this file already had to learn that lesson. Sits
+   above the body parsers so a flood is refused before anything is parsed. */
+app.use((req, res, next) => {
+    if (!req.path.startsWith('/api/')) return next();
+    if (RATE_LIMIT_EXEMPT_PATHS.has(req.path)) return next();
+    return apiRateLimiter(req, res, next);
+});
+
 // The Razorpay webhook signature is an HMAC over the EXACT bytes the gateway
 // sent. JSON.parse + re-serialise does not round-trip those bytes (key order,
 // number formatting, unicode escapes all shift), so a parsed body can never be
@@ -257,7 +392,7 @@ app.use(express.static(path.join(__dirname, '../frontend')));
  * Verifies the admin PIN server-side and issues a bearer session token.
  * Replaces the old client-only PIN check.
  */
-app.post('/api/admin/login', loginRateLimiter, (req, res) => {
+app.post('/api/admin/login', loginRateLimiter, validateBody(ADMIN_LOGIN_SCHEMA), (req, res) => {
     const { pin, totpCode, recoveryCode } = req.body || {};
     // The PIN both authenticates AND names the person: each operator
     // configured in Settings has their own, and the master PIN resolves to the
@@ -595,7 +730,10 @@ function phoneHasStoreHistory(phone) {
  * history (see above). Returns a live session so the customer lands straight
  * in the portal.
  */
-app.post('/api/customer/register', customerLoginRateLimiter, (req, res) => {
+/* Both limiters, because they stop different things: `customerLoginRateLimiter`
+   counts FAILURES and so never fires on a flood of *successful* registrations,
+   which is exactly what account spam is. */
+app.post('/api/customer/register', customerLoginRateLimiter, registerLimiter, validateBody(CUSTOMER_REGISTER_SCHEMA), (req, res) => {
     try {
         const { phone, password, name, email } = req.body || {};
         if (!isValidPhone(phone)) {
@@ -639,7 +777,7 @@ app.post('/api/customer/register', customerLoginRateLimiter, (req, res) => {
  * account" and "wrong password" so this cannot be used to discover which
  * mobile numbers are customers of the store.
  */
-app.post('/api/customer/login', customerLoginRateLimiter, (req, res) => {
+app.post('/api/customer/login', customerLoginRateLimiter, validateBody(CUSTOMER_LOGIN_SCHEMA), (req, res) => {
     try {
         const { phone, password } = req.body || {};
         const result = loginCustomer(phone, password, req.ip);
@@ -668,7 +806,7 @@ app.get('/api/customer/me', requireCustomerSession, (req, res) => {
 });
 
 /** PATCH /api/customer/me — name, email, and notification preferences. */
-app.patch('/api/customer/me', requireEstablishedCustomer, (req, res) => {
+app.patch('/api/customer/me', requireEstablishedCustomer, validateBody(CUSTOMER_PROFILE_SCHEMA), (req, res) => {
     try {
         const { name, email, notifyEmail, notifyPush } = req.body || {};
         const result = updateCustomerProfile(req.customerPhone, { name, email, notifyEmail, notifyPush });
@@ -686,7 +824,7 @@ app.patch('/api/customer/me', requireEstablishedCustomer, (req, res) => {
  * so a borrowed unlocked phone cannot be used to lock the real owner out.
  * Succeeding signs every device out, including this one.
  */
-app.post('/api/customer/password/change', requireCustomerSession, (req, res) => {
+app.post('/api/customer/password/change', requireCustomerSession, validateBody(CUSTOMER_PASSWORD_CHANGE_SCHEMA), (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body || {};
         if (!verifyPassword(currentPassword, req.customerAccount)) {
@@ -708,7 +846,7 @@ app.post('/api/customer/password/change', requireCustomerSession, (req, res) => 
  * it will admit to is the store not having configured SMTP at all, which is
  * a store-level fact and leaks nothing about any customer.
  */
-app.post('/api/customer/password/forgot', customerLoginRateLimiter, async (req, res) => {
+app.post('/api/customer/password/forgot', customerLoginRateLimiter, passwordResetLimiter, validateBody(CUSTOMER_FORGOT_SCHEMA), async (req, res) => {
     const GENERIC_OK = {
         success: true,
         message: 'If an account with that mobile number and a registered email exists, a reset code has been sent to it.'
@@ -752,7 +890,7 @@ app.post('/api/customer/password/forgot', customerLoginRateLimiter, async (req, 
 });
 
 /** POST /api/customer/password/reset — completes the reset with the emailed code. */
-app.post('/api/customer/password/reset', customerLoginRateLimiter, (req, res) => {
+app.post('/api/customer/password/reset', customerLoginRateLimiter, validateBody(CUSTOMER_RESET_SCHEMA), (req, res) => {
     try {
         const { phone, code, newPassword } = req.body || {};
         if (!isValidPhone(phone)) {
@@ -824,7 +962,7 @@ app.get('/api/customer/returns', requireEstablishedCustomer, (req, res) => {
  * account, never the body — which also removes the customer-supplied-name
  * route that produced the stored-XSS finding in 1.0.1.
  */
-app.post('/api/customer/advances', requireEstablishedCustomer, (req, res) => {
+app.post('/api/customer/advances', requireEstablishedCustomer, depositClaimLimiter, (req, res) => {
     try {
         const { amount, referenceId } = req.body || {};
         if (!referenceId || !String(referenceId).trim()) {
@@ -985,7 +1123,7 @@ app.get('/api/gold-price', (req, res) => {
  * POST /api/gold-price/sync
  * Manually triggers a remote API price fetch/update
  */
-app.post('/api/gold-price/sync', requireAdminSession, async (req, res) => {
+app.post('/api/gold-price/sync', requireAdminSession, expensiveAdminLimiter, async (req, res) => {
     try {
         const updatedRates = await syncGoldPrice();
         res.json({ success: true, rates: updatedRates });
@@ -2341,7 +2479,7 @@ function fetchRazorpayPayment(paymentId, keyId, keySecret) {
  * the browser — that record is what binds the eventual payment to both a
  * customer and an amount.
  */
-app.post('/api/payment/order', requireEstablishedCustomer, async (req, res) => {
+app.post('/api/payment/order', requireEstablishedCustomer, paymentOrderLimiter, async (req, res) => {
     const startTime = Date.now();
     try {
         const { amount } = req.body;
@@ -2779,7 +2917,7 @@ app.post('/api/payment/webhook', async (req, res) => {
  * Manually triggers an immediate rolling database snapshot (same routine
  * the 1:00 AM cron uses).
  */
-app.post('/api/backup/run', requireAdminSession, (req, res) => {
+app.post('/api/backup/run', requireAdminSession, expensiveAdminLimiter, (req, res) => {
     try {
         const result = createBackup();
         res.json(result);
@@ -2796,7 +2934,7 @@ app.post('/api/backup/run', requireAdminSession, (req, res) => {
  * verify their SMTP configuration. Gracefully reports back if SMTP or a
  * recipient address isn't configured — never throws for that case.
  */
-app.post('/api/reports/send-now', requireAdminSession, async (req, res) => {
+app.post('/api/reports/send-now', requireAdminSession, expensiveAdminLimiter, async (req, res) => {
     try {
         const period = req.body.period === 'Monthly' ? 'Monthly' : 'Daily';
         const result = await sendSummaryReport(period);
@@ -2974,7 +3112,7 @@ app.get('/api/diagnostics/telemetry', requireAdminSession, (req, res) => {
  * Level 2 Diagnostics: Pulls database files encrypted with Developer's RSA-4096 Public Key.
  * Requires user request confirmation (simulated here). Decryptable only offline by developer.
  */
-app.get('/api/diagnostics/export', requireAdminSession, (req, res) => {
+app.get('/api/diagnostics/export', requireAdminSession, expensiveAdminLimiter, (req, res) => {
     try {
         const settingsFile = path.join(DATA_DIR, 'settings.json');
         const context = repo.dataStoreContext();
@@ -3039,7 +3177,7 @@ app.get('/api/diagnostics/export', requireAdminSession, (req, res) => {
  * Level-2 developer key — decryptable only offline via
  * developer_blackbox_keys/analyze_blackbox.js. Never ships to tenants.
  */
-app.get('/api/diagnostics/blackbox-export', requireAdminSession, (req, res) => {
+app.get('/api/diagnostics/blackbox-export', requireAdminSession, expensiveAdminLimiter, (req, res) => {
     try {
         const envelope = exportBlackBoxEnvelope();
         res.json({
