@@ -37,6 +37,10 @@ export const DEFAULT_SETTINGS = {
     invoicePrefix: "GOLD",
     invoiceSeqStart: 1,
     reportEmail: "reports@goldpos.com",
+    // Ops alerts (payment/webhook failures, ledger drift, backup/rate/TLS
+    // problems — see alerting.js) go here; falls back to reportEmail when
+    // blank, since a store with one inbox still needs to receive them.
+    alertEmail: "",
     // Report emails (backupEngine's daily/monthly summaries) are skipped
     // gracefully whenever host/user/pass are blank — see emailReporter.js.
     smtp: {
@@ -205,6 +209,7 @@ export const SETTINGS_FIELD_RULES = {
     phone: { type: 'string', maxLength: 40 },
     gstNumber: { type: 'string', maxLength: 40 },
     reportEmail: { type: 'string', maxLength: 200 },
+    alertEmail: { type: 'string', maxLength: 200 },
     upiId: { type: 'string', maxLength: 120 },
     publicUrl: { type: 'string', maxLength: 300 },
     razorpayKeyId: { type: 'string', maxLength: 200 }

@@ -10,6 +10,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { readJSON, writeJSON, logError, logTelemetry, DATA_DIR } from './db.js';
+import { raiseAlert } from './alerting.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LICENSE_FILE = path.join(DATA_DIR, 'license.json');
@@ -167,6 +168,11 @@ export async function syncLicenseStatus(forceKey = null) {
         return { success: license.activated, license: readJSON(LICENSE_FILE, license) };
     } catch (err) {
         logError('Licensing sync connection failed: ' + err.message, err.stack);
+        raiseAlert({
+            code: 'CONTROL_PLANE_UNREACHABLE',
+            severity: 'warning',
+            message: 'Could not reach the licensing server for a license status sync: ' + err.message + '. Operating under local grace checks.'
+        });
         return { success: false, error: 'Could not contact licensing server. Operational state defaults to local grace checks.' };
     }
 }

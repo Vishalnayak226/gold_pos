@@ -282,6 +282,28 @@ export function highestSequences(tenantId) {
     `).all(tenantId);
 }
 
+/**
+ * Invoices whose lines no longer sum to their own header — the invariant
+ * `test_billing_math.js` §16 asserts at write time, re-checked here against
+ * whatever is actually on disk. Should never return rows; existing only to be
+ * called periodically is the point (CLAUDE.md §0 "the per-line figures always
+ * sum exactly to the header").
+ */
+export function findLineDrift(tenantId, limit = 5) {
+    return getDb().prepare(`
+        SELECT i.invoice_number,
+               i.taxable_amount_paise AS hdr_taxable,
+               i.tax_amount_paise     AS hdr_tax,
+               SUM(l.taxable_amount_paise) AS line_taxable,
+               SUM(l.tax_amount_paise)     AS line_tax
+          FROM invoices i JOIN invoice_lines l ON l.invoice_id = i.id
+         WHERE i.tenant_id = ?
+      GROUP BY i.id
+        HAVING line_taxable <> hdr_taxable OR line_tax <> hdr_tax
+         LIMIT ?
+    `).all(tenantId, limit);
+}
+
 /* --------------------------------------------------------------------------
    The legacy projection
    -------------------------------------------------------------------------- */

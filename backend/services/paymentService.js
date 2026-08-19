@@ -23,6 +23,7 @@ import {
     dataStoreContext, businessDate
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
+import { raiseAlert } from '../alerting.js';
 import { fromPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
 
@@ -104,6 +105,12 @@ export function creditCapturedPayment({ order, paymentId, capturedPaise, source 
         );
         logTelemetry('PAYMENT_AMOUNT_MISMATCH', 0,
             `Order: ${order.orderId}, captured: ${capturedPaise}, expected: ${expectedPaise}`);
+        raiseAlert({
+            code: 'PAYMENT_AMOUNT_MISMATCH',
+            severity: 'critical',
+            message: `Razorpay payment ${paymentId} was captured for ${capturedPaise} paise but order ${order.orderId} expected ${expectedPaise}. Refused to credit; manual reconciliation required.`,
+            details: { paymentId, orderId: order.orderId, capturedPaise, expectedPaise }
+        });
         settleOrder(order.orderId, 'mismatched', {
             paymentId,
             note: `captured ${capturedPaise} paise against an expected ${expectedPaise}`,
@@ -209,6 +216,12 @@ export function creditCapturedPayment({ order, paymentId, capturedPaise, source 
             `customer ${order.customerPhone} paid but has no ledger credit. Manual reconciliation required. ${err.message}`,
             err.stack
         );
+        raiseAlert({
+            code: 'PAYMENT_CREDIT_PERSIST_FAILED',
+            severity: 'critical',
+            message: `Razorpay payment ${paymentId} was captured but the advance deposit failed to persist: ${err.message}. Customer paid but has no ledger credit.`,
+            details: { paymentId, orderId: order.orderId }
+        });
         return {
             ok: false,
             status: 500,

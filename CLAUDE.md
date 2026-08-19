@@ -262,7 +262,7 @@ wrong answers.
 
 ## 8. Testing posture
 
-- `cd backend && npm test` runs eight suites in order and exits non-zero on any failure:
+- `cd backend && npm test` runs nine suites in order and exits non-zero on any failure:
   `test_billing_math.js` (pricing/rounding) → `test_schema.js` (migrations + every SQL constraint,
   asserted by attempting the violation) → `test_repositories.js` (the repository seam, the legacy
   wire-shape projections, pagination, the JSON importer) → `test_concurrency.js` (real OS processes:
@@ -270,8 +270,10 @@ wrong answers.
   (helper-level integration) → `test_routes.js` (routes + auth boundary) → `test_http.js` (money
   paths, Razorpay webhook, returns/refunds, multi-line invoices, tenders, actor identity, paged
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
-  `test_production_guard.js` (fail-closed startup). **458 checks as of 2026-08-19**
-  (145 + 43 + 90 + 16 + 11 + 29 + 107 + 17, in run order — `test_suite.js` is counted by the
+  `test_production_guard.js` (fail-closed startup) → `test_alerting.js` (raiseAlert's per-code
+  cooldown, stale-rate/ledger-drift/backup-freshness/error-rate-latency checks — Phase 3
+  alerting, `backend/alerting.js`). **474 checks as of 2026-08-19**
+  (145 + 43 + 90 + 16 + 11 + 29 + 107 + 17 + 16, in run order — `test_suite.js` is counted by the
   numbered tests it prints, not by an older tally that no longer matched anything).
   - **A GREEN `npm test` IS NOT PROOF A FORM STILL WORKS.** The HTTP suites post minimal bodies;
     a browser posts every field its form owns, including the empty ones. A body schema that

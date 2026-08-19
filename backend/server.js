@@ -14,6 +14,7 @@ import https from 'https';
 import crypto from 'crypto';
 import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseChecker.js';
 import { initBackupScheduler, createBackup } from './backupEngine.js';
+import { raiseAlert, recordRequestOutcome, initAlertScheduler } from './alerting.js';
 import { assertProductionReady, assertVaultKeyReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import {
@@ -340,6 +341,7 @@ app.use((req, res, next) => {
     res.setHeader(REQUEST_ID_HEADER, req.id);
     res.on('finish', () => {
         const duration = Date.now() - startTime;
+        recordRequestOutcome(res.statusCode, duration);
         logTelemetry(`${req.method}_${req.originalUrl}`, duration, `Status: ${res.statusCode}`, {
             requestId: req.id,
             method: req.method,
@@ -2951,6 +2953,11 @@ app.post('/api/payment/webhook', async (req, res) => {
         if (!signatureMatches) {
             logError('Razorpay webhook delivery rejected: signature mismatch.');
             logTelemetry('WEBHOOK_SIGNATURE_MISMATCH', 0, '');
+            raiseAlert({
+                code: 'WEBHOOK_SIGNATURE_MISMATCH',
+                severity: 'warning',
+                message: 'A Razorpay webhook delivery was rejected: signature did not match. Could be a misconfigured secret or a spoofed delivery.'
+            });
             return res.status(400).json({ error: 'Invalid webhook signature.' });
         }
 
@@ -3002,6 +3009,12 @@ app.post('/api/payment/webhook', async (req, res) => {
             // with another product. Loud in the log, 2xx on the wire.
             logError(`Razorpay webhook ${eventId} referenced unknown payment order ${entity.order_id} (payment ${entity.id}). No credit applied.`);
             logTelemetry('WEBHOOK_UNKNOWN_ORDER', 0, `Order: ${entity.order_id}`);
+            raiseAlert({
+                code: 'WEBHOOK_UNKNOWN_ORDER',
+                severity: 'warning',
+                message: `Razorpay reported a captured payment (${entity.id}) against an order this store has no record of (${entity.order_id}). No credit was applied.`,
+                details: { orderId: entity.order_id, paymentId: entity.id }
+            });
             return res.json({ success: true, ignored: 'unknown-order' });
         }
 
@@ -3022,6 +3035,12 @@ app.post('/api/payment/webhook', async (req, res) => {
             // claim is released so that retry is not swallowed as a duplicate.
             if (credit.status === 500) {
                 paymentService.releaseWebhookEvent(eventId);
+                raiseAlert({
+                    code: 'PAYMENT_CREDIT_FAILED',
+                    severity: 'critical',
+                    message: `A captured Razorpay payment (order ${entity.order_id}, payment ${entity.id}) could not be credited to the ledger. Money was taken but not recorded — manual reconciliation required.`,
+                    details: { orderId: entity.order_id, paymentId: entity.id }
+                });
                 return res.status(500).json({ error: 'Could not record the captured payment; please retry.' });
             }
             // An amount mismatch is a decision, not a failure — retrying it
@@ -3033,6 +3052,11 @@ app.post('/api/payment/webhook', async (req, res) => {
         res.json({ success: true, duplicate: !!credit.duplicate });
     } catch (err) {
         logError('Error handling Razorpay webhook: ' + err.message, err.stack);
+        raiseAlert({
+            code: 'WEBHOOK_PROCESSING_ERROR',
+            severity: 'critical',
+            message: 'An unhandled exception occurred while processing a Razorpay webhook delivery: ' + err.message
+        });
         // Deliberately 5xx: an unexpected fault should be retried by the
         // gateway rather than silently dropped.
         res.status(500).json({ error: 'Webhook processing failed.' });
@@ -3570,6 +3594,7 @@ function bootstrapServer() {
     initBackupScheduler();
     initReportScheduler();
     initUpdateScheduler();
+    initAlertScheduler();
 
     // Trigger initial SaaS license sync & database backup on startup.
     syncLicenseStatus().catch(() => {

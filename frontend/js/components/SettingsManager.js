@@ -492,6 +492,11 @@ export class SettingsManager {
                 <label for="set-report-email">Report Email Address</label>
                 <input type="email" id="set-report-email" class="form-control" value="${escapeHtmlAttr(s.reportEmail || '')}">
             </div>
+            <div class="form-group" style="max-width:320px;">
+                <label for="set-alert-email">Ops Alert Email Address</label>
+                <input type="email" id="set-alert-email" class="form-control" value="${escapeHtmlAttr(s.alertEmail || '')}" placeholder="Blank = send to Report Email above">
+                <p class="text-muted-small">Payment/webhook failures, ledger drift, backup and rate problems go here instead of the daily summary inbox.</p>
+            </div>
 
             <h3 class="settings-section-title" style="margin-top:24px;">SMTP Configuration</h3>
             <p class="text-muted-small" style="margin-bottom:12px;">Left blank, report emails are skipped automatically (logged, not an error).</p>
@@ -542,6 +547,7 @@ export class SettingsManager {
         document.getElementById('save-backup-btn').addEventListener('click', async () => {
             const payload = {
                 reportEmail: document.getElementById('set-report-email').value,
+                alertEmail: document.getElementById('set-alert-email').value,
                 smtp: {
                     host: document.getElementById('set-smtp-host').value,
                     port: parseInt(document.getElementById('set-smtp-port').value) || 587,

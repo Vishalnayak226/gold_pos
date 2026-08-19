@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { readJSON, writeJSON, logError, logTelemetry, DATA_DIR } from './db.js';
 import { readSettings } from './settingsStore.js';
+import { raiseAlert } from './alerting.js';
 
 const RATES_FILE = path.join(DATA_DIR, 'rates.json');
 
@@ -90,7 +91,12 @@ export async function syncGoldPrice() {
     } catch (err) {
         logError('Gold pricing sync exception: ' + err.message, err.stack);
         logTelemetry('PRICE_SYNC_FAIL', Date.now() - startTime, err.message);
-        
+        raiseAlert({
+            code: 'GOLD_RATE_SYNC_FAILED',
+            severity: 'warning',
+            message: 'The daily gold rate sync failed: ' + err.message + '. Serving the last known rate.'
+        });
+
         // Return existing rates to maintain operational stability
         return readJSON(RATES_FILE, defaultRates);
     }

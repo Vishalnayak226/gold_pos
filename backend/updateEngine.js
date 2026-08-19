@@ -35,6 +35,7 @@ import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { readJSON, writeJSON, logError, logTelemetry, DATA_DIR } from './db.js';
 import { createBackup } from './backupEngine.js';
+import { raiseAlert } from './alerting.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.join(__dirname, '..');
@@ -97,6 +98,11 @@ function verifyRelease(payloadStr, signature) {
         const isValid = verifier.verify(publicKey, signature, 'base64');
         if (!isValid) {
             logError('updateEngine: release signature verification FAILED — refusing to trust this release. Possible spoofed/tampered licensing server response.');
+            raiseAlert({
+                code: 'RELEASE_SIGNATURE_INVALID',
+                severity: 'critical',
+                message: 'A release from the licensing server failed signature verification and was refused. Possible spoofed or tampered update-channel response.'
+            });
             return null;
         }
         return JSON.parse(payloadStr);
@@ -127,6 +133,11 @@ async function fetchVerifiedRelease(channel) {
         // Server unreachable — same posture as licenseChecker.js: never
         // block anything, just skip this check cycle.
         logError('updateEngine: could not reach licensing server for release check: ' + err.message);
+        raiseAlert({
+            code: 'CONTROL_PLANE_UNREACHABLE',
+            severity: 'warning',
+            message: 'Could not reach the licensing server for a release/update check: ' + err.message
+        });
         return null;
     }
 }
@@ -354,6 +365,11 @@ export async function applyUpdate(release, { auto = false } = {}) {
             if (fs.existsSync(STAGING_DIR)) fs.rmSync(STAGING_DIR, { recursive: true, force: true });
         } catch (_) {}
         logTelemetry('UPDATE_APPLY_FAILED', 0, `${label} — rolled back: ${rolledBack}`);
+        raiseAlert({
+            code: 'UPDATE_APPLY_FAILED',
+            severity: 'critical',
+            message: `Applying ${label} failed: ${err.message}. ${rolledBack ? 'Rolled back to the previous code successfully.' : 'ROLLBACK ALSO FAILED — manual intervention required.'}`
+        });
         return { success: false, error: err.message, rolledBack };
     }
 }

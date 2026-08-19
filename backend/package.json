@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_billing_math.js && node test_schema.js && node test_repositories.js && node test_concurrency.js && node test_suite.js && node test_routes.js && node test_http.js && node test_production_guard.js",
+    "test": "node test_billing_math.js && node test_schema.js && node test_repositories.js && node test_concurrency.js && node test_suite.js && node test_routes.js && node test_http.js && node test_production_guard.js && node test_alerting.js",
     "test:billing": "node test_billing_math.js",
     "test:schema": "node test_schema.js",
     "test:repositories": "node test_repositories.js",
@@ -19,6 +19,7 @@
     "test:routes": "node test_routes.js",
     "test:http": "node test_http.js",
     "test:guard": "node test_production_guard.js",
+    "test:alerting": "node test_alerting.js",
     "test:e2e": "playwright test",
     "seed": "node seed.js",
     "key:generate": "node rotateSecretKey.js --generate",

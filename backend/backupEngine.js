@@ -8,10 +8,19 @@
 import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import { logError, logTelemetry, DATA_DIR } from './db.js';
 import { DB_FILE, checkpointAndCopy } from './repositories/connection.js';
+import { raiseAlert } from './alerting.js';
 
-const BACKUPS_DIR = path.join(process.cwd(), 'backups');
+const BACKEND_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+// Same override convention as db.js's DATA_DIR/LOGS_DIR — test/recovery
+// tooling can point this at an isolated directory. Production leaves it unset.
+const BACKUPS_DIR = path.resolve(
+    process.env.GOLD_POS_BACKUPS_DIR || process.env.GOLDPOS_BACKUPS_DIR || path.join(process.cwd(), 'backups')
+);
 
 // Ensure backups directory exists
 if (!fs.existsSync(BACKUPS_DIR)) {
@@ -55,11 +64,48 @@ export function createBackup() {
         // Prune backups older than 7 days
         pruneOldBackups();
 
+        // A file that copied is not proof it can restore a shop (WAL still
+        // holding committed rows, a pre-migration snapshot, secrets sealed
+        // with a key nobody has any more — see verifyBackup.js's header).
+        // Reuses the same tool `npm run backup:verify` and the monthly drill
+        // use, rather than re-implementing the checks here.
+        verifyLatestBackupAsync();
+
         return { success: true, folder: `backup_${todayStr}` };
     } catch (err) {
         logError('Daily backup execution failed: ' + err.message, err.stack);
+        raiseAlert({
+            code: 'BACKUP_CREATE_FAILED',
+            severity: 'critical',
+            message: 'The nightly database backup failed: ' + err.message
+        });
         return { success: false, error: err.message };
     }
+}
+
+/** Fire-and-forget: does not block the backup job on the extra restore+check work. */
+function verifyLatestBackupAsync() {
+    // No --quiet: on failure the alert email should carry the PASS/FAIL
+    // checklist, not just an exit code.
+    const child = spawn(process.execPath, ['verifyBackup.js'], { cwd: BACKEND_DIR });
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { output += chunk; });
+    child.on('error', (err) => {
+        logError('Could not launch post-backup restore verification: ' + err.message);
+    });
+    child.on('exit', (code) => {
+        if (code !== 0) {
+            raiseAlert({
+                code: 'BACKUP_VERIFY_FAILED',
+                severity: 'critical',
+                message: `Tonight's backup was created but failed restore verification (exit code ${code}). It may not be usable to recover the shop.`,
+                details: { report: output.slice(0, 3000) }
+            });
+        } else {
+            logTelemetry('BACKUP_VERIFY_SUCCESS', 0, 'Post-backup restore verification passed.');
+        }
+    });
 }
 
 /**

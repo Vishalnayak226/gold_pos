@@ -12,8 +12,28 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `1c218f6` — "Phase 34: move sessions into cookies, and put the ledger in the
-  backups" (2026-08-17), on branch **`phase-21-payment-verification-and-production-guard`**.
+- **Latest commit:** `fbe9b19` — "Phase 34 (units 2-5): secrets at rest, tamper-evident audit
+  trail, backup verification, CI security scanning; plus the emailReporter live-ledger fix and a
+  CLAUDE.md self-duplication repair" (2026-08-19), on branch
+  **`phase-21-payment-verification-and-production-guard`**.
+- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — PHASE 35 (OPERATIONAL ALERTING) IS
+  UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**474 checks**, exit 0)
+  on the working tree; `npm run test:e2e` not re-run (no request body/form/auth path changed —
+  see the substitute live-boot verification in `docs/LEDGER.md` Phase 35). New files:
+  `backend/alerting.js`, `backend/test_alerting.js`. Modified: `backend/server.js`,
+  `backend/backupEngine.js`, `backend/priceEngine.js`, `backend/licenseChecker.js`,
+  `backend/updateEngine.js`, `backend/services/paymentService.js`,
+  `backend/repositories/invoiceRepository.js`, `backend/defaultSettings.js`,
+  `backend/package.json`, `frontend/js/components/SettingsManager.js`, `CLAUDE.md`,
+  `docs/LEDGER.md`, `docs/PRODUCTION_READINESS_ROADMAP.md`.
+  - Closes `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 3's alerting line (payment/webhook, ledger
+    imbalance, backup failure, stale rates, error/latency, capacity, TLS expiry, control-plane
+    failure) — one choke point, `alerting.js#raiseAlert()`, that every signal funnels through.
+    Full detail: `docs/LEDGER.md` Phase 35.
+  - **Rest of Phase 3 still open:** migration compatibility gates / canary release / rollback /
+    post-deploy synthetic checks; protected branches / signed provenance / dual approval for fleet
+    updates; exercising the deploy pipeline against a real sandbox (no VPS/domain provisioned yet
+    — §7); the incident-response runbook (deliberately held for legal review, per Phase 34).
 - **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
   UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
   on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:

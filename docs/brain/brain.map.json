@@ -159,12 +159,13 @@
       "id": "maintenance",
       "lobe": "platform",
       "name": "Backups & Reporting",
-      "role": "The scheduled jobs: daily dated backups with 7-day pruning, and the emailed operational reports.",
+      "role": "The scheduled jobs: daily dated backups with 7-day pruning, the emailed operational reports, and operational alerting (payment/webhook failures, ledger drift, backup/rate/disk/TLS/control-plane signals) through the one raiseAlert() choke point.",
       "match": [
         "backend/backupEngine.js",
         "backend/emailReporter.js",
         "backend/verifyBackup.js",
-        "backend/verifyAuditChain.js"
+        "backend/verifyAuditChain.js",
+        "backend/alerting.js"
       ]
     },
     {
