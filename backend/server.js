@@ -5,7 +5,8 @@ import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { readJSON, writeJSON, logError, logTelemetry, newId, DATA_DIR } from './db.js';
+import { readJSON, logError, logTelemetry, newId, DATA_DIR } from './db.js';
+import { readSettings, writeSettings } from './settingsStore.js';
 import { redactSettings, OPERATOR_ROLES, validateSettingsPatch } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
@@ -13,7 +14,7 @@ import https from 'https';
 import crypto from 'crypto';
 import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseChecker.js';
 import { initBackupScheduler, createBackup } from './backupEngine.js';
-import { assertProductionReady } from './productionGuard.js';
+import { assertProductionReady, assertVaultKeyReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import {
     requireAdminSession, requireApprover, verifyAdminPin, createAdminSession, destroyAdminSession,
@@ -483,8 +484,7 @@ app.post('/api/admin/login', loginRateLimiter, validateBody(ADMIN_LOGIN_SCHEMA),
         if (submittedTotp && verifyTotp(submittedTotp, mfa.secret)) {
             mfaUsed = true;
         } else if (submittedRecovery) {
-            const settingsFile = path.join(DATA_DIR, 'settings.json');
-            const settings = readJSON(settingsFile, {});
+            const settings = readSettings();
             const consumed = consumeRecoveryCode(submittedRecovery, settings.authSalt, mfa.recoveryCodes);
             if (consumed.ok) {
                 // Single use: the surviving codes are written back before the
@@ -493,7 +493,7 @@ app.post('/api/admin/login', loginRateLimiter, validateBody(ADMIN_LOGIN_SCHEMA),
                 const row = (settings.operators || []).find(op => op && op.id === actor.id);
                 if (row) {
                     row.recoveryCodes = consumed.remainingHashes;
-                    if (!writeJSON(settingsFile, settings)) {
+                    if (!writeSettings(settings)) {
                         logError(`Could not record use of a recovery code for ${actor.name}; refusing the login rather than allowing a reusable code.`);
                         return res.status(500).json({ error: 'Could not complete sign-in. Please retry.' });
                     }
@@ -540,7 +540,7 @@ app.post('/api/admin/login', loginRateLimiter, validateBody(ADMIN_LOGIN_SCHEMA),
  * restored session still knows whose name goes on the next invoice.
  */
 app.get('/api/admin/me', requireAdminSession, (req, res) => {
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const settings = readSettings();
     res.json({
         actor: req.actor,
         canApprove: roleCanApprove(req.actor.role),
@@ -571,7 +571,7 @@ app.get('/api/admin/me', requireAdminSession, (req, res) => {
  */
 app.post('/api/admin/mfa/begin', requireAdminSession, async (req, res) => {
     try {
-        const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        const settings = readSettings();
         const targetId = String((req.body || {}).operatorId || req.actor.id);
 
         // Anyone may enrol THEMSELVES. Enrolling somebody else is an owner action:
@@ -630,9 +630,7 @@ app.post('/api/admin/mfa/enrol', requireAdminSession, (req, res) => {
                 message: 'That code does not match. Check the app has finished adding the account, then enter the current 6-digit code.'
             });
         }
-
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
+        const settings = readSettings();
         const authSalt = ensureAuthSalt(settings);
         const operator = (settings.operators || []).find(op => op && op.id === targetId);
         if (!operator) {
@@ -644,7 +642,7 @@ app.post('/api/admin/mfa/enrol', requireAdminSession, (req, res) => {
         operator.mfaEnabled = true;
         operator.recoveryCodes = recovery.hashes;
 
-        if (!writeJSON(settingsFile, settings)) {
+        if (!writeSettings(settings)) {
             return res.status(500).json({ error: 'Could not save the two-factor setup. Please retry.' });
         }
 
@@ -685,9 +683,7 @@ app.post('/api/admin/mfa/disable', requireAdminSession, (req, res) => {
                 message: 'Enter your own PIN to confirm turning off two-factor authentication.'
             });
         }
-
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
+        const settings = readSettings();
         const operator = (settings.operators || []).find(op => op && op.id === targetId);
         if (!operator) {
             return res.status(400).json({ error: 'NOT_A_NAMED_OPERATOR', message: 'That operator no longer exists.' });
@@ -696,7 +692,7 @@ app.post('/api/admin/mfa/disable', requireAdminSession, (req, res) => {
         operator.mfaEnabled = false;
         delete operator.totpSecret;
         delete operator.recoveryCodes;
-        if (!writeJSON(settingsFile, settings)) {
+        if (!writeSettings(settings)) {
             return res.status(500).json({ error: 'Could not save the change. Please retry.' });
         }
 
@@ -910,7 +906,7 @@ app.post('/api/customer/password/forgot', customerLoginRateLimiter, passwordRese
         message: 'If an account with that mobile number and a registered email exists, a reset code has been sent to it.'
     };
     try {
-        const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        const settings = readSettings();
         if (!settings.smtp || !settings.smtp.host || !settings.smtp.user || !settings.smtp.pass) {
             return res.status(400).json({
                 error: 'EMAIL_UNAVAILABLE',
@@ -1370,8 +1366,7 @@ function mergeOperators(incoming, current, authSalt) {
  */
 app.get('/api/settings/public', (req, res) => {
     try {
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
+        const settings = readSettings();
         res.json({
             companyName: settings.companyName,
             upiId: settings.upiId || '',
@@ -1396,8 +1391,7 @@ app.get('/api/settings/public', (req, res) => {
  */
 app.get('/api/settings', requireAdminSession, (req, res) => {
     try {
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
+        const settings = readSettings();
         res.json(redactSettingsForBrowser(settings));
     } catch (err) {
         logError('Error getting settings: ' + err.message, err.stack);
@@ -1411,8 +1405,7 @@ app.get('/api/settings', requireAdminSession, (req, res) => {
  */
 app.post('/api/settings', requireAdminSession, (req, res) => {
     try {
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const currentSettings = readJSON(settingsFile, {});
+        const currentSettings = readSettings();
 
         /* TYPE-CHECK BEFORE ANYTHING ELSE.
            `newSettings` below spreads req.body straight over the stored
@@ -1543,7 +1536,7 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
             newSettings.overrideGoldPrice.price18K = parseFloat(newSettings.overrideGoldPrice.price18K) || 0.0;
         }
 
-        if (!writeJSON(settingsFile, newSettings)) {
+        if (!writeSettings(newSettings)) {
             return res.status(500).json({ error: 'Failed to persist settings. Please retry.' });
         }
 
@@ -1788,8 +1781,7 @@ app.get('/api/sales/lookup', requireAdminSession, (req, res) => {
  * never a path.
  */
 function billingSettings() {
-    const settingsFile = path.join(DATA_DIR, 'settings.json');
-    const settings = readJSON(settingsFile, {});
+    const settings = readSettings();
 
     const rawPrefix = settings.invoicePrefix;
     const prefix = typeof rawPrefix === 'string' && /^[A-Za-z0-9_-]+$/.test(rawPrefix.trim())
@@ -1803,7 +1795,7 @@ function billingSettings() {
         settings.invoiceSeqStart = seqStart;
         // Best-effort. A repair that cannot be written must not stop the store
         // trading — the in-memory values above are already usable.
-        if (!writeJSON(settingsFile, settings)) {
+        if (!writeSettings(settings)) {
             logError('Invoice numbering settings were unusable and could not be repaired on disk.');
         }
     }
@@ -2022,7 +2014,7 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
             return res.status(400).json({ error: 'Line number must be a positive whole number.' });
         }
 
-        const refundSettings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        const refundSettings = readSettings();
         const threshold = round2(refundSettings.refundApprovalThreshold || 0);
         const invoiceLabel = String(invoiceId || '').trim();
 
@@ -2229,6 +2221,91 @@ app.get('/api/audit', requireAdminSession, requireApprover, (req, res) => {
     } catch (err) {
         logError('Error retrieving audit trail: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to retrieve audit trail' });
+    }
+});
+
+/**
+ * GET /api/audit/verify
+ * Recompute the audit chain and report whether it still checks out.
+ *
+ * APPROVER-ONLY, on the same gate as reading the trail itself.
+ *
+ * WHAT A GREEN ANSWER HERE DOES AND DOES NOT MEAN. It means no row has been
+ * edited or removed without the hashes after it being recomputed too. It does
+ * NOT mean the history is genuine: whoever holds the database file can edit a
+ * row and re-hash the entire tail, and this endpoint will report ok. That is an
+ * unavoidable property of a chain that lives in the same file as the data.
+ *
+ * What closes that gap is the head hash — published on every export, and
+ * therefore already in somebody else's hands. `headHash` is returned here for
+ * exactly that reason: compare it against the value in an export taken earlier,
+ * and a re-hashed chain no longer matches.
+ */
+app.get('/api/audit/verify', requireAdminSession, requireApprover, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const result = repo.audit.verifyChain(context.tenantId);
+        res.json({
+            verified: result.ok,
+            eventsInChain: result.checked,
+            /* Reported, never hidden: events written before the chain existed
+               (migration 005) carry no hashes and are not covered. Backfilling
+               them would hash whatever they say now, which proves nothing about
+               what they said then. */
+            eventsPredatingChain: result.unchained,
+            headHash: result.head,
+            brokenAt: result.brokenAt
+        });
+    } catch (err) {
+        logError('Error verifying the audit chain: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to verify the audit trail' });
+    }
+});
+
+/**
+ * GET /api/audit/export?from=&to=
+ * The trail plus the manifest needed to check it later. Approver-only.
+ *
+ * Served as a download rather than a rendered page because its purpose is to
+ * LEAVE — a copy handed to an auditor, an accountant or a regulator is what
+ * pins the head hash outside this building and makes the chain worth having.
+ *
+ * The date range narrows the ROWS, never the manifest: the head hash always
+ * describes the whole chain, because a hash over a filtered slice could be made
+ * to look clean by choosing the filter.
+ */
+app.get('/api/audit/export', requireAdminSession, requireApprover, (req, res) => {
+    try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+
+        const context = repo.dataStoreContext();
+        const dump = repo.audit.exportChain(context.tenantId, { from: q.from, to: q.to });
+
+        repo.audit.record({
+            tenantId: context.tenantId,
+            action: 'AUDIT_EXPORTED',
+            entityType: 'audit',
+            summary: `Audit trail exported (${dump.manifest.rowsExported} events)`,
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
+            ipAddress: req.ip
+        });
+
+        const stamp = new Date().toISOString().slice(0, 10);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="audit-trail-${stamp}.json"`);
+        res.send(JSON.stringify({
+            ...dump,
+            events: dump.events.map(row => ({
+                ...row,
+                detail_json: undefined,
+                detail: row.detail_json ? JSON.parse(row.detail_json) : null
+            }))
+        }, null, 2));
+    } catch (err) {
+        logError('Error exporting the audit trail: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to export the audit trail' });
     }
 });
 
@@ -2552,9 +2629,7 @@ app.post('/api/payment/order', requireEstablishedCustomer, paymentOrderLimiter, 
         if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0) {
             return res.status(400).json({ error: 'Valid amount is required' });
         }
-
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
+        const settings = readSettings();
 
         const currency = settings.currency || 'INR';
         const keyId = settings.razorpayKeyId;
@@ -2692,9 +2767,7 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
             logError(`Payment order ${razorpay_order_id} carries an unusable stored amount (${storedOrder.amountPaise ?? storedOrder.amount}).`);
             return res.status(500).json({ error: 'This payment order is not in a verifiable state. Please contact the store.' });
         }
-
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
-        const settings = readJSON(settingsFile, {});
+        const settings = readSettings();
         const keyId = settings.razorpayKeyId;
         const keySecret = settings.razorpayKeySecret;
 
@@ -2855,7 +2928,7 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
  */
 app.post('/api/payment/webhook', async (req, res) => {
     try {
-        const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+        const settings = readSettings();
         const webhookSecret = settings.razorpayWebhookSecret;
         if (!webhookSecret) {
             logError('Razorpay webhook delivery rejected: no razorpayWebhookSecret is configured in Settings.');
@@ -3172,7 +3245,6 @@ app.get('/api/diagnostics/telemetry', requireAdminSession, (req, res) => {
  */
 app.get('/api/diagnostics/export', requireAdminSession, expensiveAdminLimiter, (req, res) => {
     try {
-        const settingsFile = path.join(DATA_DIR, 'settings.json');
         const context = repo.dataStoreContext();
 
         /* BOUNDED, and that is a change worth being explicit about. This bundle
@@ -3199,7 +3271,7 @@ app.get('/api/diagnostics/export', requireAdminSession, expensiveAdminLimiter, (
         // credentials out of support bundles that get emailed around.
         const bundle = {
             timestamp: Date.now(),
-            settings: redactSettings(readJSON(settingsFile, {})),
+            settings: redactSettings(readSettings()),
             advances: advanceService.listLedger({ limit: EXPORT_SAMPLE_ROWS }).results,
             sales,
             returns,
@@ -3421,7 +3493,7 @@ export function startServer(port = PORT, host = '127.0.0.1') {
  * for a while — not something a boot should do to a live ledger unasked.
  */
 function initialiseLedger() {
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const settings = readSettings();
     const context = repo.initialiseDataStore({
         name: settings.storeName,
         gstNumber: settings.gstNumber,
@@ -3470,7 +3542,14 @@ function collectLegacySource() {
 }
 
 function bootstrapServer() {
-    /* Before the guard, because the guard asks "is the master PIN still the
+    /* FIRST, because everything below reads settings.json and reading it now
+       means decrypting it. A production install with no GOLD_POS_SECRET_KEY
+       would otherwise die inside migrateStoredPins() with a stack trace rather
+       than the numbered refusal an operator can act on. Inert outside
+       NODE_ENV=production, where the vault falls back to a dev keyfile. */
+    assertVaultKeyReady();
+
+    /* Before the main guard, because it asks "is the master PIN still the
        default?" and can only answer that against the canonical stored form. This
        is also the moment a tenant upgrading from a build that kept PINs in
        plaintext has them hashed and the plaintext deleted — once, on the first

@@ -21,8 +21,9 @@
  * ==========================================================================
  */
 
-import path from 'path';
-import { readJSON, logError, DATA_DIR } from './db.js';
+import { logError, DATA_DIR } from './db.js';
+import { resolveKey } from './secretVault.js';
+import { readSettings } from './settingsStore.js';
 import { verifyPinHash } from './adminAuth.js';
 
 // The shipped placeholders. Matching these exactly is what identifies an
@@ -116,13 +117,13 @@ export function findProductionBlockers(settings = {}, env = process.env) {
  *        the process — used by the test suite.
  * @returns {string[]} the blockers found (empty when safe)
  */
-export function assertProductionReady({ exit = true } = {}) {
-    if (process.env.NODE_ENV !== 'production') return [];
-
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
-    const blockers = findProductionBlockers(settings, process.env);
-    if (blockers.length === 0) return [];
-
+/**
+ * Print the standard refusal and (optionally) kill the process.
+ *
+ * Shared so that every way this install can be unfit for production says so in
+ * the same shape — one numbered list, on both stderr and the log file.
+ */
+function refuse(blockers, exit) {
     const message =
         '\n========================================================================\n' +
         ' REFUSING TO START IN PRODUCTION\n' +
@@ -139,4 +140,59 @@ export function assertProductionReady({ exit = true } = {}) {
 
     if (exit) process.exit(1);
     return blockers;
+}
+
+/**
+ * Refuses a production boot that has no secret-vault key.
+ *
+ * SEPARATE FROM assertProductionReady, AND CALLED BEFORE IT, for a boot-order
+ * reason: reading settings.json now means decrypting it, and the first thing
+ * bootstrapServer() does is migrateStoredPins(), which reads settings long
+ * before the main guard runs. Without this, a production install with no
+ * GOLD_POS_SECRET_KEY dies inside the PIN migration with a raw stack trace
+ * instead of the numbered refusal an operator can act on.
+ *
+ * @param {{exit?: boolean}} [options]
+ * @returns {string[]} the blockers found (empty when the key resolves)
+ */
+export function assertVaultKeyReady({ exit = true } = {}) {
+    if (process.env.NODE_ENV !== 'production') return [];
+    try {
+        resolveKey(DATA_DIR);
+        return [];
+    } catch (error) {
+        return refuse([
+            'GOLD_POS_SECRET_KEY is not set or is not 64 hexadecimal characters, so the credentials ' +
+            'in settings.json cannot be decrypted. Production will not fall back to a keyfile inside ' +
+            'the data directory, because a key stored beside the data it protects defends against ' +
+            `nothing. (${error && error.message ? error.message.split('.')[0] : 'key unavailable'}.) ` +
+            'See docs/RUNBOOKS.md - "Rotating the secret-vault key".'
+        ], exit);
+    }
+}
+
+/**
+ * Fails the process if this production configuration cannot safely take money.
+ *
+ * Called from bootstrapServer() before the listener binds, so a bad deploy
+ * fails its health check and rolls back instead of serving.
+ *
+ * @param {{exit?: boolean}} [options] `exit: false` reports without killing
+ *        the process — used by the test suite.
+ * @returns {string[]} the blockers found (empty when safe)
+ */
+export function assertProductionReady({ exit = true } = {}) {
+    if (process.env.NODE_ENV !== 'production') return [];
+
+    /* Defence in depth. assertVaultKeyReady() runs first in the real boot path,
+       so by here the key normally resolves; a caller that skipped it still gets
+       a numbered refusal rather than a stack trace. */
+    const keyBlockers = assertVaultKeyReady({ exit: false });
+    if (keyBlockers.length > 0) return exit ? process.exit(1) : keyBlockers;
+
+    const settings = readSettings();
+    const blockers = findProductionBlockers(settings, process.env);
+    if (blockers.length === 0) return [];
+
+    return refuse(blockers, exit);
 }

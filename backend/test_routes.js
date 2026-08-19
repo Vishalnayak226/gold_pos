@@ -26,6 +26,8 @@ import { fileURLToPath } from 'url';
 // defaultSettings.js is deliberately side-effect-free, so this import is safe.
 // Anything that reaches db.js is NOT — see the scrypt note below.
 import { getDefaultSettings } from './defaultSettings.js';
+// Same reasoning: secretVault.js reaches only crypto/fs/path and defaultSettings.js.
+import { resolveKey, openSettings, resetKeyCache } from './secretVault.js';
 
 /* This suite drives the server as a CHILD process, so its own process should
  * never touch a data directory at all. But db.js resolves DATA_DIR and seeds and
@@ -253,7 +255,15 @@ function assertNoSecretsIn(rawText, where) {
 }
 
 function readDiskSettings(dataDir) {
-    return JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8'));
+    const onDisk = JSON.parse(fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8'));
+    /* Credentials are encrypted at rest now, so the raw document is ciphertext.
+       Every assertion below is about whether the *value* survived a round trip,
+       which is a question about plaintext — so open the vault here. The separate
+       question of whether the bytes on disk are really encrypted is asserted
+       directly against the file, below. */
+    resetKeyCache();
+    const { key } = resolveKey(dataDir);
+    return openSettings(onDisk, key);
 }
 
 /* ==========================================================================
@@ -380,9 +390,28 @@ try {
         assert.strictEqual(disk.adminPin, undefined, 'a plaintext adminPin must never be written back');
     });
 
+    check('Every credential is encrypted at rest, not merely hashed or redacted', () => {
+        const rawFile = fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8');
+        // The strongest form of this claim: no canary secret appears anywhere in
+        // the bytes on disk. Stealing settings.json now yields nothing usable.
+        for (const [name, value] of Object.entries(REAL)) {
+            assert.ok(!rawFile.includes(value), `${name} is still readable in settings.json on disk`);
+        }
+        const onDisk = JSON.parse(rawFile);
+        assert.match(onDisk.razorpayKeySecret, /^encv1\$/, 'razorpayKeySecret should be vault ciphertext at rest');
+        assert.match(onDisk.smtp.pass, /^encv1\$/, 'smtp.pass should be vault ciphertext at rest');
+        assert.match(onDisk.adminPinHash, /^encv1\$/, 'the PIN hash is a credential too and is sealed as one');
+        // Non-secret configuration must stay plainly readable — this document is
+        // still something an operator can inspect and hand to support.
+        assert.strictEqual(onDisk.companyName, 'Renamed Jewellers');
+        assert.strictEqual(onDisk.razorpayKeyId, 'rzp_live_publickeyid');
+    });
+
     check('The master PIN is stored hashed, never in the clear', () => {
         const raw = fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8');
         assert.ok(!raw.includes(REAL.adminPin), 'the plaintext PIN is still somewhere in settings.json');
+        // Opened, because the hash is sealed at rest — the property under test is
+        // that what was stored is a hash and not the PIN itself.
         const disk = readDiskSettings(dataDir);
         assert.match(disk.adminPinHash, /^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]+$/,
             'the stored hash should be in the shared self-describing format');

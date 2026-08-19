@@ -87,7 +87,16 @@ function check(label, fn) {
 }
 
 function readData(filename) {
-    return JSON.parse(fs.readFileSync(path.join(dataDir, filename), 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(path.join(dataDir, filename), 'utf8'));
+    /* settings.json holds its credentials encrypted at rest now. Every caller
+       here is asking whether a VALUE survived some round trip, which is a
+       question about plaintext — so hand them the opened document. The separate
+       claim that the bytes on disk really are ciphertext is asserted directly
+       against the file, in "credentials are encrypted at rest". */
+    if (filename !== 'settings.json') return parsed;
+    resetKeyCache();
+    const { key } = resolveKey(dataDir);
+    return openSettings(parsed, key);
 }
 
 /**
@@ -189,6 +198,7 @@ console.log('===================================================================
 
 // Safe now: GOLD_POS_DATA_DIR is set, so db.js resolves to the temp directory.
 const { verifyPinHash, currentTotpCode } = await import('./adminAuth.js');
+const { resolveKey, openSettings, resetKeyCache } = await import('./secretVault.js');
 const repo = await import('./repositories/index.js');
 const advanceService = await import('./services/advanceService.js');
 const saleServiceModule = await import('./services/saleService.js');
@@ -2265,6 +2275,78 @@ try {
 
         const backwards = await request('/api/audit?from=2026-08-10&to=2026-08-01', { headers: adminHeaders });
         assert.equal(backwards.status, 400);
+    });
+
+    await check('the audit chain verifies, and says what it does not cover', async () => {
+        const res = await request('/api/audit/verify', { headers: adminHeaders });
+        assert.equal(res.status, 200);
+        const body = await res.json();
+        assert.equal(body.verified, true, 'a freshly written trail must verify');
+        assert.ok(body.eventsInChain > 0, 'this suite has written money events, so the chain is not empty');
+        assert.match(body.headHash, /^[0-9a-f]{64}$/, 'a verified chain publishes a head hash');
+        // Coverage is reported rather than implied: rows written before the
+        // chain existed are counted, never silently folded in.
+        assert.equal(typeof body.eventsPredatingChain, 'number');
+        assert.equal(body.brokenAt, null);
+    });
+
+    await check('the audit export carries a manifest that pins the whole chain', async () => {
+        const res = await request('/api/audit/export', { headers: adminHeaders });
+        assert.equal(res.status, 200);
+        assert.match(res.headers.get('content-disposition') || '', /attachment; filename="audit-trail-/);
+
+        const dump = await res.json();
+        assert.ok(Array.isArray(dump.events) && dump.events.length > 0);
+        assert.match(dump.manifest.chain.headHash, /^[0-9a-f]{64}$/);
+        assert.equal(dump.manifest.rowsExported, dump.events.length);
+        assert.ok(dump.manifest.howToVerify.includes('verifyAuditChain'));
+        // detail is delivered parsed, not as a JSON string the browser must re-parse.
+        assert.ok(!('detail_json' in dump.events[0]) || dump.events[0].detail_json === undefined);
+
+        /* A narrowed range changes the rows but not what the manifest DESCRIBES:
+           the chain figures always cover the whole trail, because a head hash
+           over a chosen slice would pin nothing — the filter could be picked to
+           exclude the edited row.
+
+           The head itself is not compared across the two calls on purpose:
+           exporting is an audited act, so the first export appended a row and
+           legitimately moved the head. That the head moves per export is the
+           behaviour the next check asserts directly. */
+        const narrow = await request('/api/audit/export?from=2999-01-01&to=2999-12-31', { headers: adminHeaders });
+        assert.equal(narrow.status, 200);
+        const narrowDump = await narrow.json();
+        assert.equal(narrowDump.events.length, 0, 'the range should have excluded every row');
+        assert.match(narrowDump.manifest.chain.headHash, /^[0-9a-f]{64}$/,
+            'an empty slice still publishes the whole chain’s head');
+        assert.ok(narrowDump.manifest.chain.eventsInChain > 0,
+            'the manifest must describe the whole chain, not the empty slice');
+        assert.equal(narrowDump.manifest.rowsExported, 0);
+    });
+
+    await check('exporting the trail is itself an audited act', async () => {
+        const trail = await request('/api/audit?action=AUDIT_EXPORTED&limit=50', { headers: adminHeaders });
+        assert.equal(trail.status, 200);
+        const body = await trail.json();
+        // The previous check exported twice; taking a copy of the evidence is an
+        // event the evidence should contain.
+        assert.ok(body.results.length >= 2, 'each export must leave its own audit row');
+        assert.equal(body.results[0].entityType, 'audit');
+    });
+
+    await check('verify and export are approver-only, like the trail itself', async () => {
+        const asCashier = await loginAdmin(request, { pin: '43219' });
+        assert.equal(asCashier.response.status, 200);
+
+        const verify = await request('/api/audit/verify', { headers: asCashier.headers });
+        assert.equal(verify.status, 403);
+        assert.equal((await verify.json()).error, 'APPROVER_REQUIRED');
+
+        const exported = await request('/api/audit/export', { headers: asCashier.headers });
+        assert.equal(exported.status, 403);
+
+        // ...and neither is reachable with no session at all.
+        assert.equal((await request('/api/audit/verify')).status, 401);
+        assert.equal((await request('/api/audit/export')).status, 401);
     });
 
     /* ------------------------------------------------------------------

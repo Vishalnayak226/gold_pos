@@ -149,7 +149,7 @@ check('a stock demo install reports every blocker at once', () => {
 /* ==========================================================================
    Wiring: the real server process must actually die.
    ========================================================================== */
-function bootProductionServer(settings) {
+function bootProductionServer(settings, envOverrides = {}) {
     return new Promise((resolve) => {
         const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-guard-'));
         const dataDir = path.join(tempRoot, 'data');
@@ -166,7 +166,14 @@ function bootProductionServer(settings) {
                 // boot cannot collide with a dev server on :5000.
                 PORT: '0',
                 GOLD_POS_DATA_DIR: dataDir,
-                GOLD_POS_LOGS_DIR: path.join(tempRoot, 'logs')
+                GOLD_POS_LOGS_DIR: path.join(tempRoot, 'logs'),
+                /* A valid vault key by default. In production the secret vault
+                   refuses to invent one, and that refusal fires before any other
+                   check — so without this every boot below would stop at the key
+                   and never reach the blocker it is actually testing. The boot
+                   that tests the key itself overrides this back to ''. */
+                GOLD_POS_SECRET_KEY: 'a'.repeat(64),
+                ...envOverrides
             },
             stdio: ['ignore', 'pipe', 'pipe']
         });
@@ -204,6 +211,32 @@ check('the real server exits non-zero when started in production with demo setti
     assert.strictEqual(unsafeBoot.timedOut, false,
         'server was still running 15s after boot — the production guard did not fire');
     assert.strictEqual(unsafeBoot.code, 1, `expected exit code 1, got ${unsafeBoot.code}`);
+});
+
+const noKeyBoot = await bootProductionServer({
+    companyName: 'Guard Test',
+    razorpayKeyId: 'rzp_live_real',
+    razorpayKeySecret: 'rzp_live_real_secret',
+    razorpayWebhookSecret: 'whsec_real',
+    publicUrl: 'https://app.example.com',
+    adminPin: '481625',
+    goldApiProvider: 'public'
+}, { GOLD_POS_SECRET_KEY: '' });
+fs.rmSync(noKeyBoot.tempRoot, { recursive: true, force: true });
+
+check('a production boot with no vault key is refused, and says so as a blocker', () => {
+    assert.strictEqual(noKeyBoot.timedOut, false,
+        'server was still running 15s after boot — the vault-key guard did not fire');
+    assert.strictEqual(noKeyBoot.code, 1, `expected exit code 1, got ${noKeyBoot.code}`);
+    // The point of the separate early check: an operator gets the numbered
+    // refusal, not a stack trace out of the PIN migration.
+    assert.match(noKeyBoot.output, /REFUSING TO START IN PRODUCTION/);
+    assert.match(noKeyBoot.output, /GOLD_POS_SECRET_KEY/);
+    assert.ok(!/at resolveKey/.test(noKeyBoot.output),
+        'the refusal leaked a stack trace instead of reporting a blocker');
+    // Everything else about this install is production-valid, so the key must
+    // be the ONLY thing it complains about.
+    assert.ok(!/demo credentials/i.test(noKeyBoot.output));
 });
 
 check('the refusal names every problem on stderr for the operator', () => {

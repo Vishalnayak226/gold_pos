@@ -270,8 +270,8 @@ wrong answers.
   (helper-level integration) → `test_routes.js` (routes + auth boundary) → `test_http.js` (money
   paths, Razorpay webhook, returns/refunds, multi-line invoices, tenders, actor identity, paged
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
-  `test_production_guard.js` (fail-closed startup). **443 checks as of 2026-08-17**
-  (145 + 43 + 82 + 16 + 10 + 28 + 103 + 16, in run order — `test_suite.js` is counted by the ten
+  `test_production_guard.js` (fail-closed startup). **458 checks as of 2026-08-19**
+  (145 + 43 + 90 + 16 + 11 + 29 + 107 + 17, in run order — `test_suite.js` is counted by the
   numbered tests it prints, not by an older tally that no longer matched anything).
   - **A GREEN `npm test` IS NOT PROOF A FORM STILL WORKS.** The HTTP suites post minimal bodies;
     a browser posts every field its form owns, including the empty ones. A body schema that
@@ -284,6 +284,17 @@ wrong answers.
   - `test_concurrency.js` spawns child processes and is the slowest suite by far (~1–2 min). It is
     in `npm test` anyway, because the properties it asserts — one balance cannot be spent twice, a
     kill mid-sale leaves nothing behind — are not observable any other way.
+  - **SECRETS IN `settings.json` ARE ENCRYPTED AT REST.** Every read and write of that document
+    goes through `backend/settingsStore.js` — `readSettings()` / `writeSettings()` — which opens
+    and seals via `backend/secretVault.js`. **Never add a raw `readJSON`/`writeJSON` call on
+    settings.json again:** one reader that skips decryption hands Razorpay a string starting
+    `encv1$` instead of the actual key, and one writer that skips encryption puts a live
+    credential back in the clear and silently undoes the control for that field. `db.js#migrateSettings()` is the single deliberate
+    exception — it merges the template and writes straight back, never touching a credential (no
+    credential may sit in `DEFAULT_SETTINGS`, §0), so it round-trips ciphertext untouched, and
+    keeping it on raw `readJSON` avoids an import cycle. A suite asserting on a settings value must
+    open the vault first; `test_http.js`'s `readData()` and `test_routes.js`'s
+    `readDiskSettings()` both show the pattern.
   - **A suite that opens the database must `closeDb()` before removing its temp directory.**
     Windows refuses to unlink a file with an open handle, so the `rmSync` in a `finally` throws
     EPERM — and that EPERM replaces whatever assertion actually failed, so the run reports a

@@ -1076,6 +1076,201 @@ check('rollback restores the database as it was before the import', () => {
         'rollback must keep what was there before the import');
 });
 
+
+/* ==========================================================================
+   §13 The audit trail is tamper-EVIDENT, not just append-only
+   ==========================================================================
+   The triggers from 001 stop the application editing history. They cannot stop
+   whoever holds the .db file, because dropping a trigger is one statement — so
+   every check below tampers the way that person would: with the triggers gone
+   and direct SQL, then asks whether the chain notices.
+   ========================================================================== */
+
+check('every recorded event is chained to the one before it', () => {
+    const ids = [];
+    for (let i = 1; i <= 4; i++) {
+        ids.push(repo.audit.record({
+            tenantId: context.tenantId,
+            action: 'CHAIN_TEST',
+            entityType: 'test',
+            entityId: `chain-${i}`,
+            summary: `event ${i}`,
+            actorLabel: 'suite'
+        }));
+    }
+    assert.ok(ids.every(Boolean), 'every write should have returned an id');
+
+    const rows = repo.unsafeDatabaseHandle().prepare(
+        "SELECT * FROM audit_events WHERE tenant_id = ? AND action = 'CHAIN_TEST' ORDER BY chain_seq"
+    ).all(context.tenantId);
+    assert.equal(rows.length, 4);
+
+    // Contiguous sequence, and each row's prev_hash is the previous row_hash.
+    for (let i = 1; i < rows.length; i++) {
+        assert.equal(rows[i].chain_seq, rows[i - 1].chain_seq + 1, 'chain_seq must be contiguous');
+        assert.equal(rows[i].prev_hash, rows[i - 1].row_hash, 'each row must link to the one before');
+    }
+    assert.match(rows[0].row_hash, /^[0-9a-f]{64}$/, 'row_hash should be lowercase sha256 hex');
+});
+
+check('a clean trail verifies, and reports what the chain does not cover', () => {
+    const result = repo.audit.verifyChain(context.tenantId);
+    assert.equal(result.ok, true, 'an untampered chain must verify');
+    assert.ok(result.checked > 0, 'the verification should have walked some rows');
+    assert.equal(result.brokenAt, null);
+    assert.match(result.head, /^[0-9a-f]{64}$/, 'a verified chain publishes its head hash');
+    // Honesty about coverage: rows written before migration 005 are counted,
+    // not silently skipped.
+    assert.equal(typeof result.unchained, 'number');
+});
+
+check('editing an event after the fact is detected', () => {
+    const db = repo.unsafeDatabaseHandle();
+    const victim = db.prepare(
+        "SELECT * FROM audit_events WHERE tenant_id = ? AND action = 'CHAIN_TEST' ORDER BY chain_seq LIMIT 1"
+    ).get(context.tenantId);
+
+    // Exactly what someone with the file would do: remove the control, then edit.
+    db.exec('DROP TRIGGER trg_audit_events_immutable');
+    db.prepare('UPDATE audit_events SET summary = ? WHERE id = ?')
+        .run('event 1 (quietly rewritten)', victim.id);
+
+    const result = repo.audit.verifyChain(context.tenantId);
+    assert.equal(result.ok, false, 'an edited row must break verification');
+    assert.equal(result.brokenAt.id, victim.id, 'the report must name the row that was edited');
+    assert.match(result.brokenAt.reason, /edited/);
+
+    // Put it back so the remaining checks run against a clean trail.
+    db.prepare('UPDATE audit_events SET summary = ? WHERE id = ?').run(victim.summary, victim.id);
+    assert.equal(repo.audit.verifyChain(context.tenantId).ok, true,
+        'restoring the original content must restore verification');
+});
+
+check('deleting an event is detected as a gap, not silently tolerated', () => {
+    const db = repo.unsafeDatabaseHandle();
+    const victim = db.prepare(
+        "SELECT * FROM audit_events WHERE tenant_id = ? AND action = 'CHAIN_TEST' ORDER BY chain_seq LIMIT 1 OFFSET 1"
+    ).get(context.tenantId);
+
+    db.exec('DROP TRIGGER trg_audit_events_no_delete');
+    db.prepare('DELETE FROM audit_events WHERE id = ?').run(victim.id);
+
+    const result = repo.audit.verifyChain(context.tenantId);
+    assert.equal(result.ok, false, 'a removed event must break the chain');
+    assert.match(result.brokenAt.reason, /removed/, 'the report should say an event is missing');
+
+    // Restore it, hashes and all, so the chain is whole again for the export check.
+    db.prepare(`
+        INSERT INTO audit_events (id, tenant_id, branch_id, actor_user_id, actor_label, action,
+                                  entity_type, entity_id, summary, detail_json, ip_address,
+                                  occurred_at, business_date, chain_seq, prev_hash, row_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(victim.id, victim.tenant_id, victim.branch_id, victim.actor_user_id, victim.actor_label,
+        victim.action, victim.entity_type, victim.entity_id, victim.summary, victim.detail_json,
+        victim.ip_address, victim.occurred_at, victim.business_date, victim.chain_seq,
+        victim.prev_hash, victim.row_hash);
+    assert.equal(repo.audit.verifyChain(context.tenantId).ok, true);
+});
+
+check('re-hashing the whole tail hides an edit from the chain — but not from a published head', () => {
+    const db = repo.unsafeDatabaseHandle();
+    const before = repo.audit.verifyChain(context.tenantId);
+    const publishedHead = before.head; // as it would appear in an export already sent out
+
+    // The strongest attack available to whoever holds the file: edit a row and
+    // recompute every hash after it so the chain is internally consistent again.
+    const rows = db.prepare(
+        'SELECT * FROM audit_events WHERE tenant_id = ? AND chain_seq IS NOT NULL ORDER BY chain_seq'
+    ).all(context.tenantId);
+    const target = rows.find(r => r.action === 'CHAIN_TEST');
+    target.summary = 'forged';
+    db.prepare('UPDATE audit_events SET summary = ? WHERE id = ?').run('forged', target.id);
+
+    let prev = null;
+    for (const row of rows) {
+        if (row.chain_seq < target.chain_seq) { prev = row.row_hash; continue; }
+        row.prev_hash = prev;
+        const recomputed = repo.audit.hashRow(row);
+        db.prepare('UPDATE audit_events SET prev_hash = ?, row_hash = ? WHERE id = ?')
+            .run(prev, recomputed, row.id);
+        prev = recomputed;
+    }
+
+    const after = repo.audit.verifyChain(context.tenantId);
+    // The forgery IS internally consistent — this is the honest limit of a
+    // self-contained chain, and the reason the export publishes its head.
+    assert.equal(after.ok, true, 'a fully re-hashed chain verifies against itself');
+    // ...and this is what catches it: the head no longer matches the one already
+    // in somebody else's hands.
+    assert.notEqual(after.head, publishedHead,
+        'a re-hashed chain must not reproduce the previously published head hash');
+});
+
+check('the export carries the evidence needed to check it later', () => {
+    const dump = repo.audit.exportChain(context.tenantId);
+    assert.ok(Array.isArray(dump.events), 'the export carries the events');
+    assert.ok(dump.events.length > 0);
+    assert.equal(dump.manifest.tenantId, context.tenantId);
+    assert.equal(dump.manifest.rowsExported, dump.events.length);
+    assert.equal(typeof dump.manifest.chain.verified, 'boolean');
+    assert.match(dump.manifest.chain.headHash, /^[0-9a-f]{64}$/);
+    assert.equal(typeof dump.manifest.chain.eventsPredatingChain, 'number');
+    assert.ok(dump.manifest.howToVerify.includes('verifyAuditChain'),
+        'the manifest must say how to check it');
+
+    // A filtered export still pins the WHOLE chain: a head hash over only the
+    // exported slice could be made clean by choosing the filter.
+    const narrow = repo.audit.exportChain(context.tenantId, { from: Date.now() + 1_000_000 });
+    assert.equal(narrow.events.length, 0, 'the range filter should have excluded everything');
+    assert.equal(narrow.manifest.chain.headHash, dump.manifest.chain.headHash,
+        'the head hash must describe the chain, not the slice');
+});
+
+/* ==========================================================================
+   13. Business summary email — reads the ledger, not the retired JSON files
+   ========================================================================== */
+
+console.log('\n13. Reporting');
+
+{
+    const emailReporter = await import('./emailReporter.js');
+
+    // Poison the retired JSON documents `computeSummary()` used to read
+    // before the Phase-29 SQL cutover. If the fix regresses to reading them,
+    // these figures leak into the totals below and the assertions fail.
+    const dataDir = process.env.GOLD_POS_DATA_DIR;
+    fs.writeFileSync(path.join(dataDir, 'sales_2020.json'),
+        JSON.stringify([{ timestamp: 0, totalAmount: 999999 }]));
+    fs.writeFileSync(path.join(dataDir, 'returns_2020.json'),
+        JSON.stringify([{ timestamp: 0, refundAmount: 999999 }]));
+    fs.writeFileSync(path.join(dataDir, 'advances.json'),
+        JSON.stringify([{ type: 'deposit', timestamp: 0, amount: 999999, customerPhone: 'ghost' }]));
+
+    const filter = { tenantId: context.tenantId, fromAt: 0, toAt: null };
+    const invoiceTotals = repo.invoices.periodTotals(filter);
+    const returnTotals = repo.creditNotes.periodTotals(filter);
+    const depositTotals = repo.advances.periodTotals({ ...filter, entryType: 'deposit' });
+    const liability = repo.advances.liabilitySummary(context.tenantId);
+
+    const summary = emailReporter.computeSummary(0);
+
+    check('the summary reads the live SQL ledger, not the poisoned JSON files', () => {
+        assert.equal(summary.invoiceCount, invoiceTotals.count);
+        assert.equal(summary.grossRevenue, invoiceTotals.totalAmount);
+        assert.equal(summary.returnCount, returnTotals.count);
+        assert.equal(summary.refundTotal, returnTotals.refundAmount);
+        assert.equal(summary.depositCount, depositTotals.count);
+        assert.equal(summary.depositTotal, depositTotals.depositAmount);
+        assert.equal(summary.outstandingTotal, liability.outstandingTotal);
+        assert.ok(summary.grossRevenue < 999999, 'a stale sales_2020.json must not leak into the total');
+        assert.ok(summary.depositTotal < 999999, 'a stale advances.json must not leak into the total');
+    });
+
+    check('revenue nets the period’s refunds', () => {
+        assert.equal(summary.revenue, summary.grossRevenue - summary.refundTotal);
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

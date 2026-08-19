@@ -344,16 +344,35 @@ function setByPath(obj, dotted, value) {
  * Settings screen has to be able to show "SMTP is not configured yet" instead
  * of implying a password exists when none does.
  */
-export function redactSettings(settings) {
-    const safe = JSON.parse(JSON.stringify(settings ?? {}));
+/**
+ * Deep copy of `settings` with every secret value passed through `transform`.
+ *
+ * The one place that knows how to *find* a credential in this document. Both
+ * things that need to act on every secret — redaction for the wire, and
+ * encryption for the disk — run through here, so a newly declared key in
+ * SECRET_SETTINGS_KEYS is picked up by both without either being edited.
+ *
+ * `transform` returning `undefined` leaves the value alone, which is what lets
+ * the vault skip a value that is already in the state it wants.
+ *
+ * @param {object} settings
+ * @param {(value: any, dotted: string) => any} transform
+ */
+export function mapSecretValues(settings, transform) {
+    const copy = JSON.parse(JSON.stringify(settings ?? {}));
     for (const pattern of SECRET_SETTINGS_KEYS) {
-        for (const dotted of expandPath(safe, pattern)) {
-            const value = getByPath(safe, dotted);
+        for (const dotted of expandPath(copy, pattern)) {
+            const value = getByPath(copy, dotted);
             if (value === undefined || value === null) continue;
-            setByPath(safe, dotted, String(value).length > 0 ? REDACTED_SENTINEL : '');
+            const next = transform(value, dotted);
+            if (next !== undefined) setByPath(copy, dotted, next);
         }
     }
-    return safe;
+    return copy;
+}
+
+export function redactSettings(settings) {
+    return mapSecretValues(settings, value => (String(value).length > 0 ? REDACTED_SENTINEL : ''));
 }
 
 /*

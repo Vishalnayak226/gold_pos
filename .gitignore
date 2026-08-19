@@ -27,3 +27,7 @@ developer_doomsday_keys/*.pem
 developer_blackbox_keys/*.pem
 licensing_server/keys/*private*.pem
 docs/credentials.md
+
+# Pre-rotation copies of settings.json still readable with the OLD vault key.
+# Written by backend/rotateSecretKey.js; delete once the new key is confirmed.
+backend/**/settings.json.pre-rotation-*

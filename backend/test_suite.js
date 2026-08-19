@@ -560,6 +560,97 @@ async function testBoundedAttemptMap() {
     console.log('✅ Test 10 Passed: the shared attempt map expires, forgets, and stays bounded under a flood.');
 }
 
+/* ==========================================================================
+   Test 11: the secret vault — encryption at rest for settings.json
+   ==========================================================================
+   The properties worth asserting are the ones that are easy to break silently:
+   that a round trip is lossless, that an UNSET credential stays distinguishable
+   from a set one, that upgrading a plaintext tenant needs no migration step,
+   that a ciphertext cannot be moved between fields, and that rotation actually
+   re-keys rather than merely re-writing. */
+async function testSecretVault() {
+    console.log('\nRunning Test 11: secret vault seal/open, path binding, and key rotation...');
+    const vault = await import('./secretVault.js');
+    const keyA = Buffer.from(vault.generateKeyHex(), 'hex');
+    const keyB = Buffer.from(vault.generateKeyHex(), 'hex');
+
+    // --- round trip ---------------------------------------------------------
+    const sealed = vault.seal('rzp_live_supersecret', 'razorpayKeySecret', keyA);
+    assert.ok(sealed.startsWith('encv1$'), 'sealed values are self-describing');
+    assert.ok(!sealed.includes('supersecret'), 'the plaintext must not survive in the ciphertext');
+    assert.strictEqual(vault.open(sealed, 'razorpayKeySecret', keyA), 'rzp_live_supersecret');
+
+    // Two seals of one value differ: a fresh IV each time, so an observer
+    // cannot tell that two fields hold the same secret.
+    assert.notStrictEqual(
+        vault.seal('same', 'a', keyA),
+        vault.seal('same', 'a', keyA),
+        'each seal must use a fresh IV'
+    );
+
+    // --- an unset credential stays unset ------------------------------------
+    // redactSettings() distinguishes "" (not configured) from a real value, so
+    // sealing an empty string would make the Settings screen claim a credential
+    // exists where none does.
+    assert.strictEqual(vault.seal('', 'smtp.pass', keyA), '', 'an empty secret must stay empty');
+
+    // --- lazy migration -----------------------------------------------------
+    // A tenant upgrading from a plaintext settings.json must keep working with
+    // no migration step, so open() passes non-vault values straight through.
+    assert.strictEqual(vault.open('plain-old-value', 'smtp.pass', keyA), 'plain-old-value');
+    // ...and sealing is idempotent, so re-saving does not double-encrypt.
+    assert.strictEqual(vault.seal(sealed, 'razorpayKeySecret', keyA), sealed);
+
+    // --- the wrong key fails loudly ----------------------------------------
+    assert.throws(() => vault.open(sealed, 'razorpayKeySecret', keyB), /Could not decrypt/,
+        'a wrong key must throw rather than hand back ciphertext');
+
+    // --- a ciphertext is bound to its own field -----------------------------
+    // Without the path as AAD, this value could be cut from one credential
+    // field and pasted over another, and the server would decrypt it happily.
+    assert.throws(() => vault.open(sealed, 'razorpayWebhookSecret', keyA), /Could not decrypt/,
+        'a sealed value must not decrypt under a different field name');
+
+    // --- whole-document seal/open, including the wildcard paths -------------
+    const doc = {
+        companyName: 'Vault Test Jewellers',
+        razorpayKeySecret: 'secret-one',
+        razorpayWebhookSecret: '',
+        smtp: { host: 'smtp.example.test', pass: 'secret-two' },
+        authSalt: 'salt-value',
+        adminPinHash: 'scrypt$16384$8$1$abcdef',
+        operators: [
+            { id: 'op1', name: 'A', pinHash: 'scrypt$16384$8$1$aaa', totpSecret: 'TOTPAAA' },
+            { id: 'op2', name: 'B', pinHash: 'scrypt$16384$8$1$bbb', totpSecret: '' }
+        ]
+    };
+    const sealedDoc = vault.sealSettings(doc, keyA);
+    const asText = JSON.stringify(sealedDoc);
+    for (const leaked of ['secret-one', 'secret-two', 'salt-value', 'abcdef', 'TOTPAAA']) {
+        assert.ok(!asText.includes(leaked), `${leaked} is still readable in the sealed document`);
+    }
+    // Non-secret configuration stays plainly readable — an operator must still
+    // be able to inspect this file and hand it to support.
+    assert.strictEqual(sealedDoc.companyName, 'Vault Test Jewellers');
+    assert.strictEqual(sealedDoc.smtp.host, 'smtp.example.test');
+    assert.strictEqual(sealedDoc.operators[1].name, 'B');
+    // The wildcard path really did reach into the array.
+    assert.ok(sealedDoc.operators[0].totpSecret.startsWith('encv1$'), 'operators.*.totpSecret must be sealed');
+    // An unset secret inside the array stays unset.
+    assert.strictEqual(sealedDoc.operators[1].totpSecret, '');
+
+    const opened = vault.openSettings(sealedDoc, keyA);
+    assert.deepStrictEqual(opened, doc, 'a full seal/open round trip must be lossless');
+
+    // --- rotation -----------------------------------------------------------
+    const rotated = vault.rotateSettings(sealedDoc, keyA, keyB);
+    assert.deepStrictEqual(vault.openSettings(rotated, keyB), doc, 'rotation must preserve every value');
+    assert.throws(() => vault.openSettings(rotated, keyA), /Could not decrypt/,
+        'after rotation the OLD key must no longer open the document');
+
+    console.log('✅ Test 11 Passed: secrets seal, open, stay bound to their field, and rotate cleanly.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -572,6 +663,7 @@ try {
     await testAdminPinHashing();
     await testTotpAgainstRfcVectors();
     await testBoundedAttemptMap();
+    await testSecretVault();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');
@@ -592,7 +684,9 @@ try {
     } catch (_) {
         // The suite may have failed before the store was ever opened.
     }
-    try {
+    
+
+try {
         fs.rmSync(TEST_ROOT, { recursive: true, force: true });
     } catch (err) {
         console.warn(`[cleanup] could not remove ${TEST_ROOT}: ${err.message}`);

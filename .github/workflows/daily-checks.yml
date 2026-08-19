@@ -60,3 +60,87 @@ jobs:
       - name: Audit ${{ matrix.module }} (high+ severity fails the build)
         working-directory: ${{ matrix.module }}
         run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # Security scanning (added 2026-08-17).
+  #
+  # Every tool below is free on a private repository and needs no GitHub
+  # Advanced Security licence. That constraint drove the choices: CodeQL,
+  # actions/dependency-review-action and SARIF upload all require GHAS on a
+  # private repo, so none of them is used here. Dependency *vulnerability*
+  # review is already covered by the `dependency-audit` job above (npm audit,
+  # high+ fails), so nothing is lost by their absence.
+  #
+  # NONE OF THESE HAS EVER EXECUTED — like the rest of this workflow, they need
+  # a pull request to be opened. Expect the first run to surface findings that
+  # need triage; that is the point of the gate, not a fault in it.
+  # ---------------------------------------------------------------------------
+
+  secret-scan:
+    name: Secret scan (verified credentials fail the build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # TruffleHog diffs a commit range, so it needs real history rather
+          # than the default depth-1 clone.
+          fetch-depth: 0
+      - name: Scan git history for live credentials
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified
+        # --only-verified means a finding has been checked against the issuing
+        # provider and is live. An unverified match on a test fixture or an
+        # example key would otherwise redden this gate permanently, and a gate
+        # that is always red is a gate nobody reads.
+
+  static-analysis:
+    name: Static analysis (SAST)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep OSS — security rulesets
+        run: |
+          semgrep scan \
+            --config=p/javascript \
+            --config=p/nodejs \
+            --config=p/secrets \
+            --severity=ERROR \
+            --error \
+            --exclude=node_modules \
+            --exclude=graphify-out \
+            --exclude=dist \
+            --exclude=backups \
+            --metrics=off
+        # Semgrep OSS is Apache-2.0 and runs without an account; --metrics=off
+        # keeps it from phoning home. Only ERROR-severity rules fail the build:
+        # WARNING and INFO are advisory on a codebase this size and would drown
+        # the signal.
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [backend, licensing_server]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install ${{ matrix.module }} dependencies
+        working-directory: ${{ matrix.module }}
+        run: npm ci --no-audit --no-fund
+      - name: Generate ${{ matrix.module }} SBOM
+        working-directory: ${{ matrix.module }}
+        run: npm sbom --sbom-format cyclonedx > sbom-${{ matrix.module }}.cdx.json
+        # `npm sbom` is built into npm 10+, so this adds no tooling and no
+        # dependency — it reads the same lockfile `npm ci` just installed from.
+      - name: Publish ${{ matrix.module }} SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.module }}
+          path: ${{ matrix.module }}/sbom-${{ matrix.module }}.cdx.json
+          retention-days: 90

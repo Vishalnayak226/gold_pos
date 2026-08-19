@@ -14,6 +14,50 @@ This document contains key architectural details, non-negotiable design guidelin
 
 - **Latest commit:** `1c218f6` — "Phase 34: move sessions into cookies, and put the ledger in the
   backups" (2026-08-17), on branch **`phase-21-payment-verification-and-production-guard`**.
+- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
+  UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
+  on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:
+  `backend/secretVault.js`, `backend/settingsStore.js`, `backend/rotateSecretKey.js`,
+  `backend/verifyAuditChain.js`, `backend/verifyBackup.js`,
+  `backend/repositories/migrations/005_audit_hash_chain.sql`, `docs/RUNBOOKS.md`,
+  `docs/AUDIT_AND_PII.md`. Modified: `server.js`, `adminAuth.js`, `emailReporter.js`,
+  `priceEngine.js`, `productionGuard.js`, `defaultSettings.js`, `auditRepository.js`,
+  `package.json`, `.env.example`, `.gitignore`, `.github/workflows/daily-checks.yml`, four
+  suites and the docs.
+  - **Unit 1 — secrets at rest + key rotation. DONE.** `secretVault.js` (AES-256-GCM, the field's
+    dotted path as AAD so a ciphertext cannot be moved between credentials), `settingsStore.js` as
+    the single door in and out of settings.json (**30 call sites across 8 files moved onto it**),
+    `rotateSecretKey.js`. Production refuses a keyfile fallback and reports the missing key as a
+    numbered blocker via the new `assertVaultKeyReady()`, which had to run **before**
+    `migrateStoredPins()` — the boot order matters, because that is the first thing that reads
+    settings, and it threw a stack trace instead of a refusal until this was split out.
+  - **Unit 2 — audit-trail hardening. MOSTLY DONE.** Migration 005 hash-chains `audit_events`;
+    `GET /api/audit/verify` and `/api/audit/export` (approver-only, and export is itself audited);
+    `verifyAuditChain.js` with `--expect-head`. `docs/AUDIT_AND_PII.md` classifies every field.
+    **Retention is `[needs design decision]` on purpose** — it is a legal question, and deleting
+    audit rows would break both the no-delete trigger and the chain.
+  - **Unit 3 — backup/PITR/restore/runbooks. PARTLY DONE.** `verifyBackup.js` restores the latest
+    snapshot into a temp directory and runs nine checks; both paths were exercised against a real
+    seeded snapshot. `docs/RUNBOOKS.md` carries 11 procedures. **Off-site and true PITR are NOT
+    built** — both need infrastructure or an RPO decision that does not exist yet.
+  - **Unit 4 — CI security scanning. WRITTEN, NEVER RUN.** Three jobs added to
+    `daily-checks.yml` (TruffleHog, Semgrep OSS, `npm sbom`), all chosen to be free on a private
+    repo. **2026-08-19: YAML syntax now verified locally** — PyYAML is available via the `py`
+    launcher (`py -c "import yaml"`), which the prior pass didn't find; all four workflow files
+    parse cleanly and the three new jobs were reviewed by hand (unique job names, matrix syntax,
+    action references). **Still not run** — a YAML parse proves the file is well-formed, not that
+    the jobs succeed on a runner (e.g. whether `semgrep/semgrep`'s container image can run
+    `actions/checkout`, or how TruffleHog behaves on a `schedule`/`workflow_dispatch` trigger with
+    no diff to compare). That needs an actual GitHub Actions run, which still needs a PR.
+  - **2026-08-19: the emailReporter bug above is FIXED.** `computeSummary()` now reads through
+    `backend/repositories/index.js` (`invoices.periodTotals`, `creditNotes.periodTotals`,
+    `advances.periodTotals`/`liabilitySummary`) instead of `readJSON`-ing the retired
+    `sales_*.json`/`returns_*.json`/`advances.json`. Two new checks in `test_repositories.js`
+    §13 poison those JSON files with a planted ₹9,99,999 figure and assert it never reaches the
+    summary. Also fixed in the same pass: `CLAUDE.md` had a ~285-line duplicate of its own §0–§8
+    pasted mid-sentence into itself (likely a bad edit in an earlier session) — deduplicated back
+    to one copy; `git diff --stat` against `HEAD` is now the expected +13/-2, not the ~300-line
+    diff the corruption produced.
 - **The working tree is CLEAN as of 2026-08-17.** Phase 34's first unit is committed in `1c218f6`
   (19 files: new `backend/cookies.js`, plus `adminAuth.js`, `customerAuth.js`, `server.js`,
   `backupEngine.js`, `test_http.js`, `test_routes.js`, four `tests/e2e/*.spec.js`,

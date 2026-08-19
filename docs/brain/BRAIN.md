@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Redrawn | 2026-08-17 |
-| Files in tree | 138 |
+| Redrawn | 2026-08-18 |
+| Files in tree | 146 |
 | Regions / lobes | 19 / 5 |
 | Coverage | 100.0% (0 unclaimed) |
-| Symbols filed | 1406 |
-| Cross-region relationships | 653 |
+| Symbols filed | 1517 |
+| Cross-region relationships | 686 |
 
 ---
 
@@ -22,7 +22,7 @@ flowchart TB
   subgraph pos["The POS Terminal"]
     direction LR
     pos_api["POS API Router<br/><small>1 file</small>"]
-    persistence["Persistence & Settings<br/><small>22 files</small>"]
+    persistence["Persistence & Settings<br/><small>24 files</small>"]
     domain_services["Domain Services<br/><small>4 files</small>"]
     pricing["Pricing & Billing Math<br/><small>2 files</small>"]
     pos_ui["Cashier UI Shell<br/><small>3 files</small>"]
@@ -36,9 +36,9 @@ flowchart TB
     direction LR
     licensing["Licensing<br/><small>8 files</small>"]
     updates["Release & Update Engine<br/><small>3 files</small>"]
-    security["Crypto, Auth & Black Box<br/><small>15 files</small>"]
+    security["Crypto, Auth & Black Box<br/><small>17 files</small>"]
     extensions["Tenant Extension Surface<br/><small>4 files</small>"]
-    maintenance["Backups & Reporting<br/><small>2 files</small>"]
+    maintenance["Backups & Reporting<br/><small>4 files</small>"]
   end
   subgraph ops["Build & Operations"]
     direction LR
@@ -50,7 +50,7 @@ flowchart TB
   subgraph knowledge["Docs & Agent Config"]
     direction LR
     trackers["Live Trackers<br/><small>7 files</small>"]
-    reference["Reference Docs<br/><small>8 files</small>"]
+    reference["Reference Docs<br/><small>10 files</small>"]
     agent_config["Agent Operating Rules<br/><small>10 files</small>"]
   end
 ```
@@ -66,24 +66,24 @@ flowchart TB
 | Region | Lobe | Files | Symbols | Reaches |
 |---|---|---:|---:|---|
 | [POS API Router](#pos-api-router) | The POS Terminal | 1 | 45 | Crypto, Auth & Black Box, Persistence & Settings, Customer Portal |
-| [Persistence & Settings](#persistence--settings) | The POS Terminal | 22 | 261 | Pricing & Billing Math, Test Suites, Crypto, Auth & Black Box |
+| [Persistence & Settings](#persistence--settings) | The POS Terminal | 24 | 272 | Pricing & Billing Math, Crypto, Auth & Black Box, Test Suites |
 | [Domain Services](#domain-services) | The POS Terminal | 4 | 41 | Persistence & Settings, Pricing & Billing Math, Test Suites |
 | [Pricing & Billing Math](#pricing--billing-math) | The POS Terminal | 2 | 33 | Persistence & Settings |
 | [Cashier UI Shell](#cashier-ui-shell) | The POS Terminal | 3 | 17 | Cashier UI Components, Tenant Extension Surface |
-| [Cashier UI Components](#cashier-ui-components) | The POS Terminal | 8 | 143 | Cashier UI Shell, Pricing & Billing Math, Persistence & Settings |
+| [Cashier UI Components](#cashier-ui-components) | The POS Terminal | 8 | 143 | Cashier UI Shell, Pricing & Billing Math, Test Suites |
 | [Customer Portal](#customer-portal) | The Customer Surface | 3 | 39 | Persistence & Settings, Crypto, Auth & Black Box |
 | [Licensing](#licensing) | The SaaS Platform | 8 | 55 | Persistence & Settings |
 | [Release & Update Engine](#release--update-engine) | The SaaS Platform | 3 | 56 | Persistence & Settings, Backups & Reporting |
-| [Crypto, Auth & Black Box](#crypto-auth--black-box) | The SaaS Platform | 15 | 93 | Persistence & Settings |
+| [Crypto, Auth & Black Box](#crypto-auth--black-box) | The SaaS Platform | 17 | 118 | Persistence & Settings |
 | [Tenant Extension Surface](#tenant-extension-surface) | The SaaS Platform | 4 | 22 | Persistence & Settings |
-| [Backups & Reporting](#backups--reporting) | The SaaS Platform | 2 | 12 | Persistence & Settings |
+| [Backups & Reporting](#backups--reporting) | The SaaS Platform | 4 | 28 | Persistence & Settings |
 | [Deploy & CI Pipeline](#deploy--ci-pipeline) | Build & Operations | 14 | 12 | — |
-| [Test Suites](#test-suites) | Build & Operations | 16 | 143 | Pricing & Billing Math, Crypto, Auth & Black Box, Persistence & Settings |
-| [Local Dev Loop & Manifests](#local-dev-loop--manifests) | Build & Operations | 5 | 48 | — |
+| [Test Suites](#test-suites) | Build & Operations | 16 | 144 | Pricing & Billing Math, Crypto, Auth & Black Box, Persistence & Settings |
+| [Local Dev Loop & Manifests](#local-dev-loop--manifests) | Build & Operations | 5 | 54 | — |
 | [Mobile Wrapper](#mobile-wrapper) | Build & Operations | 3 | 17 | — |
-| [Live Trackers](#live-trackers) | Docs & Agent Config | 7 | 170 | — |
-| [Reference Docs](#reference-docs) | Docs & Agent Config | 8 | 94 | — |
-| [Agent Operating Rules](#agent-operating-rules) | Docs & Agent Config | 10 | 105 | Reference Docs |
+| [Live Trackers](#live-trackers) | Docs & Agent Config | 7 | 184 | — |
+| [Reference Docs](#reference-docs) | Docs & Agent Config | 10 | 121 | — |
+| [Agent Operating Rules](#agent-operating-rules) | Docs & Agent Config | 10 | 116 | Reference Docs |
 
 ## 3. How the regions are wired
 
@@ -109,34 +109,33 @@ flowchart LR
   agent_config["Agent Operating Rules"]
   reference["Reference Docs"]
   deploy["Deploy & CI Pipeline"]
-  pos_api -->|"50"| security
-  pos_api -->|"33"| persistence
+  pos_api -->|"52"| security
+  pos_api -->|"35"| persistence
   pos_api -->|"20"| customer_portal
   pos_api -->|"11"| pricing
   persistence -->|"54"| pricing
-  persistence -.->|"5"| tests
-  persistence -->|"3"| security
+  persistence -->|"11"| security
+  persistence -.->|"6"| tests
   persistence -->|"1"| customer_portal
   domain_services -->|"100"| persistence
   domain_services -->|"36"| pricing
   domain_services -.->|"4"| tests
-  pricing -->|"11"| persistence
+  pricing -->|"15"| persistence
   pos_ui -->|"17"| pos_components
   pos_ui -->|"1"| extensions
   pos_components -->|"60"| pos_ui
   pos_components -->|"55"| pricing
-  pos_components -.->|"1"| persistence
   pos_components -.->|"1"| tests
   customer_portal -->|"11"| persistence
   customer_portal -->|"6"| security
   licensing -->|"17"| persistence
   updates -->|"21"| persistence
   updates -->|"3"| maintenance
-  security -->|"40"| persistence
+  security -->|"46"| persistence
   extensions -->|"4"| persistence
-  maintenance -->|"24"| persistence
+  maintenance -->|"26"| persistence
   tests -->|"22"| pricing
-  tests -->|"6"| security
+  tests -->|"14"| security
   tests -->|"4"| persistence
   tests -->|"2"| customer_portal
   agent_config -->|"1"| reference
@@ -179,7 +178,7 @@ The single Express router for the shop terminal — sales, payments, analytics, 
 
 **Busiest symbols:** `server.js`, `bootstrapServer()`, `initialiseLedger()`, `cookieOpts()`, `billingSettings()`, `collectLegacySource()`, `shutdown()`, `startServer()`, `clearAdminSessionCookies()`, `clearCustomerSessionCookies()` … +35
 
-**Reaches:** Crypto, Auth & Black Box (50) · Persistence & Settings (33) · Customer Portal (20) · Pricing & Billing Math (11) · Backups & Reporting (10) · Tenant Extension Surface (5) · Licensing (5) · Release & Update Engine (5) · Domain Services (4)
+**Reaches:** Crypto, Auth & Black Box (52) · Persistence & Settings (35) · Customer Portal (20) · Pricing & Billing Math (11) · Backups & Reporting (10) · Tenant Extension Surface (5) · Licensing (5) · Release & Update Engine (5) · Domain Services (4)
 
 > **Declared link** Cashier UI Shell → POS API Router (HTTP/JSON). The browser calls the Express router over the network. No AST extractor can see this edge — it is asserted by hand.
 
@@ -187,7 +186,7 @@ The single Express router for the shop terminal — sales, payments, analytics, 
 
 #### Persistence & Settings
 
-`persistence` · 22 files · 261 symbols
+`persistence` · 24 files · 272 symbols
 
 The SQLite datastore and the JSON layer it replaces. backend/repositories/ is the ADR-001 seam: connection/PRAGMAs, the migration runner, the numbered migrations, and one repository per domain — no SQL string exists above this directory, which is what keeps the documented move to PostgreSQL a swap rather than a rewrite. importLegacyJson.js carries a live tenant across from the JSON ledger with a dry run, a reconciliation report and a rollback. db.js/defaultSettings.js are the legacy JSON writers plus the settings default-merge-and-retire mechanism; settings and licence stay JSON on purpose. seed.js generates the deterministic synthetic fixture database.
 
@@ -209,18 +208,20 @@ The SQLite datastore and the JSON layer it replaces. backend/repositories/ is th
 - `backend/repositories/migrations/002_credit_note_projection.sql`
 - `backend/repositories/migrations/003_reference_reuse_after_rejection.sql`
 - `backend/repositories/migrations/004_multi_line_invoice_fidelity.sql`
+- `backend/repositories/migrations/005_audit_hash_chain.sql`
 - `backend/repositories/organisationRepository.js`
 - `backend/repositories/paymentRepository.js`
 - `backend/repositories/rateRepository.js`
 - `backend/repositories/sequenceRepository.js`
 - `backend/repositories/userRepository.js`
 - `backend/seed.js`
+- `backend/settingsStore.js`
 
 </details>
 
-**Busiest symbols:** `getDb()`, `logError()`, `index.js`, `db.js`, `logTelemetry()`, `importLegacyJson.js`, `advanceRepository.js`, `newId()`, `invoiceRepository.js`, `creditNoteRepository.js` … +251
+**Busiest symbols:** `getDb()`, `logError()`, `index.js`, `db.js`, `logTelemetry()`, `importLegacyJson.js`, `advanceRepository.js`, `newId()`, `invoiceRepository.js`, `creditNoteRepository.js` … +262
 
-**Reaches:** Pricing & Billing Math (54) · Test Suites (5, inferred only) · Crypto, Auth & Black Box (3) · Customer Portal (1)
+**Reaches:** Pricing & Billing Math (54) · Crypto, Auth & Black Box (11) · Test Suites (6, inferred only) · Customer Portal (1) · Backups & Reporting (1, inferred only)
 
 #### Domain Services
 
@@ -254,9 +255,9 @@ Gold rate sync, rate overrides, and the DOM-free billing helpers shared by the b
 
 </details>
 
-**Busiest symbols:** `billingMath.js`, `round2()`, `fromPaise()`, `toPaise()`, `round3()`, `computeReturnRefund()`, `num()`, `normalizeTaxMode()`, `computeInvoiceTotals()`, `priceEngine.js` … +23
+**Busiest symbols:** `billingMath.js`, `round2()`, `fromPaise()`, `toPaise()`, `round3()`, `computeReturnRefund()`, `num()`, `normalizeTaxMode()`, `priceEngine.js`, `computeInvoiceTotals()` … +23
 
-**Reaches:** Persistence & Settings (11)
+**Reaches:** Persistence & Settings (15)
 
 > **Declared link** Test Suites → Pricing & Billing Math (asserts every formula). test_billing_math.js imports frontend/js/lib/ directly — the reason frontend/package.json exists at all.
 
@@ -301,7 +302,7 @@ The screens themselves — billing desk, dashboard, advances ledger, settings. T
 
 **Busiest symbols:** `SettingsManager`, `BillingDesk`, `ReturnDesk`, `BillingDesk.js`, `.renderSection()`, `.setupEventListeners()`, `ReturnDesk.js`, `ReprintDesk.js`, `.fileReturn()`, `.openReturnForm()` … +133
 
-**Reaches:** Cashier UI Shell (60) · Pricing & Billing Math (55) · Persistence & Settings (1, inferred only) · Test Suites (1, inferred only)
+**Reaches:** Cashier UI Shell (60) · Pricing & Billing Math (55) · Test Suites (1, inferred only)
 
 ### The Customer Surface
 
@@ -376,7 +377,7 @@ Packaging a release, signing it, and the tiered auto/manual apply-and-rollback p
 
 #### Crypto, Auth & Black Box
 
-`security` · 15 files · 93 symbols
+`security` · 17 files · 118 symbols
 
 Admin identity and every credential the terminal verifies. adminAuth.js owns the lot: scrypt-hashed PINs (one tenant-wide authSalt, because a PIN-only login has no username to look a per-user salt up by), the migration that converts a tenant's plaintext PINs on boot and deletes them, the named-operator roster and its four roles, session issue/expiry/revocation, the approver and privileged-MFA gates, and RFC 6238 TOTP with single-use hashed recovery codes — all on node:crypto, no dependency. Also the RSA-4096/AES-256-GCM diagnostics envelope, black-box incident logging, the fail-closed production guard, and every key material path. Nothing private here is ever committed, and no credential may live in DEFAULT_SETTINGS — see CLAUDE.md §0. The two request-boundary modules live here too: rateLimit.js holds the one bounded keyed counter every attempt tracker and abuse limiter shares, validation.js holds the runtime shape checker that both request bodies and validateSettingsPatch() run through, and cookies.js is the hand-rolled Cookie parse/serialise behind the HttpOnly session transport and its double-submit CSRF pair.
 
@@ -394,15 +395,17 @@ Admin identity and every credential the terminal verifies. adminAuth.js owns the
 - `backend/keys/release_public.pem`
 - `backend/productionGuard.js`
 - `backend/rateLimit.js`
+- `backend/rotateSecretKey.js`
+- `backend/secretVault.js`
 - `backend/validation.js`
 - `developer_blackbox_keys/analyze_blackbox.js`
 - `developer_blackbox_keys/package.json`
 
 </details>
 
-**Busiest symbols:** `adminAuth.js`, `blackBoxLogger.js`, `cryptoHelper.js`, `productionGuard.js`, `validation.js`, `migrateStoredPins()`, `rateLimit.js`, `parseCookies()`, `analyze_blackbox.js`, `assertProductionReady()` … +83
+**Busiest symbols:** `adminAuth.js`, `rotateSecretKey.js`, `secretVault.js`, `productionGuard.js`, `blackBoxLogger.js`, `cryptoHelper.js`, `resolveKey()`, `validation.js`, `migrateStoredPins()`, `openSettings()` … +108
 
-**Reaches:** Persistence & Settings (40)
+**Reaches:** Persistence & Settings (46)
 
 #### Tenant Extension Surface
 
@@ -425,7 +428,7 @@ The hook dispatcher and drop-in surface that lets a tenant customise behaviour w
 
 #### Backups & Reporting
 
-`maintenance` · 2 files · 12 symbols
+`maintenance` · 4 files · 28 symbols
 
 The scheduled jobs: daily dated backups with 7-day pruning, and the emailed operational reports.
 
@@ -433,12 +436,14 @@ The scheduled jobs: daily dated backups with 7-day pruning, and the emailed oper
 
 - `backend/backupEngine.js`
 - `backend/emailReporter.js`
+- `backend/verifyAuditChain.js`
+- `backend/verifyBackup.js`
 
 </details>
 
-**Busiest symbols:** `backupEngine.js`, `emailReporter.js`, `createBackup()`, `sendSummaryReport()`, `sendMailIfConfigured()`, `initBackupScheduler()`, `initReportScheduler()`, `pruneOldBackups()`, `computeSummary()`, `getTransporter()` … +2
+**Busiest symbols:** `emailReporter.js`, `backupEngine.js`, `verifyBackup.js`, `createBackup()`, `sendSummaryReport()`, `sendMailIfConfigured()`, `initBackupScheduler()`, `initReportScheduler()`, `pruneOldBackups()`, `computeSummary()` … +18
 
-**Reaches:** Persistence & Settings (24)
+**Reaches:** Persistence & Settings (26)
 
 ### Build & Operations
 
@@ -473,7 +478,7 @@ The owner's internal Dev → Sandbox → Live pipeline: PM2 ecosystem files, ngi
 
 #### Test Suites
 
-`tests` · 16 files · 143 symbols
+`tests` · 16 files · 144 symbols
 
 Assert-driven, no framework: billing math, helper integration, HTTP routes/auth, the money paths and Razorpay webhook, and the fail-closed production startup guard — all five run by npm test against temp data dirs, never backend/data/. Playwright end-to-end journeys live under tests/e2e/ and run separately (npm run test:e2e) because they need a browser binary. Anything touching money must be covered here before it is called done.
 
@@ -498,15 +503,15 @@ Assert-driven, no framework: billing math, helper integration, HTTP routes/auth,
 
 </details>
 
-**Busiest symbols:** `test_billing_math.js`, `test_http.js`, `test_repositories.js`, `test_routes.js`, `test_suite.js`, `fixtures.js`, `row()`, `test_concurrency.js`, `return-desk.spec.js`, `test_schema.js` … +133
+**Busiest symbols:** `test_billing_math.js`, `test_http.js`, `test_routes.js`, `test_repositories.js`, `test_suite.js`, `fixtures.js`, `row()`, `test_concurrency.js`, `return-desk.spec.js`, `test_schema.js` … +134
 
-**Reaches:** Pricing & Billing Math (22) · Crypto, Auth & Black Box (6) · Persistence & Settings (4) · Customer Portal (2)
+**Reaches:** Pricing & Billing Math (22) · Crypto, Auth & Black Box (14) · Persistence & Settings (4) · Customer Portal (2)
 
 > **Declared link** Test Suites → Pricing & Billing Math (asserts every formula). test_billing_math.js imports frontend/js/lib/ directly — the reason frontend/package.json exists at all.
 
 #### Local Dev Loop & Manifests
 
-`dev-loop` · 5 files · 48 symbols
+`dev-loop` · 5 files · 54 symbols
 
 The scripts that start and restart the thing locally, plus the dependency manifests that define the budget in CLAUDE.md §0. Restart_Server.bat frees port 5000 before relaunching, which is the safe way to restart after a code change.
 
@@ -520,7 +525,7 @@ The scripts that start and restart the thing locally, plus the dependency manife
 
 </details>
 
-**Busiest symbols:** `scripts`, `package.json`, `dependencies`, `package.json`, `@playwright/test`, `cors`, `devDependencies`, `dotenv`, `engines`, `express` … +38
+**Busiest symbols:** `scripts`, `package.json`, `dependencies`, `package.json`, `@playwright/test`, `cors`, `devDependencies`, `dotenv`, `engines`, `express` … +44
 
 #### Mobile Wrapper
 
@@ -542,7 +547,7 @@ A Capacitor shell around the same web frontend. Carries no business logic of its
 
 #### Live Trackers
 
-`trackers` · 7 files · 170 symbols
+`trackers` · 7 files · 184 symbols
 
 What is to be done and what was built. Checklists mark [x] only when verified; the ledger is index-style and points back at them.
 
@@ -558,18 +563,20 @@ What is to be done and what was built. Checklists mark [x] only when verified; t
 
 </details>
 
-**Busiest symbols:** `Gold POS — Manual Testing Notepad`, `5. Roadmap to SaaS-Ready Deployment (Phase 9 series — Planned)`, `4. Build checklist`, `Gold POS — Production Readiness and Future-Proof Roadmap`, `Gold Savings Scheme Module — Plan & Build Checklist (Phase 20 series)`, `5. Delivery roadmap`, `Track A — Dev/Sandbox/Live pipeline infrastructure`, `12. Customer Portal (`http://localhost:5000/customer.html`)`, `GO_LIVE_CHECKLIST.md`, `Project Plan: SaaS Gold Business POS` … +160
+**Busiest symbols:** `Gold POS — Manual Testing Notepad`, `Gold POS — Production Readiness and Future-Proof Roadmap`, `5. Roadmap to SaaS-Ready Deployment (Phase 9 series — Planned)`, `4. Build checklist`, `Gold Savings Scheme Module — Plan & Build Checklist (Phase 20 series)`, `5. Delivery roadmap`, `Track A — Dev/Sandbox/Live pipeline infrastructure`, `12. Customer Portal (`http://localhost:5000/customer.html`)`, `GO_LIVE_CHECKLIST.md`, `Project Plan: SaaS Gold Business POS` … +174
 
 #### Reference Docs
 
-`reference` · 8 files · 94 symbols
+`reference` · 10 files · 121 symbols
 
 Architecture, requirements, and the handover snapshot. ai_handover.md §0 is the first and usually only thing a fresh session should read.
 
 <details><summary>Files</summary>
 
 - `deploy/README.md`
+- `docs/AUDIT_AND_PII.md`
 - `docs/BRD.md`
+- `docs/RUNBOOKS.md`
 - `docs/adr/ADR-001-transactional-datastore.md`
 - `docs/ai_handover.md`
 - `docs/archive/README.md`
@@ -579,11 +586,11 @@ Architecture, requirements, and the handover snapshot. ai_handover.md §0 is the
 
 </details>
 
-**Busiest symbols:** `Former §6 — Completion Checklist, closed Phases 1–18`, `Deployment Runbook — Per-Tenant Cloud Instance`, `AI Handover: Gold Business POS (SaaS Platform)`, `4. Operational Commands & Maintenance`, `3. Scope of Requirements`, `8. Multi-environment pipeline (Dev / Sandbox / Live) — Phase 19`, `Business Requirements Document (BRD)`, `ADR-001 — Transactional datastore for the financial ledger`, `Native Android Customer App (v1 — Capacitor Wrapper)`, `2. Core Security & Licensing Flows` … +84
+**Busiest symbols:** `Runbooks — Gold POS`, `Former §6 — Completion Checklist, closed Phases 1–18`, `Deployment Runbook — Per-Tenant Cloud Instance`, `AI Handover: Gold Business POS (SaaS Platform)`, `4. Operational Commands & Maintenance`, `Audit trail and personal data — classification and handling`, `3. Scope of Requirements`, `8. Multi-environment pipeline (Dev / Sandbox / Live) — Phase 19`, `Business Requirements Document (BRD)`, `ADR-001 — Transactional datastore for the financial ledger` … +111
 
 #### Agent Operating Rules
 
-`agent-config` · 10 files · 105 symbols
+`agent-config` · 10 files · 116 symbols
 
 The rules a session loads and the mechanism that enforces them: standing rules, the reasoning behind them, the guard hooks, the vendored skill, and this brain.
 
@@ -602,7 +609,7 @@ The rules a session loads and the mechanism that enforces them: standing rules, 
 
 </details>
 
-**Busiest symbols:** `build-brain.mjs`, `Project operating rules — Gold POS`, `Project foundation — how this project is run`, `Gold POS — Project Brain`, `The POS Terminal`, `5. Regions in detail`, `Karpathy Guidelines`, `The Project Brain`, `The SaaS Platform`, `Adding to it` … +95
+**Busiest symbols:** `build-brain.mjs`, `Project operating rules — Gold POS`, `Project foundation — how this project is run`, `Gold POS — Project Brain`, `The POS Terminal`, `5. Regions in detail`, `Karpathy Guidelines`, `The Project Brain`, `The SaaS Platform`, `Adding to it` … +106
 
 **Reaches:** Reference Docs (1)
 

@@ -12,7 +12,9 @@ import nodemailer from 'nodemailer';
 import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
-import { readJSON, DATA_DIR, logError, logTelemetry } from './db.js';
+import { logError, logTelemetry } from './db.js';
+import { readSettings } from './settingsStore.js';
+import * as repo from './repositories/index.js';
 
 function getTransporter(settings) {
     const smtp = settings.smtp;
@@ -28,43 +30,27 @@ function getTransporter(settings) {
 /**
  * Aggregates sales + advances activity since periodStart, plus the most
  * recent backup snapshot folder, into a plain summary object.
+ *
+ * Reads through the repository seam, not `backend/data/*.json` — the JSON
+ * ledger stopped being written at the Phase-29 SQL cutover (CLAUDE.md §0), so
+ * a `readJSON` here would report the same frozen snapshot on every run.
  */
-function computeSummary(periodStart) {
-    const files = fs.readdirSync(DATA_DIR);
+export function computeSummary(periodStart) {
+    const { tenantId } = repo.dataStoreContext();
+    const filter = { tenantId, fromAt: periodStart, toAt: null };
 
-    let sales = [];
-    files.forEach(f => {
-        if (f.startsWith('sales_') && f.endsWith('.json')) {
-            sales = sales.concat(readJSON(path.join(DATA_DIR, f), []));
-        }
-    });
-    const periodSales = sales.filter(s => (s.timestamp || 0) >= periodStart);
-    const grossRevenue = periodSales.reduce((sum, s) => sum + (parseFloat(s.totalAmount) || 0), 0);
-
+    const invoiceTotals = repo.invoices.periodTotals(filter);
+    const returnTotals = repo.creditNotes.periodTotals(filter);
     // Refunds are subtracted, not listed beside the takings. An owner reading
     // "Revenue" on a summary mail reads it as money kept, so a period with
     // returns in it has to report the net or the figure is simply wrong.
-    let returns = [];
-    files.forEach(f => {
-        if (f.startsWith('returns_') && f.endsWith('.json')) {
-            returns = returns.concat(readJSON(path.join(DATA_DIR, f), []));
-        }
-    });
-    const periodReturns = returns.filter(r => (r.timestamp || 0) >= periodStart);
-    const refundTotal = periodReturns.reduce((sum, r) => sum + (parseFloat(r.refundAmount) || 0), 0);
-    const revenue = grossRevenue - refundTotal;
+    const revenue = invoiceTotals.totalAmount - returnTotals.refundAmount;
 
-    const advances = readJSON(path.join(DATA_DIR, 'advances.json'), []);
-    const periodDeposits = advances.filter(a => a.type === 'deposit' && (a.timestamp || 0) >= periodStart);
-    const depositTotal = periodDeposits.reduce((sum, a) => sum + (parseFloat(a.amount) || 0), 0);
-
-    const balances = new Map();
-    advances.forEach(a => {
-        const delta = a.type === 'deposit' ? parseFloat(a.amount) : -parseFloat(a.amount);
-        balances.set(a.customerPhone, (balances.get(a.customerPhone) || 0) + (delta || 0));
-    });
-    let outstandingTotal = 0;
-    balances.forEach(b => { if (b > 0) outstandingTotal += b; });
+    const depositTotals = repo.advances.periodTotals({ ...filter, entryType: 'deposit' });
+    // The store's whole outstanding liability, deliberately NOT narrowed by
+    // the period — same rule /api/advances follows: what the store owes its
+    // customers is not a property of the period being reported.
+    const { outstandingTotal } = repo.advances.liabilitySummary(tenantId);
 
     const backupsDir = path.join(process.cwd(), 'backups');
     let latestBackup = 'None';
@@ -74,13 +60,13 @@ function computeSummary(periodStart) {
     }
 
     return {
-        invoiceCount: periodSales.length,
+        invoiceCount: invoiceTotals.count,
         revenue,
-        grossRevenue,
-        returnCount: periodReturns.length,
-        refundTotal,
-        depositCount: periodDeposits.length,
-        depositTotal,
+        grossRevenue: invoiceTotals.totalAmount,
+        returnCount: returnTotals.count,
+        refundTotal: returnTotals.refundAmount,
+        depositCount: depositTotals.count,
+        depositTotal: depositTotals.depositAmount,
         outstandingTotal,
         latestBackup
     };
@@ -117,7 +103,7 @@ function buildSummaryHtml(summary, periodLabel, companyName) {
  * rather than a 500.
  */
 export async function sendMailIfConfigured({ to, subject, html }) {
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const settings = readSettings();
     const transporter = getTransporter(settings);
     if (!transporter) {
         return { success: false, reason: 'SMTP is not configured on this store. Please contact the store directly.' };
@@ -148,8 +134,7 @@ export async function sendMailIfConfigured({ to, subject, html }) {
  * can report success/skip/failure without a try/catch at every call site.
  */
 export async function sendSummaryReport(periodLabel = 'Daily') {
-    const settingsFile = path.join(DATA_DIR, 'settings.json');
-    const settings = readJSON(settingsFile, {});
+    const settings = readSettings();
 
     const transporter = getTransporter(settings);
     if (!transporter) {

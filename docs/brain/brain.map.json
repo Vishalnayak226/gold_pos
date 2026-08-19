@@ -48,7 +48,8 @@
         "backend/defaultSettings.js",
         "backend/seed.js",
         "backend/repositories/**",
-        "backend/importLegacyJson.js"
+        "backend/importLegacyJson.js",
+        "backend/settingsStore.js"
       ]
     },
     {
@@ -138,7 +139,9 @@
         "backend/developer_doomsday_keys/**",
         "developer_blackbox_keys/**",
         "**.env.example",
-        "backend/productionGuard.js"
+        "backend/productionGuard.js",
+        "backend/secretVault.js",
+        "backend/rotateSecretKey.js"
       ]
     },
     {
@@ -159,7 +162,9 @@
       "role": "The scheduled jobs: daily dated backups with 7-day pruning, and the emailed operational reports.",
       "match": [
         "backend/backupEngine.js",
-        "backend/emailReporter.js"
+        "backend/emailReporter.js",
+        "backend/verifyBackup.js",
+        "backend/verifyAuditChain.js"
       ]
     },
     {
@@ -229,7 +234,9 @@
         "docs/credentials.md",
         "**README.md",
         "docs/archive/**",
-        "docs/adr/**"
+        "docs/adr/**",
+        "docs/RUNBOOKS.md",
+        "docs/AUDIT_AND_PII.md"
       ]
     },
     {

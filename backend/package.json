@@ -20,7 +20,13 @@
     "test:http": "node test_http.js",
     "test:guard": "node test_production_guard.js",
     "test:e2e": "playwright test",
-    "seed": "node seed.js"
+    "seed": "node seed.js",
+    "key:generate": "node rotateSecretKey.js --generate",
+    "key:rotate": "node rotateSecretKey.js --generate-new",
+    "key:rotate:dry-run": "node rotateSecretKey.js --generate-new --dry-run",
+    "audit:verify": "node verifyAuditChain.js",
+    "backup:verify": "node verifyBackup.js",
+    "restore:drill": "node verifyBackup.js --keep"
   },
   "dependencies": {
     "cors": "^2.8.5",

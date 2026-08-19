@@ -235,7 +235,244 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
 - [ ] Named staff, RBAC/least privilege, strong password or passkey, MFA for owner/manager/control plane, device/session view, revocation and forced expiry.
 - [x] HttpOnly/Secure/SameSite browser sessions; CSRF protection where cookies apply. Verified 2026-08-17: `npm test` (443/443) + `npm run test:e2e` (43/43). See `docs/LEDGER.md` Phase 34.
 - [ ] OTP or audited store-assisted customer phone verification.
-- [ ] Secrets outside settings responses/exports; redaction, encryption and key-rotation runbook.
+- [x] Secrets outside settings responses/exports; redaction, encryption and key-rotation runbook. *(Redaction 2026-08-13 (Phase 27); **encryption at rest and the rotation runbook closed 2026-08-17, Phase 34**. Until now the Razorpay secret, the SMTP password, the tenant `authSalt`, every operator PIN hash and every TOTP secret sat in `settings.json` as plaintext — so redaction protected the wire while the file itself handed over live keys to anyone who took the directory. `backend/secretVault.js` seals them with AES-256-GCM under `GOLD_POS_SECRET_KEY`, **binding each ciphertext to its own dotted path as AAD** so a value cannot be cut from `smtp.pass` and pasted over `razorpayWebhookSecret`. The key is refused from inside the data directory under `NODE_ENV=production` — a key stored beside the data it protects defends against nothing — and that refusal is reported as a numbered startup blocker rather than thrown, via the new `assertVaultKeyReady()` which runs before anything reads settings. Migration is lazy: `open()` passes non-vault values through, so an existing tenant upgrades with no flag day. Rotation is `backend/rotateSecretKey.js` (`npm run key:rotate`), which verifies the rotated document reads back under the new key **before** replacing the original and leaves a timestamped pre-rotation copy. All thirty settings read/write call sites across eight files moved onto one choke point, `backend/settingsStore.js`, because a single reader that skipped decryption would hand Razorpay a string starting `encv1# Gold POS — Production Readiness and Future-Proof Roadmap
+
+**Audit date:** 2026-08-07  
+**Reviewed:** working tree on `main` at `e4999bc`, including current uncommitted work  
+**Status:** authoritative production plan; `PROJECT_PLAN.md` remains the feature-history ledger
+
+## 1. Executive decision
+
+This project can become a strong vertical retail platform for gold businesses. It already has a useful nucleus: gold-rate handling, billing arithmetic, advances, a customer portal, licensing, signed updates, deployment scripts, and a planned savings-scheme module.
+
+It is **not ready for real-money production today**. The main gap is not visual polish or another feature. It is the financial and operational foundation: JSON storage cannot make an invoice number, sale, payment, and advance redemption one atomic transaction; several browser flows no longer match the protected API; payment amounts are not bound to stored orders; the shared admin PIN is not an accountable staff identity; and the tests do not exercise HTTP routes, persistence failures, browsers, payments, restores, or deployment.
+
+The right order is:
+
+1. Freeze feature expansion and close P0 correctness/security defects.
+2. Move financial state to a transactional database and immutable audit model.
+3. Prove security, recovery, compliance, and deployment in sandbox.
+4. Run one controlled pilot store.
+5. Add full jewellery-retail operations and the savings-scheme module.
+6. Scale into tenant-aware SaaS and a richer mobile product.
+
+> **Go-live rule:** do not enable live Razorpay, customer-entered manual UPI credits, automatic fleet updates, or a paying tenant until Phase 0 and Phase 1 exit gates are green.
+
+## 2. Current architecture and capability
+
+| Area | Current implementation | Assessment |
+|---|---|---|
+| Admin POS | Vanilla HTML/CSS/ES modules served by Express | Lightweight; browser/API regressions need automated coverage |
+| Customer portal | One `customer.html`; backend now has password/session APIs | UI still uses legacy phone/public advance calls, so security is not wired end to end |
+| API | One Express process and a 1,300+ line `server.js` | Keep a modular monolith, but split route, domain, and persistence concerns |
+| Data | JSON files with synchronous atomic rename | Protects one file from torn writes; cannot provide multi-file transactions, constraints, indexes, or multi-process scale |
+| Financial model | One aggregate gold line and a flat advances ledger | Useful prototype, not yet a complete jewellery POS/accountable ledger |
+| Payments | Razorpay order call + browser callback verification; manual UPI reference | Missing persisted orders, amount binding, captured-state webhook, reconciliation, refunds, disputes |
+| Identity | Shared four-digit admin PIN; customer password/session file | No named staff, roles, MFA, staff attribution, or verified mobile ownership |
+| Licensing/updates | Separate licensing service, signed manifests, self-update | Promising base; high blast radius and not proven on a live VPS |
+| Backups | Daily same-disk copy, seven-day retention | Convenience copy, not disaster recovery |
+| CI/CD | Actions tests/audits and three-stage SSH deployment | Pipeline unexercised; gates omit key tests and rollback proof |
+| Mobile | Capacitor remote-WebView scaffold | Not built/store-tested; one binary/domain per tenant will not scale |
+| Extensions | In-process dynamic JavaScript imports | Trusted customization only; not a security sandbox |
+
+### Strengths to preserve
+
+- Shared browser/server billing arithmetic and 57 passing math checks.
+- Server recalculation of discount and GST fields.
+- Atomic per-file replacement and explicit handling of important write failures.
+- Signed license payloads and release manifests, with non-production/production separation.
+- Customer passwords hashed with scrypt and persisted sessions stored as hashes.
+- Login throttling and a deliberately small dependency surface.
+- Clear deployment intent and a domain-specific savings-scheme design.
+
+## 3. Evidence-based risk register
+
+### P0 — stop ship
+
+| Finding | Current evidence | Required outcome |
+|---|---|---|
+| ~~Customer portal/API mismatch~~ **RESOLVED 2026-08-08** | `customer.html` calls `/api/advances/lookup`, `/api/advances`, and payment routes without a customer bearer token | Rebuilt around `/api/customer/*`; register/login/reset/session/ledger/payment all browser-tested. See `CHANGELOG.md` [Unreleased] |
+| ~~Admin advance/API mismatch~~ **RESOLVED 2026-08-08** | Billing advance lookup and Advances manual deposit use raw `fetch()` against admin-gated routes | Both moved to `adminFetch()`; the E2E pass asserts zero 4xx/5xx across the admin terminal |
+| ~~Payment amount not bound to order~~ **RESOLVED 2026-08-08** | Order is not persisted; verify trusts the caller's `amount`. The gateway signature does not bind that submitted amount | Orders persisted to `backend/data/payment_orders.json` with customer, amount and status at creation; `/api/payment/verify` credits the *stored* amount and no longer reads `req.body.amount` at all. Order bound to its owner (403 on another customer's order) and unknown ids rejected (400). Live-verified: a ₹100 order with `amount: 500000` posted back credited ₹100. **Still open from the original wording:** amount is not stored in paise, and there is no `fetch payment` call to Razorpay confirming captured/paid state — the stored order amount is trusted as what the gateway collected |
+| ~~Manual UPI creates unverified credit~~ **RESOLVED 2026-08-08** | An authenticated customer can enter arbitrary reference text and immediately receive a ledger deposit | Deposit rows carry `status`; portal UPI submissions are written `pending` and hold no balance until approved at `POST /api/advances/:id/approve` from the Advances tab. Reference IDs unique across the ledger (case/whitespace-insensitive), enforced in `recordAdvanceDeposit`. Balance arithmetic centralised in `billingMath.js` so the server, Dashboard and Advances tab cannot disagree. A missing `status` reads as approved, so existing tenant ledgers keep their balances |
+| Demo mode can create mock credit | Shipped defaults activate an exact-key mock bypass | Production boot fails closed on demo keys/provider/default credentials |
+| Advance over-redemption possible | Sale calculation treats the requested redemption as its own “balance” and does not verify the ledger | Lock/read authoritative balance in the transaction and reject over-redemption |
+| Sale is not atomic | Sequence, sale, and redemption are separate JSON writes; partial success is explicitly possible | One ACID transaction for number, invoice/lines, tender, advance, stock, and audit |
+| Server accepts authoritative commercial inputs | Rate, metal value, making value, timestamp and spread fields originate in the request; metal value is not recomputed from weight × approved rate | Server owns time, IDs, rate snapshot and all financial calculations; overrides require permission + reason |
+| Dependency gate fails | Current backend audit reports direct high `nodemailer` and moderate `node-cron`/transitive `uuid` findings | Upgrade/test; `npm ci`; SBOM; high/critical blocks release |
+| Tests overstate assurance | Passing suites test arithmetic/crypto helpers, not the server, database, browser, payments, recovery, or deployment | Add API, DB, E2E, security, migration, recovery and deployment tests |
+
+### P1 — before a paying pilot
+
+- Named staff accounts and roles (`owner`, `manager`, `cashier`, `auditor`), strong credentials, session revocation, and privileged MFA.
+  *(**Partially done 2026-08-12.** Named operators with per-person PINs and the four roles are
+  configured in Settings → Staff & Roles; the PIN both authenticates and identifies, so the session
+  carries a real actor. `requireAdminSession` attaches `req.actor` at the single choke point every
+  admin route already passes through, and **every financial write now names a person** — the sale,
+  the return/refund, the advance redemption, the counter deposit, and the deposit approval. Approving
+  or rejecting a customer's unverified UPI claim is gated to `owner`/`manager` by `requireApprover`.
+  A store that configures no operators still works: the legacy master PIN resolves to the `owner`
+  identity, matching the bootstrap row in `userRepository.js`. Verified by 6 checks in `test_http.js`.
+  **Completed 2026-08-13** — the three items this line previously deferred are all now done:
+  - **Strong credentials.** Every PIN — the master one and each operator's — is stored as a scrypt
+    hash in the same `scrypt$N$r$p$<hex>` format `customerAuth.js` already used for customer
+    passwords. Nothing plaintext is written, and an existing tenant is migrated on its next boot with
+    nobody retyping anything (`migratePinsToHashes`). The tenant salt and every hash are masked out
+    of `GET /api/settings` and of the support export. **Honest limit:** a 4-digit PIN is a
+    10,000-value keyspace, so a stolen `settings.json` still yields to an offline grind whatever the
+    KDF — the UI allows 8 digits and the Settings copy asks for 6+, and the login lockout is what
+    defends the live endpoint. Replacing the PIN with a username/password login remains Phase 2.
+  - **Session revocation.** Deactivating, removing, re-PINning or *demoting* an operator ends their
+    live sessions inside the same request (`revokeSessionsForRosterChange`), so the credential and
+    the access can no longer diverge for up to 12 hours. An owner or manager can also see every live
+    sign-in and end one deliberately (`GET /api/admin/sessions`, `POST /api/admin/sessions/revoke`);
+    tokens never appear in that listing, only opaque handles, and nobody can revoke their own session
+    from it.
+  - **Privileged MFA.** Per-operator TOTP (RFC 6238, HMAC-SHA1 via `node:crypto` — no dependency
+    added; the enrolment QR uses the `qrcode` package already in the budget). Enrolment requires a
+    live code, so a secret nobody actually holds cannot be stored. Ten single-use recovery codes are
+    issued once and kept only as hashes, because a lost phone must not lock a shop out of its own
+    till. With `requireMfaForApprovers` on, releasing money needs a session that passed the factor —
+    which the shared master PIN cannot do, by design, since there is no person to enrol.
+    Interoperability with real authenticator apps is pinned against the published RFC 6238 vectors
+    in `test_suite.js` Test 9, not merely against our own generator.)*
+- Never return Razorpay/SMTP/admin secrets to a browser. Use environment/secret management and expose only redacted configuration state.
+  *(**The browser half is done.** `redactSettingsForBrowser` builds the operator roster field by
+  field rather than spreading and nulling — so a credential added later cannot leak by default — and
+  as of 2026-08-13 the tenant PIN salt, every scrypt hash and every TOTP secret are excluded from
+  `GET /api/settings` and from the support export. Asserted by `the tenant salt and every PIN hash are
+  kept out of the browser` in `test_http.js`, which greps the raw response for `scrypt$`. **Still
+  open:** the secrets are still stored on the tenant's disk in `settings.json` rather than in
+  environment/secret management, and Razorpay/SMTP credentials are still held there in plaintext —
+  only the PINs and TOTP secrets are hashed, because those are credentials this system *verifies*
+  rather than ones it must *present* to a third party.)*
+- Remove open CORS unless a documented native origin requires it. Add strict CSP/security headers, safe cache rules, request limits, and runtime schemas.
+- Verify customer phone ownership via OTP or audited store-assisted proof.
+- Scrub PII from telemetry. `req.originalUrl` currently includes query strings such as phone lookup; error/detail logs also contain financial identifiers despite “zero PII” claims.
+- Encrypted off-site backups, point-in-time recovery where available, retention policy, restore automation, and recurring restore evidence.
+- Explicit `Asia/Kolkata` business timezone for invoice date, schedules, reports, backups, and financial-year sequences.
+- Append-only audit events for access, rate/settings changes, invoices, reversals, payments, exports, updates, and actor identity.
+- Exercise dev/sandbox/live and a deliberately failed rollback on real infrastructure.
+- Disable tenant extensions by default. Imported JavaScript has full filesystem/network/process power; a Promise timeout cannot stop a synchronous loop or malicious code.
+- Correct claims such as “fully completed,” “system integrity verified,” “zero PII,” and “cannot corrupt” unless a test or isolation boundary proves them.
+
+### P2 — needed for a competitive jewellery POS
+
+- Product/SKU catalogue: barcode/QR, category, purity, HSN, hallmark/HUID, gross/net/stone weights, stone value, wastage, making policy, images, price tags.
+- Lot inventory and immutable stock movements for purchase, sale, return, repair, transfer, adjustment, and physical count.
+- Multi-line invoices, split tender, cash/card/UPI/bank/advance allocation, quotes, hold/resume, reprint, delivery.
+  *(**Multi-line invoices, split tender and the allocation vocabulary landed 2026-08-12; reprint
+  shipped in Phase 22.** Quotes, hold/resume and delivery are not started.)*
+- Returns/exchange, void/cancel, credit/debit notes, refund lifecycle, approval thresholds, and reversal entries instead of history edits.
+  *(**Returns, credit notes and refunds shipped in Phase 23**, per-line on 2026-08-12; a return has
+  always been a new document pointing at the original, never a history edit. **Refund approval
+  thresholds landed 2026-08-13** — `refundApprovalThreshold` refuses a refund at or above a configured
+  amount unless an owner or manager authorises it, checked against the amount the SERVER priced rather
+  than one the client proposed, and additionally requiring the second factor when
+  `requireMfaForApprovers` is on. 0 disables it, which is the previous behaviour and the default.
+  Exchange and void/cancel are not started.)*
+- Customer master with consent/preferences, deduplication, correction/export and legally appropriate deletion/anonymisation.
+- Vendor/purchase, branch transfer, old-gold workflows only after legal/business definition.
+- Cash drawer and shift close/count/variance, staff permissions/commissions, daily closing.
+- GST-ready invoice and export configuration reviewed by a practising CA.
+- Paginated search/reports, accounting export, settlement/advance reconciliation, profitability and inventory ageing.
+  *(**Pagination landed 2026-08-12.** `GET /api/sales`, `/api/returns` and `/api/advances` each
+  returned the whole ledger as a bare array, and the Dashboard, Return Desk and Advances tab each
+  downloaded a store's entire trading history on tab open. All three now answer with a clamped
+  `{results, total, truncated, limit}` page, and — the part that made paging safe rather than merely
+  smaller — **the aggregates the screens were summing are computed server-side over the whole
+  matched set**, so a revenue tile cannot silently understate a month once it outgrows one page. A
+  per-customer advance rollup (`GET /api/advances/customers`) replaced the client-side collapse of
+  the full ledger, since a customer's spendable balance is their whole history and cannot be
+  computed from a page. Accounting export, settlement reconciliation, profitability and ageing are
+  not started.)*
+
+## 4. Target architecture
+
+Build a **jewellery commerce operating system**, not only a bill calculator: one authoritative ledger for sales, payments, advances, stock and schemes; auditable reversals instead of edits; multi-branch-ready identity and data; and safe operation during ordinary provider/network failures.
+
+### Recommended decision: modular monolith + PostgreSQL
+
+- Keep one backend application, divided into identity, organisation, catalogue, pricing, sales, payments, advances, inventory, schemes, reporting, audit, licensing and notifications modules. Do not introduce microservices yet.
+- PostgreSQL provides migrations, constraints, row locks, unique/idempotency keys, transactions and a transactional outbox. Put `tenant_id` and `branch_id` on tenant-owned rows.
+- Support both shared managed SaaS and dedicated tenant deployments from the same schema.
+- Store money as integer paise where possible; constrained decimals for grams/rates/percentages. JavaScript floating point must not be the ledger source of truth.
+- Use object storage for PDFs, product images, exports and encrypted artifacts—not the app filesystem.
+- Use a durable job table/worker for emails, webhooks, reminders, reports, imports and rate sync. Jobs must be idempotent and observable.
+- Define/version the API with OpenAPI and runtime validation; generate clients/types where practical.
+- Introduce TypeScript, linting, formatting, reproducible builds and component/E2E tests incrementally. A framework is optional; “buildless” is not itself future-proof.
+- Keep the control plane separate, but move it to a real database and protect fleet-wide signing/publishing with named MFA identities, audit and dual approval.
+
+**Fast-pilot alternative:** SQLite WAL can deliver ACID for one process/tenant sooner. Treat it as a time-boxed bridge behind repository interfaces and migration tooling; PostgreSQL remains the multi-branch/shared-SaaS destination.
+
+### Minimum data domains
+
+| Domain | Records |
+|---|---|
+| Identity | users, roles, permissions, sessions, MFA, customer identities, consents |
+| Organisation | tenants, stores, branches, counters, business-day/financial-year sequences |
+| Catalogue | products, variants, lots, barcodes, stock movements/counts/transfers |
+| Pricing | sources, approved immutable snapshots, price/making/tax policies |
+| Sales | quotes/carts, invoices/lines, taxes, discounts, tenders, returns, credit notes |
+| Payments | orders, attempts, provider events, captures, refunds, settlements, reconciliation |
+| Customer funds | accounts, append-only entries, reservations, redemptions, reversals |
+| Schemes | definitions, enrollments, installments, benefits, maturity, redemption |
+| Operations | audit events, outbox/jobs, notifications, exports, devices, deployments |
+
+Every financial row needs a stable UUID, human document number, tenant/branch, server time, business date, creator/approver, explicit state, source/idempotency key, and reversal relationship.
+
+## 5. Delivery roadmap
+
+The estimates are planning ranges for a small experienced team. Recalibrate after Phase 0 tests expose the real defect count. AI assistance can shorten coding, but not merchant UAT, settlement, security/legal review, restore drills, or app-store review.
+
+### Phase 0 — Stabilise current code (1–2 weeks)
+
+**Goal:** remove immediate money/security hazards before infrastructure or features.
+
+- [x] Freeze feature work, including Scheme work, except P0 remediation. *(Held since 2026-08-08 — Scheme phases 20.2–20.5 remain unstarted and blocked on the product decisions in `SCHEME_MODULE_PLAN.md` §7; every commit since has been P0 remediation.)*
+- [x] Create reproducible seeded dev/test data with no real customer information. *(2026-08-09 — `backend/seed.js`, `npm run seed`. Deterministic: a seeded mulberry32 PRNG and a fixed 2026-01-05 epoch, verified by diffing two independent runs byte-for-byte. Synthetic: invented names, the 90000000xx phone block, `@example.test` addresses. Isolated: refuses to write into `backend/data/` without `--force`, verified. Seeds settings, an active licence, fixed rates, 4 portal logins, an advances ledger covering approved/pending/rejected/redeemed, and invoices across two calendar years so annual partitioning is exercised. The Playwright fixture imports it directly.)*
+- [x] Wire `customer.html` to register/login/logout/profile/password/reset and authenticated customer advance APIs. *(2026-08-08 — `backend/customerAuth.js` + `/api/customer/*`; verified by a 53-check API pass, a 20-check post-restart pass, and a 29-check Playwright pass at a 390px viewport, all green with `backend/data/` restored byte-identical afterwards.)*
+- [x] Replace every raw call to an admin-gated route with the authenticated API client. *(2026-08-08 — `BillingDesk` advance lookup and `AdvancesManager` counter deposit moved to `adminFetch()`; the Playwright pass asserts zero 4xx/5xx across the whole admin terminal, which is what would surface a remaining raw call.)*
+- [x] Persist payment orders and bind phone, amount in paise, currency, state and expiry. *(2026-08-09 — `payment_orders.json` rows now carry `customerPhone`, `amountPaise` (integer, authoritative), `amount` (rupee mirror for legacy readers only), `currency`, `status` (`created`/`paid`/`failed`/`mismatched`) and `expiresAt`. `toPaise`/`fromPaise` live in `frontend/js/lib/billingMath.js` with the rest of the money math and are covered by 6 conversion assertions in `test_billing_math.js`; the HTTP suite asserts the persisted paise/currency/status on a real order.)*
+- [x] Add signed Razorpay raw-body webhook ingestion, event-ID idempotency, out-of-order handling and reconciliation. Credit only captured/paid transactions. *(2026-08-09 — `POST /api/payment/webhook`, mounted with `express.raw()` **before** the global JSON parser so the HMAC covers the exact bytes sent, and exempted from the licence gate so a lapsed licence cannot discard money already taken. Fails closed with no `razorpayWebhookSecret`. Credits only `payment.captured`; marks `payment.failed`; acknowledges anything else 2xx so Razorpay stops retrying. Separately, `/api/payment/verify` now calls `GET /v1/payments/:id` and refuses to credit unless the gateway itself reports `captured` for the order's exact paise — an `authorized` payment returns 202 and waits for the webhook. 12 HTTP checks cover unsigned, wrong-secret, post-signing tampering, credit, replay under the same and a different event id, amount mismatch, unknown order, `payment.failed`, unrelated events, and the no-secret refusal.)*
+- [x] Convert manual UPI to a pending claim requiring manager reconciliation. *(Done 2026-08-12; the pending-claim half shipped earlier — a customer's manual UPI submission is written `status: 'pending'`, counts for nothing in any balance, and requires an explicit approval at `POST /api/advances/:id/approve`; duplicate references are rejected at the single ledger write path. Covered by Playwright and by the advance-status assertions in `test_billing_math.js`. **Design decision taken 2026-08-11 (owner): a manager is a DISTINCT NAMED ROLE, not a PIN-gated action** — a second PIN beside the admin PIN would be the parallel auth path CLAUDE.md §1 forbids, and an unnamed PIN answers "who approved this claim?" with "someone who knew the PIN", which is accountability theatre on the one flow that most needs the real thing. The minimal identity slice was pulled forward into Phase 1 rather than waiting for Phase 2's full RBAC, so `approved_by_user_id` exists on the advance row from the first schema instead of arriving as a second migration later. **Landed 2026-08-11:** `users.role IN ('owner','manager','cashier','auditor')`, an `approvers` view restricted to active owners/managers, and `CHECK (status <> 'posted' OR approved_by_user_id IS NOT NULL)` so an entry cannot be posted anonymously — verified by 4 checks in `test_schema.js`. **Closed 2026-08-12:** the named-role half now exists on the live JSON path too. Operators with per-person PINs and the four roles are configured in Settings → Staff & Roles, `POST /api/advances/:id/approve` and `/reject` are gated by `requireApprover` (owner/manager only), and the approved row records `reviewedBy: {id, name, role}` — so "a manager reconciled this claim" is a stored fact rather than a description of a control that did not exist. A cashier attempting it gets a 403 naming their role, and the row is left untouched. Verified by `a cashier cannot approve a deposit, a manager can` in `test_http.js`. The `reviewedBy` field maps to `advance_entries.approved_by_user_id` at cutover; the CHECK constraint already forbids an anonymous post on the SQL side.)*
+- [x] Validate real advance balance and make the server authoritative for rate, metal value, time and sale totals. *(2026-08-09 — `/api/sales` resolves the rate from `getActiveGoldRates()` by purity and computes `metalValue` as weight × that rate; it no longer reads `goldPricePerGram` or `metalValue` from the body except to detect drift and answer `rateCorrected` so the desk reprints. The `...req.body` spread is replaced by an explicit field allowlist, so the timestamp is the server's clock and unknown client fields are dropped. A sale is refused 503 rather than priced against a zero/unusable rate. Advance balance was already validated server-side; the E2E suite re-asserts it with a tampered client. Verified by 5 HTTP checks and 4 Playwright checks.)*
+- [x] Reject duplicate payment/reference IDs and use cryptographically strong IDs. *(2026-08-09 — completes the half done on 2026-08-08. Ledger ids now come from `newId()` in `backend/db.js` (`crypto.randomBytes`, 48 bits, one generator for every write path) instead of `Math.random().toString(36)`; the transaction-journal suffix moved to CSPRNG too. Manual-UPI `referenceId` uniqueness is enforced at `recordAdvanceDeposit()` — the single choke point every deposit source runs through — and re-verified end-to-end by a Playwright check that submits the same UTR twice and asserts one ledger row. Gateway payment ids remain deduplicated, now across both the checkout and webhook paths.)*
+- [x] Fail production startup on demo keys, mock rates, default credentials, missing public URLs, or environment confusion. *(2026-08-09 — `backend/productionGuard.js`, called from `bootstrapServer()` before any scheduler starts or the port binds. Under `NODE_ENV=production` it exits 1 on: demo or missing Razorpay credentials, a missing webhook secret, a missing or non-https public URL, a missing or default `1234` admin PIN, the `mock` gold price provider, and a `NODE_ENV`/`ENV_NAME` disagreement. Reports every blocker at once rather than one per failed boot. Inert outside production on purpose. 16 checks in `backend/test_production_guard.js`, the last two of which boot a real server process with demo settings and assert it exits non-zero — a guard that is only unit-tested is a guard nobody has confirmed is wired in.)*
+- [ ] Upgrade vulnerable dependencies; use `npm ci`; run all suites in every gate. *(Dependencies: done — `npm audit` reports 0 vulnerabilities on both `backend/` and `licensing_server/`. Gates: done 2026-08-09 — all four workflows now use `npm ci` and run `npm test` (all five suites) instead of `npm install` and `test_suite.js` alone. **Still open:** none of this has executed on GitHub Actions yet. Root cause found 2026-08-11 and it was not the missing deploy target: `daily-checks.yml` — the one gate needing no infrastructure — triggered only on push-to-`main` and a nightly cron, while all nine unpushed commits sit on feature branches and `origin/main`, `origin/develop` and `origin/staging` are all still at `e4999bc`. The cron therefore only ever re-tested an old `main`. Fixed by adding a `pull_request` trigger on every branch plus pushes to the three pipeline branches; the workflow is renamed "CI — tests & security audit" to match its actual role. Still marked unchecked until a run is observed green on GitHub rather than assumed — that needs the branch pushed and a PR opened.)*
+- [x] Add route tests for auth/money endpoints and Playwright cashier/customer journeys. *(2026-08-09 — route tests: `test_routes.js` (27) + `test_http.js` (24, of which 17 are new money-path checks) + `test_production_guard.js` (16). Playwright: `backend/tests/e2e/` — 4 cashier journeys (clean sale, advance redemption, stale-rate reprint warning, over-redemption refusal) and 6 customer journeys (balance excluding pending, wrong password, mock checkout deposit, manual UPI pending, duplicate reference, logout), the customer set run at both Desktop Chrome and a 390px Pixel 7 viewport. 16/16 green. Each spec boots its own server on an ephemeral port against its own seeded temp database, so `backend/data/` is never touched. Not wired into `npm test` — it needs a browser binary, and `npm test` must keep running on a bare checkout; run `npm run test:e2e` deliberately.)*
+- [x] Correct documentation claims and distinguish “implemented” from “independently verified.” *(2026-08-09 — this Phase 0 block rewritten with what verified each item; `docs/ai_handover.md` §0 rewritten (it still described a `phase-20.1-customer-auth` merge conflict that had already been resolved three commits earlier, and understated how far `origin` is behind); `docs/LEDGER.md` and `docs/TESTING_CHECKLIST.md` updated. Two claims corrected rather than ticked: manual-UPI manager reconciliation above, and the CI gate, which is configured but has never run.)*
+
+**Exit:** all P0s have regression tests; no high/critical audit finding; customer/cashier golden paths pass in desktop and mobile viewports; production cannot run in demo mode.
+
+### Phase 1 — Transactional financial foundation (3–5 weeks)
+
+**Goal:** make duplicate money, partial writes and silent corruption structurally difficult.
+
+- [x] Approve ADR-001: PostgreSQL recommended, or time-boxed SQLite bridge. *(2026-08-11 — **accepted as the SQLite bridge**, not Postgres. `docs/adr/ADR-001-transactional-datastore.md` records the full argument; the short version is that deployment is already one process per tenant with its own data directory, so SQLite maps 1:1 onto it, adds zero dependencies (`node:sqlite` is stdlib, so the §0 budget is untouched), keeps `backupEngine.js` working, and needs no server on a VPS that does not exist yet. Postgres remains the destination and the ADR names four explicit revisit triggers. The repository seam that makes the swap cheap is item 4 below regardless of engine.)*
+- [x] Lay the schema foundation: connection management, migration runner, initial schema. *(2026-08-11 — `backend/repositories/connection.js` (WAL, `foreign_keys=ON`, `busy_timeout`, `synchronous=FULL`, SAVEPOINT-nesting `inTransaction()`), `migrate.js` (idempotent, transactional per migration, refuses an edited already-applied migration by name), and `001_initial_schema.sql` — 19 tables, every quantity a scaled INTEGER (`_paise`/`_mg`/`_paise_per_g`/`_bp`), not one REAL. Verified by 43 checks in the new `backend/test_schema.js`, each asserting an invariant by attempting the violation and requiring a throw.)*
+- [x] Migrate organisations, staff, customers, rates, invoices/lines, tenders, payment orders/events, advances/entries and audit. *(2026-08-13 — ten repositories under `backend/repositories/`, one per domain, each projecting back to the exact legacy wire shape via `toLegacySale()` / `toLegacyReturn()` / `toLegacyAdvance()` so no screen or test above the seam changes. Verified by 71 checks in the new `backend/test_repositories.js`, including a field-set assertion per shape so a dropped field fails as loudly as a renamed one.)*
+- [x] Build a JSON importer with dry run, validation report, counts/checksums, backup, rollback and repeatability. *(2026-08-13 — `backend/importLegacyJson.js`, `npm run import:legacy[:dry-run]`. The dry run really writes every row inside the transaction and then rolls it back, so the report is a rehearsal rather than a guess; reconciliation is scoped to `import:*` idempotency keys so it stays true on a database that already holds data; the pre-write backup is checkpointed, not copied. Rehearsed end-to-end in `test_repositories.js` §12: dry run, commit, re-run no-op, fatal-row refusal, corrupt-file refusal, and rollback.)*
+- [x] Split route handlers, domain services and repositories. *(2026-08-15 — **complete; the route half landed.** `server.js` now imports the four services and the repository index and reaches persistence only through them: every ledger `readJSON`/`writeJSON` call site is gone, and the ~500 lines of JSON read-modify-write they sat in went with them (`readSalesRecords`, `readReturnRecords`, `summarizeInvoiceReturns`, `withReturnState`, `pagedLedger`, `computeAdvanceLedger`, `buildAdvanceDepositRow`, `recordAdvanceDeposit`, `reviewPendingDeposit`, `recordPaymentOrder`, `settlePaymentOrder`, `claimPaymentEvent`, `validateSaleLine`, `validateTenders`). `settings.json` and `license.json` stay JSON on purpose — they are configuration, not ledger (§0). Verified by the full suite: 426 checks.)*
+- [x] Execute invoice allocation + sale/lines + tender + advance redemption + stock + audit in one transaction. *(2026-08-13 — `saleService.createSale()` does all of it inside one `inTransaction()`. Proven by crash injection rather than by inspection: `test_concurrency.js` kills the process at four separate write steps and asserts the ledger is byte-for-byte unchanged each time, and that the invoice number the dead sale had taken is reissued rather than burned. Stock is not in scope — there is no stock module yet (Phase 5).)*
+- [x] Add unique constraints for invoice scope, provider order/payment/event IDs, references and idempotency keys. *(Schema 2026-08-11, **enforced in production 2026-08-15.** `test_schema.js` covers each index by attempting the violation: unique invoice number, unique financial-year sequence slot, partial unique indexes on idempotency keys, provider order id, provider payment id, webhook event id, tender reference and advance reference. With the routes cut over these are now the live guarantee rather than a dormant one — `test_http.js` proves the webhook path end-to-end, including that the same gateway payment under a NEW event id still credits exactly once, which event-id deduplication alone would have let through.)*
+- [x] Make advances append-only with `pending`, `posted`, `reversed`; reserve funds safely during checkout. *(Schema half done 2026-08-11: financial fields frozen by trigger, DELETE refused, transitions restricted to `pending→posted|rejected` and `posted→reversed`, amounts signed so a balance is a plain SUM, and `CHECK (status <> 'posted' OR approved_by_user_id IS NOT NULL)` binds every posting to a named approver. **Reservation closed 2026-08-13:** the balance check runs INSIDE the sale's own `BEGIN IMMEDIATE` transaction, so two tills redeeming one balance serialise on the write lock — the second reads what the first already spent and is refused. `test_concurrency.js` §2 races ten processes at one ₹1,000 balance and asserts exactly one wins and the balance never goes negative. **Route cut-over landed 2026-08-15**, so the reservation is now what a real till actually gets.)*
+- [x] Add explicit invoice transitions and reversal/credit-note behavior; issued facts are never edited. *(2026-08-13 — `issued → partially_returned → returned` driven by `returnService`, with the invoice's own figures never rewritten: what came back is a running counter on the line plus a numbered credit note pointing at the invoice. `test_repositories.js` §7 asserts the filed invoice is untouched after a return, and that three partial returns sum back to the invoice's filed gross to the paise.)*
+- [x] Paginate/filter every list and remove full-history browser loads. *(2026-08-13 for the services; **routes landed 2026-08-15.** `GET /api/sales`, `/api/sales/lookup`, `/api/returns`, `/api/advances` and `/api/advances/customers` now filter, page and aggregate in SQL. The route this replaced read every `sales_YYYY.json` off disk, concatenated the store's entire history into one array and serialised the lot — the single largest thing the server did, and it got slower every day the store traded.
+
+  Two aggregates are deliberately NOT the page: each ledger's period `totals` are summed by the database over the whole matched set (`invoices.periodTotals`, `creditNotes.periodTotals`, `advances.periodTotals`, sharing one filter builder with `search()` so a page and the figures printed above it can never describe different rows), and the advance liability `summary` ignores the date filter entirely because a lifetime balance is not a property of the period being browsed. `GET /api/advances/customers` rolls up per customer in SQL (`advances.customerRollup`) — the tab used to download the whole ledger and collapse it in the browser, which meant it could not be paged without reporting wrong balances.)*
+- [x] Add concurrency, crash-injection, duplicate-request and migration tests. *(2026-08-13 — `backend/test_concurrency.js`, 16 checks driving real OS processes because `node:sqlite` is synchronous and an in-process test would prove only that a for-loop works. 40 concurrent sales produce 40 distinct numbers with no gaps; 10 tills racing one ₹1,000 balance produce exactly one redemption; 100 submissions of one idempotency key produce one invoice; 20 racing deposits on one UTR credit once; `process.exit()` at four write steps leaves nothing behind. Found and fixed a real open-time lock bug — see the LEDGER entry.)*
+
+**Exit:** process kills at every write step cannot create an unbalanced sale; 100 duplicate/concurrent submissions create one result; imported totals reconcile exactly; rollback is rehearsed.
+
+### Phase 2 — Identity, security, privacy and compliance (2–4 weeks)
+
+**Goal:** accountable access and a defensible production baseline.
+
+- [ ] Named staff, RBAC/least privilege, strong password or passkey, MFA for owner/manager/control plane, device/session view, revocation and forced expiry.
+- [x] HttpOnly/Secure/SameSite browser sessions; CSRF protection where cookies apply. Verified 2026-08-17: `npm test` (443/443) + `npm run test:e2e` (43/43). See `docs/LEDGER.md` Phase 34.
+- [ ] OTP or audited store-assisted customer phone verification.
+. Runbooks 1 and 2 in `docs/RUNBOOKS.md` cover rotation and the lost-key path. Verified by Test 11 in `test_suite.js` (round trip, empty-stays-empty, lazy passthrough, wrong key, field binding, wildcard paths, rotation), a new at-rest check in `test_routes.js` asserting no canary secret survives in the file bytes, and a new `test_production_guard.js` check that a keyless production boot refuses with a blocker and not a stack trace.)*
 - [ ] Same-origin policy, CSP/security headers, runtime schemas, upload/request limits, rate/abuse limits and safe errors.
   *(Audited 2026-08-16, because this line read as untouched and mostly is not. **Already in place:**
   the same-origin/CORS allowlist and a full helmet CSP directive set (`server.js`, asserted by
@@ -271,7 +508,36 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   malformed or oversized body, and the stack in `error.log` where it belongs. An unmatched `/api/*`
   path answers a JSON 404 rather than the HTML one a `fetch()` cannot parse.)*
 - [ ] Structured audit/security logs with PII classification, retention, clock sync, access control, alerts and tamper-evident export.
-  *(Partly done 2026-08-16 — **the trail is now readable**, which was the gap this strand kept
+  *(**Advanced substantially on 2026-08-17, Phase 34 — three of the six sub-items closed.**
+  **Tamper-evident export: done.** The trail was append-only by trigger, which stops the
+  *application* rewriting history and proves nothing to a third party, because dropping a trigger
+  is one statement for whoever holds the .db file. Migration 005 adds `chain_seq`/`prev_hash`/
+  `row_hash`, so each event hashes its own content plus the previous row's hash;
+  `GET /api/audit/verify` and `GET /api/audit/export` (both approver-only) expose verification and
+  a manifest, `backend/verifyAuditChain.js` does it from the command line, and taking an export is
+  itself an audited event. **The limit is documented rather than papered over:** a holder of the
+  file can edit a row and recompute the whole tail, and the chain will then verify against itself —
+  what defeats that is the head hash already being in somebody else's hands, which is why the
+  export publishes it and why the runbook says to send exports off-site. Rows written before 005
+  are NOT backfilled and are reported as "predating the chain", because hashing them today would
+  prove nothing about what they said then while looking authoritative. Six checks in
+  `test_repositories.js` §13 assert this by tampering the way an attacker would — dropping the
+  triggers and editing with direct SQL — including the honest one that a fully re-hashed chain does
+  verify but cannot reproduce a published head.
+  **PII classification: done** — `docs/AUDIT_AND_PII.md`, a five-class scheme (P0 public → P4
+  accountability) with every field placed, plus a checklist for adding one.
+  **Access control: done** — approver-only on the trail, verification and export alike.
+  **Clock sync:** documented as host provisioning (NTP), not implemented here.
+  **Alerts:** still open, and shared with the Phase 3 alerting line below.
+  **Retention: `[needs design decision: audit and personal-data retention periods]`, deliberately
+  unstarted.** Not an engineering question — how long a jeweller must keep records naming who
+  approved a refund is Indian tax/company law and the tenant's insurer. It also collides with the
+  chain: `trg_audit_events_no_delete` refuses a DELETE outright, so a retention job needs an
+  archive-then-prune path recording a checkpoint hash for the pruned range, or verification reports
+  a gap forever after. That is worth building once the period is known and not before. Reasoning in
+  `docs/AUDIT_AND_PII.md` §5.)*
+
+  *(Earlier, 2026-08-16 — **the trail became readable**, which was the gap this strand kept
   hitting. `audit_events` has been append-only by trigger since Phase 24 and written on every money
   path since Phase 29, but nothing exposed it, so it was evidence in principle and not in practice.
   `GET /api/audit` and an Audit Trail screen close that: approver-only, on the same
@@ -303,7 +569,7 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   `paymentService`, so the trail is written on every money path. What was still missing on
   2026-08-15 was the **read** path: nothing exposed the trail, so an append-only table nobody can
   read is evidence in principle and not in practice.)*
-- [ ] Independent security review; SAST, secret scanning, dependency review, SBOM and host/image scans where applicable.
+- [ ] Independent security review; SAST, secret scanning, dependency review, SBOM and host/image scans where applicable. *(**Scanning jobs added to `daily-checks.yml` on 2026-08-17, Phase 34, and NOT ticked because not one of them has ever executed** — like the rest of that workflow they need a pull request, and none has been opened. Three jobs: `secret-scan` (TruffleHog OSS over full history, `--only-verified` so an example key in a fixture cannot redden the gate permanently), `static-analysis` (Semgrep OSS, `p/javascript` + `p/nodejs` + `p/secrets`, ERROR severity only), and `sbom` (CycloneDX via `npm sbom`, which is built into npm 10+ and so adds no tooling and no dependency, published as a 90-day artifact per module). **Every tool was chosen to be free on a private repository:** CodeQL, `actions/dependency-review-action` and SARIF upload all need GitHub Advanced Security on a private repo, so none is used; dependency vulnerability review is already covered by the existing `npm audit` job. Expect the first real run to surface findings needing triage — that is the gate working. **Independent review remains external and unstarted.**)*
 - [ ] Privacy notice, purposes/consents, rights workflow, retention/deletion, vendor register, incident response and export policy reviewed by Indian counsel.
 - [ ] GST invoice, credit-note, records and applicable e-invoice/e-way configuration reviewed by a practising CA for the pilot merchant.
 
@@ -332,11 +598,11 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   context object, so a reported error id is one grep. **Still open on this line:** metrics and
   critical-flow traces.)*
 - [ ] Alert on payment/webhook failures, ledger imbalance, backup failure, stale rates, error/latency, capacity, TLS expiry and control-plane failure.
-- [ ] Encrypted off-site backup and point-in-time recovery; automated isolated restore; monthly restore drill.
+- [ ] Encrypted off-site backup and point-in-time recovery; automated isolated restore; monthly restore drill. *(**Two of the four closed 2026-08-17, Phase 34.** **Automated isolated restore: done** — `backend/verifyBackup.js` (`npm run backup:verify`) restores the latest snapshot into a temp directory and runs nine checks against it: files present, ledger present, SQLite `integrity_check`, migrations fully applied, business records actually there, **every invoice still summing to its own lines**, the audit chain verifying, and — the one that matters most now — whether the restored `settings.json` can be DECRYPTED on this host. It never touches the live install and exits non-zero on any failure, so it is usable as a scheduled job. Both paths were exercised against a real seeded snapshot: a clean one verifies 9/9, and one sealed with an unavailable key fails on exactly that check with an intact ledger. **Monthly restore drill: done** — procedure, failure-meaning table and a drill log in `docs/RUNBOOKS.md` §4. **Still open: off-site** (needs a destination — no VPS or object store is provisioned) **and point-in-time recovery** (SQLite PITR means WAL archiving or much more frequent snapshots; picking the interval is an RPO decision nobody has taken). **Partly closed: "encrypted"** — the credentials inside a snapshot are now ciphertext, so a stolen backup yields no keys, but the archive as a whole is not encrypted. **A trap worth knowing:** snapshots deliberately carry sealed secrets and never the key, so a restore onto a host without `GOLD_POS_SECRET_KEY` produces an intact ledger nobody can log into. Called out in the drill runbook.)*
 - [ ] Migration compatibility gates, canary/pilot release, rollback and post-deploy synthetic checks.
 - [ ] Protected branches, reviewed PRs, signed provenance, artifact retention, scoped secrets and dual approval for fleet auto-updates.
 - [ ] Exercise existing GitHub deploy paths on real sandbox, including forced failure/rollback.
-- [ ] Runbooks: day open/close, payment mismatch, invoice duplicate, rate outage, connectivity loss, device loss, termination, restore and incident.
+- [ ] Runbooks: day open/close, payment mismatch, invoice duplicate, rate outage, connectivity loss, device loss, termination, restore and incident. *(**Eight of the nine written 2026-08-17, Phase 34 — `docs/RUNBOOKS.md`.** Day open/close, payment mismatch, duplicate/missing invoice number, rate outage, connectivity loss, lost or stolen device, tenant offboarding, and restore-from-backup, plus three the roadmap line did not name but the vault made necessary: rotating the secret-vault key, recovering from a lost key, and proving the audit trail has not been altered. **Missing: incident response**, left open deliberately — it overlaps the Phase 2 line requiring an incident process reviewed by Indian counsel, and writing a procedure that a lawyer then rewrites is wasted work. Not ticked until that ninth one exists.)*
 
 **Initial measured targets:** 99.9% monthly availability; p95 ordinary API latency below 300 ms at pilot load; zero duplicate invoice/payment/ledger posting; RPO ≤15 minutes; RTO ≤60 minutes. Do not promise them contractually until measured.
 

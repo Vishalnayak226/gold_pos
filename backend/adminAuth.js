@@ -20,8 +20,8 @@
  */
 
 import crypto from 'crypto';
-import path from 'path';
-import { readJSON, writeJSON, DATA_DIR, logTelemetry, logError } from './db.js';
+import { logTelemetry, logError } from './db.js';
+import { readSettings, writeSettings } from './settingsStore.js';
 import { OPERATOR_ROLES, APPROVER_ROLES } from './defaultSettings.js';
 import { createBoundedMap } from './rateLimit.js';
 import { parseCookies } from './cookies.js';
@@ -189,11 +189,13 @@ export function migratePinsToHashes(settings) {
  * plaintext left to convert, so it does nothing and writes nothing.
  */
 export function migrateStoredPins() {
-    const settingsFile = path.join(DATA_DIR, 'settings.json');
-    const settings = readJSON(settingsFile, null);
-    if (!settings) return false;
+    /* Read through the store so a sealed document is opened before the hash
+       migration inspects it. A null here means no settings file at all, which is
+       a fresh install with nothing to migrate. */
+    const settings = readSettings();
+    if (!settings || Object.keys(settings).length === 0) return false;
     if (!migratePinsToHashes(settings)) return false;
-    if (!writeJSON(settingsFile, settings)) {
+    if (!writeSettings(settings)) {
         logError('Could not persist hashed PINs — settings.json was not written.');
         return false;
     }
@@ -357,8 +359,7 @@ function clearFailedLogins(key) {
  * treated `false`. See resolveActor for the actor/mfa split.
  */
 export function verifyAdminPin(pin) {
-    const settingsFile = path.join(DATA_DIR, 'settings.json');
-    const settings = readJSON(settingsFile, {});
+    const settings = readSettings();
 
     /* Upgrade any plaintext PIN here too, not only at boot.
        bootstrapServer() calls migrateStoredPins(), but a process that imports the
@@ -367,7 +368,7 @@ export function verifyAdminPin(pin) {
        salt and no hash, and refuse a correct PIN. Idempotent: once there is
        nothing plaintext left, this writes nothing. */
     if (migratePinsToHashes(settings)) {
-        writeJSON(settingsFile, settings);
+        writeSettings(settings);
     }
     return resolveActor(pin, settings);
 }
@@ -779,7 +780,7 @@ export function requireApprover(req, res, next) {
        is at the terminal, and re-asking for a code on every approval would train
        a manager to leave the app authenticated on someone else's screen, which is
        the behaviour this is trying to prevent. */
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const settings = readSettings();
     if (settings.requireMfaForApprovers === true && req.adminSession && !req.adminSession.mfaUsed) {
         logTelemetry('APPROVAL_DENIED_NO_MFA', 0, `${req.actor.name} (${req.actor.role}) at ${req.path}`);
         return res.status(403).json({

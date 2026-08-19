@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import path from 'path';
 import fs from 'fs';
 import { readJSON, writeJSON, logError, logTelemetry, DATA_DIR } from './db.js';
+import { readSettings } from './settingsStore.js';
 
 const RATES_FILE = path.join(DATA_DIR, 'rates.json');
 
@@ -26,7 +27,7 @@ readJSON(RATES_FILE, defaultRates);
  */
 export async function syncGoldPrice() {
     const startTime = Date.now();
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const settings = readSettings();
     const provider = settings.goldApiProvider === 'mock' ? 'mock' : 'public';
 
     logTelemetry('PRICE_SYNC_START', 0, `Provider: ${provider}`);
@@ -100,7 +101,7 @@ export async function syncGoldPrice() {
  * Checks and prioritizes manual overrides for 24K, 22K, and 18K individually.
  */
 export function getActiveGoldRates() {
-    const settings = readJSON(path.join(DATA_DIR, 'settings.json'), {});
+    const settings = readSettings();
     const rates = readJSON(RATES_FILE, defaultRates);
     const override = settings.overrideGoldPrice || {};
 
