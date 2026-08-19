@@ -6,14 +6,19 @@
 # not duplicated inline in CI YAML. See deploy/README.md "Multi-environment
 # pipeline" for the full path/branch/app-name table.
 #
-# Usage: remote-deploy.sh <checkout-path> <branch> <module-dir> <ecosystem-file>
+# Usage: remote-deploy.sh <checkout-path> <branch> <module-dir> <ecosystem-file> [--rollback]
 #   checkout-path   e.g. /opt/gold-pos/dev-backend
 #   branch          e.g. develop
 #   module-dir      backend | licensing_server (which package.json to install)
 #   ecosystem-file  path relative to checkout-path, e.g. deploy/ecosystem.dev.config.cjs
+#   --rollback      optional. Resets to the commit recorded by the LAST normal
+#                   deploy instead of fetching the branch — see "Rollback"
+#                   below. Used by the cd-*.yml post-deploy synthetic check
+#                   when it fails, so a bad build doesn't sit live.
 #
 # Example:
 #   deploy/remote-deploy.sh /opt/gold-pos/dev-backend develop backend deploy/ecosystem.dev.config.cjs
+#   deploy/remote-deploy.sh /opt/gold-pos/dev-backend develop backend deploy/ecosystem.dev.config.cjs --rollback
 
 set -euo pipefail
 
@@ -21,17 +26,39 @@ CHECKOUT_PATH="${1:?checkout-path required}"
 BRANCH="${2:?branch required}"
 MODULE_DIR="${3:?module-dir required (backend|licensing_server)}"
 ECOSYSTEM_FILE="${4:?ecosystem-file required, relative to checkout-path}"
+ROLLBACK_FLAG="${5:-}"
 
 if [[ "$MODULE_DIR" != "backend" && "$MODULE_DIR" != "licensing_server" ]]; then
     echo "error: module-dir must be 'backend' or 'licensing_server', got '$MODULE_DIR'" >&2
     exit 1
 fi
 
-echo "==> Deploying $CHECKOUT_PATH ($MODULE_DIR) to branch $BRANCH"
 cd "$CHECKOUT_PATH"
 
-git fetch origin "$BRANCH"
-git reset --hard "origin/$BRANCH"
+# Rollback: reset to whatever the last NORMAL deploy recorded as "known good
+# before it ran", rather than fetching the branch again — the branch tip is
+# the build that just failed its post-deploy check, so re-fetching it would
+# just redeploy the same bad commit.
+ROLLBACK_MARKER=".rollback-sha"
+if [[ "$ROLLBACK_FLAG" == "--rollback" ]]; then
+    if [[ ! -f "$ROLLBACK_MARKER" ]]; then
+        echo "error: no $CHECKOUT_PATH/$ROLLBACK_MARKER exists — nothing to roll back to (is this the very first deploy?)" >&2
+        exit 1
+    fi
+    PREV_SHA="$(cat "$ROLLBACK_MARKER")"
+    echo "==> Rolling back $CHECKOUT_PATH ($MODULE_DIR) to $PREV_SHA"
+    git reset --hard "$PREV_SHA"
+else
+    echo "==> Deploying $CHECKOUT_PATH ($MODULE_DIR) to branch $BRANCH"
+    # Record the commit we are ABOUT to move off of, before moving. If this
+    # deploy's own post-deploy check fails, that is the commit a rollback
+    # returns to. Skipped on a from-scratch checkout (no prior HEAD to save).
+    if git rev-parse HEAD >/dev/null 2>&1; then
+        git rev-parse HEAD > "$ROLLBACK_MARKER"
+    fi
+    git fetch origin "$BRANCH"
+    git reset --hard "origin/$BRANCH"
+fi
 
 # Re-apply this environment's real signing keys. backend/keys/*_public.pem are
 # tracked files, so the reset above just reverted them to the ones generated on

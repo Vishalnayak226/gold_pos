@@ -272,9 +272,14 @@ wrong answers.
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
   `test_production_guard.js` (fail-closed startup) → `test_alerting.js` (raiseAlert's per-code
   cooldown, stale-rate/ledger-drift/backup-freshness/error-rate-latency checks — Phase 3
-  alerting, `backend/alerting.js`). **474 checks as of 2026-08-19**
-  (145 + 43 + 90 + 16 + 11 + 29 + 107 + 17 + 16, in run order — `test_suite.js` is counted by the
+  alerting, `backend/alerting.js`). **478 checks as of 2026-08-19**
+  (145 + 46 + 90 + 16 + 12 + 29 + 107 + 17 + 16, in run order — `test_suite.js` is counted by the
   numbered tests it prints, not by an older tally that no longer matched anything).
+  - **`migrate.js --check-safety` (`npm run migrate:check-safety`) statically scans every
+    migration on disk for a destructive DDL pattern** (`DROP TABLE`/`DROP COLUMN`/rename) and
+    fails loudly — CLAUDE.md §1 requires additive, backward-compatible schema changes, and until
+    Phase 36 nothing enforced that beyond code review. No database involved, so it runs in CI with
+    nothing installed but Node. Wired as its own job in `daily-checks.yml`.
   - **A GREEN `npm test` IS NOT PROOF A FORM STILL WORKS.** The HTTP suites post minimal bodies;
     a browser posts every field its form owns, including the empty ones. A body schema that
     refused `totpCode: ""` broke every admin sign-in on 2026-08-17 with all eight suites green —

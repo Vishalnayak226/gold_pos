@@ -12,28 +12,29 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `fbe9b19` — "Phase 34 (units 2-5): secrets at rest, tamper-evident audit
-  trail, backup verification, CI security scanning; plus the emailReporter live-ledger fix and a
-  CLAUDE.md self-duplication repair" (2026-08-19), on branch
-  **`phase-21-payment-verification-and-production-guard`**.
-- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — PHASE 35 (OPERATIONAL ALERTING) IS
-  UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**474 checks**, exit 0)
-  on the working tree; `npm run test:e2e` not re-run (no request body/form/auth path changed —
-  see the substitute live-boot verification in `docs/LEDGER.md` Phase 35). New files:
-  `backend/alerting.js`, `backend/test_alerting.js`. Modified: `backend/server.js`,
-  `backend/backupEngine.js`, `backend/priceEngine.js`, `backend/licenseChecker.js`,
-  `backend/updateEngine.js`, `backend/services/paymentService.js`,
-  `backend/repositories/invoiceRepository.js`, `backend/defaultSettings.js`,
-  `backend/package.json`, `frontend/js/components/SettingsManager.js`, `CLAUDE.md`,
-  `docs/LEDGER.md`, `docs/PRODUCTION_READINESS_ROADMAP.md`.
-  - Closes `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 3's alerting line (payment/webhook, ledger
-    imbalance, backup failure, stale rates, error/latency, capacity, TLS expiry, control-plane
-    failure) — one choke point, `alerting.js#raiseAlert()`, that every signal funnels through.
-    Full detail: `docs/LEDGER.md` Phase 35.
-  - **Rest of Phase 3 still open:** migration compatibility gates / canary release / rollback /
-    post-deploy synthetic checks; protected branches / signed provenance / dual approval for fleet
-    updates; exercising the deploy pipeline against a real sandbox (no VPS/domain provisioned yet
-    — §7); the incident-response runbook (deliberately held for legal review, per Phase 34).
+- **Latest commit:** `1a66e73` — "Phase 35: operational alerting" (2026-08-19), on branch
+  **`phase-21-payment-verification-and-production-guard`**, pushed to `origin` the same day
+  (compare link for the PR that will actually exercise CI:
+  `github.com/Vishalnayak226/gold_pos/compare/develop...phase-21-payment-verification-and-production-guard`).
+- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — PHASE 36 (MIGRATION GATE, CANARY ROLLOUT,
+  DEPLOY ROLLBACK) IS UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green
+  (**478 checks**, exit 0) on the working tree; `npm run test:e2e` not re-run (no request
+  body/form/auth path changed). New: nothing (no new files this phase). Modified:
+  `backend/repositories/migrate.js`, `backend/test_schema.js`, `backend/test_suite.js`,
+  `backend/updateEngine.js`, `backend/package.json`, `licensing_server/server.js`,
+  `deploy/remote-deploy.sh`, `deploy/README.md`, `.github/workflows/daily-checks.yml`,
+  `.github/workflows/cd-dev.yml`, `.github/workflows/cd-sandbox.yml`,
+  `.github/workflows/cd-live.yml`, `CLAUDE.md`, `docs/LEDGER.md`,
+  `docs/PRODUCTION_READINESS_ROADMAP.md`.
+  - Closes `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 3's line on migration gates / canary release
+    / rollback / post-deploy synthetic checks. Full detail: `docs/LEDGER.md` Phase 36.
+  - **The SSH/GitHub-Environment deploy wiring is unverified** — YAML-parsed and the git-reset
+    rollback logic proven against a throwaway local repo, but never run on an Actions runner (no
+    PR opened yet) or against a real VPS (none provisioned, §7). Same caveat as Phase 34's CI
+    security-scanning jobs.
+  - **Rest of Phase 3 still open:** protected branches / signed provenance / dual approval for
+    fleet updates; exercising the deploy pipeline against a real sandbox (no VPS/domain
+    provisioned yet — §7); the incident-response runbook (held for legal review, per Phase 34).
 - **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
   UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
   on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:

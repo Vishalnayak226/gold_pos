@@ -144,3 +144,28 @@ jobs:
           name: sbom-${{ matrix.module }}
           path: ${{ matrix.module }}/sbom-${{ matrix.module }}.cdx.json
           retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Migration compatibility gate (added 2026-08-19, Phase 36).
+  #
+  # CLAUDE.md §1 requires every schema change to be additive and backward-
+  # compatible with a live tenant's backend/data/ directory. The migration
+  # runner (backend/repositories/migrate.js) protects a database from an
+  # EDITED migration, but has no opinion on a migration that is destructive
+  # the first time it runs — a DROP COLUMN applies cleanly and permanently
+  # deletes that column's data on every tenant that upgrades into it, with
+  # nothing above it complaining before this gate existed. Static and file-
+  # only, so it needs no database and no test data directory.
+  # ---------------------------------------------------------------------------
+
+  migration-safety:
+    name: Migration compatibility gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Scan migrations/ for destructive DDL
+        working-directory: backend
+        run: node repositories/migrate.js --check-safety

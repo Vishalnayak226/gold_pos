@@ -263,7 +263,17 @@ app.get('/api/releases/latest', (req, res) => {
         // string (never a re-serialized object, which could reorder keys
         // and break the signature) and only JSON.parses it after that
         // verification succeeds.
-        const latest = candidates.reduce((best, r) => (isNewerVersion(r.version, best.version) ? r : best), candidates[0]);
+        //
+        // Two entries can share a version: that's how a canary/pilot rollout
+        // widens (see POST /api/admin/releases below) — the same version is
+        // republished with a higher rolloutPercent rather than mutating the
+        // original signed entry. On a tie, the most recently published one
+        // wins, so republishing actually takes effect.
+        const latest = candidates.reduce((best, r) => {
+            if (isNewerVersion(r.version, best.version)) return r;
+            if (r.version === best.version && r.publishedAt > best.publishedAt) return r;
+            return best;
+        }, candidates[0]);
         res.json({ payload: latest.payload, signature: latest.signature });
     } catch (err) {
         res.status(500).json({ error: 'Failed to read release registry' });
@@ -388,7 +398,7 @@ app.post('/api/admin/keys', authenticateAdmin, async (req, res) => {
  */
 app.post('/api/admin/releases', authenticateAdmin, (req, res) => {
     try {
-        const { version, channel, changelog, downloadUrl, sha256 } = req.body;
+        const { version, channel, changelog, downloadUrl, sha256, rolloutPercent } = req.body;
         if (!version || !channel || !downloadUrl || !sha256) {
             return res.status(400).json({ error: 'version, channel, downloadUrl, and sha256 are all required' });
         }
@@ -407,6 +417,19 @@ app.post('/api/admin/releases', authenticateAdmin, (req, res) => {
         if (changelog && String(changelog).length > 5000) {
             return res.status(400).json({ error: 'changelog is too long (max 5000 characters)' });
         }
+        // Canary/pilot rollout — only meaningful on the security channel,
+        // since it's the only one a POS client ever auto-applies (see
+        // backend/updateEngine.js#checkForUpdates). Defaults to 100 (full
+        // rollout) so publishing without the field behaves exactly as before
+        // this existed. To widen an in-progress rollout, republish the SAME
+        // version/channel/downloadUrl/sha256 with a higher percentage — the
+        // picking logic above takes the most recently published entry on a
+        // version tie, so the wider figure takes effect without needing a
+        // second signed payload for a "different" release.
+        const rolloutPct = rolloutPercent === undefined ? 100 : Number(rolloutPercent);
+        if (!Number.isInteger(rolloutPct) || rolloutPct < 1 || rolloutPct > 100) {
+            return res.status(400).json({ error: 'rolloutPercent must be an integer from 1 to 100' });
+        }
 
         const manifest = {
             version,
@@ -414,6 +437,7 @@ app.post('/api/admin/releases', authenticateAdmin, (req, res) => {
             changelog: changelog || '',
             downloadUrl,
             sha256,
+            rolloutPercent: rolloutPct,
             publishedAt: Date.now()
         };
         const payloadStr = JSON.stringify(manifest);
@@ -566,7 +590,7 @@ app.get('/', (req, res) => {
 
             <div style="border-top:1px dashed #cbd5e1; margin-top:15px; padding-top:15px;">
                 <h2 style="font-size:15px; margin-bottom:10px;">Publish Release</h2>
-                <div class="form-grid" style="grid-template-columns: repeat(3,1fr) 2fr 1.5fr; align-items:start;">
+                <div class="form-grid" style="grid-template-columns: repeat(3,1fr) 2fr 1fr 1.5fr; align-items:start;">
                     <input type="text" id="rel-version" placeholder="Version (1.1.0)">
                     <select id="rel-channel">
                         <option value="security">security (auto-applies)</option>
@@ -575,6 +599,7 @@ app.get('/', (req, res) => {
                     </select>
                     <input type="text" id="rel-sha256" placeholder="SHA-256 of release zip">
                     <input type="text" id="rel-url" placeholder="Download URL (https://...)">
+                    <input type="number" id="rel-rollout" placeholder="Rollout %" min="1" max="100" value="100" title="Percent of the security channel's tenants that auto-apply this build. Republish the same version/sha256 with a higher number to widen it later. Only meaningful for the security channel.">
                     <button onclick="publishRelease()">PUBLISH</button>
                 </div>
                 <textarea id="rel-changelog" placeholder="Changelog for this release..." style="width:100%; box-sizing:border-box; margin-top:10px; padding:8px; font-family:inherit; font-size:13px;" rows="2"></textarea>
@@ -700,7 +725,7 @@ app.get('/', (req, res) => {
                 tbody.innerHTML = releases.map(r => \`
                     <tr>
                         <td><strong>\${escapeHtml(r.version)}</strong></td>
-                        <td>\${escapeHtml(r.channel)}</td>
+                        <td>\${escapeHtml(r.channel)}\${(r.rolloutPercent || 100) < 100 ? \` <span style="color:#b45309;">(\${r.rolloutPercent}% rollout)</span>\` : ''}</td>
                         <td>\${new Date(r.publishedAt).toLocaleString()}</td>
                         <td>\${escapeHtml(r.changelog || '')}</td>
                     </tr>
@@ -713,6 +738,7 @@ app.get('/', (req, res) => {
                 const sha256 = document.getElementById('rel-sha256').value.trim();
                 const downloadUrl = document.getElementById('rel-url').value.trim();
                 const changelog = document.getElementById('rel-changelog').value.trim();
+                const rolloutPercent = parseInt(document.getElementById('rel-rollout').value, 10) || 100;
                 const statusEl = document.getElementById('release-status');
 
                 if (!version || !sha256 || !downloadUrl) {
@@ -720,14 +746,17 @@ app.get('/', (req, res) => {
                     return;
                 }
                 if (channel === 'security') {
-                    const confirmed = confirm('This release is on the SECURITY channel — every tenant will auto-apply it (after backup + signature verification) on their next daily check, with no manual approval step. Continue?');
+                    const rolloutNote = rolloutPercent < 100
+                        ? \`only the \${rolloutPercent}% of tenants in this build's rollout cohort will\`
+                        : 'every tenant will';
+                    const confirmed = confirm(\`This release is on the SECURITY channel — \${rolloutNote} auto-apply it (after backup + signature verification) on their next daily check, with no manual approval step. Continue?\`);
                     if (!confirmed) return;
                 }
 
                 const res = await fetch('/api/admin/releases', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + adminToken },
-                    body: JSON.stringify({ version, channel, changelog, downloadUrl, sha256 })
+                    body: JSON.stringify({ version, channel, changelog, downloadUrl, sha256, rolloutPercent })
                 });
 
                 if (res.ok) {
@@ -736,6 +765,7 @@ app.get('/', (req, res) => {
                     document.getElementById('rel-sha256').value = '';
                     document.getElementById('rel-url').value = '';
                     document.getElementById('rel-changelog').value = '';
+                    document.getElementById('rel-rollout').value = '100';
                     loadKeys();
                 } else {
                     const data = await res.json().catch(() => ({}));

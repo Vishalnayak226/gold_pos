@@ -244,10 +244,32 @@ CI run it over SSH (§8.4). Example, deploying Dev by hand:
 deploy/remote-deploy.sh /opt/gold-pos/dev-backend develop backend deploy/ecosystem.dev.config.cjs
 ```
 
-**Rollback:** re-run the same command against a specific commit —
-`git checkout <previous-sha>` at the checkout path, then re-run
-`remote-deploy.sh` (or just `pm2 restart <app-name>` after the checkout, no
-need to redo `npm ci` if dependencies didn't change).
+**Rollback (automatic, added 2026-08-19 Phase 36):** every normal deploy
+writes `.rollback-sha` at the checkout path — the commit it was about to
+move off of — before it fetches and resets. `cd-dev.yml`/`cd-sandbox.yml`/
+`cd-live.yml` all react to a failed post-deploy smoke test by calling
+`remote-deploy.sh` again with a trailing `--rollback`, which resets to
+that recorded commit instead of the branch tip (the branch tip is the
+build that just failed), reinstalls, and restarts — then the job still
+ends red, because a rollback restores service, it does not turn a bad
+build into a good one. Manually:
+
+```bash
+deploy/remote-deploy.sh /opt/gold-pos/dev-backend develop backend deploy/ecosystem.dev.config.cjs --rollback
+```
+
+To roll back further than one deploy (`.rollback-sha` only ever holds the
+*immediately* previous commit), `git checkout <sha>` at the checkout path by
+hand instead, then re-run `remote-deploy.sh` without `--rollback` — a normal
+deploy always records wherever it finds HEAD, so the next deploy's rollback
+marker will be correct again afterward.
+
+**Not yet exercised against a real VPS** (§7 — none is provisioned as of
+2026-08-19): the git-reset/rollback-marker mechanics were verified locally
+against a throwaway repo, and all four workflow YAML files parse cleanly, but
+the SSH/GitHub-Environment wiring itself has never run on an Actions runner.
+Same caveat as the CI security-scanning jobs in `daily-checks.yml` — it needs
+a real pull request, and this needs a real VPS, to prove out.
 
 ### 8.4 CI/CD (GitHub Actions)
 

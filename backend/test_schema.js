@@ -30,7 +30,7 @@ process.env.GOLD_POS_LOGS_DIR = path.join(TEMP_ROOT, 'logs');
 
 const assert = (await import('assert')).default;
 const { getDb, inTransaction, closeDb, DB_FILE } = await import('./repositories/connection.js');
-const { runMigrations, migrationStatus, discoverMigrations } = await import('./repositories/migrate.js');
+const { runMigrations, migrationStatus, discoverMigrations, findDestructivePatterns, checkMigrationSafety } = await import('./repositories/migrate.js');
 
 let passed = 0;
 function check(label, fn) {
@@ -120,6 +120,27 @@ check('an edited already-applied migration is refused, naming the file', () => {
     const err = refuses(() => runMigrations(), /already been applied has been edited/);
     assert.match(err.message, /001_initial_schema\.sql/);
     db.prepare('UPDATE schema_migrations SET checksum = ? WHERE version = 1').run(original.checksum);
+});
+
+check('the migration safety gate is clean against every migration actually on disk', () => {
+    // The gate CI runs (`npm run migrate:check-safety`) — proves the real
+    // files in migrations/ stay additive, not just the fixture strings below.
+    assert.deepStrictEqual(checkMigrationSafety().violations, []);
+});
+
+check('the migration safety gate flags a dropped table, column, or rename', () => {
+    assert.strictEqual(findDestructivePatterns('CREATE TABLE foo (id TEXT)').length, 0);
+    assert.strictEqual(findDestructivePatterns('ALTER TABLE foo ADD COLUMN bar TEXT').length, 0);
+    assert.strictEqual(findDestructivePatterns('DROP INDEX uq_foo').length, 0, 'dropping an index is not destructive to data');
+
+    assert.strictEqual(findDestructivePatterns('DROP TABLE foo').length, 1);
+    assert.strictEqual(findDestructivePatterns('ALTER TABLE foo DROP COLUMN bar').length, 1);
+    assert.strictEqual(findDestructivePatterns('ALTER TABLE foo RENAME COLUMN bar TO baz').length, 1);
+    assert.strictEqual(findDestructivePatterns('ALTER TABLE foo RENAME TO bar').length, 1);
+});
+
+check('the migration safety gate ignores destructive words inside SQL comments', () => {
+    assert.strictEqual(findDestructivePatterns('-- do not DROP TABLE foo by hand, see runbook\nCREATE TABLE foo (id TEXT)').length, 0);
 });
 
 check('WAL, foreign keys and full durability are actually on', () => {

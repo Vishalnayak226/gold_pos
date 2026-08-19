@@ -72,6 +72,28 @@ function isNewerVersion(a, b) {
     return false;
 }
 
+/**
+ * Canary/pilot rollout gate. A release's `rolloutPercent` (default 100,
+ * see licensing_server's POST /api/admin/releases) names what fraction of
+ * the security channel's tenants may auto-apply it. Cohort membership is a
+ * deterministic hash of this install's license key and the release version
+ * — the same tenant always lands in the same bucket for a given version, so
+ * a held-back tenant doesn't flap in and out across daily checks, and a
+ * widened rollout (republishing with a higher percentage) only ever ADDS
+ * tenants, never drops one that was already auto-applying.
+ *
+ * @param {string} licenseKey
+ * @param {string} version
+ * @param {number} rolloutPercent
+ * @returns {boolean}
+ */
+export function isInRolloutCohort(licenseKey, version, rolloutPercent) {
+    if (rolloutPercent >= 100) return true;
+    const digest = crypto.createHash('sha256').update(`${licenseKey}:${version}`).digest();
+    const bucket = digest.readUInt32BE(0) % 100; // 0..99
+    return bucket < rolloutPercent;
+}
+
 function getLocalVersion() {
     try {
         return JSON.parse(fs.readFileSync(LOCAL_PACKAGE_JSON, 'utf8')).version || '0.0.0';
@@ -386,9 +408,20 @@ export async function checkForUpdates() {
 
         const securityRelease = await fetchVerifiedRelease('security');
         if (securityRelease && isNewerVersion(securityRelease.version, localVersion)) {
-            console.log(`[UpdateEngine] Verified security release ${securityRelease.version} found — auto-applying.`);
-            await applyUpdate(securityRelease, { auto: true });
-            return; // a restart is likely imminent under PM2; nothing more to do this cycle
+            const license = readJSON(LICENSE_FILE, {});
+            const rolloutPercent = securityRelease.rolloutPercent ?? 100;
+            if (isInRolloutCohort(license.licenseKey, securityRelease.version, rolloutPercent)) {
+                console.log(`[UpdateEngine] Verified security release ${securityRelease.version} found — auto-applying.`);
+                await applyUpdate(securityRelease, { auto: true });
+                return; // a restart is likely imminent under PM2; nothing more to do this cycle
+            }
+            // Held back by a canary/pilot rollout, not an error — this install
+            // will pick it up once the publisher widens the percentage (a
+            // republish of the same version) or the check-in falls in-cohort
+            // for a later version. Re-evaluated every daily check; nothing to
+            // persist.
+            logTelemetry('UPDATE_ROLLOUT_HELD_BACK', 0, `${securityRelease.version} (${rolloutPercent}% rollout)`);
+            return;
         }
 
         const anyRelease = await fetchVerifiedRelease(null);

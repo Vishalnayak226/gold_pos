@@ -87,6 +87,8 @@ jobs:
               deploy/ecosystem.licensing-live.config.cjs
 
       - name: Smoke test
+        id: smoke
+        continue-on-error: true # a failure here triggers the rollback steps below, not an immediate job failure
         env:
           BASE: https://app.${{ vars.PIPELINE_DOMAIN }}
         run: |
@@ -104,3 +106,50 @@ jobs:
             exit 1
           fi
           curl -fsS "$BASE/api/health"
+
+      # -----------------------------------------------------------------------
+      # Rollback (added 2026-08-19, Phase 36). Without this, a build that fails
+      # the smoke test above is already live — remote-deploy.sh already did
+      # `git reset --hard` and restarted pm2 before this step ever runs, so a
+      # red job here previously meant "go SSH in and fix it by hand" instead of
+      # "service already recovered, go read why the build failed." The backend
+      # deploy step above now writes .rollback-sha (the commit it was ABOUT to
+      # move off of) before every deploy; --rollback resets to exactly that.
+      # This still requires the same manual "production" environment approval
+      # every Live deploy already requires — rollback only reacts to a build
+      # that already got that approval and then failed its own smoke test.
+      # -----------------------------------------------------------------------
+      - name: Roll back backend on failed smoke test
+        if: steps.smoke.outcome == 'failure'
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            /opt/gold-pos/live-backend/deploy/remote-deploy.sh \
+              /opt/gold-pos/live-backend main backend \
+              deploy/ecosystem.live.config.cjs --rollback
+
+      - name: Re-verify readiness after rollback, then fail the job
+        if: steps.smoke.outcome == 'failure'
+        env:
+          BASE: https://app.${{ vars.PIPELINE_DOMAIN }}
+        run: |
+          # This step ONLY runs after a failed smoke test, so it always ends
+          # the job red — a rollback restores service, it does not turn a bad
+          # build into a good one. The point of re-polling is purely to tell
+          # the difference between "rolled back cleanly, go read the smoke
+          # test output above" and "rollback didn't come back either, this
+          # needs a human on the VPS right now."
+          for _ in $(seq 1 20); do
+            if curl -fsS --max-time 5 "$BASE/api/ready"; then READY=1; break; fi
+            sleep 3
+          done
+          if [ "${READY:-0}" = "1" ]; then
+            echo "::error::Deploy failed its post-deploy smoke test and was rolled back to the previous commit — service is restored, but this build did NOT ship. See the 'Smoke test' step above for what failed."
+          else
+            echo "::error::Deploy failed its post-deploy smoke test AND the rollback did not come back ready either — this needs a human on the VPS now, not just a re-run."
+          fi
+          exit 1

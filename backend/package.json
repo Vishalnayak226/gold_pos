@@ -13,6 +13,7 @@
     "test:concurrency": "node test_concurrency.js",
     "migrate": "node repositories/migrate.js",
     "migrate:status": "node repositories/migrate.js --status",
+    "migrate:check-safety": "node repositories/migrate.js --check-safety",
     "import:legacy": "node importLegacyJson.js",
     "import:legacy:dry-run": "node importLegacyJson.js --dry-run",
     "test:integration": "node test_suite.js",

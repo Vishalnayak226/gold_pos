@@ -114,6 +114,65 @@ export function migrationStatus() {
     return { onDisk, applied: [...applied.values()], pending, drifted, orphaned };
 }
 
+// Schema changes this project's own rule (CLAUDE.md §1: "Data-shape changes
+// are additive and backward-compatible... Never rewrite an existing record
+// shape in a way that cannot be applied to a live backend/data/ directory")
+// forbids outright. `runMigrations()` protects a database from an EDITED
+// migration (checksum drift) but has no opinion on a migration that is
+// destructive the first time it runs — a `DROP COLUMN` applies cleanly and
+// permanently deletes that column's data on every tenant that upgrades, with
+// nothing above it complaining. This is a static, file-only check (matched
+// against comment-stripped SQL text, so a filename or explanatory comment
+// mentioning "DROP TABLE" can't trip it) so it runs with no database, no temp
+// directory, and no CLAUDE.md §8 data-dir ceremony — see checkMigrationSafety.
+const DESTRUCTIVE_PATTERNS = [
+    { name: 'DROP TABLE', regex: /\bDROP\s+TABLE\b/i },
+    { name: 'DROP COLUMN', regex: /\bDROP\s+COLUMN\b/i },
+    { name: 'RENAME COLUMN', regex: /\bRENAME\s+COLUMN\b/i },
+    { name: 'RENAME TO (table rename)', regex: /\bRENAME\s+TO\b/i }
+    // Deliberately NOT flagged: DROP INDEX / DROP TRIGGER / DROP VIEW. None
+    // of those deletes a row of business data — 003_reference_reuse_after_
+    // rejection.sql already drops and replaces a unique index, which is a
+    // normal, safe, additive-in-spirit constraint change.
+];
+
+/**
+ * Scans one migration's SQL text for a destructive DDL pattern. Pure and
+ * file-independent so it is trivial to unit test against fixture strings
+ * without touching the real migrations/ directory.
+ *
+ * @param {string} sql
+ * @returns {{ pattern: string, snippet: string }[]}
+ */
+export function findDestructivePatterns(sql) {
+    const withoutComments = sql.replace(/--.*$/gm, '');
+    const violations = [];
+    for (const { name, regex } of DESTRUCTIVE_PATTERNS) {
+        const match = withoutComments.match(regex);
+        if (match) {
+            const start = Math.max(0, match.index - 20);
+            violations.push({ pattern: name, snippet: withoutComments.slice(start, match.index + match[0].length + 20).trim() });
+        }
+    }
+    return violations;
+}
+
+/**
+ * Runs findDestructivePatterns() over every migration on disk. No database
+ * involved — safe to run in CI with nothing installed but Node.
+ *
+ * @returns {{ ok: boolean, violations: { filename: string, pattern: string, snippet: string }[] }}
+ */
+export function checkMigrationSafety() {
+    const violations = [];
+    for (const migration of discoverMigrations()) {
+        for (const v of findDestructivePatterns(migration.sql)) {
+            violations.push({ filename: migration.filename, ...v });
+        }
+    }
+    return { ok: violations.length === 0, violations };
+}
+
 /**
  * Applies every pending migration.
  *
@@ -188,7 +247,20 @@ const invokedDirectly = process.argv[1] &&
 if (invokedDirectly) {
     const args = new Set(process.argv.slice(2));
     try {
-        if (args.has('--status')) {
+        if (args.has('--check-safety')) {
+            const { ok, violations } = checkMigrationSafety();
+            if (ok) {
+                console.log(`✅ ${discoverMigrations().length} migration(s) on disk, no destructive DDL found.`);
+            } else {
+                console.error(`❌ ${violations.length} destructive-DDL finding(s):`);
+                for (const v of violations) console.error(`  ${v.filename}: ${v.pattern} — "…${v.snippet}…"`);
+                console.error('\nA schema change that drops or renames an existing table/column is not additive');
+                console.error('and cannot apply to a live backend/data/ directory (CLAUDE.md §1). If this migration');
+                console.error('really needs to reshape a column, add the new one, backfill it, and retire the old');
+                console.error('one in a later migration once nothing reads it — never remove data in the same step.');
+                process.exit(1);
+            }
+        } else if (args.has('--status')) {
             const { applied, pending, drifted, orphaned } = migrationStatus();
             console.log(`Database: ${DB_FILE}`);
             console.log(`Applied:  ${applied.length}`);

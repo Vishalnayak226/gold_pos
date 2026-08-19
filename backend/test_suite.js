@@ -651,6 +651,52 @@ async function testSecretVault() {
     console.log('✅ Test 11 Passed: secrets seal, open, stay bound to their field, and rotate cleanly.');
 }
 
+async function testRolloutCohort() {
+    console.log('\nRunning Test 12: canary/pilot rollout cohort gate...');
+    const { isInRolloutCohort } = await import('./updateEngine.js');
+
+    // 100% always includes everyone, regardless of license key or version —
+    // this is what makes the feature backward-compatible: a release manifest
+    // published before rolloutPercent existed defaults to 100 and behaves
+    // exactly as it did before this gate existed.
+    assert.strictEqual(isInRolloutCohort('ANY-KEY', '2.0.0', 100), true);
+    assert.strictEqual(isInRolloutCohort('OTHER-KEY', '9.9.9', 100), true);
+
+    // 0% (below the server's own 1-100 validation range, but the client-side
+    // function itself has no lower bound) excludes everyone.
+    assert.strictEqual(isInRolloutCohort('ANY-KEY', '2.0.0', 0), false);
+
+    // Deterministic: the same (licenseKey, version) always lands in the same
+    // bucket, so a held-back tenant doesn't flap in and out across daily
+    // checks just from being re-evaluated.
+    const a1 = isInRolloutCohort('TENANT-ABC-123', '2.1.0', 30);
+    const a2 = isInRolloutCohort('TENANT-ABC-123', '2.1.0', 30);
+    assert.strictEqual(a1, a2, 'cohort membership must be stable across repeated evaluations');
+
+    // Monotonic: widening the rollout (republishing with a higher percentage)
+    // can only ever ADD tenants to the cohort, never remove one that was
+    // already auto-applying — the exact property a safe rollout needs.
+    let everIncluded = false;
+    for (let pct = 1; pct <= 100; pct++) {
+        const included = isInRolloutCohort('TENANT-ABC-123', '2.1.0', pct);
+        if (everIncluded) {
+            assert.strictEqual(included, true, `tenant included at a lower percent must stay included at ${pct}%`);
+        }
+        if (included) everIncluded = true;
+    }
+    assert.strictEqual(everIncluded, true, 'every tenant must be included by the time rollout reaches 100%');
+
+    // Different license keys are independent — a whole tenant fleet does not
+    // move in lockstep as one block for a partial rollout to mean anything.
+    const buckets = new Set();
+    for (let i = 0; i < 50; i++) {
+        buckets.add(isInRolloutCohort(`TENANT-${i}`, '2.1.0', 50));
+    }
+    assert.ok(buckets.has(true) && buckets.has(false), 'a 50% rollout across 50 distinct tenants should include some and exclude others');
+
+    console.log('✅ Test 12 Passed: rollout cohort gating is deterministic, monotonic, and per-tenant.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -664,6 +710,7 @@ try {
     await testTotpAgainstRfcVectors();
     await testBoundedAttemptMap();
     await testSecretVault();
+    await testRolloutCohort();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');
