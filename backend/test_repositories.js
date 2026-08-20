@@ -1271,6 +1271,113 @@ console.log('\n13. Reporting');
     });
 }
 
+/* ==========================================================================
+   14. Lot inventory — items, lots and immutable movements (Phase 5.2)
+   ========================================================================== */
+
+console.log('\n14. Lot inventory');
+
+{
+    const itemId = repo.inventory.createItem({
+        tenantId: context.tenantId, name: 'Test Bangle Set', category: 'Bangles', purity: '22K'
+    });
+
+    check('a created item is listed and readable', () => {
+        const item = repo.inventory.getItem(context.tenantId, itemId);
+        assert.equal(item.name, 'Test Bangle Set');
+        assert.equal(item.purity, '22K');
+        assert.equal(item.is_active, 1);
+        assert.ok(repo.inventory.listItems(context.tenantId).some(i => i.id === itemId));
+    });
+
+    check('updateItem patches metadata without touching what was not passed', () => {
+        const updated = repo.inventory.updateItem(context.tenantId, itemId, { category: 'Bridal Bangles' });
+        assert.equal(updated.category, 'Bridal Bangles');
+        assert.equal(updated.name, 'Test Bangle Set', 'an unpassed field must survive the patch');
+    });
+
+    check('openLot() must run inside a transaction', () => {
+        assert.throws(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId, weightMg: 50000,
+            actorUserId: context.ownerUserId
+        }), /must run inside inTransaction/);
+    });
+
+    let lotId;
+    check('openLot() creates a lot whose balance equals its opening weight', () => {
+        ({ lotId } = repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId, weightMg: 50000,
+            label: 'Opening stock', actorUserId: context.ownerUserId
+        })));
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 50000);
+    });
+
+    check('openLot() refuses a zero or negative opening weight', () => {
+        assert.throws(() => repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId, weightMg: 0,
+            actorUserId: context.ownerUserId
+        })), /positive integer/);
+    });
+
+    check('recordAdjustment() can increase and decrease a lot\'s balance', () => {
+        repo.inTransaction(() => repo.inventory.recordAdjustment({
+            tenantId: context.tenantId, lotId, weightDeltaMg: 500,
+            reason: 'count found extra', actorUserId: context.ownerUserId
+        }));
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 50500);
+
+        repo.inTransaction(() => repo.inventory.recordAdjustment({
+            tenantId: context.tenantId, lotId, weightDeltaMg: -1500,
+            reason: 'breakage', actorUserId: context.ownerUserId
+        }));
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 49000);
+    });
+
+    check('recordAdjustment() refuses to take a lot negative', () => {
+        assert.throws(() => repo.inTransaction(() => repo.inventory.recordAdjustment({
+            tenantId: context.tenantId, lotId, weightDeltaMg: -999999,
+            actorUserId: context.ownerUserId
+        })), /would take lot .* negative/);
+        // The refused attempt must not have partially applied.
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 49000);
+    });
+
+    check('an inventory movement cannot be edited or deleted — append-only by trigger', () => {
+        const db = repo.unsafeDatabaseHandle();
+        const row = db.prepare('SELECT id FROM inventory_movements WHERE lot_id = ? LIMIT 1').get(lotId);
+        assert.throws(() => db.prepare('UPDATE inventory_movements SET weight_delta_mg = 1 WHERE id = ?').run(row.id),
+            /append-only/);
+        assert.throws(() => db.prepare('DELETE FROM inventory_movements WHERE id = ?').run(row.id),
+            /append-only/);
+    });
+
+    check('itemStockSummary() reports the item\'s current weight', () => {
+        const summary = repo.inventory.itemStockSummary(context.tenantId);
+        const row = summary.find(s => s.item_id === itemId);
+        assert.equal(row.balance_mg, 49000);
+    });
+
+    check('itemStockSummary() still reports an item filtered to a branch it has zero lots in — not silently dropped', () => {
+        const otherItemId = repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Zero-Stock Item', purity: '24K'
+        });
+        // No lot ever opened for otherItemId in any branch.
+        const summary = repo.inventory.itemStockSummary(context.tenantId, { branchId: context.branchId });
+        const row = summary.find(s => s.item_id === otherItemId);
+        assert.ok(row, 'an item with no lots in the filtered branch must still appear');
+        assert.equal(row.balance_mg, 0);
+    });
+
+    check('listLots() and listMovements() scope correctly by item', () => {
+        const lots = repo.inventory.listLots(context.tenantId, { itemId });
+        assert.ok(lots.some(l => l.id === lotId));
+        assert.equal(lots.find(l => l.id === lotId).balance_mg, 49000);
+
+        const movements = repo.inventory.listMovements(context.tenantId, { lotId });
+        assert.equal(movements.length, 3, 'opening + two adjustments; the refused negative attempt must not appear');
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

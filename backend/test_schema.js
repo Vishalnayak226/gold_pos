@@ -448,6 +448,54 @@ check('a different event id for the same payment is still accepted', () => {
 });
 
 /* --------------------------------------------------------------------------
+   4b. Lot inventory (Phase 5.2) — the CHECK constraints, exercised via raw
+   SQL rather than through inventoryRepository.js. The repository's own
+   openLot() refuses a non-positive weight before a query is ever issued, so
+   a test that only calls the repository would prove the JS guard works and
+   never actually exercise the DB CHECK behind it — the backstop that still
+   matters if a future write path skips the repository.
+   -------------------------------------------------------------------------- */
+
+db.prepare(`INSERT INTO inventory_items (id, tenant_id, name, purity, is_active, created_at, updated_at)
+    VALUES (?,?,?,?,?,?,?)`).run('ITM1', 'T1', 'Test Chain', '22K', 1, NOW, NOW);
+db.prepare(`INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, created_by_user_id, created_at)
+    VALUES (?,?,?,?,?,?)`).run('LOT1', 'T1', 'B1', 'ITM1', 'U-MGR', NOW);
+
+check('a movement with a zero weight delta is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO inventory_movements
+        (id, tenant_id, branch_id, item_id, lot_id, movement_type, weight_delta_mg, actor_user_id, created_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run('MOV1', 'T1', 'B1', 'ITM1', 'LOT1', 'adjustment', 0, 'U-MGR', NOW, TODAY),
+        /CHECK|constraint/i);
+});
+
+check('an opening_balance movement with a non-positive weight is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO inventory_movements
+        (id, tenant_id, branch_id, item_id, lot_id, movement_type, weight_delta_mg, actor_user_id, created_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run('MOV2', 'T1', 'B1', 'ITM1', 'LOT1', 'opening_balance', -500, 'U-MGR', NOW, TODAY),
+        /CHECK|constraint/i);
+});
+
+check('an unrecognised movement_type is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO inventory_movements
+        (id, tenant_id, branch_id, item_id, lot_id, movement_type, weight_delta_mg, actor_user_id, created_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run('MOV3', 'T1', 'B1', 'ITM1', 'LOT1', 'purchase', 1000, 'U-MGR', NOW, TODAY),
+        /CHECK|constraint/i);
+});
+
+check('a valid adjustment movement is accepted, and cannot then be edited or deleted', () => {
+    db.prepare(`INSERT INTO inventory_movements
+        (id, tenant_id, branch_id, item_id, lot_id, movement_type, weight_delta_mg, actor_user_id, created_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run('MOV4', 'T1', 'B1', 'ITM1', 'LOT1', 'opening_balance', 25000, 'U-MGR', NOW, TODAY);
+
+    refuses(() => db.prepare('UPDATE inventory_movements SET weight_delta_mg = 1 WHERE id = ?').run('MOV4'), /append-only/);
+    refuses(() => db.prepare('DELETE FROM inventory_movements WHERE id = ?').run('MOV4'), /append-only/);
+});
+
+/* --------------------------------------------------------------------------
    5. Audit is genuinely immutable
    -------------------------------------------------------------------------- */
 

@@ -123,6 +123,11 @@ The right order is:
 
 - Product/SKU catalogue: barcode/QR, category, purity, HSN, hallmark/HUID, gross/net/stone weights, stone value, wastage, making policy, images, price tags.
 - Lot inventory and immutable stock movements for purchase, sale, return, repair, transfer, adjustment, and physical count.
+  *(**Opening-balance and adjustment/physical-count movements landed 2026-08-20, Phase 37** — see
+  the Phase 5 §2 note further down for full detail. **Purchase, sale, return, repair and transfer
+  movements are not started** — purchase and transfer stay gated on the legal/business definition
+  named two lines below, and sale/return/repair integration is a deliberately separate, unstarted
+  pass into the billing flow.)*
 - Multi-line invoices, split tender, cash/card/UPI/bank/advance allocation, quotes, hold/resume, reprint, delivery.
   *(**Multi-line invoices, split tender and the allocation vocabulary landed 2026-08-12; reprint
   shipped in Phase 22.** Quotes, hold/resume and delivery are not started.)*
@@ -360,6 +365,11 @@ The right order is:
 
 - Product/SKU catalogue: barcode/QR, category, purity, HSN, hallmark/HUID, gross/net/stone weights, stone value, wastage, making policy, images, price tags.
 - Lot inventory and immutable stock movements for purchase, sale, return, repair, transfer, adjustment, and physical count.
+  *(**Opening-balance and adjustment/physical-count movements landed 2026-08-20, Phase 37** — see
+  the Phase 5 §2 note further down for full detail. **Purchase, sale, return, repair and transfer
+  movements are not started** — purchase and transfer stay gated on the legal/business definition
+  named two lines below, and sale/return/repair integration is a deliberately separate, unstarted
+  pass into the billing flow.)*
 - Multi-line invoices, split tender, cash/card/UPI/bank/advance allocation, quotes, hold/resume, reprint, delivery.
   *(**Multi-line invoices, split tender and the allocation vocabulary landed 2026-08-12; reprint
   shipped in Phase 22.** Quotes, hold/resume and delivery are not started.)*
@@ -630,7 +640,29 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    reproduces every filed line, and the Return Desk prices a return against a named line. The
    catalogue/SKU half of this slice — barcode, labels, HSN, hallmark/HUID, stone weights, wastage —
    is **not** started; see the note below on why it is the larger half.)*
-2. Lot inventory, purchase receiving, adjustments/counts and branch transfer. *(Not started.)*
+2. Lot inventory, purchase receiving, adjustments/counts and branch transfer.
+   *(**Lot inventory and adjustments/counts landed 2026-08-20, Phase 37** — the ungated half of
+   this line. `inventory_items` (catalogue metadata), `inventory_lots` (a distinguishable batch of
+   an item) and `inventory_movements` (append-only, trigger-enforced, exactly like
+   `advance_entries`) via `backend/repositories/inventoryRepository.js`, `GET`/`POST
+   /api/inventory/*`, and a new Inventory tab (`frontend/js/components/InventoryManager.js`).
+   Stock only ever enters through an `opening_balance` movement (opening a new lot) or changes
+   through an `adjustment` (a physical count, breakage, or correction) — refused if it would take
+   a lot negative. **Purchase receiving and branch transfer are still NOT built** — the P2 section
+   below gates both behind a legal/business definition (GST reverse-charge treatment for buying
+   from a vendor or a customer, inter-GSTIN accounting for moving stock between branches) that has
+   never been made; this migration's own header comment names the gap explicitly so a future
+   change does not reinvent a `purchase`/`transfer` movement type without it. **Not wired into the
+   sale/invoice flow** — a sale does not decrement stock yet; doing so would touch
+   `computeInvoiceTotals`, which the "Cost note" below calls the most-tested function in the tree,
+   and deserves its own pass. Verified: `test_schema.js` +4 (the CHECK constraints, via raw SQL
+   bypassing the repository's own guards), `test_repositories.js` +11 (lot lifecycle, the
+   negative-balance refusal, and a LEFT JOIN bug caught and fixed before it shipped — an item with
+   zero lots in a branch-filtered stock query was silently dropped instead of reported at zero), a
+   real local HTTP boot (item → lot → adjustment → refused-negative-adjustment → stock summary, all
+   over the actual API with session cookies and CSRF), and a headless-Chromium run driving the real
+   admin UI (login → new item → new lot → view lots → adjust → recent activity, screenshotted,
+   zero console errors). Tests: 478 → 493, green, exit 0. See `docs/LEDGER.md` Phase 37.)*
 3. Split tenders, cash shifts/closing, quotes/holds, reprint and delivery.
    *(**Reprint shipped in Phase 22. Split tenders landed 2026-08-12** — a sale records how it was
    paid across up to 10 tenders (`cash`/`card`/`upi`/`razorpay`/`bank_transfer`/`other`), validated

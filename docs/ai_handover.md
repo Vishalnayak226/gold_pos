@@ -12,29 +12,27 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `1a66e73` — "Phase 35: operational alerting" (2026-08-19), on branch
+- **Latest commit:** `6cd1fd4` — "Phase 36: migration compatibility gate, canary/pilot rollout,
+  deploy rollback" (2026-08-19), on branch
   **`phase-21-payment-verification-and-production-guard`**, pushed to `origin` the same day
   (compare link for the PR that will actually exercise CI:
   `github.com/Vishalnayak226/gold_pos/compare/develop...phase-21-payment-verification-and-production-guard`).
-- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — PHASE 36 (MIGRATION GATE, CANARY ROLLOUT,
-  DEPLOY ROLLBACK) IS UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green
-  (**478 checks**, exit 0) on the working tree; `npm run test:e2e` not re-run (no request
-  body/form/auth path changed). New: nothing (no new files this phase). Modified:
-  `backend/repositories/migrate.js`, `backend/test_schema.js`, `backend/test_suite.js`,
-  `backend/updateEngine.js`, `backend/package.json`, `licensing_server/server.js`,
-  `deploy/remote-deploy.sh`, `deploy/README.md`, `.github/workflows/daily-checks.yml`,
-  `.github/workflows/cd-dev.yml`, `.github/workflows/cd-sandbox.yml`,
-  `.github/workflows/cd-live.yml`, `CLAUDE.md`, `docs/LEDGER.md`,
+- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-20 — PHASE 37 (LOT INVENTORY) IS UNCOMMITTED AND
+  UNREVIEWED.** Nothing is staged. `npm test` is green (**493 checks**, exit 0) on the working
+  tree. `npm run test:e2e` re-run in full (new nav button touches the shared sidebar every
+  existing spec renders against) — **43/43 green**, confirming the new tab did not regress any
+  existing journey. New:
+  `backend/repositories/migrations/006_lot_inventory.sql`, `backend/repositories/inventoryRepository.js`,
+  `frontend/js/components/InventoryManager.js`. Modified: `backend/repositories/index.js`,
+  `backend/server.js`, `backend/test_schema.js`, `backend/test_repositories.js`,
+  `frontend/js/app.js`, `frontend/index.html`, `CLAUDE.md`, `docs/LEDGER.md`,
   `docs/PRODUCTION_READINESS_ROADMAP.md`.
-  - Closes `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 3's line on migration gates / canary release
-    / rollback / post-deploy synthetic checks. Full detail: `docs/LEDGER.md` Phase 36.
-  - **The SSH/GitHub-Environment deploy wiring is unverified** — YAML-parsed and the git-reset
-    rollback logic proven against a throwaway local repo, but never run on an Actions runner (no
-    PR opened yet) or against a real VPS (none provisioned, §7). Same caveat as Phase 34's CI
-    security-scanning jobs.
-  - **Rest of Phase 3 still open:** protected branches / signed provenance / dual approval for
-    fleet updates; exercising the deploy pipeline against a real sandbox (no VPS/domain
-    provisioned yet — §7); the incident-response runbook (held for legal review, per Phase 34).
+  - Closes the ungated half of `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 5.2's line (lot
+    inventory + adjustments/counts). **Purchase receiving and branch transfer deliberately NOT
+    built** — gated behind a legal/business definition (GST reverse-charge, inter-GSTIN
+    accounting) that has never been made; confirmed the scope split with the user before writing
+    any code rather than guessing. **Not wired into the sale/invoice flow** — a sale does not
+    decrement stock yet. Full detail: `docs/LEDGER.md` Phase 37.
 - **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
   UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
   on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:

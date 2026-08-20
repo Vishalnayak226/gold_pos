@@ -9,6 +9,7 @@ import { ReprintDesk } from './components/ReprintDesk.js';
 import { ReturnDesk } from './components/ReturnDesk.js';
 import { Dashboard } from './components/Dashboard.js';
 import { AdvancesManager } from './components/AdvancesManager.js';
+import { InventoryManager } from './components/InventoryManager.js';
 import { CustomerAccountsManager } from './components/CustomerAccountsManager.js';
 import { AuditTrail } from './components/AuditTrail.js';
 import { SettingsManager } from './components/SettingsManager.js';
@@ -24,6 +25,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.returnDesk = new ReturnDesk();
     window.dashboard = new Dashboard();
     window.advancesManager = new AdvancesManager();
+    window.inventoryManager = new InventoryManager();
     window.customerAccountsManager = new CustomerAccountsManager();
     window.auditTrail = new AuditTrail();
     window.settingsManager = new SettingsManager();
@@ -346,6 +348,9 @@ function initNavigation() {
             }
             if (targetId === 'advances-tab' && window.advancesManager && isAdminAuthenticated()) {
                 window.advancesManager.refresh();
+            }
+            if (targetId === 'inventory-tab' && window.inventoryManager && isAdminAuthenticated()) {
+                window.inventoryManager.refresh();
             }
             if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && isAdminAuthenticated()) {
                 window.customerAccountsManager.refresh();

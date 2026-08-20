@@ -55,7 +55,7 @@ import { importLegacyJson, collectSource, formatReport } from './importLegacyJso
 // preview from, so the persisted ledger and the cashier's screen can never
 // drift apart. Lives under frontend/ because release_pipeline.js and
 // updateEngine.js ship and replace backend/ and frontend/ as a pair.
-import { normalizeTaxMode, round2, toPaise, fromPaise, ADVANCE_STATUS } from '../frontend/js/lib/billingMath.js';
+import { normalizeTaxMode, round2, round3, toPaise, fromPaise, ADVANCE_STATUS } from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
 
 const app = express();
@@ -2488,6 +2488,221 @@ app.post('/api/advances/:id/reject', requireAdminSession, requireApprover, (req,
     } catch (err) {
         logError('Error rejecting advance deposit: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to reject the deposit' });
+    }
+});
+
+/* ==========================================================================
+   API Routes: Lot Inventory (roadmap Phase 5.2, the ungated slice)
+
+   No route here creates a `purchase` or `transfer` movement — the roadmap's
+   own P2 section gates vendor/purchase and branch transfer behind a legal/
+   business definition (GST reverse-charge, inter-GSTIN accounting) that has
+   not been made. Stock only ever enters via an opening-balance lot or moves
+   via an adjustment — see 006_lot_inventory.sql for the full reasoning.
+   Every write is requireAdminSession only (no requireApprover): the
+   movement itself is the audit trail, matching this feature's "straight-
+   forward CRUD-and-ledger" scope rather than advance_entries' approval
+   workflow.
+   ========================================================================== */
+
+const PURITY_RULE = { type: 'enum', values: ['24K', '22K', '18K'], required: true };
+
+const INVENTORY_ITEM_CREATE_SCHEMA = {
+    name: { type: 'string', maxLength: 200, minLength: 1, required: true },
+    category: { type: 'string', maxLength: 100 },
+    purity: PURITY_RULE
+};
+
+const INVENTORY_ITEM_PATCH_SCHEMA = {
+    name: { type: 'string', maxLength: 200, minLength: 1 },
+    category: { type: 'string', maxLength: 100 },
+    purity: { ...PURITY_RULE, required: false },
+    isActive: { type: 'boolean' }
+};
+
+const INVENTORY_LOT_OPEN_SCHEMA = {
+    itemId: { type: 'string', maxLength: 64, minLength: 1, required: true },
+    weightGrams: { type: 'number', min: 0.001, max: 100000, required: true },
+    label: { type: 'string', maxLength: 200 },
+    reason: { type: 'string', maxLength: 500 }
+};
+
+const INVENTORY_ADJUST_SCHEMA = {
+    weightDeltaGrams: { type: 'number', min: -100000, max: 100000, required: true },
+    reason: { type: 'string', maxLength: 500 }
+};
+
+/** grams (wire) -> integer milligrams (storage), matching saleService.js's weightMilligrams(). */
+function gramsToMg(grams) {
+    return Math.round(Number(grams) * 1000);
+}
+
+function inventoryItemToWire(row) {
+    return {
+        id: row.id, name: row.name, category: row.category, purity: row.purity,
+        skuCode: row.sku_code, isActive: Boolean(row.is_active),
+        createdAt: row.created_at, updatedAt: row.updated_at
+    };
+}
+
+function inventoryLotToWire(row) {
+    return {
+        id: row.id, branchId: row.branch_id, itemId: row.item_id, label: row.label,
+        weightGrams: round3(row.balance_mg / 1000), createdAt: row.created_at
+    };
+}
+
+function inventoryMovementToWire(row) {
+    return {
+        id: row.id, branchId: row.branch_id, itemId: row.item_id, lotId: row.lot_id,
+        movementType: row.movement_type, weightDeltaGrams: round3(row.weight_delta_mg / 1000),
+        reason: row.reason, actorUserId: row.actor_user_id,
+        createdAt: row.created_at, businessDate: row.business_date
+    };
+}
+
+app.get('/api/inventory/items', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const activeOnly = req.query.activeOnly === 'true';
+        res.json(repo.inventory.listItems(context.tenantId, { activeOnly }).map(inventoryItemToWire));
+    } catch (err) {
+        logError('Error listing inventory items: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list inventory items' });
+    }
+});
+
+app.post('/api/inventory/items', requireAdminSession, validateBody(INVENTORY_ITEM_CREATE_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const id = repo.inventory.createItem({
+            tenantId: context.tenantId,
+            name: req.body.name,
+            category: req.body.category || null,
+            purity: req.body.purity
+        });
+        res.json({ success: true, id, item: inventoryItemToWire(repo.inventory.getItem(context.tenantId, id)) });
+    } catch (err) {
+        logError('Error creating inventory item: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to create the inventory item' });
+    }
+});
+
+app.patch('/api/inventory/items/:id', requireAdminSession, validateBody(INVENTORY_ITEM_PATCH_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const updated = repo.inventory.updateItem(context.tenantId, req.params.id, req.body || {});
+        if (!updated) return res.status(404).json({ error: 'No inventory item with that id' });
+        res.json({ success: true, item: inventoryItemToWire(updated) });
+    } catch (err) {
+        logError('Error updating inventory item: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to update the inventory item' });
+    }
+});
+
+/**
+ * GET /api/inventory/stock
+ * Current on-hand weight per item, summed across every lot. Scoped to the
+ * caller's own branch unless the deployment ever grows more than one — today
+ * that is always the bootstrap branch, matching how every other route in
+ * this file resolves "which branch" from context rather than the client.
+ */
+app.get('/api/inventory/stock', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const summary = repo.inventory.itemStockSummary(context.tenantId, { branchId: context.branchId });
+        res.json(summary.map(row => ({
+            itemId: row.item_id, name: row.name, category: row.category, purity: row.purity,
+            isActive: Boolean(row.is_active), weightGrams: round3(row.balance_mg / 1000)
+        })));
+    } catch (err) {
+        logError('Error reading inventory stock summary: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to read the stock summary' });
+    }
+});
+
+app.get('/api/inventory/lots', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const lots = repo.inventory.listLots(context.tenantId, {
+            branchId: context.branchId,
+            itemId: req.query.itemId || null
+        });
+        res.json(lots.map(inventoryLotToWire));
+    } catch (err) {
+        logError('Error listing inventory lots: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list inventory lots' });
+    }
+});
+
+/**
+ * POST /api/inventory/lots
+ * Opens a new lot with its opening-balance movement — the only way stock
+ * enters this system today (see the section header above for why there is
+ * no purchase-receiving route yet).
+ */
+app.post('/api/inventory/lots', requireAdminSession, validateBody(INVENTORY_LOT_OPEN_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const item = repo.inventory.getItem(context.tenantId, req.body.itemId);
+        if (!item) return res.status(400).json({ error: 'No inventory item with that id' });
+
+        const { lotId } = repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId,
+            branchId: context.branchId,
+            itemId: req.body.itemId,
+            weightMg: gramsToMg(req.body.weightGrams),
+            label: req.body.label || null,
+            reason: req.body.reason || null,
+            actorUserId: resolveActorUserId(req.actor)
+        }));
+        res.json({ success: true, id: lotId, lot: inventoryLotToWire(repo.inventory.getLot(context.tenantId, lotId)) });
+    } catch (err) {
+        logError('Error opening inventory lot: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to open the inventory lot' });
+    }
+});
+
+/**
+ * POST /api/inventory/lots/:id/adjust
+ * A physical count found more or less than the book figure, breakage, or a
+ * correction. Positive or negative weightDeltaGrams; refused if it would
+ * take the lot negative.
+ */
+app.post('/api/inventory/lots/:id/adjust', requireAdminSession, validateBody(INVENTORY_ADJUST_SCHEMA), (req, res) => {
+    try {
+        const weightDeltaMg = gramsToMg(req.body.weightDeltaGrams);
+        if (weightDeltaMg === 0) {
+            return res.status(400).json({ error: 'weightDeltaGrams must not round to zero milligrams.' });
+        }
+        const context = repo.dataStoreContext();
+        const movementId = repo.inTransaction(() => repo.inventory.recordAdjustment({
+            tenantId: context.tenantId,
+            lotId: req.params.id,
+            weightDeltaMg,
+            reason: req.body.reason || null,
+            actorUserId: resolveActorUserId(req.actor)
+        }));
+        res.json({ success: true, movementId, balanceGrams: round3(repo.inventory.lotBalanceMg(req.params.id) / 1000) });
+    } catch (err) {
+        logError('Error adjusting inventory lot: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to adjust the inventory lot' });
+    }
+});
+
+app.get('/api/inventory/movements', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const movements = repo.inventory.listMovements(context.tenantId, {
+            branchId: context.branchId,
+            itemId: req.query.itemId || null,
+            lotId: req.query.lotId || null,
+            limit: req.query.limit
+        });
+        res.json(movements.map(inventoryMovementToWire));
+    } catch (err) {
+        logError('Error listing inventory movements: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list inventory movements' });
     }
 });
 

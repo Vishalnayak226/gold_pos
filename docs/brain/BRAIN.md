@@ -6,12 +6,12 @@
 
 | | |
 |---|---|
-| Redrawn | 2026-08-19 |
-| Files in tree | 148 |
+| Redrawn | 2026-08-20 |
+| Files in tree | 151 |
 | Regions / lobes | 19 / 5 |
 | Coverage | 100.0% (0 unclaimed) |
-| Symbols filed | 1532 |
-| Cross-region relationships | 722 |
+| Symbols filed | 1576 |
+| Cross-region relationships | 736 |
 
 ---
 
@@ -22,11 +22,11 @@ flowchart TB
   subgraph pos["The POS Terminal"]
     direction LR
     pos_api["POS API Router<br/><small>1 file</small>"]
-    persistence["Persistence & Settings<br/><small>24 files</small>"]
+    persistence["Persistence & Settings<br/><small>26 files</small>"]
     domain_services["Domain Services<br/><small>4 files</small>"]
     pricing["Pricing & Billing Math<br/><small>2 files</small>"]
     pos_ui["Cashier UI Shell<br/><small>3 files</small>"]
-    pos_components["Cashier UI Components<br/><small>8 files</small>"]
+    pos_components["Cashier UI Components<br/><small>9 files</small>"]
   end
   subgraph customer["The Customer Surface"]
     direction LR
@@ -65,21 +65,21 @@ flowchart TB
 
 | Region | Lobe | Files | Symbols | Reaches |
 |---|---|---:|---:|---|
-| [POS API Router](#pos-api-router) | The POS Terminal | 1 | 45 | Crypto, Auth & Black Box, Persistence & Settings, Customer Portal |
-| [Persistence & Settings](#persistence--settings) | The POS Terminal | 24 | 273 | Pricing & Billing Math, Crypto, Auth & Black Box, Test Suites |
+| [POS API Router](#pos-api-router) | The POS Terminal | 1 | 54 | Crypto, Auth & Black Box, Persistence & Settings, Customer Portal |
+| [Persistence & Settings](#persistence--settings) | The POS Terminal | 26 | 290 | Pricing & Billing Math, Crypto, Auth & Black Box, Test Suites |
 | [Domain Services](#domain-services) | The POS Terminal | 4 | 41 | Persistence & Settings, Pricing & Billing Math, Test Suites |
 | [Pricing & Billing Math](#pricing--billing-math) | The POS Terminal | 2 | 33 | Persistence & Settings, Backups & Reporting |
 | [Cashier UI Shell](#cashier-ui-shell) | The POS Terminal | 3 | 17 | Cashier UI Components, Tenant Extension Surface |
-| [Cashier UI Components](#cashier-ui-components) | The POS Terminal | 8 | 143 | Cashier UI Shell, Pricing & Billing Math, Test Suites |
+| [Cashier UI Components](#cashier-ui-components) | The POS Terminal | 9 | 158 | Cashier UI Shell, Pricing & Billing Math, Test Suites |
 | [Customer Portal](#customer-portal) | The Customer Surface | 3 | 39 | Persistence & Settings, Crypto, Auth & Black Box |
 | [Licensing](#licensing) | The SaaS Platform | 8 | 55 | Persistence & Settings, Backups & Reporting |
-| [Release & Update Engine](#release--update-engine) | The SaaS Platform | 3 | 56 | Persistence & Settings, Backups & Reporting |
+| [Release & Update Engine](#release--update-engine) | The SaaS Platform | 3 | 57 | Persistence & Settings, Backups & Reporting |
 | [Crypto, Auth & Black Box](#crypto-auth--black-box) | The SaaS Platform | 17 | 118 | Persistence & Settings |
 | [Tenant Extension Surface](#tenant-extension-surface) | The SaaS Platform | 4 | 22 | Persistence & Settings |
 | [Backups & Reporting](#backups--reporting) | The SaaS Platform | 5 | 44 | Persistence & Settings |
 | [Deploy & CI Pipeline](#deploy--ci-pipeline) | Build & Operations | 14 | 12 | — |
-| [Test Suites](#test-suites) | Build & Operations | 17 | 152 | Pricing & Billing Math, Crypto, Auth & Black Box, Persistence & Settings |
-| [Local Dev Loop & Manifests](#local-dev-loop--manifests) | Build & Operations | 5 | 55 | — |
+| [Test Suites](#test-suites) | Build & Operations | 17 | 153 | Pricing & Billing Math, Crypto, Auth & Black Box, Persistence & Settings |
+| [Local Dev Loop & Manifests](#local-dev-loop--manifests) | Build & Operations | 5 | 56 | — |
 | [Mobile Wrapper](#mobile-wrapper) | Build & Operations | 3 | 17 | — |
 | [Live Trackers](#live-trackers) | Docs & Agent Config | 7 | 184 | Agent Operating Rules |
 | [Reference Docs](#reference-docs) | Docs & Agent Config | 10 | 121 | — |
@@ -124,9 +124,9 @@ flowchart LR
   domain_services -->|"3"| maintenance
   pricing -->|"15"| persistence
   pricing -->|"3"| maintenance
-  pos_ui -->|"17"| pos_components
+  pos_ui -->|"19"| pos_components
   pos_ui -->|"1"| extensions
-  pos_components -->|"60"| pos_ui
+  pos_components -->|"68"| pos_ui
   pos_components -->|"55"| pricing
   pos_components -.->|"1"| tests
   customer_portal -->|"11"| persistence
@@ -171,7 +171,7 @@ it must. These orderings are asserted by hand.
 
 #### POS API Router
 
-`pos-api` · 1 file · 45 symbols
+`pos-api` · 1 file · 54 symbols
 
 The single Express router for the shop terminal — sales, payments, analytics, settings, and every /api route the cashier UI calls. The choke point most cross-cutting fixes belong at.
 
@@ -181,9 +181,9 @@ The single Express router for the shop terminal — sales, payments, analytics, 
 
 </details>
 
-**Busiest symbols:** `server.js`, `bootstrapServer()`, `initialiseLedger()`, `cookieOpts()`, `billingSettings()`, `collectLegacySource()`, `shutdown()`, `startServer()`, `clearAdminSessionCookies()`, `clearCustomerSessionCookies()` … +35
+**Busiest symbols:** `server.js`, `bootstrapServer()`, `initialiseLedger()`, `cookieOpts()`, `billingSettings()`, `collectLegacySource()`, `shutdown()`, `startServer()`, `clearAdminSessionCookies()`, `clearCustomerSessionCookies()` … +44
 
-**Reaches:** Crypto, Auth & Black Box (52) · Persistence & Settings (35) · Customer Portal (20) · Backups & Reporting (15) · Pricing & Billing Math (11) · Tenant Extension Surface (5) · Licensing (5) · Release & Update Engine (5) · Domain Services (4)
+**Reaches:** Crypto, Auth & Black Box (52) · Persistence & Settings (35) · Customer Portal (20) · Backups & Reporting (15) · Pricing & Billing Math (14) · Tenant Extension Surface (5) · Licensing (5) · Release & Update Engine (5) · Domain Services (4)
 
 > **Declared link** Cashier UI Shell → POS API Router (HTTP/JSON). The browser calls the Express router over the network. No AST extractor can see this edge — it is asserted by hand.
 
@@ -191,7 +191,7 @@ The single Express router for the shop terminal — sales, payments, analytics, 
 
 #### Persistence & Settings
 
-`persistence` · 24 files · 273 symbols
+`persistence` · 26 files · 290 symbols
 
 The SQLite datastore and the JSON layer it replaces. backend/repositories/ is the ADR-001 seam: connection/PRAGMAs, the migration runner, the numbered migrations, and one repository per domain — no SQL string exists above this directory, which is what keeps the documented move to PostgreSQL a swap rather than a rewrite. importLegacyJson.js carries a live tenant across from the JSON ledger with a dry run, a reconciliation report and a rollback. db.js/defaultSettings.js are the legacy JSON writers plus the settings default-merge-and-retire mechanism; settings and licence stay JSON on purpose. seed.js generates the deterministic synthetic fixture database.
 
@@ -207,6 +207,7 @@ The SQLite datastore and the JSON layer it replaces. backend/repositories/ is th
 - `backend/repositories/creditNoteRepository.js`
 - `backend/repositories/customerRepository.js`
 - `backend/repositories/index.js`
+- `backend/repositories/inventoryRepository.js`
 - `backend/repositories/invoiceRepository.js`
 - `backend/repositories/migrate.js`
 - `backend/repositories/migrations/001_initial_schema.sql`
@@ -214,6 +215,7 @@ The SQLite datastore and the JSON layer it replaces. backend/repositories/ is th
 - `backend/repositories/migrations/003_reference_reuse_after_rejection.sql`
 - `backend/repositories/migrations/004_multi_line_invoice_fidelity.sql`
 - `backend/repositories/migrations/005_audit_hash_chain.sql`
+- `backend/repositories/migrations/006_lot_inventory.sql`
 - `backend/repositories/organisationRepository.js`
 - `backend/repositories/paymentRepository.js`
 - `backend/repositories/rateRepository.js`
@@ -224,7 +226,7 @@ The SQLite datastore and the JSON layer it replaces. backend/repositories/ is th
 
 </details>
 
-**Busiest symbols:** `getDb()`, `logError()`, `index.js`, `db.js`, `logTelemetry()`, `importLegacyJson.js`, `advanceRepository.js`, `newId()`, `invoiceRepository.js`, `creditNoteRepository.js` … +263
+**Busiest symbols:** `getDb()`, `logError()`, `index.js`, `db.js`, `logTelemetry()`, `importLegacyJson.js`, `advanceRepository.js`, `newId()`, `invoiceRepository.js`, `creditNoteRepository.js` … +280
 
 **Reaches:** Pricing & Billing Math (54) · Crypto, Auth & Black Box (11) · Test Suites (6, inferred only) · Customer Portal (1) · Backups & Reporting (1, inferred only)
 
@@ -260,7 +262,7 @@ Gold rate sync, rate overrides, and the DOM-free billing helpers shared by the b
 
 </details>
 
-**Busiest symbols:** `billingMath.js`, `round2()`, `fromPaise()`, `toPaise()`, `round3()`, `computeReturnRefund()`, `num()`, `priceEngine.js`, `normalizeTaxMode()`, `computeInvoiceTotals()` … +23
+**Busiest symbols:** `billingMath.js`, `round2()`, `fromPaise()`, `round3()`, `toPaise()`, `computeReturnRefund()`, `num()`, `priceEngine.js`, `normalizeTaxMode()`, `computeInvoiceTotals()` … +23
 
 **Reaches:** Persistence & Settings (15) · Backups & Reporting (3)
 
@@ -282,13 +284,13 @@ The admin single-page terminal: boot sequence, license gate, navigation controll
 
 **Busiest symbols:** `adminFetch()`, `app.js`, `logTelemetry()`, `initAdminAuth()`, `loadFrontendExtension()`, `canApprove()`, `getActor()`, `loadActor()`, `setActor()`, `checkLicenseStatus()` … +7
 
-**Reaches:** Cashier UI Components (17) · Tenant Extension Surface (1)
+**Reaches:** Cashier UI Components (19) · Tenant Extension Surface (1)
 
 > **Declared link** Cashier UI Shell → POS API Router (HTTP/JSON). The browser calls the Express router over the network. No AST extractor can see this edge — it is asserted by hand.
 
 #### Cashier UI Components
 
-`pos-components` · 8 files · 143 symbols
+`pos-components` · 9 files · 158 symbols
 
 The screens themselves — billing desk, dashboard, advances ledger, settings. The pattern any new screen should copy rather than reinvent.
 
@@ -299,15 +301,16 @@ The screens themselves — billing desk, dashboard, advances ledger, settings. T
 - `frontend/js/components/BillingDesk.js`
 - `frontend/js/components/CustomerAccountsManager.js`
 - `frontend/js/components/Dashboard.js`
+- `frontend/js/components/InventoryManager.js`
 - `frontend/js/components/ReprintDesk.js`
 - `frontend/js/components/ReturnDesk.js`
 - `frontend/js/components/SettingsManager.js`
 
 </details>
 
-**Busiest symbols:** `SettingsManager`, `BillingDesk`, `ReturnDesk`, `BillingDesk.js`, `.renderSection()`, `.setupEventListeners()`, `ReturnDesk.js`, `ReprintDesk.js`, `.fileReturn()`, `.openReturnForm()` … +133
+**Busiest symbols:** `SettingsManager`, `BillingDesk`, `ReturnDesk`, `BillingDesk.js`, `.renderSection()`, `.setupEventListeners()`, `ReturnDesk.js`, `ReprintDesk.js`, `.fileReturn()`, `.openReturnForm()` … +148
 
-**Reaches:** Cashier UI Shell (60) · Pricing & Billing Math (55) · Test Suites (1, inferred only)
+**Reaches:** Cashier UI Shell (68) · Pricing & Billing Math (55) · Test Suites (1, inferred only)
 
 ### The Customer Surface
 
@@ -360,7 +363,7 @@ The RSA handshake that decides whether a tenant may run: the central signing ser
 
 #### Release & Update Engine
 
-`updates` · 3 files · 56 symbols
+`updates` · 3 files · 57 symbols
 
 Packaging a release, signing it, and the tiered auto/manual apply-and-rollback path on the tenant side. Security-channel releases apply themselves; feature and patch ones ask.
 
@@ -372,7 +375,7 @@ Packaging a release, signing it, and the tiered auto/manual apply-and-rollback p
 
 </details>
 
-**Busiest symbols:** `updateEngine.js`, `applyUpdate()`, `release_pipeline.js`, `checkForUpdates()`, `Changelog`, `copyTreeExcludingProtected()`, `fetchVerifiedRelease()`, `[1.2.0] — 2026-08-07`, `[Unreleased]`, `applyPendingUpdate()` … +46
+**Busiest symbols:** `updateEngine.js`, `applyUpdate()`, `checkForUpdates()`, `release_pipeline.js`, `Changelog`, `copyTreeExcludingProtected()`, `fetchVerifiedRelease()`, `[1.2.0] — 2026-08-07`, `[Unreleased]`, `applyPendingUpdate()` … +47
 
 **Reaches:** Persistence & Settings (21) · Backups & Reporting (8)
 
@@ -484,7 +487,7 @@ The owner's internal Dev → Sandbox → Live pipeline: PM2 ecosystem files, ngi
 
 #### Test Suites
 
-`tests` · 17 files · 152 symbols
+`tests` · 17 files · 153 symbols
 
 Assert-driven, no framework: billing math, helper integration, HTTP routes/auth, the money paths and Razorpay webhook, and the fail-closed production startup guard — all five run by npm test against temp data dirs, never backend/data/. Playwright end-to-end journeys live under tests/e2e/ and run separately (npm run test:e2e) because they need a browser binary. Anything touching money must be covered here before it is called done.
 
@@ -510,15 +513,15 @@ Assert-driven, no framework: billing math, helper integration, HTTP routes/auth,
 
 </details>
 
-**Busiest symbols:** `test_billing_math.js`, `test_http.js`, `test_routes.js`, `test_repositories.js`, `test_suite.js`, `fixtures.js`, `row()`, `test_concurrency.js`, `return-desk.spec.js`, `test_schema.js` … +142
+**Busiest symbols:** `test_billing_math.js`, `test_http.js`, `test_routes.js`, `test_repositories.js`, `test_suite.js`, `fixtures.js`, `row()`, `test_concurrency.js`, `return-desk.spec.js`, `test_schema.js` … +143
 
-**Reaches:** Pricing & Billing Math (22) · Crypto, Auth & Black Box (14) · Persistence & Settings (4) · Customer Portal (2)
+**Reaches:** Pricing & Billing Math (22) · Crypto, Auth & Black Box (14) · Persistence & Settings (4) · Customer Portal (2) · Release & Update Engine (1)
 
 > **Declared link** Test Suites → Pricing & Billing Math (asserts every formula). test_billing_math.js imports frontend/js/lib/ directly — the reason frontend/package.json exists at all.
 
 #### Local Dev Loop & Manifests
 
-`dev-loop` · 5 files · 55 symbols
+`dev-loop` · 5 files · 56 symbols
 
 The scripts that start and restart the thing locally, plus the dependency manifests that define the budget in CLAUDE.md §0. Restart_Server.bat frees port 5000 before relaunching, which is the safe way to restart after a code change.
 
@@ -532,7 +535,7 @@ The scripts that start and restart the thing locally, plus the dependency manife
 
 </details>
 
-**Busiest symbols:** `scripts`, `package.json`, `dependencies`, `package.json`, `@playwright/test`, `cors`, `devDependencies`, `dotenv`, `engines`, `express` … +45
+**Busiest symbols:** `scripts`, `package.json`, `dependencies`, `package.json`, `@playwright/test`, `cors`, `devDependencies`, `dotenv`, `engines`, `express` … +46
 
 #### Mobile Wrapper
 

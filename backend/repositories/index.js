@@ -28,6 +28,7 @@ export * as users from './userRepository.js';
 export * as rates from './rateRepository.js';
 export * as sequences from './sequenceRepository.js';
 export * as audit from './auditRepository.js';
+export * as inventory from './inventoryRepository.js';
 export * as organisation from './organisationRepository.js';
 
 export { inTransaction, inTransactionNow, backupTo, checkpointAndCopy, closeDb, DB_FILE, migrationStatus };
