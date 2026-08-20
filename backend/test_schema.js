@@ -511,6 +511,49 @@ check('an audit event can be written but never altered or deleted', () => {
 });
 
 /* --------------------------------------------------------------------------
+   5c. Cash shifts (Phase 5.3) — one open shift per branch, and a closed
+   shift is terminal. Exercised via raw SQL, the same reasoning as 4b: the
+   repository's own guards (getOpenShift/status checks) would otherwise be
+   the only thing tested, leaving the DB triggers behind them unexercised.
+   -------------------------------------------------------------------------- */
+
+db.prepare(`INSERT INTO cash_shifts (id, tenant_id, branch_id, status, opening_float_paise, opened_by_user_id, opened_at, business_date)
+    VALUES (?,?,?,?,?,?,?,?)`).run('SHIFT1', 'T1', 'B1', 'open', 500000, 'U-MGR', NOW, TODAY);
+
+check('a second open shift on the same branch is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO cash_shifts (id, tenant_id, branch_id, status, opening_float_paise, opened_by_user_id, opened_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?)`).run('SHIFT2', 'T1', 'B1', 'open', 100000, 'U-MGR', NOW, TODAY),
+        /UNIQUE|constraint/i);
+});
+
+check('the opening float cannot be rewritten after the fact', () => {
+    refuses(() => db.prepare('UPDATE cash_shifts SET opening_float_paise = 999 WHERE id = ?').run('SHIFT1'),
+        /opening facts cannot be changed/);
+});
+
+check('a shift cannot be closed without a count, an approver and a variance all at once', () => {
+    refuses(() => db.prepare('UPDATE cash_shifts SET status = ? WHERE id = ?').run('closed', 'SHIFT1'),
+        /CHECK|constraint/i);
+});
+
+check('closing a shift properly, then editing or reopening it, is refused', () => {
+    db.prepare(`UPDATE cash_shifts SET status='closed', counted_cash_paise=?, expected_cash_paise=?, variance_paise=?, closed_by_user_id=?, closed_at=? WHERE id=?`)
+        .run(500000, 500000, 0, 'U-MGR', NOW, 'SHIFT1');
+
+    refuses(() => db.prepare('UPDATE cash_shifts SET status = ? WHERE id = ?').run('open', 'SHIFT1'),
+        /cannot be reopened or edited/);
+    refuses(() => db.prepare('UPDATE cash_shifts SET closing_note = ? WHERE id = ?').run('edited after close', 'SHIFT1'),
+        /cannot be reopened or edited/);
+    refuses(() => db.prepare('DELETE FROM cash_shifts WHERE id = ?').run('SHIFT1'), /append-only/);
+});
+
+check('a new shift can open on the branch once the old one is closed', () => {
+    db.prepare(`INSERT INTO cash_shifts (id, tenant_id, branch_id, status, opening_float_paise, opened_by_user_id, opened_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?)`).run('SHIFT3', 'T1', 'B1', 'open', 500000, 'U-MGR', NOW, TODAY);
+    assert.strictEqual(db.prepare("SELECT status FROM cash_shifts WHERE id = 'SHIFT3'").get().status, 'open');
+});
+
+/* --------------------------------------------------------------------------
    6. Transactions — the whole reason for the migration
    -------------------------------------------------------------------------- */
 

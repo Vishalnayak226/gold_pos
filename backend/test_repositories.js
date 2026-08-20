@@ -1378,6 +1378,117 @@ console.log('\n14. Lot inventory');
     });
 }
 
+/* ==========================================================================
+   16. Cash shifts — open with a float, close with a count (Phase 5.3)
+   ========================================================================== */
+
+console.log('\n16. Cash shifts');
+
+{
+    check('at most one shift may be open per branch at a time', () => {
+        assert.equal(repo.cashShifts.getOpenShift(context.tenantId, context.branchId), null);
+
+        const shiftId = repo.inTransaction(() => repo.cashShifts.openShift({
+            tenantId: context.tenantId, branchId: context.branchId, openingFloatPaise: 500000,
+            openingNote: 'Morning float', actorUserId: context.ownerUserId
+        }));
+        assert.ok(repo.cashShifts.getOpenShift(context.tenantId, context.branchId));
+
+        assert.throws(() => repo.inTransaction(() => repo.cashShifts.openShift({
+            tenantId: context.tenantId, branchId: context.branchId, openingFloatPaise: 100000,
+            actorUserId: context.ownerUserId
+        })), /already open/);
+
+        // Close it (zero cash activity yet, so expected == float) so later
+        // checks in this section can open their own shift cleanly.
+        const { expectedPaise, variancePaise } = repo.inTransaction(() => repo.cashShifts.closeShift({
+            tenantId: context.tenantId, shiftId, countedCashPaise: 500000, actorUserId: context.ownerUserId
+        }));
+        assert.equal(expectedPaise, 500000);
+        assert.equal(variancePaise, 0);
+        assert.equal(repo.cashShifts.getOpenShift(context.tenantId, context.branchId), null,
+            'a closed shift is not the open shift');
+    });
+
+    let shiftId, shift;
+    check('a fresh shift starts with expected cash equal to its float', () => {
+        shiftId = repo.inTransaction(() => repo.cashShifts.openShift({
+            tenantId: context.tenantId, branchId: context.branchId, openingFloatPaise: 200000,
+            actorUserId: context.ownerUserId
+        }));
+        shift = repo.cashShifts.getShift(context.tenantId, shiftId);
+        assert.equal(repo.cashShifts.expectedCashAsOf(shift).expectedPaise, 200000);
+    });
+
+    check('a cash sale, a cash advance deposit and a cash refund all move expected cash correctly', () => {
+        // Cash sale: 5g @ 22K = 5 * 687500 = 3437500 paise metal value, no
+        // making charge/discount, exclusive 3% tax -> total 3540625 paise.
+        const sale = saleService.createSale({
+            purity: '22K', weightGrams: 5, customerName: 'Shift Test Customer', customerPhone: '9998887771',
+            makingChargeAmount: 0, makingChargePercent: 0, discountPercent: 0,
+            tenders: [{ method: 'cash' }] // whole bill in cash
+        }, DEPS);
+        assert.equal(sale.ok, true, sale.error);
+        const saleTotalPaise = toPaise(sale.sale.totalAmount);
+
+        // Cash advance deposit: +₹1,200.
+        const deposit = advanceService.recordDeposit({
+            customerPhone: '9998887771', customerName: 'Shift Test Customer',
+            amount: 1200, paymentMethod: 'Cash', referenceId: 'SHIFT-TEST-UTR-1'
+        }, DEPS);
+        assert.equal(deposit.success, true, deposit.error);
+
+        // Cash refund against the sale just filed: -₹500 (part of the metal value, priced by the return).
+        const ret = returnService.createReturn({
+            invoiceId: sale.invoiceId, weightGrams: 1, refundMode: 'cash', note: 'shift test partial return'
+        }, DEPS);
+        assert.equal(ret.ok, true, ret.error);
+        const refundPaise = toPaise(ret.return.refundAmount);
+
+        const { expectedPaise, cashTenders, cashDeposits, cashRefunds } = repo.cashShifts.expectedCashAsOf(shift);
+        assert.equal(cashTenders, saleTotalPaise);
+        assert.equal(cashDeposits, 120000);
+        assert.equal(cashRefunds, refundPaise);
+        assert.equal(expectedPaise, 200000 + saleTotalPaise + 120000 - refundPaise);
+    });
+
+    check('closeShift() freezes expected cash and reports the variance against what was counted', () => {
+        const { expectedPaise } = repo.cashShifts.expectedCashAsOf(shift);
+        const countedPaise = expectedPaise - 150; // the drawer was short ₹1.50
+        const result = repo.inTransaction(() => repo.cashShifts.closeShift({
+            tenantId: context.tenantId, shiftId, countedCashPaise: countedPaise,
+            closingNote: 'short by a stray coin', actorUserId: context.ownerUserId
+        }));
+        assert.equal(result.expectedPaise, expectedPaise);
+        assert.equal(result.variancePaise, -150);
+
+        const closed = repo.cashShifts.getShift(context.tenantId, shiftId);
+        assert.equal(closed.status, 'closed');
+        assert.equal(closed.counted_cash_paise, countedPaise);
+        assert.equal(closed.variance_paise, -150);
+    });
+
+    check('closeShift() refuses an already-closed shift', () => {
+        assert.throws(() => repo.inTransaction(() => repo.cashShifts.closeShift({
+            tenantId: context.tenantId, shiftId, countedCashPaise: 0, actorUserId: context.ownerUserId
+        })), /already closed/);
+    });
+
+    check('a closed shift cannot be edited — trigger-enforced, not just refused in JS', () => {
+        const db = repo.unsafeDatabaseHandle();
+        assert.throws(() => db.prepare('UPDATE cash_shifts SET counted_cash_paise = 0 WHERE id = ?').run(shiftId),
+            /cannot be reopened or edited/);
+        assert.throws(() => db.prepare('DELETE FROM cash_shifts WHERE id = ?').run(shiftId),
+            /append-only/);
+    });
+
+    check('listShifts() returns shift history newest first', () => {
+        const shifts = repo.cashShifts.listShifts(context.tenantId, { branchId: context.branchId });
+        assert.ok(shifts.length >= 2, 'both shifts opened in this section should be listed');
+        assert.ok(shifts[0].opened_at >= shifts[1].opened_at);
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

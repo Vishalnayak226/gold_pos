@@ -2707,6 +2707,125 @@ app.get('/api/inventory/movements', requireAdminSession, (req, res) => {
 });
 
 /* ==========================================================================
+   API Routes: Cash Shifts (roadmap Phase 5.3)
+
+   "Expected cash" is never trusted from the client — it is always computed
+   server-side from the ledger over the shift's own time window (see
+   cashShiftRepository.js#expectedCashAsOf). requireAdminSession only, no
+   requireApprover: the shift record itself (who opened it, who closed it,
+   what was counted) is the audit trail, matching this feature's
+   straightforward-CRUD scope — the same call made for inventory adjustments
+   above. Gating a large-variance close behind an approver is a reasonable
+   follow-up, not built here.
+   ========================================================================== */
+
+const CASH_SHIFT_OPEN_SCHEMA = {
+    openingFloat: { type: 'number', min: 0, max: 1000000, required: true },
+    openingNote: { type: 'string', maxLength: 500 }
+};
+
+const CASH_SHIFT_CLOSE_SCHEMA = {
+    countedCash: { type: 'number', min: 0, max: 10000000, required: true },
+    closingNote: { type: 'string', maxLength: 500 }
+};
+
+function cashShiftToWire(row) {
+    return {
+        id: row.id, branchId: row.branch_id, status: row.status,
+        openingFloat: fromPaise(row.opening_float_paise), openingNote: row.opening_note,
+        openedByUserId: row.opened_by_user_id, openedAt: row.opened_at,
+        countedCash: row.counted_cash_paise != null ? fromPaise(row.counted_cash_paise) : null,
+        expectedCash: row.expected_cash_paise != null ? fromPaise(row.expected_cash_paise) : null,
+        variance: row.variance_paise != null ? fromPaise(row.variance_paise) : null,
+        closedByUserId: row.closed_by_user_id, closedAt: row.closed_at, closingNote: row.closing_note,
+        businessDate: row.business_date
+    };
+}
+
+/**
+ * GET /api/cash-shifts/current
+ * The branch's open shift (if any), plus a live preview of expected cash —
+ * the same computation `close` freezes, so a cashier can see where the
+ * drawer stands before committing to a count.
+ */
+app.get('/api/cash-shifts/current', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const shift = repo.cashShifts.getOpenShift(context.tenantId, context.branchId);
+        if (!shift) return res.json({ shift: null });
+
+        const preview = repo.cashShifts.expectedCashAsOf(shift);
+        res.json({
+            shift: cashShiftToWire(shift),
+            expectedCash: fromPaise(preview.expectedPaise),
+            cashTenders: fromPaise(preview.cashTenders),
+            cashDeposits: fromPaise(preview.cashDeposits),
+            cashRefunds: fromPaise(preview.cashRefunds)
+        });
+    } catch (err) {
+        logError('Error reading current cash shift: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to read the current cash shift' });
+    }
+});
+
+app.post('/api/cash-shifts/open', requireAdminSession, validateBody(CASH_SHIFT_OPEN_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const shiftId = repo.inTransaction(() => repo.cashShifts.openShift({
+            tenantId: context.tenantId,
+            branchId: context.branchId,
+            openingFloatPaise: toPaise(req.body.openingFloat),
+            openingNote: req.body.openingNote || null,
+            actorUserId: resolveActorUserId(req.actor)
+        }));
+        res.json({ success: true, id: shiftId, shift: cashShiftToWire(repo.cashShifts.getShift(context.tenantId, shiftId)) });
+    } catch (err) {
+        logError('Error opening cash shift: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to open the shift' });
+    }
+});
+
+/**
+ * POST /api/cash-shifts/:id/close
+ * Freezes expected cash as of now, records what the cashier/manager
+ * actually counted, and closes the shift. The response always names both
+ * figures and the variance — never just "closed" — because the whole point
+ * of this route is to surface a mismatch, not hide one behind a success flag.
+ */
+app.post('/api/cash-shifts/:id/close', requireAdminSession, validateBody(CASH_SHIFT_CLOSE_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const result = repo.inTransaction(() => repo.cashShifts.closeShift({
+            tenantId: context.tenantId,
+            shiftId: req.params.id,
+            countedCashPaise: toPaise(req.body.countedCash),
+            closingNote: req.body.closingNote || null,
+            actorUserId: resolveActorUserId(req.actor)
+        }));
+        res.json({
+            success: true,
+            expectedCash: fromPaise(result.expectedPaise),
+            variance: fromPaise(result.variancePaise),
+            shift: cashShiftToWire(repo.cashShifts.getShift(context.tenantId, req.params.id))
+        });
+    } catch (err) {
+        logError('Error closing cash shift: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to close the shift' });
+    }
+});
+
+app.get('/api/cash-shifts', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const shifts = repo.cashShifts.listShifts(context.tenantId, { branchId: context.branchId, limit: req.query.limit });
+        res.json(shifts.map(cashShiftToWire));
+    } catch (err) {
+        logError('Error listing cash shifts: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list cash shifts' });
+    }
+});
+
+/* ==========================================================================
    API Routes: Razorpay Payment Gateway Integration
    ========================================================================== */
 

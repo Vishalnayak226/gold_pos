@@ -12,27 +12,39 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `6cd1fd4` — "Phase 36: migration compatibility gate, canary/pilot rollout,
-  deploy rollback" (2026-08-19), on branch
-  **`phase-21-payment-verification-and-production-guard`**, pushed to `origin` the same day
-  (compare link for the PR that will actually exercise CI:
+- **Latest commit:** `28b9a02` — "Phase 37: lot inventory - items, lots, and immutable stock
+  movements" (2026-08-20), on branch **`phase-21-payment-verification-and-production-guard`**,
+  pushed to `origin` the same day (compare link for the PR that will actually exercise CI:
   `github.com/Vishalnayak226/gold_pos/compare/develop...phase-21-payment-verification-and-production-guard`).
-- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-20 — PHASE 37 (LOT INVENTORY) IS UNCOMMITTED AND
-  UNREVIEWED.** Nothing is staged. `npm test` is green (**493 checks**, exit 0) on the working
-  tree. `npm run test:e2e` re-run in full (new nav button touches the shared sidebar every
-  existing spec renders against) — **43/43 green**, confirming the new tab did not regress any
-  existing journey. New:
-  `backend/repositories/migrations/006_lot_inventory.sql`, `backend/repositories/inventoryRepository.js`,
-  `frontend/js/components/InventoryManager.js`. Modified: `backend/repositories/index.js`,
-  `backend/server.js`, `backend/test_schema.js`, `backend/test_repositories.js`,
+- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-20, AND SPLIT BETWEEN TWO CONCURRENT STREAMS OF
+  WORK — READ THIS BEFORE STAGING ANYTHING.** A second session was mid-edit on audit-log
+  retention in this exact tree while Phase 38 (below) was built: uncommitted new files
+  `backend/auditRetention.js`, `backend/repositories/auditRetentionRepository.js`,
+  `backend/repositories/migrations/007_audit_retention_checkpoints.sql`, and edits to
+  `backend/defaultSettings.js` and `backend/repositories/auditRepository.js` — **none of that is
+  staged, none of it is described by this row, and none of it should be committed by anyone who
+  did not write it.** `git status` before touching `server.js`, `repositories/index.js`,
+  `test_schema.js`, or `test_repositories.js` — Phase 38 already used `git add -p`-equivalent
+  surgery (reconstructing a "HEAD + only this phase's lines" version, verified to run standalone)
+  to stage its own lines out of files that had both streams' additions merged into one git hunk
+  with no separating context line. If the audit-retention session's work is still sitting
+  uncommitted when you read this, it is very likely still in progress or simply not yet
+  committed by whoever owns it — do not assume it is abandoned or fair game to fold into an
+  unrelated commit.
+- **⚠️ THE WORKING TREE ALSO CARRIES PHASE 38 (CASH SHIFTS), UNCOMMITTED as this row is written.**
+  `npm test` is green (**505 checks** in this phase's own staged state — the actual working tree
+  also carries the other session's additional uncommitted checks on top of that, so a plain
+  `npm test` run right now will report a higher number that is not entirely this phase's). Full
+  43/43 Playwright e2e re-run (another new nav button) — green. New:
+  `backend/repositories/migrations/008_cash_shifts.sql`, `backend/repositories/cashShiftRepository.js`,
+  `frontend/js/components/CashShiftManager.js`. Modified (staged surgically, see above):
+  `backend/repositories/index.js`, `backend/server.js`, `backend/test_schema.js`,
+  `backend/test_repositories.js`. Modified (entirely this phase, staged normally):
   `frontend/js/app.js`, `frontend/index.html`, `CLAUDE.md`, `docs/LEDGER.md`,
   `docs/PRODUCTION_READINESS_ROADMAP.md`.
-  - Closes the ungated half of `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 5.2's line (lot
-    inventory + adjustments/counts). **Purchase receiving and branch transfer deliberately NOT
-    built** — gated behind a legal/business definition (GST reverse-charge, inter-GSTIN
-    accounting) that has never been made; confirmed the scope split with the user before writing
-    any code rather than guessing. **Not wired into the sale/invoice flow** — a sale does not
-    decrement stock yet. Full detail: `docs/LEDGER.md` Phase 37.
+  - Closes the cash-shifts third of `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 5.3's line (split
+    tenders / cash shifts / quotes-holds / reprint / delivery). **Quotes/holds and delivery are
+    still not started.** Full detail: `docs/LEDGER.md` Phase 38.
 - **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
   UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
   on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:

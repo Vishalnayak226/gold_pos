@@ -667,9 +667,21 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    *(**Reprint shipped in Phase 22. Split tenders landed 2026-08-12** — a sale records how it was
    paid across up to 10 tenders (`cash`/`card`/`upi`/`razorpay`/`bank_transfer`/`other`), validated
    in integer paise to sum exactly to the amount payable after any advance redemption. **Cash
-   shifts/closing, quotes/holds and delivery are not started** — but they are now merely unbuilt
-   rather than impossible: until tenders existed there was no payment data on a sale at all, so a
-   drawer count had nothing to reconcile against.)*
+   shifts/closing landed 2026-08-20, Phase 38** — `cash_shifts` (`backend/repositories/migrations/
+   008_cash_shifts.sql`), append-only by trigger like `advance_entries`, one open shift per branch
+   at a time. Expected cash is never stored until close — always computed fresh over the shift's
+   own window: opening float, plus every cash tender and cash advance deposit, minus every cash
+   refund, all read live from the existing ledger tables (`tenders`, `advance_entries`,
+   `credit_notes`). `GET`/`POST /api/cash-shifts/*` and a new Cash Shifts tab
+   (`frontend/js/components/CashShiftManager.js`) with a live expected-cash preview on an open
+   shift. **Quotes/holds and delivery are still not started.** Verified: `test_schema.js` +5 (the
+   one-open-shift-per-branch constraint, the opening-facts-immutable and closed-is-terminal
+   triggers, all via raw SQL); `test_repositories.js` +7 (a real cash sale, cash advance deposit
+   and cash refund all moving expected cash correctly, the second-open-shift and
+   already-closed refusals, listShifts ordering); a headless-Chromium run driving the actual admin UI (open a
+   shift, watch the live preview, close it, see the variance in the app's own alert). Tests:
+   505 checks in this commit (see `docs/LEDGER.md` Phase 38 for the concurrent-session caveat on
+   this figure).)*
 4. Returns/exchanges, credit notes, refunds, approvals and old-gold only after legal sign-off.
    *(**Returns, credit notes and refunds shipped in Phase 23**, and were extended to per-line
    returns on 2026-08-12. **Approvals are done as of 2026-08-13**: advance deposits are owner/manager
