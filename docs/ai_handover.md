@@ -12,40 +12,38 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `c868d91` — "Phase 38: cash shifts - open with a float, close with a count"
+- **Latest commit:** `8bcd784` — "Phase 39: quotes and holds - save a cart without filing it"
   (2026-08-20), on branch **`phase-21-payment-verification-and-production-guard`**, pushed to
   `origin` the same day (compare link for the PR that will actually exercise CI:
   `github.com/Vishalnayak226/gold_pos/compare/develop...phase-21-payment-verification-and-production-guard`).
 - **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-20, AND SPLIT BETWEEN TWO CONCURRENT STREAMS OF
   WORK — READ THIS BEFORE STAGING ANYTHING.** A second session was mid-edit on audit-log
-  retention in this exact tree across Phases 38 and 39: uncommitted new files
+  retention in this exact tree across Phases 38, 39 and 40: uncommitted new files
   `backend/auditRetention.js`, `backend/repositories/auditRetentionRepository.js`,
   `backend/repositories/migrations/007_audit_retention_checkpoints.sql`, and edits to
   `backend/defaultSettings.js` and `backend/repositories/auditRepository.js` — **none of that is
   staged, none of it is described by this row, and none of it should be committed by anyone who
   did not write it.** `git status` before touching `server.js`, `repositories/index.js`,
-  `test_schema.js`, or `test_repositories.js` — both Phase 38 and Phase 39 used `git add -p`-
+  `test_schema.js`, or `test_repositories.js` — Phases 38, 39 and 40 all used `git add -p`-
   equivalent surgery (reconstructing a "HEAD + only this phase's lines" version, verified to run
   standalone) to stage their own lines out of files that had both streams' additions merged into
   one git hunk with no separating context line. If the audit-retention session's work is still
   sitting uncommitted when you read this, it is very likely still in progress or simply not yet
   committed by whoever owns it — do not assume it is abandoned or fair game to fold into an
   unrelated commit.
-- **⚠️ THE WORKING TREE ALSO CARRIES PHASE 39 (QUOTES & HOLDS), UNCOMMITTED as this row is
-  written.** `npm test` is green (**514 checks** in this phase's own staged state — the actual
+- **⚠️ THE WORKING TREE ALSO CARRIES PHASE 40 (INVOICE DELIVERY STATUS), UNCOMMITTED as this row
+  is written.** `npm test` is green (**519 checks** in this phase's own staged state — the actual
   working tree also carries the other session's additional uncommitted checks on top of that, so
   a plain `npm test` run right now will report a higher number that is not entirely this phase's).
-  Full 43/43 Playwright e2e re-run — load-bearing here, not a formality: this is the first change
-  in this session's phases to touch `BillingDesk.js`, the most heavily e2e-covered file in the
-  tree. New: `backend/repositories/migrations/009_sale_drafts.sql`,
-  `backend/repositories/saleDraftRepository.js`, `frontend/js/components/QuotesHoldsManager.js`.
-  Modified (staged surgically, see above): `backend/repositories/index.js`, `backend/server.js`,
-  `backend/test_schema.js`, `backend/test_repositories.js`. Modified (entirely this phase, staged
-  normally): `frontend/js/components/BillingDesk.js`, `frontend/js/app.js`, `frontend/index.html`,
+  Full 43/43 Playwright e2e re-run — `ReprintDesk.js` has its own dedicated spec. New:
+  `backend/repositories/migrations/010_invoice_delivery.sql`. Modified (staged surgically, see
+  above): `backend/repositories/index.js`, `backend/server.js`, `backend/test_schema.js`,
+  `backend/test_repositories.js`. Modified (entirely this phase, staged normally):
+  `backend/repositories/invoiceRepository.js`, `frontend/js/components/ReprintDesk.js`,
   `CLAUDE.md`, `docs/LEDGER.md`, `docs/PRODUCTION_READINESS_ROADMAP.md`.
-  - Closes the quotes/holds two-fifths of `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 5.3's line
-    (split tenders / cash shifts / quotes-holds / reprint / delivery). **Delivery is still not
-    started.** Full detail: `docs/LEDGER.md` Phase 39.
+  - **Closes `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 5.3's line entirely** — split tenders,
+    cash shifts (Phase 38), quotes/holds (Phase 39) and now delivery (Phase 40) are all landed;
+    only reprint predates this run. Full detail: `docs/LEDGER.md` Phase 40.
 - **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
   UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
   on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:

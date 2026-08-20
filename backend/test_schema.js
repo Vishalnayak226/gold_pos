@@ -253,6 +253,16 @@ check('a negative total is refused', () => {
     );
 });
 
+check('an invoice defaults to pending delivery, and an unknown delivery status is refused', () => {
+    insertInvoice({ id: 'INV-8B', invoice_number: 'INV-00000FB-26', sequence_value: 108 });
+    assert.strictEqual(db.prepare("SELECT delivery_status FROM invoices WHERE id = 'INV-8B'").get().delivery_status, 'pending');
+
+    refuses(
+        () => insertInvoice({ id: 'INV-8C', invoice_number: 'INV-00000FC-26', sequence_value: 109, delivery_status: 'shipped' }),
+        /CHECK|constraint/i
+    );
+});
+
 check('an invoice line cannot report more returned weight than it sold', () => {
     db.prepare(`INSERT INTO invoice_lines
         (id, invoice_id, line_number, purity, weight_mg, rate_paise_per_g, metal_value_paise,

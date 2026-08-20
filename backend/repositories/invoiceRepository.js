@@ -111,6 +111,28 @@ export function setState(invoiceId, state) {
     if (result.changes !== 1) throw new Error(`No invoice ${invoiceId} to transition.`);
 }
 
+/**
+ * Marks an invoice delivered. Reversible by markPending() below — this is
+ * operational status, not a financial fact, so unlike everything else this
+ * repository touches it carries no immutability trigger.
+ */
+export function markDelivered(tenantId, invoiceId, { actorUserId, note = null, at = Date.now() }) {
+    const result = getDb().prepare(`
+        UPDATE invoices SET delivery_status = 'delivered', delivered_at = ?, delivered_by_user_id = ?, delivery_note = ?
+        WHERE id = ? AND tenant_id = ?
+    `).run(at, actorUserId, note, invoiceId, tenantId);
+    if (result.changes !== 1) throw new Error(`No invoice ${invoiceId} for this tenant.`);
+}
+
+/** Reverts an invoice to pending — a correction, not a new fact, so the delivered_at/by/note are cleared rather than kept as history. */
+export function markPending(tenantId, invoiceId) {
+    const result = getDb().prepare(`
+        UPDATE invoices SET delivery_status = 'pending', delivered_at = NULL, delivered_by_user_id = NULL, delivery_note = NULL
+        WHERE id = ? AND tenant_id = ?
+    `).run(invoiceId, tenantId);
+    if (result.changes !== 1) throw new Error(`No invoice ${invoiceId} for this tenant.`);
+}
+
 /* --------------------------------------------------------------------------
    Reads
    -------------------------------------------------------------------------- */
@@ -420,7 +442,15 @@ export function toLegacySale(invoice, lines, extra = {}) {
         /* WHO BILLED IT. Resolved from created_by_user_id back to the
            `{id, name, role}` an admin session carries, so the wire shape is the
            one the desk has always read. */
-        actor: extra.actor || null
+        actor: extra.actor || null,
+
+        /* DELIVERY (Phase 5.3, additive — nothing in the legacy JSON ledger
+           ever had this). 'pending' for every invoice filed before this
+           column existed, which is exactly true: nothing was ever marked
+           delivered. */
+        deliveryStatus: invoice.delivery_status || 'pending',
+        deliveredAt: invoice.delivered_at || null,
+        deliveryNote: invoice.delivery_note || null
     };
 }
 

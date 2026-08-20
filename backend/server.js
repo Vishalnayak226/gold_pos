@@ -2969,6 +2969,44 @@ app.post('/api/sale-drafts/:id/discard', requireAdminSession, (req, res) => {
 });
 
 /* ==========================================================================
+   API Routes: Invoice Delivery Status (roadmap Phase 5.3, the last piece)
+
+   Reversible on purpose — this is operational status, not a financial fact,
+   so a mis-tap corrects with the same route rather than needing a second
+   "undo" mechanism.
+   ========================================================================== */
+
+const DELIVERY_SCHEMA = {
+    delivered: { type: 'boolean', required: true },
+    note: { type: 'string', maxLength: 500 }
+};
+
+app.post('/api/sales/:invoiceNumber/delivery', requireAdminSession, validateBody(DELIVERY_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const invoice = repo.invoices.findByNumber(context.tenantId, req.params.invoiceNumber);
+        if (!invoice) return res.status(404).json({ error: 'No invoice with that number' });
+
+        if (req.body.delivered) {
+            repo.invoices.markDelivered(context.tenantId, invoice.id, {
+                actorUserId: resolveActorUserId(req.actor), note: req.body.note || null
+            });
+        } else {
+            repo.invoices.markPending(context.tenantId, invoice.id);
+        }
+        const updated = repo.invoices.findByNumber(context.tenantId, req.params.invoiceNumber);
+        res.json({
+            success: true, invoiceNumber: updated.invoice_number,
+            deliveryStatus: updated.delivery_status, deliveredAt: updated.delivered_at,
+            deliveryNote: updated.delivery_note
+        });
+    } catch (err) {
+        logError('Error updating invoice delivery status: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to update delivery status' });
+    }
+});
+
+/* ==========================================================================
    API Routes: Razorpay Payment Gateway Integration
    ========================================================================== */
 

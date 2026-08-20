@@ -684,8 +684,15 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    by the server's own recompute at submission. `GET`/`POST`/`PATCH /api/sale-drafts/*`, two new
    buttons on the Billing Desk (`HOLD`/`QUOTE`) that save the active cart without filing anything,
    and a new Quotes & Holds tab (`frontend/js/components/QuotesHoldsManager.js`) whose Resume
-   button loads a saved cart straight back into the Billing Desk's own state. **Delivery is still
-   not started** — this phase closes only the quotes/holds two-fifths of the roadmap line.
+   button loads a saved cart straight back into the Billing Desk's own state. **Delivery landed
+   2026-08-20, Phase 40, closing the line.** Four additive columns on `invoices`
+   (`delivery_status`/`delivered_at`/`delivered_by_user_id`/`delivery_note`, migration
+   `010_invoice_delivery.sql`) rather than a new table — this is one more fact about an invoice
+   that already exists, not a ledger of its own events, and it is deliberately reversible (a plain
+   `UPDATE`, no immutability trigger) since it is operational status, not a financial fact.
+   `POST /api/sales/:invoiceNumber/delivery` and a Delivery column with a Mark Delivered/Mark
+   Pending toggle added to the Reprint Desk's results table — the screen that already looks an
+   invoice up by number/phone/name, so delivery tracking needed no new screen of its own.
    Verified: `test_schema.js` +3 (kind/status enums, `json_valid(cart_json)`, and that the table
    really is freely mutable — no immutability trigger, unlike every other table this session
    added); `test_repositories.js` +6 (an empty cart refused, a full create → edit → resume →
@@ -696,7 +703,16 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    re-run — load-bearing here specifically, since this is the first change in this session's
    phases to touch `BillingDesk.js`, the most heavily e2e-covered file in the tree. Tests: 514
    checks in this commit (see `docs/LEDGER.md` Phase 39 for the concurrent-session caveat this
-   figure carries forward from Phase 38).)*
+   figure carries forward from Phase 38). **Phase 40 (delivery) verified separately:**
+   `test_schema.js` +1 (defaults to pending, an unknown status refused); `test_repositories.js`
+   +4 (mark delivered reaches the wire shape, mark pending clears the facts rather than keeping
+   them as history, a cross-tenant mark refused); the exact wire-shape field-list test in
+   `test_repositories.js` intentionally updated to include the three new fields — the same test
+   CLAUDE.md calls load-bearing for catching an accidentally DROPPED field, deliberately extended
+   here for an intentionally ADDED one; a headless-Chromium run — filed a sale, found it on the
+   Reprint Desk, toggled Mark Delivered then Mark Pending, watched the badge and button flip both
+   times with zero console errors. Full 43/43 Playwright e2e re-run again (`ReprintDesk.js` has
+   its own dedicated spec). Tests: 514 → 519, green, exit 0.)*
 4. Returns/exchanges, credit notes, refunds, approvals and old-gold only after legal sign-off.
    *(**Returns, credit notes and refunds shipped in Phase 23**, and were extended to per-line
    returns on 2026-08-12. **Approvals are done as of 2026-08-13**: advance deposits are owner/manager

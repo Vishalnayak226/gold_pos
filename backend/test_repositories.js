@@ -220,7 +220,8 @@ check('the persisted sale carries every legacy field, in rupees', () => {
     // BOTH shapes at once (CLAUDE.md §0), and a projection that returns only
     // the rollup is the regression this assertion exists to catch.
     const expected = [
-        'actor', 'appliedAdvance', 'customerName', 'customerPhone', 'discount', 'discountPercent',
+        'actor', 'appliedAdvance', 'customerName', 'customerPhone', 'deliveredAt', 'deliveryNote',
+        'deliveryStatus', 'discount', 'discountPercent',
         'goldPricePerGram', 'goldRateSource', 'id', 'lines', 'makingChargeAmount', 'makingChargePercent',
         'metalValue', 'purity', 'taxAmount', 'taxMode', 'taxPercent', 'taxableAmount',
         'tenders', 'timestamp', 'totalAmount', 'weightGrams'
@@ -1558,6 +1559,46 @@ console.log('\n17. Sale drafts');
 
         const quotesOnly = repo.saleDrafts.listDrafts(context.tenantId, { branchId: context.branchId, status: 'discarded', kind: 'quote' });
         assert.ok(quotesOnly.some(d => d.id === quoteId));
+    });
+}
+
+/* ==========================================================================
+   18. Invoice delivery status (Phase 5.3)
+   ========================================================================== */
+
+console.log('\n18. Invoice delivery');
+
+{
+    check('a filed invoice defaults to pending delivery', () => {
+        assert.equal(CASH_SALE.sale.deliveryStatus, 'pending');
+        assert.equal(CASH_SALE.sale.deliveredAt, null);
+    });
+
+    const invoiceRowId = repo.unsafeDatabaseHandle()
+        .prepare('SELECT id FROM invoices WHERE invoice_number = ?').get(CASH_SALE.invoiceId).id;
+
+    check('markDelivered() records who and when, and it reaches the wire shape', () => {
+        repo.invoices.markDelivered(context.tenantId, invoiceRowId, {
+            actorUserId: context.ownerUserId, note: 'Picked up by customer'
+        });
+        const row = repo.invoices.findById(invoiceRowId);
+        const wire = repo.invoices.toLegacySale(row, repo.invoices.linesFor(invoiceRowId));
+        assert.equal(wire.deliveryStatus, 'delivered');
+        assert.ok(wire.deliveredAt);
+        assert.equal(wire.deliveryNote, 'Picked up by customer');
+    });
+
+    check('markPending() reverts it, clearing the delivery facts rather than keeping them as history', () => {
+        repo.invoices.markPending(context.tenantId, invoiceRowId);
+        const row = repo.invoices.findById(invoiceRowId);
+        assert.equal(row.delivery_status, 'pending');
+        assert.equal(row.delivered_at, null);
+        assert.equal(row.delivery_note, null);
+    });
+
+    check('markDelivered() refuses an invoice id from a different tenant', () => {
+        assert.throws(() => repo.invoices.markDelivered('NO-SUCH-TENANT', invoiceRowId, { actorUserId: context.ownerUserId }),
+            /No invoice .* for this tenant/);
     });
 }
 

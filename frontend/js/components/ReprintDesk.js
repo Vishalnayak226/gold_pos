@@ -56,6 +56,7 @@ function formatWhen(ts) {
 export class ReprintDesk {
     constructor() {
         this.results = [];
+        this.lastSearchData = null;
         this.selected = null;
         this.company = { name: '', logo: '' };
         this.render();
@@ -179,6 +180,7 @@ export class ReprintDesk {
                 return;
             }
             this.results = data.results || [];
+            this.lastSearchData = data;
             this.renderResults(data);
             logTelemetry(`Reprint search returned ${this.results.length} invoice(s).`);
         } catch (err) {
@@ -209,6 +211,14 @@ export class ReprintDesk {
                 <td>${escapeHtml(sale.customerPhone || '—')}</td>
                 <td>${escapeHtml(describeSaleGoods(sale))}</td>
                 <td class="text-right">${money(sale.totalAmount)}</td>
+                <td>${sale.deliveryStatus === 'delivered'
+                    ? `<span style="font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; color:var(--color-success); background:var(--color-success-bg);" title="${sale.deliveredAt ? formatWhen(sale.deliveredAt) : ''}">Delivered</span>`
+                    : '<span style="font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; color:var(--color-text-muted); background:var(--color-surface-alt, #f1f5f9);">Pending</span>'}
+                    <button type="button" class="btn btn-secondary btn-sm toggle-delivery-btn" style="margin-left:6px;"
+                            data-invoice="${escapeHtml(sale.id)}" data-delivered="${sale.deliveryStatus === 'delivered' ? '1' : '0'}">
+                        ${sale.deliveryStatus === 'delivered' ? 'Mark Pending' : 'Mark Delivered'}
+                    </button>
+                </td>
                 <td class="text-right">
                     <button type="button" class="btn btn-secondary btn-sm reprint-open-btn"
                             data-invoice="${escapeHtml(sale.id)}">Open</button>
@@ -230,6 +240,7 @@ export class ReprintDesk {
                         <th>Phone</th>
                         <th>Goods</th>
                         <th class="text-right">Total</th>
+                        <th>Delivery</th>
                         <th class="text-right">Reprint</th>
                     </tr>
                 </thead>
@@ -243,6 +254,36 @@ export class ReprintDesk {
                 if (sale) this.renderInvoice(sale);
             });
         });
+        resultsEl.querySelectorAll('.toggle-delivery-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.toggleDelivery(
+                btn.getAttribute('data-invoice'), btn.getAttribute('data-delivered') === '1'
+            ));
+        });
+    }
+
+    /** Flips an invoice's delivery status. Reversible on purpose — see the route's own comment for why. */
+    async toggleDelivery(invoiceNumber, currentlyDelivered) {
+        try {
+            const res = await adminFetch(`/api/sales/${encodeURIComponent(invoiceNumber)}/delivery`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ delivered: !currentlyDelivered })
+            });
+            const body = await res.json();
+            if (!res.ok) {
+                alert(body.message || body.error || 'Failed to update delivery status.');
+                return;
+            }
+            const sale = this.results.find(s => s.id === invoiceNumber);
+            if (sale) {
+                sale.deliveryStatus = body.deliveryStatus;
+                sale.deliveredAt = body.deliveredAt;
+            }
+            this.renderResults(this.lastSearchData || { truncated: false, total: this.results.length });
+            logTelemetry(`Invoice ${invoiceNumber} marked ${body.deliveryStatus}.`);
+        } catch (err) {
+            alert('Could not reach the server.');
+        }
     }
 
     /**
