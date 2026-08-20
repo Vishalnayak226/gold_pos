@@ -389,7 +389,11 @@ export class BillingDesk {
                             </div>
                         </div>
 
-                        <div style="display:flex; gap:10px; width: 100%; margin-top:20px;">
+                        <div style="display:flex; gap:10px; width: 100%; margin-top:10px;">
+                            <button type="button" id="save-hold-btn" class="btn btn-secondary" style="flex:1;" title="Park this cart to free the counter, resume it later">HOLD</button>
+                            <button type="button" id="save-quote-btn" class="btn btn-secondary" style="flex:1;" title="Save as a price estimate for the customer, not a sale">QUOTE</button>
+                        </div>
+                        <div style="display:flex; gap:10px; width: 100%; margin-top:10px;">
                             <button type="button" id="print-invoice-btn" class="btn btn-secondary" style="flex:1;">PRINT INVOICE</button>
                             <button type="button" id="generate-invoice-btn" class="btn btn-primary" style="flex:2;">SAVE INVOICE</button>
                         </div>
@@ -592,6 +596,75 @@ export class BillingDesk {
 
         // Submit Invoice
         submitBtn.addEventListener('click', () => this.submitSale());
+
+        document.getElementById('save-hold-btn')?.addEventListener('click', () => this.saveDraft('hold'));
+        document.getElementById('save-quote-btn')?.addEventListener('click', () => this.saveDraft('quote'));
+    }
+
+    /**
+     * Saves the current cart as a quote or a hold (roadmap Phase 5.3) — never
+     * as an invoice. The cart is sent exactly as it stands in the browser;
+     * nothing here touches computeInvoiceTotals or the server's own money
+     * path. Resuming a draft later re-enters this exact same cart, and the
+     * eventual sale is still priced and validated the normal way at
+     * submission — a draft carries no special trust of its own.
+     */
+    async saveDraft(kind) {
+        const lines = this.activeLines();
+        if (lines.length === 0) {
+            alert('Add at least one item before saving a quote or hold.');
+            return;
+        }
+        try {
+            const res = await adminFetch('/api/sale-drafts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    kind, customerName: this.customerName, customerPhone: this.customerPhone,
+                    discountPercent: this.discountPercent, cart: lines
+                })
+            });
+            const body = await res.json();
+            if (!res.ok) {
+                alert(body.message || body.error || `Failed to save the ${kind}.`);
+                return;
+            }
+            alert(`${kind === 'quote' ? 'Quote' : 'Hold'} saved. Find it under the Quotes & Holds tab to resume it later.`);
+            logTelemetry(`Saved cart as a ${kind} (${body.id}).`);
+            this.resetForm();
+        } catch (err) {
+            alert('Could not reach the server.');
+        }
+    }
+
+    /**
+     * Loads a saved quote/hold back into the active cart, mirroring
+     * resetForm()'s field list. The cart is loaded exactly as saved — a
+     * stale rate or a moved tax setting is resolved the same way it always
+     * is, at submission, by the server's own recompute, not by this method
+     * guessing at what "re-pricing" should mean before that.
+     */
+    loadDraftCart(draft) {
+        this.resetForm();
+        this.cart = (draft.cart || []).map(line => ({ ...line }));
+        this.customerName = draft.customerName || '';
+        this.customerPhone = draft.customerPhone || '';
+        this.discountPercent = draft.discountPercent || 0;
+
+        const nameInput = document.getElementById('customer-name');
+        const phoneInput = document.getElementById('customer-phone');
+        const discountInput = document.getElementById('manual-discount');
+        if (nameInput) nameInput.value = this.customerName;
+        if (phoneInput) phoneInput.value = this.customerPhone;
+        if (discountInput) discountInput.value = this.discountPercent;
+
+        const previewName = document.getElementById('preview-customer-name');
+        const previewPhone = document.getElementById('preview-customer-phone');
+        if (previewName) previewName.textContent = this.customerName || 'Cash Sale';
+        if (previewPhone) previewPhone.textContent = this.customerPhone || '-';
+
+        this.renderCart();
+        this.recalculate();
     }
 
     async lookupCustomerAdvance(phone) {

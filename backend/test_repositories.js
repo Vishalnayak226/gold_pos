@@ -1489,6 +1489,78 @@ console.log('\n16. Cash shifts');
     });
 }
 
+/* ==========================================================================
+   17. Sale drafts — quotes and holds (Phase 5.3)
+   ========================================================================== */
+
+console.log('\n17. Sale drafts');
+
+{
+    const CART = [
+        { purityKey: '22k', purity: '22K', description: 'Bangle', weightGrams: 12, goldPricePerGram: 6875, metalValue: 82500, makingChargePercent: 10, makingChargeAmount: 8250 }
+    ];
+
+    check('createDraft() refuses an empty cart', () => {
+        assert.throws(() => repo.saleDrafts.createDraft({
+            tenantId: context.tenantId, branchId: context.branchId, kind: 'hold', cart: [],
+            actorUserId: context.ownerUserId
+        }), /non-empty array/);
+    });
+
+    let holdId;
+    check('createDraft() saves a hold with the cart exactly as given', () => {
+        holdId = repo.saleDrafts.createDraft({
+            tenantId: context.tenantId, branchId: context.branchId, kind: 'hold',
+            customerName: 'Walk-in', cart: CART, actorUserId: context.ownerUserId
+        });
+        const draft = repo.saleDrafts.getDraft(context.tenantId, holdId);
+        assert.strictEqual(draft.status, 'open');
+        assert.strictEqual(draft.kind, 'hold');
+        assert.deepStrictEqual(JSON.parse(draft.cart_json), CART);
+    });
+
+    check('updateDraft() edits an open draft\'s cart', () => {
+        const widerCart = [...CART, { purityKey: '22k', purity: '22K', description: 'Ring', weightGrams: 3, goldPricePerGram: 6875, metalValue: 20625, makingChargePercent: 10, makingChargeAmount: 2062.5 }];
+        const updated = repo.saleDrafts.updateDraft(context.tenantId, holdId, { cart: widerCart, customerPhone: '9998887770' });
+        assert.strictEqual(JSON.parse(updated.cart_json).length, 2);
+        assert.strictEqual(updated.customer_phone, '9998887770');
+    });
+
+    check('resumeDraft() transitions to resumed and is then terminal', () => {
+        const resumed = repo.saleDrafts.resumeDraft(context.tenantId, holdId, context.ownerUserId);
+        assert.strictEqual(resumed.status, 'resumed');
+        assert.ok(resumed.resumed_at);
+
+        assert.throws(() => repo.saleDrafts.updateDraft(context.tenantId, holdId, { cart: CART }),
+            /is resumed, not open/);
+        assert.throws(() => repo.saleDrafts.resumeDraft(context.tenantId, holdId, context.ownerUserId),
+            /already resumed/);
+    });
+
+    let quoteId;
+    check('discardDraft() transitions to discarded', () => {
+        quoteId = repo.saleDrafts.createDraft({
+            tenantId: context.tenantId, branchId: context.branchId, kind: 'quote',
+            customerName: 'Priya', cart: CART, actorUserId: context.ownerUserId
+        });
+        const discarded = repo.saleDrafts.discardDraft(context.tenantId, quoteId, context.ownerUserId);
+        assert.strictEqual(discarded.status, 'discarded');
+        assert.ok(discarded.discarded_at);
+    });
+
+    check('listDrafts() defaults to open, and filters by kind', () => {
+        const openDrafts = repo.saleDrafts.listDrafts(context.tenantId, { branchId: context.branchId });
+        assert.ok(!openDrafts.some(d => d.id === holdId), 'the resumed hold must not appear in the open list');
+        assert.ok(!openDrafts.some(d => d.id === quoteId), 'the discarded quote must not appear in the open list');
+
+        const resumedOnly = repo.saleDrafts.listDrafts(context.tenantId, { branchId: context.branchId, status: 'resumed' });
+        assert.ok(resumedOnly.some(d => d.id === holdId));
+
+        const quotesOnly = repo.saleDrafts.listDrafts(context.tenantId, { branchId: context.branchId, status: 'discarded', kind: 'quote' });
+        assert.ok(quotesOnly.some(d => d.id === quoteId));
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

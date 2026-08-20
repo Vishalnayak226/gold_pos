@@ -674,14 +674,29 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    refund, all read live from the existing ledger tables (`tenders`, `advance_entries`,
    `credit_notes`). `GET`/`POST /api/cash-shifts/*` and a new Cash Shifts tab
    (`frontend/js/components/CashShiftManager.js`) with a live expected-cash preview on an open
-   shift. **Quotes/holds and delivery are still not started.** Verified: `test_schema.js` +5 (the
-   one-open-shift-per-branch constraint, the opening-facts-immutable and closed-is-terminal
-   triggers, all via raw SQL); `test_repositories.js` +7 (a real cash sale, cash advance deposit
-   and cash refund all moving expected cash correctly, the second-open-shift and
-   already-closed refusals, listShifts ordering); a headless-Chromium run driving the actual admin UI (open a
-   shift, watch the live preview, close it, see the variance in the app's own alert). Tests:
-   505 checks in this commit (see `docs/LEDGER.md` Phase 38 for the concurrent-session caveat on
-   this figure).)*
+   shift. **Quotes/holds landed 2026-08-20, Phase 39** — `sale_drafts`
+   (`backend/repositories/migrations/009_sale_drafts.sql`), the one table this session's phases
+   added that is deliberately NOT append-only: a quote or a hold is scratch state, never a
+   financial record, until the ordinary `POST /api/sales` path turns one into a real invoice. The
+   cart is stored as opaque JSON and never priced or validated by the backend — it is priced by
+   the Billing Desk at save time and re-priced there again at resume time, through the unmodified
+   billing flow, so a stale rate or a moved tax setting is resolved exactly the way it always is:
+   by the server's own recompute at submission. `GET`/`POST`/`PATCH /api/sale-drafts/*`, two new
+   buttons on the Billing Desk (`HOLD`/`QUOTE`) that save the active cart without filing anything,
+   and a new Quotes & Holds tab (`frontend/js/components/QuotesHoldsManager.js`) whose Resume
+   button loads a saved cart straight back into the Billing Desk's own state. **Delivery is still
+   not started** — this phase closes only the quotes/holds two-fifths of the roadmap line.
+   Verified: `test_schema.js` +3 (kind/status enums, `json_valid(cart_json)`, and that the table
+   really is freely mutable — no immutability trigger, unlike every other table this session
+   added); `test_repositories.js` +6 (an empty cart refused, a full create → edit → resume →
+   list-excludes-resumed lifecycle, a resumed draft's terminal refusal); a headless-Chromium run
+   driving the real admin UI — entered an item on the Billing Desk, saved it as a Hold, found it
+   under Quotes & Holds, resumed it, and watched the Billing Desk reload the exact cart and
+   re-price it live to the paise through the unmodified billing engine. Full 43/43 Playwright e2e
+   re-run — load-bearing here specifically, since this is the first change in this session's
+   phases to touch `BillingDesk.js`, the most heavily e2e-covered file in the tree. Tests: 514
+   checks in this commit (see `docs/LEDGER.md` Phase 39 for the concurrent-session caveat this
+   figure carries forward from Phase 38).)*
 4. Returns/exchanges, credit notes, refunds, approvals and old-gold only after legal sign-off.
    *(**Returns, credit notes and refunds shipped in Phase 23**, and were extended to per-line
    returns on 2026-08-12. **Approvals are done as of 2026-08-13**: advance deposits are owner/manager

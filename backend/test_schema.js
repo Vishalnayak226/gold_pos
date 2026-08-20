@@ -554,6 +554,42 @@ check('a new shift can open on the branch once the old one is closed', () => {
 });
 
 /* --------------------------------------------------------------------------
+   5d. Sale drafts — quotes and holds (Phase 5.3). Unlike 4b/5c above, this
+   table is NOT append-only — a draft is mutable scratch state, not a
+   financial record (see 009_sale_drafts.sql). What matters here is the
+   CHECK constraints: a bad kind/status/cart is refused at the database
+   layer, not just by the repository's own guards.
+   -------------------------------------------------------------------------- */
+
+check('kind must be quote or hold', () => {
+    refuses(() => db.prepare(`INSERT INTO sale_drafts (id, tenant_id, branch_id, kind, customer_name, customer_phone, cart_json, created_by_user_id, created_at, updated_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run('SD1', 'T1', 'B1', 'layaway', '', '', '[{"weightGrams":5}]', 'U-MGR', NOW, NOW, TODAY),
+        /CHECK|constraint/i);
+});
+
+check('cart_json must actually be valid JSON', () => {
+    refuses(() => db.prepare(`INSERT INTO sale_drafts (id, tenant_id, branch_id, kind, customer_name, customer_phone, cart_json, created_by_user_id, created_at, updated_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run('SD2', 'T1', 'B1', 'hold', '', '', 'not json at all', 'U-MGR', NOW, NOW, TODAY),
+        /CHECK|constraint/i);
+});
+
+check('a valid draft can be written, updated freely, and defaults to open', () => {
+    db.prepare(`INSERT INTO sale_drafts (id, tenant_id, branch_id, kind, customer_name, customer_phone, cart_json, created_by_user_id, created_at, updated_at, business_date)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run('SD3', 'T1', 'B1', 'quote', 'Asha Rao', '9876543210', '[{"weightGrams":5,"purity":"22K"}]', 'U-MGR', NOW, NOW, TODAY);
+    const row = db.prepare("SELECT status, kind FROM sale_drafts WHERE id = 'SD3'").get();
+    assert.strictEqual(row.status, 'open');
+    assert.strictEqual(row.kind, 'quote');
+
+    // Fully mutable — no immutability trigger exists for this table.
+    db.prepare("UPDATE sale_drafts SET cart_json = '[{\"weightGrams\":8,\"purity\":\"22K\"}]' WHERE id = 'SD3'").run();
+    const updatedCart = JSON.parse(db.prepare("SELECT cart_json FROM sale_drafts WHERE id = 'SD3'").get().cart_json);
+    assert.strictEqual(updatedCart[0].weightGrams, 8, 'a draft is scratch state — an ordinary UPDATE must just work');
+});
+
+/* --------------------------------------------------------------------------
    6. Transactions — the whole reason for the migration
    -------------------------------------------------------------------------- */
 

@@ -2826,6 +2826,149 @@ app.get('/api/cash-shifts', requireAdminSession, (req, res) => {
 });
 
 /* ==========================================================================
+   API Routes: Sale Drafts — quotes and holds (roadmap Phase 5.3)
+
+   The cart is opaque here — never priced, validated or written into
+   invoices/tenders by this route. It is priced by the Billing Desk at save
+   time and re-priced there again at resume time, through the ordinary
+   billing flow. This is why a draft needs no requireApprover and no money
+   validation beyond "is this shaped like a cart at all": nothing here is a
+   financial fact until POST /api/sales files a real invoice.
+   ========================================================================== */
+
+const MAX_DRAFT_LINES = 50; // matches the invoice line cap (CLAUDE.md §0)
+
+const SALE_DRAFT_CREATE_SCHEMA = {
+    kind: { type: 'enum', values: ['quote', 'hold'], required: true },
+    customerName: NAME_RULE,
+    customerPhone: PHONE_RULE,
+    discountPercent: { type: 'number', min: 0, max: 100 },
+    note: { type: 'string', maxLength: 500 },
+    validUntil: { type: 'integer', min: 0, max: 9999999999999 }
+};
+
+const SALE_DRAFT_UPDATE_SCHEMA = {
+    customerName: NAME_RULE,
+    customerPhone: PHONE_RULE,
+    discountPercent: { type: 'number', min: 0, max: 100 },
+    note: { type: 'string', maxLength: 500 },
+    validUntil: { type: 'integer', min: 0, max: 9999999999999 }
+};
+
+function assertValidCart(cart) {
+    if (!Array.isArray(cart) || cart.length === 0) {
+        throw new saleService.DomainRefusal(400, 'cart must be a non-empty list of line items.');
+    }
+    if (cart.length > MAX_DRAFT_LINES) {
+        throw new saleService.DomainRefusal(400, `A draft may hold at most ${MAX_DRAFT_LINES} lines.`);
+    }
+    for (const [i, line] of cart.entries()) {
+        if (!line || typeof line !== 'object' || !(Number(line.weightGrams) > 0)) {
+            throw new saleService.DomainRefusal(400, `Line ${i + 1} needs a positive weightGrams.`);
+        }
+    }
+}
+
+function saleDraftToWire(row) {
+    return {
+        id: row.id, branchId: row.branch_id, kind: row.kind, status: row.status,
+        customerName: row.customer_name, customerPhone: row.customer_phone,
+        cart: JSON.parse(row.cart_json), discountPercent: round2(row.discount_bp / 100),
+        note: row.note, validUntil: row.valid_until,
+        createdByUserId: row.created_by_user_id, createdAt: row.created_at, updatedAt: row.updated_at,
+        resumedAt: row.resumed_at, discardedAt: row.discarded_at
+    };
+}
+
+app.get('/api/sale-drafts', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const drafts = repo.saleDrafts.listDrafts(context.tenantId, {
+            branchId: context.branchId,
+            kind: req.query.kind || null,
+            status: req.query.status || 'open',
+            limit: req.query.limit
+        });
+        res.json(drafts.map(saleDraftToWire));
+    } catch (err) {
+        logError('Error listing sale drafts: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list quotes/holds' });
+    }
+});
+
+app.post('/api/sale-drafts', requireAdminSession, validateBody(SALE_DRAFT_CREATE_SCHEMA), (req, res) => {
+    try {
+        assertValidCart(req.body.cart);
+        const context = repo.dataStoreContext();
+        const id = repo.saleDrafts.createDraft({
+            tenantId: context.tenantId,
+            branchId: context.branchId,
+            kind: req.body.kind,
+            customerName: req.body.customerName || '',
+            customerPhone: req.body.customerPhone || '',
+            cart: req.body.cart,
+            discountBp: Math.round((req.body.discountPercent || 0) * 100),
+            note: req.body.note || null,
+            validUntil: req.body.validUntil || null,
+            actorUserId: resolveActorUserId(req.actor)
+        });
+        res.json({ success: true, id, draft: saleDraftToWire(repo.saleDrafts.getDraft(context.tenantId, id)) });
+    } catch (err) {
+        if (err instanceof saleService.DomainRefusal) return res.status(err.status).json({ error: err.message });
+        logError('Error saving sale draft: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to save the quote/hold' });
+    }
+});
+
+app.patch('/api/sale-drafts/:id', requireAdminSession, validateBody(SALE_DRAFT_UPDATE_SCHEMA), (req, res) => {
+    try {
+        if (req.body.cart !== undefined) assertValidCart(req.body.cart);
+        const context = repo.dataStoreContext();
+        const patch = { ...req.body };
+        if (patch.discountPercent !== undefined) {
+            patch.discountBp = Math.round(patch.discountPercent * 100);
+            delete patch.discountPercent;
+        }
+        const updated = repo.saleDrafts.updateDraft(context.tenantId, req.params.id, patch);
+        if (!updated) return res.status(404).json({ error: 'No quote/hold with that id' });
+        res.json({ success: true, draft: saleDraftToWire(updated) });
+    } catch (err) {
+        if (err instanceof saleService.DomainRefusal) return res.status(err.status).json({ error: err.message });
+        logError('Error updating sale draft: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to update the quote/hold' });
+    }
+});
+
+/**
+ * POST /api/sale-drafts/:id/resume
+ * Marks the draft resumed and hands back its cart — the Billing Desk loads
+ * it into the active cart and re-prices it through the ordinary flow. A
+ * resumed draft is terminal: resuming again, or editing it, is refused, the
+ * same way a filed invoice is not a draft anymore either.
+ */
+app.post('/api/sale-drafts/:id/resume', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const resumed = repo.saleDrafts.resumeDraft(context.tenantId, req.params.id, resolveActorUserId(req.actor));
+        res.json({ success: true, draft: saleDraftToWire(resumed) });
+    } catch (err) {
+        logError('Error resuming sale draft: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to resume the quote/hold' });
+    }
+});
+
+app.post('/api/sale-drafts/:id/discard', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const discarded = repo.saleDrafts.discardDraft(context.tenantId, req.params.id, resolveActorUserId(req.actor));
+        res.json({ success: true, draft: saleDraftToWire(discarded) });
+    } catch (err) {
+        logError('Error discarding sale draft: ' + err.message, err.stack);
+        res.status(400).json({ error: err.message || 'Failed to discard the quote/hold' });
+    }
+});
+
+/* ==========================================================================
    API Routes: Razorpay Payment Gateway Integration
    ========================================================================== */
 

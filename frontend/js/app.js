@@ -11,6 +11,7 @@ import { Dashboard } from './components/Dashboard.js';
 import { AdvancesManager } from './components/AdvancesManager.js';
 import { InventoryManager } from './components/InventoryManager.js';
 import { CashShiftManager } from './components/CashShiftManager.js';
+import { QuotesHoldsManager } from './components/QuotesHoldsManager.js';
 import { CustomerAccountsManager } from './components/CustomerAccountsManager.js';
 import { AuditTrail } from './components/AuditTrail.js';
 import { SettingsManager } from './components/SettingsManager.js';
@@ -28,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.advancesManager = new AdvancesManager();
     window.inventoryManager = new InventoryManager();
     window.cashShiftManager = new CashShiftManager();
+    window.quotesHoldsManager = new QuotesHoldsManager();
     window.customerAccountsManager = new CustomerAccountsManager();
     window.auditTrail = new AuditTrail();
     window.settingsManager = new SettingsManager();
@@ -356,6 +358,9 @@ function initNavigation() {
             }
             if (targetId === 'cash-shifts-tab' && window.cashShiftManager && isAdminAuthenticated()) {
                 window.cashShiftManager.refresh();
+            }
+            if (targetId === 'quotes-holds-tab' && window.quotesHoldsManager && isAdminAuthenticated()) {
+                window.quotesHoldsManager.refresh();
             }
             if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && isAdminAuthenticated()) {
                 window.customerAccountsManager.refresh();

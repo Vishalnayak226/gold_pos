@@ -30,6 +30,7 @@ export * as sequences from './sequenceRepository.js';
 export * as audit from './auditRepository.js';
 export * as inventory from './inventoryRepository.js';
 export * as cashShifts from './cashShiftRepository.js';
+export * as saleDrafts from './saleDraftRepository.js';
 export * as organisation from './organisationRepository.js';
 
 export { inTransaction, inTransactionNow, backupTo, checkpointAndCopy, closeDb, DB_FILE, migrationStatus };

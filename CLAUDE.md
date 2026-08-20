@@ -272,8 +272,8 @@ wrong answers.
   ledgers, PIN hashing, session revocation, TOTP, the refund threshold) →
   `test_production_guard.js` (fail-closed startup) → `test_alerting.js` (raiseAlert's per-code
   cooldown, stale-rate/ledger-drift/backup-freshness/error-rate-latency checks — Phase 3
-  alerting, `backend/alerting.js`). **505 checks as of 2026-08-20**
-  (145 + 55 + 108 + 16 + 12 + 29 + 107 + 17 + 16, in run order — `test_suite.js` is counted by the
+  alerting, `backend/alerting.js`). **514 checks as of 2026-08-20**
+  (145 + 58 + 114 + 16 + 12 + 29 + 107 + 17 + 16, in run order — `test_suite.js` is counted by the
   numbered tests it prints, not by an older tally that no longer matched anything).
   - **`migrate.js --check-safety` (`npm run migrate:check-safety`) statically scans every
     migration on disk for a destructive DDL pattern** (`DROP TABLE`/`DROP COLUMN`/rename) and
