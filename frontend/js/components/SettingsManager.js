@@ -336,6 +336,29 @@ export class SettingsManager {
                     <span class="text-muted-small">Lowering this is a destructive action and requires confirmation — it can create duplicate invoice numbers.</span>
                 </div>
             </div>
+            <h3 class="settings-section-title" style="margin-top:30px;">Old-Gold Exchange</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Off by default. When on, the Billing Desk can weigh, test and credit gold a customer
+                trades in — the credit posts as an ordinary advance, redeemable like any other.
+                <strong>Buying gold from a customer's GST/reverse-charge treatment is not handled
+                here</strong> and remains a legal question for your CA before relying on this at
+                scale.
+            </p>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-oldgold-enabled">Accept Old-Gold Exchange</label>
+                    <select id="set-oldgold-enabled" class="form-control">
+                        <option value="false"${s.oldGoldExchangeEnabled ? '' : ' selected'}>No</option>
+                        <option value="true"${s.oldGoldExchangeEnabled ? ' selected' : ''}>Yes</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="set-oldgold-deduction">Deduction (%)</label>
+                    <input type="number" id="set-oldgold-deduction" class="form-control"
+                           value="${Number(s.oldGoldDeductionPercent) || 0}" step="0.5" min="0" max="100">
+                    <span class="text-muted-small">Covers refining loss and margin — subtracted from the tested weight before it is valued.</span>
+                </div>
+            </div>
             <h3 class="settings-section-title" style="margin-top:30px;">Gold Savings Schemes</h3>
             <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
                 Off by default. Terms below are an engineering placeholder — an "11 installments +
@@ -409,6 +432,8 @@ export class SettingsManager {
                 adminPin: document.getElementById('set-admin-pin').value.trim() || null,
                 invoicePrefix: document.getElementById('set-invoice-prefix').value || 'GOLD',
                 invoiceSeqStart: requestedSeq,
+                oldGoldExchangeEnabled: document.getElementById('set-oldgold-enabled').value === 'true',
+                oldGoldDeductionPercent: parseFloat(document.getElementById('set-oldgold-deduction').value) || 0,
                 goldSchemeEnabled: document.getElementById('set-scheme-enabled').value === 'true',
                 goldSchemeInstallmentCount: parseInt(document.getElementById('set-scheme-installments').value, 10) || 11,
                 goldSchemeBonusInstallments: parseInt(document.getElementById('set-scheme-bonus').value, 10) || 0,

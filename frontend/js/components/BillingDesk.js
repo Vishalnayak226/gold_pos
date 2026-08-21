@@ -57,6 +57,9 @@ export class BillingDesk {
         this.makingChargeAmount = 0;
         this.taxSlab = 3; // Default 3% GST
         this.taxMode = 'Exclusive'; // Default
+        // Off by default, matching backend/defaultSettings.js — the panel
+        // stays hidden until Settings turns this on.
+        this.oldGoldExchangeEnabled = false;
         this.defaultDiscountConfig = 0;
         this.discountPercent = 0;
         this.discountAmount = 0;
@@ -141,7 +144,11 @@ export class BillingDesk {
                 }
                 
                 this.taxMode = normalizeTaxMode(settings.taxMode);
-                
+
+                this.oldGoldExchangeEnabled = settings.oldGoldExchangeEnabled === true;
+                const oldGoldPanel = document.getElementById('old-gold-exchange-panel');
+                if (oldGoldPanel) oldGoldPanel.style.display = this.oldGoldExchangeEnabled ? 'block' : 'none';
+
                 if (settings.defaultDiscountPercent !== undefined) {
                     this.defaultDiscountConfig = parseInt(settings.defaultDiscountPercent, 10) || 0;
                     this.discountPercent = this.defaultDiscountConfig;
@@ -389,6 +396,37 @@ export class BillingDesk {
                             </div>
                         </div>
 
+                        <!--
+                            Old-gold exchange. Off by default (settings.oldGoldExchangeEnabled) —
+                            hidden entirely until fetchSettings() shows it, matching the wastage
+                            summary row's "no element visible when the module never existed"
+                            contract. Requires the customer phone field above to be filled: the
+                            credit posts to that customer's advance balance, the same mechanism
+                            the Apply Advance box beside it already redeems.
+                        -->
+                        <div id="old-gold-exchange-panel" style="display: none; margin-top: 14px;">
+                            <div class="advance-alert-box" style="flex-direction: column; align-items: stretch; gap: 10px;">
+                                <strong>Old-Gold Exchange</strong>
+                                <p class="text-muted-small">Weighs and values gold the customer trades in, then credits it to their advance balance above. Enter the customer's phone number first.</p>
+                                <input type="text" id="old-gold-description" class="form-control" placeholder="Item description (e.g. one bangle)">
+                                <div style="display:flex; gap:10px;">
+                                    <select id="old-gold-declared-purity" class="form-control" title="Declared purity">
+                                        <option value="22K" selected>Declared: 22K</option>
+                                        <option value="24K">Declared: 24K</option>
+                                        <option value="18K">Declared: 18K</option>
+                                    </select>
+                                    <select id="old-gold-tested-purity" class="form-control" title="Tested purity">
+                                        <option value="22K" selected>Tested: 22K</option>
+                                        <option value="24K">Tested: 24K</option>
+                                        <option value="18K">Tested: 18K</option>
+                                    </select>
+                                    <input type="number" id="old-gold-gross-weight" class="form-control" placeholder="Gross weight (g)" min="0" step="0.001">
+                                </div>
+                                <button type="button" id="record-old-gold-exchange-btn" class="btn btn-secondary">Record Exchange</button>
+                                <p id="old-gold-exchange-result" class="text-muted-small"></p>
+                            </div>
+                        </div>
+
                         <div style="display:flex; gap:10px; width: 100%; margin-top:10px;">
                             <button type="button" id="save-hold-btn" class="btn btn-secondary" style="flex:1;" title="Park this cart to free the counter, resume it later">HOLD</button>
                             <button type="button" id="save-quote-btn" class="btn btn-secondary" style="flex:1;" title="Save as a price estimate for the customer, not a sale">QUOTE</button>
@@ -558,6 +596,9 @@ export class BillingDesk {
             }
         });
 
+        const recordOldGoldBtn = document.getElementById('record-old-gold-exchange-btn');
+        if (recordOldGoldBtn) recordOldGoldBtn.addEventListener('click', () => this.recordOldGoldExchange());
+
         // Cart: bank the entry form as a line and clear it for the next item.
         const addItemBtn = document.getElementById('add-item-btn');
         if (addItemBtn) addItemBtn.addEventListener('click', () => this.addEntryToCart());
@@ -690,6 +731,59 @@ export class BillingDesk {
         } catch (err) {
             console.error('Failed to lookup customer advance:', err);
             this.clearAdvance();
+        }
+    }
+
+    /**
+     * Records an old-gold exchange for the customer currently entered above,
+     * then refreshes the advance balance display so the new credit shows up
+     * exactly where any other advance would — the panel creates the credit,
+     * `lookupCustomerAdvance()` and the existing Apply Advance button do the
+     * rest, unchanged.
+     */
+    async recordOldGoldExchange() {
+        const resultEl = document.getElementById('old-gold-exchange-result');
+        const phone = document.getElementById('customer-phone')?.value?.trim() || '';
+        if (!/^\d{10}$/.test(phone)) {
+            if (resultEl) resultEl.textContent = 'Enter a valid 10-digit customer phone number above first.';
+            return;
+        }
+        const grossWeightGrams = parseFloat(document.getElementById('old-gold-gross-weight')?.value);
+        if (!Number.isFinite(grossWeightGrams) || grossWeightGrams <= 0) {
+            if (resultEl) resultEl.textContent = 'Enter the gross weight as weighed.';
+            return;
+        }
+
+        const body = {
+            customerPhone: phone,
+            customerName: document.getElementById('customer-name')?.value?.trim() || '',
+            description: document.getElementById('old-gold-description')?.value?.trim() || '',
+            declaredPurity: document.getElementById('old-gold-declared-purity')?.value,
+            testedPurity: document.getElementById('old-gold-tested-purity')?.value,
+            grossWeightGrams
+        };
+
+        try {
+            const res = await adminFetch('/api/old-gold-exchanges', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                if (resultEl) resultEl.textContent = data.error || 'Could not record the exchange.';
+                return;
+            }
+            if (resultEl) {
+                resultEl.textContent = `Credited ${money(data.exchange.creditAmount)} for `
+                    + `${data.exchange.netWeightGrams}g net ${data.exchange.testedPurity}.`;
+            }
+            document.getElementById('old-gold-gross-weight').value = '';
+            document.getElementById('old-gold-description').value = '';
+            await this.lookupCustomerAdvance(phone);
+        } catch (err) {
+            console.error('Failed to record old-gold exchange:', err);
+            if (resultEl) resultEl.textContent = 'Could not record the exchange — check your connection and try again.';
         }
     }
 

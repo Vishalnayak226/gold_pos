@@ -142,6 +142,13 @@ export const DEFAULT_SETTINGS = {
        docs/AUDIT_AND_PII.md §5 and backend/auditRetention.js. */
     auditRetentionEnabled: false,
     auditRetentionDays: 2555,
+    /* Old-gold exchange (backend/services/oldGoldService.js). Off by default
+       — the route answers 404, exactly as if it never existed. The credit
+       posts as an ordinary advance deposit; no GST/RCM treatment is computed
+       here, which stays an unresolved legal question — see
+       PRODUCTION_READINESS_ROADMAP.md Phase 5 §4. */
+    oldGoldExchangeEnabled: false,
+    oldGoldDeductionPercent: 5,
     /* Gold savings schemes (backend/services/goldSchemeService.js). Off by
        default — the routes 404 as though the module never existed. Terms
        below are an ENGINEERING PLACEHOLDER (an "11 installments + 1 free"
@@ -236,6 +243,8 @@ export const SETTINGS_FIELD_RULES = {
     razorpayKeyId: { type: 'string', maxLength: 200 },
     auditRetentionEnabled: { type: 'boolean' },
     auditRetentionDays: { type: 'integer', min: 1, max: 36500 },
+    oldGoldExchangeEnabled: { type: 'boolean' },
+    oldGoldDeductionPercent: { type: 'number', min: 0, max: 100 },
     goldSchemeEnabled: { type: 'boolean' },
     goldSchemeInstallmentCount: { type: 'integer', min: 1, max: 60 },
     goldSchemeBonusInstallments: { type: 'integer', min: 0, max: 12 },

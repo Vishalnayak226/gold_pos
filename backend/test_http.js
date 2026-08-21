@@ -1811,6 +1811,87 @@ try {
         assert.equal(stored.reviewedBy.role, 'manager');
     });
 
+    await check('old-gold exchange is off by default — the route answers as though it never existed', async () => {
+        const response = await request('/api/old-gold-exchanges', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerPhone: phone, declaredPurity: '22K', testedPurity: '22K', grossWeightGrams: 10
+            })
+        });
+        assert.equal(response.status, 404);
+    });
+
+    await check('enabling old-gold exchange requires an owner/manager, then credits a redeemable balance', async () => {
+        // Pinned explicitly rather than trusting the ambient rate this deep into
+        // a long-running suite — same defensive technique the "manual rate
+        // override" check above already uses, and for the same reason.
+        assert.equal((await postSettings({
+            oldGoldExchangeEnabled: true, oldGoldDeductionPercent: 10,
+            overrideGoldPrice: { active: true, price24K: 0, price22K: 1000, price18K: 0 }
+        })).status, 200);
+
+        // A dedicated phone, never used elsewhere in this suite — "apply
+        // advance" is all-or-nothing (it always redeems the WHOLE available
+        // balance, never a chosen sub-amount), so proving "this exchange's
+        // credit is spendable" needs a customer whose balance is EXACTLY this
+        // credit, not the shared fixture `phone` with its own accumulated
+        // history from every other check in this file.
+        const oldGoldPhone = '9111222333';
+
+        try {
+            const cashierSession = await loginAdmin(request, { pin: '4321' });
+            const refused = await request('/api/old-gold-exchanges', {
+                method: 'POST',
+                headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    customerPhone: oldGoldPhone, declaredPurity: '22K', testedPurity: '22K', grossWeightGrams: 10
+                })
+            });
+            assert.equal(refused.status, 403);
+
+            const allowed = await request('/api/old-gold-exchanges', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    customerPhone: oldGoldPhone, customerName: 'Old Gold Customer',
+                    declaredPurity: '24K', testedPurity: '22K', grossWeightGrams: 10,
+                    description: 'One bangle, tested at 22K'
+                })
+            });
+            assert.equal(allowed.status, 200, JSON.stringify(await allowed.clone().json().catch(() => null)));
+            const { exchange } = await allowed.json();
+            // 10g − 10% deduction = 9g net, credited at the TESTED purity's rate
+            // (FIXTURE_RATE = 1000/g for 22K) — never the declared purity's.
+            assert.equal(exchange.netWeightGrams, 9);
+            assert.equal(exchange.creditAmount, 9000);
+
+            const posted = ledger.advances().find(e => e.id === exchange.advanceEntryId);
+            assert.ok(posted, 'the exchange must name the advance entry it produced');
+            assert.equal(posted.amount, 9000);
+            assert.equal(posted.status, 'approved');
+            assert.equal(posted.customerPhone, oldGoldPhone);
+
+            // The credit is spendable immediately — an ordinary advance
+            // redemption against a real sale, zero new logic.
+            const sale = await request('/api/sales', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    purity: '22K', weightGrams: 20, makingChargeAmount: 0, discountPercent: 0,
+                    customerPhone: oldGoldPhone, appliedAdvance: 9000, totalAmount: 0
+                })
+            });
+            assert.equal(sale.status, 200);
+            assert.equal((await sale.json()).sale.appliedAdvance, 9000);
+        } finally {
+            await postSettings({
+                oldGoldExchangeEnabled: false, oldGoldDeductionPercent: 5,
+                overrideGoldPrice: { active: false, price24K: 0, price22K: 0, price18K: 0 }
+            });
+        }
+    });
+
     await check('gold savings schemes are off by default — the routes answer as though they never existed', async () => {
         const response = await request('/api/gold-schemes/enrollments', {
             method: 'POST',

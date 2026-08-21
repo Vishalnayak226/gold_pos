@@ -733,8 +733,18 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    *(**Returns, credit notes and refunds shipped in Phase 23**, and were extended to per-line
    returns on 2026-08-12. **Approvals are done as of 2026-08-13**: advance deposits are owner/manager
    only and named on the row, and a refund at or above `refundApprovalThreshold` needs the same
-   authority (plus a second factor when the store requires one). **Exchanges and old-gold remain
-   blocked on legal sign-off.**)*
+   authority (plus a second factor when the store requires one). **Old-gold exchange: engineering
+   built 2026-08-21 (Phase 41), flagged off by default** — `oldGoldExchangeEnabled` (default
+   `false`, so the route 404s as though the route never existed) and `oldGoldDeductionPercent`
+   (default `5`, covering refining loss/margin). `backend/services/oldGoldService.js` values gold a
+   customer trades in and posts the credit as an ORDINARY advance deposit — no new redemption
+   mechanism, the existing advance/credit machinery already wired into `computeInvoiceTotals()`
+   applies it. Owner/manager only, the same authority bar a posted advance deposit already needs.
+   **What this does NOT do, deliberately: no GST/reverse-charge treatment.** Whether buying gold
+   from a customer attracts tax under RCM is still a legal question nobody has answered, and this
+   module computes a valuation only — enabling it for a live tenant still needs that legal sign-off
+   first. Full detail: `docs/LEDGER.md` Phase 41. **General exchanges (non-gold) remain unbuilt and
+   blocked on legal sign-off**, as before.)*
 5. Customer master, consent/communications, accounting exports and tax/reconciliation reports.
    *(Not started.)*
 

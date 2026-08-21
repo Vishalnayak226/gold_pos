@@ -17,6 +17,7 @@
 import {
     computeInvoiceTotals,
     computeReturnRefund,
+    computeOldGoldCredit,
     computeGoldGramsForAmount,
     computeGoldSchemePayout,
     round3,
@@ -1700,6 +1701,44 @@ check('a negative making charge is floored rather than credited', () => {
     const t = computeInvoiceTotals({ metalValue: 1000, makingChargeAmount: -400, taxSlab: 0 });
     near(t.preTaxTotal, 1000, 'the negative making charge does not reduce the bill');
     near(t.totalAmount, 1000, 'total');
+});
+
+group('20. Old-gold exchange credit (Phase 41, flagged off by default)');
+
+check('a 5% deduction on 10g nets 9.5g, credited at the tested purity\'s rate', () => {
+    const r = computeOldGoldCredit({ grossWeightGrams: 10, ratePerGram: 6875, deductionPercent: 5 });
+    near(r.netWeightGrams, 9.5, 'netWeightGrams');
+    near(r.creditAmount, round2(9.5 * 6875), 'creditAmount');
+});
+
+check('a 0% deduction credits the full weight', () => {
+    const r = computeOldGoldCredit({ grossWeightGrams: 10, ratePerGram: 1000, deductionPercent: 0 });
+    near(r.netWeightGrams, 10, 'netWeightGrams');
+    near(r.creditAmount, 10000, 'creditAmount');
+});
+
+check('a 100% deduction credits nothing, never a negative amount', () => {
+    const r = computeOldGoldCredit({ grossWeightGrams: 10, ratePerGram: 1000, deductionPercent: 100 });
+    near(r.netWeightGrams, 0, 'netWeightGrams');
+    near(r.creditAmount, 0, 'creditAmount');
+});
+
+check('a deduction percentage outside 0-100 is clamped, not trusted', () => {
+    const over = computeOldGoldCredit({ grossWeightGrams: 10, ratePerGram: 1000, deductionPercent: 150 });
+    near(over.netWeightGrams, 0, 'over 100% clamps to 100%');
+    const under = computeOldGoldCredit({ grossWeightGrams: 10, ratePerGram: 1000, deductionPercent: -20 });
+    near(under.netWeightGrams, 10, 'a negative deduction clamps to 0%, never inflating the credit');
+});
+
+check('the credit is store-rate arithmetic, not a fraction of a 24K price', () => {
+    // The store already configures a distinct rate per purity — the tested
+    // purity's OWN rate is passed straight in, never a 24K rate scaled down.
+    const at22K = computeOldGoldCredit({ grossWeightGrams: 5, ratePerGram: 6875, deductionPercent: 10 });
+    const at18K = computeOldGoldCredit({ grossWeightGrams: 5, ratePerGram: 5625, deductionPercent: 10 });
+    near(at22K.netWeightGrams, at18K.netWeightGrams, 'the SAME net weight');
+    if (at22K.creditAmount === at18K.creditAmount) {
+        throw new Error('different purity rates must produce different credit amounts');
+    }
 });
 
 group('21. Gold savings schemes (Phase 41, flagged off by default)');

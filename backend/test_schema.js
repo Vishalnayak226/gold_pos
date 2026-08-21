@@ -585,6 +585,45 @@ check('a negative rows_pruned is refused', () => {
 });
 
 /* --------------------------------------------------------------------------
+   5c. Old-gold exchange (Phase 41) — append-only, matching audit_events.
+   -------------------------------------------------------------------------- */
+
+const insertOldGold = (overrides = {}) => db.prepare(`
+    INSERT INTO old_gold_exchanges
+        (id, tenant_id, branch_id, declared_purity, tested_purity,
+         gross_weight_mg, deduction_bp, net_weight_mg, rate_paise_per_g, credit_amount_paise,
+         actor_user_id, created_at, business_date)
+    VALUES (@id, @tenantId, @branchId, @declaredPurity, @testedPurity,
+            @grossWeightMg, @deductionBp, @netWeightMg, @ratePaisePerG, @creditAmountPaise,
+            @actorUserId, @createdAt, @businessDate)
+`).run({
+    id: 'OGX1', tenantId: 'T1', branchId: 'B1', declaredPurity: '22K', testedPurity: '22K',
+    grossWeightMg: 10000, deductionBp: 500, netWeightMg: 9500, ratePaisePerG: 687500,
+    creditAmountPaise: 6531250, actorUserId: 'U-MGR', createdAt: NOW, businessDate: TODAY,
+    ...overrides
+});
+
+check('a well-formed exchange inserts, and cannot then be edited or deleted', () => {
+    insertOldGold();
+    refuses(() => db.prepare('UPDATE old_gold_exchanges SET credit_amount_paise = ? WHERE id = ?').run(1, 'OGX1'),
+        /append-only/);
+    refuses(() => db.prepare('DELETE FROM old_gold_exchanges WHERE id = ?').run('OGX1'), /append-only/);
+});
+
+check('net weight cannot exceed gross weight', () => {
+    refuses(() => insertOldGold({ id: 'OGX2', grossWeightMg: 1000, netWeightMg: 1001 }), /CHECK|constraint/i);
+});
+
+check('a deduction outside 0-10000 basis points is refused', () => {
+    refuses(() => insertOldGold({ id: 'OGX3', deductionBp: -1 }), /CHECK|constraint/i);
+    refuses(() => insertOldGold({ id: 'OGX4', deductionBp: 10001 }), /CHECK|constraint/i);
+});
+
+check('an unsupported tested purity is refused', () => {
+    refuses(() => insertOldGold({ id: 'OGX5', testedPurity: '14K' }), /CHECK|constraint/i);
+});
+
+/* --------------------------------------------------------------------------
    5d. Gold savings schemes (Phase 41) — terms snapshot immutable, installments
    append-only, matching the pattern every other money-adjacent table here uses.
    -------------------------------------------------------------------------- */

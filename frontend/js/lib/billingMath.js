@@ -163,6 +163,35 @@ function clampMakingPercent(percent) {
 }
 
 /**
+ * Credit for gold a customer trades in ("old-gold exchange").
+ *
+ * `ratePerGram` is the store's own already-resolved rate for the TESTED
+ * purity (activeRates.price22K etc — the same per-purity rate a sale line
+ * prices from, never a 24K rate scaled by a fraction; this store already
+ * configures one rate per purity, so there is nothing to scale). Resolving
+ * which purity's rate that is stays the caller's job (backend/services/
+ * oldGoldService.js), same as saleService.js resolves a sale line's rate —
+ * this function only ever accepts an already-priced ₹/g figure.
+ *
+ * `deductionPercent` covers refining loss and margin — the store is not a
+ * refiner and cannot turn traded-in gold back into billable stock at 100%
+ * of its tested weight.
+ *
+ * Deliberately silent on tax: whether buying gold from a customer attracts
+ * GST under reverse charge is an unresolved legal question (CLAUDE.md,
+ * docs/PRODUCTION_READINESS_ROADMAP.md Phase 5 §4), not something this
+ * function may guess at.
+ */
+export function computeOldGoldCredit({ grossWeightGrams = 0, ratePerGram = 0, deductionPercent = 0 } = {}) {
+    const deduction = Math.min(100, Math.max(0, num(deductionPercent)));
+    const netWeightGrams = round3(Math.max(0, num(grossWeightGrams)) * (1 - deduction / 100));
+    return {
+        netWeightGrams,
+        creditAmount: computeMetalValue(netWeightGrams, ratePerGram)
+    };
+}
+
+/**
  * Gold-gram equivalent an installment payment locks, at the rate in force
  * the moment it was paid. Simple division — the store's own already-resolved
  * per-purity rate (activeRates.price22K, matching every other place in this

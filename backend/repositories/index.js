@@ -29,6 +29,7 @@ export * as rates from './rateRepository.js';
 export * as sequences from './sequenceRepository.js';
 export * as audit from './auditRepository.js';
 export * as auditRetention from './auditRetentionRepository.js';
+export * as oldGold from './oldGoldRepository.js';
 export * as goldSchemes from './goldSchemeRepository.js';
 export * as inventory from './inventoryRepository.js';
 export * as cashShifts from './cashShiftRepository.js';

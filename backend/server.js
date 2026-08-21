@@ -50,6 +50,7 @@ import * as repo from './repositories/index.js';
 import * as saleService from './services/saleService.js';
 import * as returnService from './services/returnService.js';
 import * as advanceService from './services/advanceService.js';
+import * as oldGoldService from './services/oldGoldService.js';
 import * as goldSchemeService from './services/goldSchemeService.js';
 import * as paymentService from './services/paymentService.js';
 import { importLegacyJson, collectSource, formatReport } from './importLegacyJson.js';
@@ -2407,6 +2408,45 @@ app.post('/api/advances', requireAdminSession, (req, res) => {
     } catch (err) {
         logError('Error saving advance deposit transaction: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to submit advance deposit' });
+    }
+});
+
+/**
+ * POST /api/old-gold-exchanges
+ *
+ * Records gold a customer trades in and credits its value onto their advance
+ * balance — a spendable credit against a sale, the same way any other
+ * advance deposit already works. FLAGGED OFF by default: answers 404 unless
+ * settings.oldGoldExchangeEnabled is true, so a store that has not turned
+ * this on sees it as though it never existed.
+ *
+ * Owner/manager only (oldGoldService checks this itself, same as a posted
+ * advance deposit) — crediting a customer's balance is cash-equivalent.
+ */
+app.post('/api/old-gold-exchanges', requireAdminSession, (req, res) => {
+    try {
+        const result = oldGoldService.recordExchange({
+            customerPhone: req.body && req.body.customerPhone,
+            customerName: req.body && req.body.customerName,
+            description: req.body && req.body.description,
+            declaredPurity: req.body && req.body.declaredPurity,
+            testedPurity: req.body && req.body.testedPurity,
+            grossWeightGrams: req.body && req.body.grossWeightGrams
+        }, {
+            getActiveGoldRates,
+            getSettings: readSettings,
+            isValidPhone,
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'counter',
+            ipAddress: req.ip
+        });
+        if (!result.success) {
+            return res.status(result.status || 400).json({ error: result.error, code: result.code });
+        }
+        res.json({ success: true, exchange: result.exchange });
+    } catch (err) {
+        logError('Error recording old-gold exchange: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to record old-gold exchange' });
     }
 });
 
