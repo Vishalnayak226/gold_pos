@@ -36,6 +36,7 @@ may read it).
 10. [Connectivity loss](#10-connectivity-loss)
 11. [Lost or stolen counter device](#11-lost-or-stolen-counter-device)
 12. [Offboarding a tenant](#12-offboarding-a-tenant)
+13. [Incident response — DRAFT, pending Indian counsel review](#13-incident-response--draft-pending-indian-counsel-review)
 
 ---
 
@@ -386,10 +387,119 @@ internet outage. What stops working:
 
 ---
 
+## 13. Incident response — DRAFT, pending Indian counsel review
+
+**This section is a draft, not an approved procedure.** `PRODUCTION_READINESS_ROADMAP.md` Phase 2
+held it back deliberately — it overlaps the line requiring an incident process reviewed by Indian
+counsel, and writing a polished procedure a lawyer then rewrites wholesale is wasted work. Written
+now (2026-08-21, Phase 41) on the owner's decision not to leave the runbook set with a blank page
+where this belongs, on the explicit understanding that a lawyer is expected to change it — the
+notification-obligation and authority sections especially. Do not treat this as legal advice or as
+a substitute for that review.
+
+**Scope.** "Incident" here means: a security breach or suspected breach (unauthorised access,
+credential compromise, a suspicious export), a data-integrity incident (the audit chain fails
+`npm run audit:verify`, a ledger drift alert fires and is not a known bug), or a sustained
+outage with financial impact (see runbooks 7–10 for the operational side of those; this section
+covers the response *process* around them, not the technical fix).
+
+### 13.1 Detection and triage
+
+Most incidents surface through the alerting already in place (`backend/alerting.js`) or a report
+from a tenant or a customer, not a dedicated monitoring product. On any of the following, start
+this runbook rather than treating it as an ordinary bug:
+
+- A `CRITICAL` alert whose cause is not immediately explainable by a known, already-fixed issue —
+  especially `LEDGER_LINE_DRIFT`, a failed `npm run audit:verify`, or repeated authentication
+  failures against one account.
+- A report (from a tenant, a customer, or a third party) of data they should not have been able to
+  see, or an account behaving as though someone else controls it.
+- Discovery that a secret — the vault key, a Razorpay credential, an operator's TOTP secret — may
+  have left the building (a lost device not yet worked through runbook 11, a credential visible in
+  a log or export that should have been redacted).
+
+**Triage question:** does this affect one tenant's data, or could it affect more than one? This
+codebase is single-tenant-per-install by construction (ADR-001), so a breach is normally scoped to
+one install's data directory — but confirm rather than assume, particularly for anything touching
+the licensing server, which *is* shared infrastructure across tenants.
+
+### 13.2 Containment
+
+`[needs decision: who holds the authority to take a live, revenue-generating install offline, and
+under what conditions they may do so without waiting for sign-off]` — this is a business-continuity
+call, not an engineering one, and guessing at it here would be inventing store policy the same way
+CLAUDE.md §4 already declines to guess at a PIN keyspace or a dual-control threshold.
+
+Until that is decided, the containment actions already available and already reversible:
+
+- **End specific sessions**, not the whole install: Admin desk → Staff & Roles → the operator →
+  sign out. Reaches exactly the credential in question.
+- **Rotate the vault key** (runbook 1) if a credential compromise is suspected — this re-encrypts
+  every secret in `settings.json` under a new key, so a copied-but-not-yet-decrypted `settings.json`
+  becomes useless.
+- **Full stop**: `Restart_Server.bat` / stopping the PM2 process ends all trading. This is the
+  blunt instrument — reversible, but not to be reached for without the authority question above
+  being settled, since a jewellery counter offline is itself a financial and customer-facing event.
+
+### 13.3 Evidence preservation
+
+This is the one part of incident response this codebase already has direct machinery for, because
+the audit trail and its retention were built with exactly this in mind:
+
+- **Take an audit export immediately** (`GET /api/audit/export`, or `node backend/verifyAuditChain.js`
+  from the CLI) — this both records the evidence and publishes a head hash outside the database, so
+  a later dispute about whether the trail was altered has something to compare against (see
+  `docs/AUDIT_AND_PII.md` and runbook 3).
+- **If `auditRetentionEnabled` is on for this tenant (Phase 41; off by default — check
+  Settings), suspend the nightly prune job for the duration of the investigation.** A prune that
+  runs mid-incident does not destroy evidence — the chain still verifies past a checkpoint — but it
+  does make some historical rows harder to review in full. There is no code-level "pause" switch
+  yet; turning `auditRetentionEnabled` off in Settings for the duration is the interim mechanism.
+- **Take a PITR or ad-hoc backup snapshot** (`node backend/backupEngine.js`'s `createBackup()`, or
+  if PITR is enabled for this tenant, the most recent entry under `backups/pitr/`) before making any
+  containment change that writes to the database — rotating the vault key, for instance, changes
+  `settings.json` on disk.
+- **Preserve logs as they stand.** `error.log` and `telemetry.log` are append-only by convention
+  (not by trigger, unlike the audit chain) — copy them aside rather than relying on them not being
+  rotated or truncated while the investigation runs.
+
+### 13.4 Notification obligations
+
+`[needs decision: Indian counsel review]` — CERT-In's directions under section 70B (cited in
+`PRODUCTION_READINESS_ROADMAP.md`'s references) impose incident-reporting duties with tight
+timelines for covered entities, and the Digital Personal Data Protection Rules, 2025 impose
+separate breach-notification duties toward affected individuals and (per the Rules) the Data
+Protection Board. Whether either applies to a given install, on what timeline, and through what
+channel is exactly the review this section has been waiting on. **Do not attempt to satisfy either
+obligation from this runbook alone** — engage counsel as soon as an incident is confirmed to involve
+personal data or a security breach, not after the fact.
+
+### 13.5 Post-incident review
+
+Once contained:
+
+1. Record what happened, when it was detected, what containment actions were taken and by whom —
+   the audit trail covers the system's own actions; this covers the human ones, which the trail
+   cannot see.
+2. Re-run `npm run audit:verify` and `npm run backup:verify` (or `node backend/verifyBackup.js
+   --backup <pitr-snapshot>` if a PITR snapshot is the more recent recovery point) to confirm the
+   ledger and its evidence are intact before resuming normal trading.
+3. If a credential was rotated during containment, confirm every legitimate consumer of it (the
+   Razorpay dashboard's webhook config, an operator's re-enrolled TOTP app) has the new value —
+   half a rotation is an outage, not a fix.
+4. Log the incident in this file's drill log below, entry type "incident" rather than "drill",
+   so the historical record distinguishes a rehearsal from the real thing.
+5. Feed anything this runbook did not anticipate back into it. A runbook that is never updated
+   after the incident it was written for is decoration.
+
+---
+
 ## Drill log
 
-Record each monthly restore drill here. An unrecorded drill did not happen.
+Record each monthly restore drill here, and — per runbook 13.5 — every real incident too, marked
+`incident` rather than `drill` so the record distinguishes a rehearsal from the real thing. An
+unrecorded drill did not happen.
 
-| Date | Snapshot tested | Result | Run by |
-|---|---|---|---|
-| _(none recorded yet)_ | | | |
+| Date | Type | Snapshot tested | Result | Run by |
+|---|---|---|---|---|
+| _(none recorded yet)_ | | | | |
