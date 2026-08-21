@@ -16,6 +16,7 @@ import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseCh
 import { initBackupScheduler, createBackup } from './backupEngine.js';
 import { raiseAlert, recordRequestOutcome, initAlertScheduler } from './alerting.js';
 import { initAuditRetentionScheduler } from './auditRetention.js';
+import { initPitrScheduler } from './pitr.js';
 import { assertProductionReady, assertVaultKeyReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import {
@@ -4329,6 +4330,7 @@ function bootstrapServer() {
     initUpdateScheduler();
     initAlertScheduler();
     initAuditRetentionScheduler();
+    initPitrScheduler();
 
     // Trigger initial SaaS license sync & database backup on startup.
     syncLicenseStatus().catch(() => {

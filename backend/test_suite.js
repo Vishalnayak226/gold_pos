@@ -39,6 +39,9 @@ const __dirname = path.dirname(__filename);
 const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-suite-'));
 process.env.GOLD_POS_DATA_DIR = path.join(TEST_ROOT, 'data');
 process.env.GOLD_POS_LOGS_DIR = path.join(TEST_ROOT, 'logs');
+// pitr.js resolves this once at import — set before any dynamic import of it,
+// same reason as DATA_DIR/LOGS_DIR above, or Test 13 litters backend/backups/pitr.
+process.env.GOLD_POS_PITR_DIR = path.join(TEST_ROOT, 'pitr');
 fs.mkdirSync(process.env.GOLD_POS_DATA_DIR, { recursive: true });
 fs.mkdirSync(process.env.GOLD_POS_LOGS_DIR, { recursive: true });
 
@@ -697,6 +700,50 @@ async function testRolloutCohort() {
     console.log('✅ Test 12 Passed: rollout cohort gating is deterministic, monotonic, and per-tenant.');
 }
 
+async function testPitrScheduler() {
+    console.log('\nRunning Test 13: point-in-time recovery snapshots...');
+    const pitr = await import('./pitr.js');
+    const { readSettings, writeSettings } = await import('./settingsStore.js');
+
+    // Disabled (no settings.json at all yet — the real "never configured"
+    // state) must be a true no-op: no directory, nothing to find.
+    pitr.archivePitrSnapshot();
+    assert.strictEqual(fs.existsSync(pitr.PITR_DIR), false,
+        'disabled PITR must never create its directory');
+    assert.strictEqual(pitr.latestPitrSnapshot(), null);
+
+    // An old snapshot directory, seeded BEFORE the first real archive, so one
+    // call can exercise both "a snapshot is taken" and "an expired one is
+    // pruned" without a sleep or a second call fighting the interval cooldown.
+    fs.mkdirSync(pitr.PITR_DIR, { recursive: true });
+    const staleDir = path.join(pitr.PITR_DIR, 'stale-snapshot');
+    fs.mkdirSync(staleDir);
+    const twoDaysAgo = (Date.now() - 2 * 24 * 60 * 60 * 1000) / 1000;
+    fs.utimesSync(staleDir, twoDaysAgo, twoDaysAgo);
+
+    writeSettings({
+        ...readSettings(),
+        pitrEnabled: true, pitrIntervalMinutes: 5, pitrRetentionHours: 24
+    });
+    pitr.archivePitrSnapshot();
+
+    assert.strictEqual(fs.existsSync(staleDir), false,
+        'a snapshot older than pitrRetentionHours must be pruned on the next archive');
+    const latest = pitr.latestPitrSnapshot();
+    assert.ok(latest && fs.existsSync(latest), 'enabling PITR must produce a fresh snapshot');
+    assert.ok(fs.existsSync(path.join(latest, 'settings.json')),
+        'a snapshot must carry configuration alongside the ledger, same as a nightly backup');
+
+    // Called again immediately: still inside pitrIntervalMinutes, so this must
+    // be a no-op — no second snapshot directory appears.
+    const countBefore = fs.readdirSync(pitr.PITR_DIR).length;
+    pitr.archivePitrSnapshot();
+    assert.strictEqual(fs.readdirSync(pitr.PITR_DIR).length, countBefore,
+        'a second call inside the configured interval must not take another snapshot');
+
+    console.log('✅ Test 13 Passed: PITR is off by default, snapshots on enable, and prunes on schedule.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -711,6 +758,7 @@ try {
     await testBoundedAttemptMap();
     await testSecretVault();
     await testRolloutCohort();
+    await testPitrScheduler();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');

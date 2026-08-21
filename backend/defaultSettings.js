@@ -142,6 +142,14 @@ export const DEFAULT_SETTINGS = {
        docs/AUDIT_AND_PII.md §5 and backend/auditRetention.js. */
     auditRetentionEnabled: false,
     auditRetentionDays: 2555,
+    /* Point-in-time recovery: frequent local snapshots (backend/pitr.js). Off
+       by default — the once-nightly backup stays the only recovery point
+       until this is turned on. pitrIntervalMinutes below 5 has no effect: the
+       scheduler itself only ticks every 5 minutes. Off-site shipping is a
+       separate, unbuilt follow-on — see backend/pitr.js's header. */
+    pitrEnabled: false,
+    pitrIntervalMinutes: 15,
+    pitrRetentionHours: 24,
     /* Old-gold exchange (backend/services/oldGoldService.js). Off by default
        — the route answers 404, exactly as if it never existed. The credit
        posts as an ordinary advance deposit; no GST/RCM treatment is computed
@@ -243,6 +251,12 @@ export const SETTINGS_FIELD_RULES = {
     razorpayKeyId: { type: 'string', maxLength: 200 },
     auditRetentionEnabled: { type: 'boolean' },
     auditRetentionDays: { type: 'integer', min: 1, max: 36500 },
+    pitrEnabled: { type: 'boolean' },
+    // Below 5 has no effect (the scheduler's own tick is fixed at 5 minutes)
+    // but is not refused outright — a tenant lowering it from, say, 15 to 5
+    // in stages should not be blocked at the boundary itself.
+    pitrIntervalMinutes: { type: 'integer', min: 5, max: 1440 },
+    pitrRetentionHours: { type: 'integer', min: 1, max: 720 },
     oldGoldExchangeEnabled: { type: 'boolean' },
     oldGoldDeductionPercent: { type: 'number', min: 0, max: 100 },
     goldSchemeEnabled: { type: 'boolean' },
