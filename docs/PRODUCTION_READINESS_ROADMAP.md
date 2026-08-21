@@ -539,13 +539,18 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   **Access control: done** — approver-only on the trail, verification and export alike.
   **Clock sync:** documented as host provisioning (NTP), not implemented here.
   **Alerts:** still open, and shared with the Phase 3 alerting line below.
-  **Retention: `[needs design decision: audit and personal-data retention periods]`, deliberately
-  unstarted.** Not an engineering question — how long a jeweller must keep records naming who
-  approved a refund is Indian tax/company law and the tenant's insurer. It also collides with the
-  chain: `trg_audit_events_no_delete` refuses a DELETE outright, so a retention job needs an
-  archive-then-prune path recording a checkpoint hash for the pruned range, or verification reports
-  a gap forever after. That is worth building once the period is known and not before. Reasoning in
-  `docs/AUDIT_AND_PII.md` §5.)*
+  **Retention: mechanism built 2026-08-21 (Phase 41), flagged off by default.** The owner decided
+  not to wait for the legal retention-period call to build the archive-then-prune path — it exists
+  now, gated by `auditRetentionEnabled` (default `false`, so an existing or new install behaves
+  exactly as before until a tenant turns it on) and `auditRetentionDays` (default `2555`, an
+  engineering placeholder, not the legal figure). `trg_audit_events_no_delete` is still respected —
+  the prune job drops and recreates it inside the same transaction as the delete, and
+  `verifyChain()` seeds itself from the last prune's checkpoint hash automatically, so a pruned
+  chain still verifies instead of reporting a permanent gap. **Still genuinely open:**
+  `[needs design decision: the real audit and personal-data retention periods]` — how long a
+  jeweller must keep records naming who approved a refund is Indian tax/company law and the
+  tenant's insurer, not engineering, and picking that number is still nobody's call to make here.
+  Reasoning in `docs/AUDIT_AND_PII.md` §5.)*
 
   *(Earlier, 2026-08-16 — **the trail became readable**, which was the gap this strand kept
   hitting. `audit_events` has been append-only by trigger since Phase 24 and written on every money

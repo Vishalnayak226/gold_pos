@@ -521,6 +521,29 @@ check('an audit event can be written but never altered or deleted', () => {
 });
 
 /* --------------------------------------------------------------------------
+   5b. Audit retention checkpoints (Phase 37) — the archive-then-prune record.
+   This table has no append-only trigger of its own (each prune run writes
+   exactly one row and nothing ever revisits it), so what matters here is
+   just the ordinary CHECK constraint and that a row can be written at all.
+   -------------------------------------------------------------------------- */
+
+check('a retention checkpoint can be recorded', () => {
+    db.prepare(`INSERT INTO audit_retention_checkpoints
+        (id, tenant_id, pruned_through_chain_seq, pruned_through_occurred_at, checkpoint_hash, rows_pruned, created_at)
+        VALUES (?,?,?,?,?,?,?)`)
+        .run('ARC1', 'T1', 5, NOW, 'a'.repeat(64), 5, NOW);
+    assert.strictEqual(db.prepare("SELECT rows_pruned FROM audit_retention_checkpoints WHERE id = 'ARC1'").get().rows_pruned, 5);
+});
+
+check('a negative rows_pruned is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO audit_retention_checkpoints
+        (id, tenant_id, pruned_through_chain_seq, pruned_through_occurred_at, checkpoint_hash, rows_pruned, created_at)
+        VALUES (?,?,?,?,?,?,?)`)
+        .run('ARC2', 'T1', 6, NOW, 'b'.repeat(64), -1, NOW),
+        /CHECK|constraint/i);
+});
+
+/* --------------------------------------------------------------------------
    5c. Cash shifts (Phase 5.3) — one open shift per branch, and a closed
    shift is terminal. Exercised via raw SQL, the same reasoning as 4b: the
    repository's own guards (getOpenShift/status checks) would otherwise be

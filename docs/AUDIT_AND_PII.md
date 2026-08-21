@@ -6,8 +6,9 @@ engineer deciding where a new field belongs, an operator answering a customer's
 request about their data, and an auditor asking whether the trail can be trusted.
 
 **Status.** Classification and access control are settled and implemented.
-**Retention is deliberately unset** — see §5, which explains why guessing it
-would be worse than leaving it open.
+**Retention has a mechanism now (Phase 41, 2026-08-21), flagged off by default**
+— see §5. The actual retention *period* is still an open legal question; the
+mechanism exists so the day it is answered is a settings change, not a build.
 
 Related: `docs/RUNBOOKS.md` §3 (proving the trail), `docs/adr/` (data store
 decisions), `CLAUDE.md` §0 (which data lives in SQL and which in JSON).
@@ -128,11 +129,27 @@ is the mitigation, and it belongs in provisioning rather than here.
 
 ---
 
-## 5. Retention — deliberately unset, and why
+## 5. Retention — mechanism built, period still unset
 
-**No automatic deletion of audit events or customer records is implemented, and
-none should be added without a decision from the business.** `[needs design
-decision: audit and personal-data retention periods]`
+**Phase 41 (2026-08-21) built the archive-then-prune mechanism this section used
+to say was worth building "once the period is known, and not before."** The
+owner decided not to wait: the mechanism exists now, gated behind
+`auditRetentionEnabled` (default `false`) in settings, and `auditRetentionDays`
+(default `2555`, ~7 years) is an ENGINEERING PLACEHOLDER, not the legal
+determination this section still calls for. Disabled — the default for every
+existing and new install — audit_events grows forever exactly as it always has;
+nothing added in Phase 41 changes behaviour until a tenant explicitly turns it
+on. `[needs design decision: the real audit and personal-data retention
+periods]` remains open — a business/legal question, not an engineering one, per
+the three reasons below.
+
+**How it works, briefly** (full detail in `backend/repositories/
+auditRetentionRepository.js`): a nightly job prunes only a CONTIGUOUS PREFIX of
+the chain — never the middle, never a gap — and records a checkpoint row
+holding the last pruned row's hash and `chain_seq`. `verifyChain()` seeds
+itself from that checkpoint automatically, so a pruned chain still verifies
+instead of reporting a permanent gap, which is exactly the mechanism reason 2
+below used to say was missing.
 
 Three reasons, in order of weight:
 

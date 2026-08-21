@@ -1380,6 +1380,103 @@ console.log('\n14. Lot inventory');
 }
 
 /* ==========================================================================
+   15. Audit retention — archive-then-prune (Phase 41, flagged off by default)
+   ========================================================================== */
+
+console.log('\n15. Audit retention');
+
+{
+    const db = repo.unsafeDatabaseHandle();
+
+    check('pruning with nothing eligible is a true no-op', () => {
+        const before = repo.audit.verifyChain(context.tenantId);
+        const result = repo.auditRetention.pruneOlderThan(context.tenantId, 0);
+        assert.equal(result.chainRowsPruned, 0);
+        assert.equal(result.unchainedRowsPruned, 0);
+        assert.equal(result.checkpoint, null);
+        const after = repo.audit.verifyChain(context.tenantId);
+        assert.equal(after.checked, before.checked, 'nothing should have been removed');
+    });
+
+    // Two rows dated safely in the past (older than everything the rest of this
+    // suite has written, including the CHAIN_TEST rows from §13) and two dated
+    // safely in the future — so "prune everything older than right now" has an
+    // unambiguous, deterministic boundary regardless of how long the suite has
+    // been running or how many other chained rows already exist.
+    const PAST = Date.now() - 60_000;
+    const FUTURE = Date.now() + 60_000;
+    let ids = [];
+    check('a batch of events can be recorded to prune', () => {
+        ids = [
+            repo.audit.record({ tenantId: context.tenantId, action: 'RETENTION_TEST', entityType: 'test', entityId: 'retain-1', summary: 'old event 1', actorLabel: 'suite', occurredAt: PAST }),
+            repo.audit.record({ tenantId: context.tenantId, action: 'RETENTION_TEST', entityType: 'test', entityId: 'retain-2', summary: 'old event 2', actorLabel: 'suite', occurredAt: PAST }),
+            repo.audit.record({ tenantId: context.tenantId, action: 'RETENTION_TEST', entityType: 'test', entityId: 'retain-3', summary: 'future event 1', actorLabel: 'suite', occurredAt: FUTURE }),
+            repo.audit.record({ tenantId: context.tenantId, action: 'RETENTION_TEST', entityType: 'test', entityId: 'retain-4', summary: 'future event 2', actorLabel: 'suite', occurredAt: FUTURE })
+        ];
+        assert.ok(ids.every(Boolean));
+    });
+
+    let checkpointAfterFirstPrune;
+    check('pruning at "now" removes every chained row older than it, as one contiguous prefix', () => {
+        const totalBefore = db.prepare(
+            'SELECT COUNT(*) AS n FROM audit_events WHERE tenant_id = ? AND chain_seq IS NOT NULL'
+        ).get(context.tenantId).n;
+
+        const result = repo.auditRetention.pruneOlderThan(context.tenantId, Date.now());
+        assert.ok(result.checkpoint, 'a checkpoint must be recorded when chained rows are pruned');
+        checkpointAfterFirstPrune = result.checkpoint;
+        assert.equal(result.chainRowsPruned, totalBefore - 2,
+            'everything except the two future-dated events should be pruned');
+
+        const survivors = db.prepare(
+            "SELECT entity_id FROM audit_events WHERE tenant_id = ? AND action = 'RETENTION_TEST' ORDER BY chain_seq"
+        ).all(context.tenantId).map(r => r.entity_id);
+        assert.deepEqual(survivors, ['retain-3', 'retain-4'], 'only the two future-dated rows should survive');
+    });
+
+    check('the chain still verifies after pruning, seeded from the checkpoint', () => {
+        const result = repo.audit.verifyChain(context.tenantId);
+        assert.equal(result.ok, true, 'a pruned chain must still verify, not report a permanent gap');
+        assert.equal(result.prunedThrough, checkpointAfterFirstPrune.chain_seq);
+        assert.equal(result.checked, 2, 'only the two surviving rows should be walked');
+    });
+
+    check('a second prune at the same cutoff is a no-op — it never re-prunes past its own checkpoint', () => {
+        const result = repo.auditRetention.pruneOlderThan(context.tenantId, Date.now());
+        assert.equal(result.chainRowsPruned, 0, 'nothing before the existing checkpoint remains to prune');
+        assert.equal(result.checkpoint, null, 'no new checkpoint should be written when there is nothing to prune');
+    });
+
+    check('the no-delete trigger is back in place after pruning — a plain DELETE is still refused', () => {
+        const victim = db.prepare(
+            "SELECT id FROM audit_events WHERE tenant_id = ? AND action = 'RETENTION_TEST' LIMIT 1"
+        ).get(context.tenantId);
+        assert.throws(() => db.prepare('DELETE FROM audit_events WHERE id = ?').run(victim.id), /append-only/);
+    });
+
+    check('unchained (pre-chain) rows age out on occurred_at alone, no checkpoint required', () => {
+        // Simulate a row written before migration 005: no chain_seq/prev_hash/row_hash.
+        const legacyId = 'AUD-LEGACYTEST01';
+        db.prepare(`
+            INSERT INTO audit_events (id, tenant_id, branch_id, actor_user_id, actor_label, action,
+                                      entity_type, entity_id, summary, detail_json, ip_address,
+                                      occurred_at, business_date, chain_seq, prev_hash, row_hash)
+            VALUES (?, ?, ?, ?, ?, 'LEGACY_TEST', 'test', 'legacy-1', 'predates the chain', NULL, NULL,
+                    ?, '2020-01-01', NULL, NULL, NULL)
+        `).run(legacyId, context.tenantId, context.branchId, context.ownerUserId, 'suite', 1000);
+
+        const before = db.prepare('SELECT COUNT(*) AS n FROM audit_events WHERE id = ?').get(legacyId).n;
+        assert.equal(before, 1);
+
+        const result = repo.auditRetention.pruneOlderThan(context.tenantId, Date.now());
+        assert.ok(result.unchainedRowsPruned >= 1, 'the legacy row must be pruned by age');
+
+        const after = db.prepare('SELECT COUNT(*) AS n FROM audit_events WHERE id = ?').get(legacyId).n;
+        assert.equal(after, 0);
+    });
+}
+
+/* ==========================================================================
    16. Cash shifts — open with a float, close with a count (Phase 5.3)
    ========================================================================== */
 

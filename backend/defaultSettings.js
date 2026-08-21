@@ -133,7 +133,15 @@ export const DEFAULT_SETTINGS = {
     // production process without it can take money it will never hear back
     // about — assertProductionReady() (backend/productionGuard.js) refuses to
     // boot in that state. Blank is correct for a local/offline counter install.
-    publicUrl: ""
+    publicUrl: "",
+    /* Archive-then-prune for audit_events. Off by default: the trail behaves
+       exactly as it always has, growing forever, until a tenant turns this
+       on. auditRetentionDays is a placeholder long enough to be safe for
+       common record-keeping practice — NOT a legal determination; the real
+       figure is a tax/company-law and insurer question. See
+       docs/AUDIT_AND_PII.md §5 and backend/auditRetention.js. */
+    auditRetentionEnabled: false,
+    auditRetentionDays: 2555
 };
 
 /**
@@ -212,7 +220,9 @@ export const SETTINGS_FIELD_RULES = {
     alertEmail: { type: 'string', maxLength: 200 },
     upiId: { type: 'string', maxLength: 120 },
     publicUrl: { type: 'string', maxLength: 300 },
-    razorpayKeyId: { type: 'string', maxLength: 200 }
+    razorpayKeyId: { type: 'string', maxLength: 200 },
+    auditRetentionEnabled: { type: 'boolean' },
+    auditRetentionDays: { type: 'integer', min: 1, max: 36500 }
 };
 
 /**

@@ -171,11 +171,25 @@ export function hashRow(row) {
 /**
  * Recompute the whole chain and report the first place it disagrees.
  *
+ * If retention has ever pruned this chain (backend/repositories/
+ * auditRetentionRepository.js), the walk seeds itself from the most recent
+ * checkpoint instead of assuming the chain starts at NULL — the checkpoint's
+ * hash plays exactly the role a real previous row's row_hash would, so a
+ * pruned chain still verifies instead of reporting a permanent gap. Tenants
+ * that have never pruned have no checkpoint row, and this is a no-op lookup
+ * that changes nothing about today's behaviour.
+ *
  * @param {string} tenantId
  * @returns {{ok: boolean, checked: number, unchained: number, head: string|null,
- *            brokenAt: {chainSeq: number, id: string, reason: string}|null}}
+ *            brokenAt: {chainSeq: number, id: string, reason: string}|null,
+ *            prunedThrough: number}}
  */
 export function verifyChain(tenantId) {
+    const checkpoint = getDb().prepare(`
+        SELECT pruned_through_chain_seq, checkpoint_hash FROM audit_retention_checkpoints
+        WHERE tenant_id = ? ORDER BY pruned_through_chain_seq DESC LIMIT 1
+    `).get(tenantId);
+
     const rows = getDb().prepare(`
         SELECT * FROM audit_events
         WHERE tenant_id = ? AND chain_seq IS NOT NULL
@@ -190,8 +204,8 @@ export function verifyChain(tenantId) {
         'SELECT COUNT(*) AS n FROM audit_events WHERE tenant_id = ? AND chain_seq IS NULL'
     ).get(tenantId).n;
 
-    let previousHash = null;
-    let previousSeq = 0;
+    let previousHash = checkpoint ? checkpoint.checkpoint_hash : null;
+    let previousSeq = checkpoint ? checkpoint.pruned_through_chain_seq : 0;
     for (const row of rows) {
         if (row.chain_seq !== previousSeq + 1) {
             return brokenAt(row, `chain_seq jumped from ${previousSeq} to ${row.chain_seq} — an event was removed`,
@@ -214,7 +228,8 @@ export function verifyChain(tenantId) {
         checked: rows.length,
         unchained,
         head: previousHash,
-        brokenAt: null
+        brokenAt: null,
+        prunedThrough: checkpoint ? checkpoint.pruned_through_chain_seq : 0
     };
 }
 

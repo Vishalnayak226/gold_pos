@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseChecker.js';
 import { initBackupScheduler, createBackup } from './backupEngine.js';
 import { raiseAlert, recordRequestOutcome, initAlertScheduler } from './alerting.js';
+import { initAuditRetentionScheduler } from './auditRetention.js';
 import { assertProductionReady, assertVaultKeyReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import {
@@ -4110,6 +4111,7 @@ function bootstrapServer() {
     initReportScheduler();
     initUpdateScheduler();
     initAlertScheduler();
+    initAuditRetentionScheduler();
 
     // Trigger initial SaaS license sync & database backup on startup.
     syncLicenseStatus().catch(() => {
