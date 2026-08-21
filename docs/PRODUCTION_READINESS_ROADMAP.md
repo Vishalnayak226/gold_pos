@@ -642,9 +642,20 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    *(**Multi-line sale landed 2026-08-12.** An invoice now holds up to 50 lines, each with its own
    purity, weight, store-side rate, making charge and discount, and each carrying its allocated
    share of the invoice's taxable value and GST. The Billing Desk has a cart, the Reprint Desk
-   reproduces every filed line, and the Return Desk prices a return against a named line. The
-   catalogue/SKU half of this slice — barcode, labels, HSN, hallmark/HUID, stone weights, wastage —
-   is **not** started; see the note below on why it is the larger half.)*
+   reproduces every filed line, and the Return Desk prices a return against a named line.
+   **Catalogue/SKU metadata landed 2026-08-21, Phase 42** — `inventory_items` gained `hsn_code`
+   and nominal `gross_weight_mg`/`net_weight_mg`/`stone_weight_mg`/`stone_value_paise` (the
+   design's catalogue figures, same placement as `purity`); `inventory_lots` gained
+   `hallmark_huid` (BIS assigns one per physical article, so it lives on the lot, not the design).
+   `sku_code` (reserved since Phase 37) is now settable and becomes the barcode value; a new
+   Label button on the Inventory tab prints a QR tag (reusing the existing `/api/qrcode`
+   endpoint) with the item's HSN/weight detail alongside it, and an Edit action lets catalogue
+   detail be added to an item after creation. **Wastage landed 2026-08-21, Phase 41** (built
+   concurrently with this phase, in the same shared tree) — see the note below, now resolved.
+   **Still not wired: this catalogue into the sale/invoice flow** — a Billing Desk line is still
+   typed by staff exactly as before; auto-filling a line from a catalogue item, or decrementing
+   stock on sale, would touch `computeInvoiceTotals` and needs its own dedicated pass, same
+   boundary Phase 37 already drew for stock. See `docs/LEDGER.md` Phase 41 and Phase 42.)*
 2. Lot inventory, purchase receiving, adjustments/counts and branch transfer.
    *(**Lot inventory and adjustments/counts landed 2026-08-20, Phase 37** — the ungated half of
    this line. `inventory_items` (catalogue metadata), `inventory_lots` (a distinguishable batch of

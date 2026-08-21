@@ -20,6 +20,15 @@ function formatGrams(g) {
     return `${Number(g).toFixed(2)} g`;
 }
 
+/** `null`/`undefined` prints as an em dash — a catalogue field nobody has filled in yet, not a zero. */
+function formatGramsOrDash(g) {
+    return g == null ? '—' : formatGrams(g);
+}
+
+function formatAmountOrDash(amount) {
+    return amount == null ? '—' : `₹${Number(amount).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
 /**
  * Lot inventory — items, lots, and the movements that explain a lot's
  * current weight (roadmap Phase 5.2, the ungated slice).
@@ -32,6 +41,12 @@ function formatGrams(g) {
  * correction) — both internal facts with no tax event of their own. See
  * backend/repositories/migrations/006_lot_inventory.sql for the full
  * reasoning.
+ *
+ * Also carries the SKU-catalogue slice (roadmap Phase 5.1) that 006 reserved
+ * `sku_code` for: barcode/HSN/gross-net-stone weight on the item (the
+ * design's nominal figures), hallmark/HUID on the lot (BIS assigns one per
+ * physical article, not per design). None of it feeds billing or stock —
+ * see backend/repositories/migrations/011_sku_catalogue.sql.
  */
 export class InventoryManager {
     constructor() {
@@ -40,6 +55,7 @@ export class InventoryManager {
         this.movements = [];
         this.expandedItemId = null;
         this.lotsByItem = new Map();
+        this.editingItemId = null;
         this.render();
     }
 
@@ -56,7 +72,7 @@ export class InventoryManager {
             </p>
 
             <div class="advances-toolbar">
-                <input type="text" id="inventory-search" class="form-control" placeholder="Search by item name or category...">
+                <input type="text" id="inventory-search" class="form-control" placeholder="Search by item name, category, barcode or HSN...">
                 <button type="button" id="inventory-refresh-btn" class="btn btn-secondary">Refresh</button>
                 <button type="button" id="inventory-new-item-btn" class="btn btn-secondary">+ New Item</button>
                 <button type="button" id="inventory-new-lot-btn" class="btn btn-primary">+ New Lot</button>
@@ -81,6 +97,38 @@ export class InventoryManager {
                         </select>
                     </div>
                 </div>
+                <div class="form-group-row">
+                    <div class="form-group">
+                        <label for="item-sku">Barcode / SKU</label>
+                        <input type="text" id="item-sku" class="form-control" maxlength="64" placeholder="Scan or type — optional">
+                    </div>
+                    <div class="form-group">
+                        <label for="item-hsn">HSN Code</label>
+                        <input type="text" id="item-hsn" class="form-control" maxlength="20" placeholder="e.g. 7113">
+                    </div>
+                </div>
+                <p style="font-size:12px; color:var(--color-text-muted); margin:4px 0 8px;">
+                    Gross/net/stone weight below are the design's nominal figures for the catalogue and the
+                    printed tag — what actually sells is still whatever the scale reads at billing.
+                </p>
+                <div class="form-group-row">
+                    <div class="form-group">
+                        <label for="item-gross-weight">Gross Weight (g)</label>
+                        <input type="number" id="item-gross-weight" class="form-control" min="0.001" step="0.001" placeholder="Optional">
+                    </div>
+                    <div class="form-group">
+                        <label for="item-net-weight">Net (Metal) Weight (g)</label>
+                        <input type="number" id="item-net-weight" class="form-control" min="0.001" step="0.001" placeholder="Optional">
+                    </div>
+                    <div class="form-group">
+                        <label for="item-stone-weight">Stone Weight (g)</label>
+                        <input type="number" id="item-stone-weight" class="form-control" min="0" step="0.001" placeholder="Optional">
+                    </div>
+                    <div class="form-group">
+                        <label for="item-stone-value">Stone Value (₹)</label>
+                        <input type="number" id="item-stone-value" class="form-control" min="0" step="0.01" placeholder="Optional">
+                    </div>
+                </div>
                 <div style="display:flex; gap:10px;">
                     <button type="button" id="submit-item-btn" class="btn btn-primary">Save Item</button>
                     <button type="button" id="cancel-item-btn" class="btn btn-secondary">Cancel</button>
@@ -102,6 +150,10 @@ export class InventoryManager {
                         <label for="lot-label">Label</label>
                         <input type="text" id="lot-label" class="form-control" maxlength="200" placeholder="e.g. Opening stock">
                     </div>
+                    <div class="form-group">
+                        <label for="lot-huid">Hallmark HUID</label>
+                        <input type="text" id="lot-huid" class="form-control" maxlength="32" placeholder="If this lot is one piece">
+                    </div>
                 </div>
                 <div style="display:flex; gap:10px;">
                     <button type="button" id="submit-lot-btn" class="btn btn-primary">Open Lot</button>
@@ -114,6 +166,7 @@ export class InventoryManager {
                 <thead>
                     <tr>
                         <th>Item</th>
+                        <th>Barcode</th>
                         <th>Category</th>
                         <th>Purity</th>
                         <th class="text-right">On Hand</th>
@@ -143,12 +196,15 @@ export class InventoryManager {
 
         document.getElementById('inventory-new-item-btn').addEventListener('click', () => {
             const form = document.getElementById('new-item-form');
-            form.style.display = form.style.display === 'none' ? 'block' : 'none';
+            const willShow = form.style.display === 'none';
+            if (willShow) this.resetItemForm();
+            form.style.display = willShow ? 'block' : 'none';
         });
         document.getElementById('cancel-item-btn').addEventListener('click', () => {
             document.getElementById('new-item-form').style.display = 'none';
+            this.editingItemId = null;
         });
-        document.getElementById('submit-item-btn').addEventListener('click', () => this.submitNewItem());
+        document.getElementById('submit-item-btn').addEventListener('click', () => this.submitItemForm());
 
         document.getElementById('inventory-new-lot-btn').addEventListener('click', () => {
             const form = document.getElementById('new-lot-form');
@@ -181,7 +237,7 @@ export class InventoryManager {
         } catch (err) {
             console.error('Failed to load inventory:', err);
             const tbody = document.getElementById('inventory-table-body');
-            if (tbody) tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--color-danger);">Inventory could not be loaded. Check the server is reachable and try Refresh.</td></tr>`;
+            if (tbody) tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--color-danger);">Inventory could not be loaded. Check the server is reachable and try Refresh.</td></tr>`;
         }
     }
 
@@ -193,30 +249,128 @@ export class InventoryManager {
             : '<option value="">No active items — create one first</option>';
     }
 
-    async submitNewItem() {
+    /** Clears the New/Edit Item form and drops any in-progress edit. */
+    resetItemForm() {
+        this.editingItemId = null;
+        ['item-name', 'item-category', 'item-sku', 'item-hsn', 'item-gross-weight',
+            'item-net-weight', 'item-stone-weight', 'item-stone-value'].forEach(id => {
+            document.getElementById(id).value = '';
+        });
+        document.getElementById('item-purity').value = '22K';
+        document.getElementById('item-form-status').textContent = '';
+        document.getElementById('submit-item-btn').textContent = 'Save Item';
+    }
+
+    /** Opens the same form pre-filled, for adding/correcting catalogue detail on an item that already exists. */
+    editItem(itemId) {
+        const item = this.items.find(i => i.id === itemId);
+        if (!item) return;
+        this.editingItemId = itemId;
+        document.getElementById('item-name').value = item.name || '';
+        document.getElementById('item-category').value = item.category || '';
+        document.getElementById('item-purity').value = item.purity;
+        document.getElementById('item-sku').value = item.skuCode || '';
+        document.getElementById('item-hsn').value = item.hsnCode || '';
+        document.getElementById('item-gross-weight').value = item.grossWeightGrams ?? '';
+        document.getElementById('item-net-weight').value = item.netWeightGrams ?? '';
+        document.getElementById('item-stone-weight').value = item.stoneWeightGrams ?? '';
+        document.getElementById('item-stone-value').value = item.stoneValueAmount ?? '';
+        document.getElementById('item-form-status').textContent = '';
+        document.getElementById('submit-item-btn').textContent = 'Update Item';
+        document.getElementById('new-item-form').style.display = 'block';
+        document.getElementById('new-item-form').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    async submitItemForm() {
         const statusEl = document.getElementById('item-form-status');
         const name = document.getElementById('item-name').value.trim();
         const category = document.getElementById('item-category').value.trim();
         const purity = document.getElementById('item-purity').value;
+        const skuCode = document.getElementById('item-sku').value.trim();
+        const hsnCode = document.getElementById('item-hsn').value.trim();
+        const grossWeightGrams = parseFloat(document.getElementById('item-gross-weight').value);
+        const netWeightGrams = parseFloat(document.getElementById('item-net-weight').value);
+        const stoneWeightGrams = parseFloat(document.getElementById('item-stone-weight').value);
+        const stoneValueAmount = parseFloat(document.getElementById('item-stone-value').value);
         if (!name) { statusEl.textContent = 'Item name is required.'; return; }
 
+        const payload = {
+            name, category: category || undefined, purity,
+            skuCode: skuCode || undefined, hsnCode: hsnCode || undefined,
+            grossWeightGrams: Number.isFinite(grossWeightGrams) ? grossWeightGrams : undefined,
+            netWeightGrams: Number.isFinite(netWeightGrams) ? netWeightGrams : undefined,
+            stoneWeightGrams: Number.isFinite(stoneWeightGrams) ? stoneWeightGrams : undefined,
+            stoneValueAmount: Number.isFinite(stoneValueAmount) ? stoneValueAmount : undefined
+        };
+        const editing = this.editingItemId;
+        const url = editing ? `/api/inventory/items/${encodeURIComponent(editing)}` : '/api/inventory/items';
+        const method = editing ? 'PATCH' : 'POST';
+
         try {
-            const res = await adminFetch('/api/inventory/items', {
-                method: 'POST',
+            const res = await adminFetch(url, {
+                method,
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, category: category || undefined, purity })
+                body: JSON.stringify(payload)
             });
             const body = await res.json();
-            if (!res.ok) { statusEl.textContent = body.message || body.error || 'Failed to create item.'; return; }
+            if (!res.ok) { statusEl.textContent = body.message || body.error || 'Failed to save the item.'; return; }
 
-            statusEl.textContent = '';
-            document.getElementById('item-name').value = '';
-            document.getElementById('item-category').value = '';
             document.getElementById('new-item-form').style.display = 'none';
+            this.resetItemForm();
             await this.refresh();
         } catch (err) {
             statusEl.textContent = 'Could not reach the server.';
         }
+    }
+
+    /**
+     * Opens a small printable tag in a new tab: a QR of the barcode value
+     * (scannable by any phone or QR-capable scanner — reuses the existing
+     * /api/qrcode endpoint rather than adding a barcode-symbology library)
+     * plus the catalogue text a jeweller's shelf tag actually needs.
+     */
+    async printLabel(itemId) {
+        const item = this.items.find(i => i.id === itemId);
+        if (!item) return;
+        if (!item.skuCode) { alert('This item has no barcode/SKU set yet — add one via Edit first.'); return; }
+
+        let qrDataUrl = '';
+        try {
+            const res = await adminFetch(`/api/qrcode?data=${encodeURIComponent(item.skuCode)}`);
+            if (res.ok) qrDataUrl = (await res.json()).dataUrl;
+        } catch (err) { /* label still prints without the QR image */ }
+
+        const rows = [
+            ['Purity', item.purity],
+            ['HSN', item.hsnCode || '—'],
+            ['Gross Wt', formatGramsOrDash(item.grossWeightGrams)],
+            ['Net Wt', formatGramsOrDash(item.netWeightGrams)],
+            ['Stone Wt', formatGramsOrDash(item.stoneWeightGrams)]
+        ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`).join('');
+
+        const win = window.open('', '_blank', 'width=420,height=560');
+        if (!win) { alert('Pop-up blocked — allow pop-ups to print a label.'); return; }
+        win.document.write(`
+            <html><head><title>Label — ${escapeHtml(item.name)}</title>
+            <style>
+                body { font-family: Arial, sans-serif; padding: 16px; }
+                .tag { width: 260px; border: 1px solid #333; border-radius: 6px; padding: 12px; text-align: center; }
+                .tag h3 { margin: 0 0 4px; font-size: 15px; }
+                .tag img { width: 140px; height: 140px; margin: 8px auto; }
+                .tag .code { font-family: monospace; font-size: 12px; letter-spacing: 1px; margin-bottom: 8px; }
+                .tag .rows div { display: flex; justify-content: space-between; font-size: 12px; padding: 2px 0; border-top: 1px dashed #ccc; }
+            </style></head>
+            <body>
+                <div class="tag">
+                    <h3>${escapeHtml(item.name)}</h3>
+                    ${qrDataUrl ? `<img src="${qrDataUrl}" alt="barcode">` : ''}
+                    <div class="code">${escapeHtml(item.skuCode)}</div>
+                    <div class="rows">${rows}</div>
+                </div>
+                <script>window.onload = () => window.print();</script>
+            </body></html>
+        `);
+        win.document.close();
     }
 
     async submitNewLot() {
@@ -224,6 +378,7 @@ export class InventoryManager {
         const itemId = document.getElementById('lot-item').value;
         const weightGrams = parseFloat(document.getElementById('lot-weight').value);
         const label = document.getElementById('lot-label').value.trim();
+        const hallmarkHuid = document.getElementById('lot-huid').value.trim();
         if (!itemId) { statusEl.textContent = 'Choose an item.'; return; }
         if (!(weightGrams > 0)) { statusEl.textContent = 'Weight must be a positive number of grams.'; return; }
 
@@ -231,7 +386,7 @@ export class InventoryManager {
             const res = await adminFetch('/api/inventory/lots', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ itemId, weightGrams, label: label || undefined })
+                body: JSON.stringify({ itemId, weightGrams, label: label || undefined, hallmarkHuid: hallmarkHuid || undefined })
             });
             const body = await res.json();
             if (!res.ok) { statusEl.textContent = body.message || body.error || 'Failed to open the lot.'; return; }
@@ -239,6 +394,7 @@ export class InventoryManager {
             statusEl.textContent = '';
             document.getElementById('lot-weight').value = '';
             document.getElementById('lot-label').value = '';
+            document.getElementById('lot-huid').value = '';
             document.getElementById('new-lot-form').style.display = 'none';
             await this.refresh();
         } catch (err) {
@@ -292,32 +448,44 @@ export class InventoryManager {
         if (query) {
             rows = rows.filter(s =>
                 (s.name || '').toLowerCase().includes(query) ||
-                (s.category || '').toLowerCase().includes(query));
+                (s.category || '').toLowerCase().includes(query) ||
+                (s.skuCode || '').toLowerCase().includes(query) ||
+                (s.hsnCode || '').toLowerCase().includes(query));
         }
 
         if (rows.length === 0) {
             const message = this.stock.length === 0
                 ? 'No inventory items yet. Use "+ New Item" to start a catalogue entry, then "+ New Lot" to record what is on the shelf.'
                 : 'No item matches that filter.';
-            tbody.innerHTML = `<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--color-text-light); font-style:italic;">${message}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding:30px; color:var(--color-text-light); font-style:italic;">${message}</td></tr>`;
             return;
         }
 
         tbody.innerHTML = rows.map(s => {
             const expanded = this.expandedItemId === s.itemId;
             const lots = this.lotsByItem.get(s.itemId) || [];
+            const catalogueRows = [
+                ['HSN', s.hsnCode || '—'],
+                ['Gross Wt', formatGramsOrDash(s.grossWeightGrams)],
+                ['Net Wt', formatGramsOrDash(s.netWeightGrams)],
+                ['Stone Wt', formatGramsOrDash(s.stoneWeightGrams)],
+                ['Stone Value', formatAmountOrDash(s.stoneValueAmount)]
+            ].map(([label, value]) => `<span style="margin-right:16px;"><b>${escapeHtml(label)}:</b> ${escapeHtml(value)}</span>`).join('');
+
             const lotsRow = expanded ? `
                 <tr>
-                    <td colspan="6" style="background:var(--color-surface-alt, #f8fafc); padding:10px 20px;">
+                    <td colspan="7" style="background:var(--color-surface-alt, #f8fafc); padding:10px 20px;">
+                        <div style="font-size:12px; color:var(--color-text-muted); margin-bottom:10px;">${catalogueRows}</div>
                         ${lots.length === 0
                             ? '<p style="font-size:12px; color:var(--color-text-muted); margin:0;">No lots yet for this item.</p>'
                             : `<table class="advances-table" style="margin:0;">
-                                <thead><tr><th>Lot</th><th>Label</th><th class="text-right">Weight</th><th>Opened</th><th></th></tr></thead>
+                                <thead><tr><th>Lot</th><th>Label</th><th>Hallmark HUID</th><th class="text-right">Weight</th><th>Opened</th><th></th></tr></thead>
                                 <tbody>
                                     ${lots.map(l => `
                                         <tr>
                                             <td style="font-family:monospace; font-size:12px;">${escapeHtml(l.id)}</td>
                                             <td>${escapeHtml(l.label || '—')}</td>
+                                            <td style="font-family:monospace; font-size:12px;">${escapeHtml(l.hallmarkHuid || '—')}</td>
                                             <td class="text-right">${formatGrams(l.weightGrams)}</td>
                                             <td style="white-space:nowrap;">${formatWhen(l.createdAt)}</td>
                                             <td>
@@ -342,13 +510,18 @@ export class InventoryManager {
             return `
                 <tr>
                     <td>${escapeHtml(s.name)}</td>
+                    <td style="font-family:monospace; font-size:12px;">${escapeHtml(s.skuCode || '—')}</td>
                     <td>${escapeHtml(s.category || '—')}</td>
                     <td>${escapeHtml(s.purity)}</td>
                     <td class="text-right">${formatGrams(s.weightGrams)}</td>
                     <td>${s.isActive
                         ? '<span style="font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; color:var(--color-success); background:var(--color-success-bg);">Active</span>'
                         : '<span style="font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; color:var(--color-text-muted); background:var(--color-surface-alt, #f1f5f9);">Inactive</span>'}</td>
-                    <td><button type="button" class="btn btn-secondary btn-sm toggle-lots-btn" data-item="${escapeHtml(s.itemId)}">${expanded ? 'Hide Lots' : 'View Lots'}</button></td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-secondary btn-sm toggle-lots-btn" data-item="${escapeHtml(s.itemId)}">${expanded ? 'Hide Lots' : 'View Lots'}</button>
+                        <button type="button" class="btn btn-secondary btn-sm edit-item-btn" data-item="${escapeHtml(s.itemId)}">Edit</button>
+                        <button type="button" class="btn btn-secondary btn-sm label-item-btn" data-item="${escapeHtml(s.itemId)}">Label</button>
+                    </td>
                 </tr>
                 ${lotsRow}
             `;
@@ -356,6 +529,12 @@ export class InventoryManager {
 
         tbody.querySelectorAll('.toggle-lots-btn').forEach(btn => {
             btn.addEventListener('click', () => this.toggleLots(btn.getAttribute('data-item')));
+        });
+        tbody.querySelectorAll('.edit-item-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.editItem(btn.getAttribute('data-item')));
+        });
+        tbody.querySelectorAll('.label-item-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.printLabel(btn.getAttribute('data-item')));
         });
         tbody.querySelectorAll('.submit-adjust-btn').forEach(btn => {
             btn.addEventListener('click', () => this.submitAdjustment(btn.getAttribute('data-lot')));

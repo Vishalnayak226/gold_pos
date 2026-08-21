@@ -1699,6 +1699,99 @@ console.log('\n18. Invoice delivery');
     });
 }
 
+/* ==========================================================================
+   19. SKU catalogue mechanics — barcode, HSN, hallmark/HUID, gross/net/stone
+   weight (roadmap Phase 5.1, the catalogue-metadata half of "Catalogue,
+   multi-line sale, barcode/labels, HSN/hallmark and weight/stone/making
+   model" — see 011_sku_catalogue.sql for what this deliberately does not
+   touch: billing, stock decrement, and wastage, all still out of scope).
+   ========================================================================== */
+
+console.log('\n19. SKU catalogue mechanics');
+
+{
+    let itemId;
+    check('createItem() stores the catalogue fields and getItem() reads them back', () => {
+        itemId = repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Catalogue Ring A102', category: 'Rings', purity: '22K',
+            skuCode: 'SKU-A102', hsnCode: '7113', grossWeightMg: 4200, netWeightMg: 3800,
+            stoneWeightMg: 400, stoneValuePaise: 500000
+        });
+        const item = repo.inventory.getItem(context.tenantId, itemId);
+        assert.equal(item.sku_code, 'SKU-A102');
+        assert.equal(item.hsn_code, '7113');
+        assert.equal(item.gross_weight_mg, 4200);
+        assert.equal(item.net_weight_mg, 3800);
+        assert.equal(item.stone_weight_mg, 400);
+        assert.equal(item.stone_value_paise, 500000);
+    });
+
+    check('createItem() leaves catalogue fields NULL when not given — an existing item is not forced to have them', () => {
+        const plainId = repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Plain Chain', purity: '24K'
+        });
+        const item = repo.inventory.getItem(context.tenantId, plainId);
+        assert.equal(item.sku_code, null);
+        assert.equal(item.gross_weight_mg, null);
+    });
+
+    check('createItem() refuses a net weight greater than the gross weight', () => {
+        assert.throws(() => repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Bad Weights', purity: '22K',
+            grossWeightMg: 1000, netWeightMg: 1500
+        }), /Net weight cannot exceed gross weight/);
+    });
+
+    check('createItem() refuses a stone weight greater than the gross weight', () => {
+        assert.throws(() => repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Bad Stone Weight', purity: '22K',
+            grossWeightMg: 1000, stoneWeightMg: 1200
+        }), /Stone weight cannot exceed gross weight/);
+    });
+
+    check('updateItem() patches only the catalogue fields passed, leaving the rest untouched', () => {
+        const updated = repo.inventory.updateItem(context.tenantId, itemId, { hsnCode: '7117' });
+        assert.equal(updated.hsn_code, '7117');
+        assert.equal(updated.sku_code, 'SKU-A102', 'an unpassed catalogue field must survive the patch');
+        assert.equal(updated.gross_weight_mg, 4200);
+    });
+
+    check('updateItem() also enforces the net/gross weight invariant, mixing the patch with the existing row', () => {
+        assert.throws(() => repo.inventory.updateItem(context.tenantId, itemId, { netWeightMg: 9000 }),
+            /Net weight cannot exceed gross weight/);
+    });
+
+    check('findItemBySku() finds an item by its barcode value, scoped to the tenant', () => {
+        const found = repo.inventory.findItemBySku(context.tenantId, 'SKU-A102');
+        assert.equal(found.id, itemId);
+        assert.equal(repo.inventory.findItemBySku(context.tenantId, 'NO-SUCH-CODE'), null);
+        assert.equal(repo.inventory.findItemBySku(context.tenantId, ''), null);
+    });
+
+    check('itemStockSummary() carries the catalogue fields through for the shelf/label view', () => {
+        const summary = repo.inventory.itemStockSummary(context.tenantId);
+        const row = summary.find(s => s.item_id === itemId);
+        assert.equal(row.sku_code, 'SKU-A102');
+        assert.equal(row.stone_value_paise, 500000);
+    });
+
+    check('openLot() records a hallmark HUID on the lot it opens', () => {
+        const { lotId } = repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId, weightMg: 4200,
+            actorUserId: context.ownerUserId, hallmarkHuid: 'HUID12345678'
+        }));
+        const lot = repo.inventory.getLot(context.tenantId, lotId);
+        assert.equal(lot.hallmark_huid, 'HUID12345678');
+    });
+
+    check('a second lot cannot reuse the same HUID for the same tenant — BIS assigns one per physical article', () => {
+        assert.throws(() => repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId, weightMg: 4200,
+            actorUserId: context.ownerUserId, hallmarkHuid: 'HUID12345678'
+        })), /UNIQUE|constraint/i);
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

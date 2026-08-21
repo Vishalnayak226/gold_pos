@@ -2508,24 +2508,44 @@ app.post('/api/advances/:id/reject', requireAdminSession, requireApprover, (req,
 
 const PURITY_RULE = { type: 'enum', values: ['24K', '22K', '18K'], required: true };
 
+// SKU-catalogue fields (roadmap Phase 5.1, 011_sku_catalogue.sql): nominal
+// design-level figures, printed on the catalogue and a shelf tag — never
+// read by billing or stock movements. See that migration's header for why
+// gross/net/stone weight live on the item, not the lot, and why hallmark
+// HUID is the one exception (lot-level, see INVENTORY_LOT_OPEN_SCHEMA).
+const SKU_CATALOGUE_FIELDS = {
+    skuCode: { type: 'string', maxLength: 64 },
+    hsnCode: { type: 'string', maxLength: 20 },
+    grossWeightGrams: { type: 'number', min: 0.001, max: 100000 },
+    netWeightGrams: { type: 'number', min: 0.001, max: 100000 },
+    stoneWeightGrams: { type: 'number', min: 0, max: 100000 },
+    stoneValueAmount: { type: 'number', min: 0, max: 100000000 }
+};
+
 const INVENTORY_ITEM_CREATE_SCHEMA = {
     name: { type: 'string', maxLength: 200, minLength: 1, required: true },
     category: { type: 'string', maxLength: 100 },
-    purity: PURITY_RULE
+    purity: PURITY_RULE,
+    ...SKU_CATALOGUE_FIELDS
 };
 
 const INVENTORY_ITEM_PATCH_SCHEMA = {
     name: { type: 'string', maxLength: 200, minLength: 1 },
     category: { type: 'string', maxLength: 100 },
     purity: { ...PURITY_RULE, required: false },
-    isActive: { type: 'boolean' }
+    isActive: { type: 'boolean' },
+    ...SKU_CATALOGUE_FIELDS
 };
 
 const INVENTORY_LOT_OPEN_SCHEMA = {
     itemId: { type: 'string', maxLength: 64, minLength: 1, required: true },
     weightGrams: { type: 'number', min: 0.001, max: 100000, required: true },
     label: { type: 'string', maxLength: 200 },
-    reason: { type: 'string', maxLength: 500 }
+    reason: { type: 'string', maxLength: 500 },
+    // BIS assigns one HUID per physical article, so this is meaningful only
+    // when the lot being opened represents a single piece — see
+    // 011_sku_catalogue.sql.
+    hallmarkHuid: { type: 'string', maxLength: 32 }
 };
 
 const INVENTORY_ADJUST_SCHEMA = {
@@ -2538,10 +2558,19 @@ function gramsToMg(grams) {
     return Math.round(Number(grams) * 1000);
 }
 
+/** null-safe mg -> grams; a NULL catalogue weight (never entered) stays null on the wire rather than becoming 0. */
+function mgToGramsOrNull(mg) {
+    return mg == null ? null : round3(mg / 1000);
+}
+
 function inventoryItemToWire(row) {
     return {
         id: row.id, name: row.name, category: row.category, purity: row.purity,
-        skuCode: row.sku_code, isActive: Boolean(row.is_active),
+        skuCode: row.sku_code, hsnCode: row.hsn_code, isActive: Boolean(row.is_active),
+        grossWeightGrams: mgToGramsOrNull(row.gross_weight_mg),
+        netWeightGrams: mgToGramsOrNull(row.net_weight_mg),
+        stoneWeightGrams: mgToGramsOrNull(row.stone_weight_mg),
+        stoneValueAmount: row.stone_value_paise == null ? null : fromPaise(row.stone_value_paise),
         createdAt: row.created_at, updatedAt: row.updated_at
     };
 }
@@ -2549,6 +2578,7 @@ function inventoryItemToWire(row) {
 function inventoryLotToWire(row) {
     return {
         id: row.id, branchId: row.branch_id, itemId: row.item_id, label: row.label,
+        hallmarkHuid: row.hallmark_huid || null,
         weightGrams: round3(row.balance_mg / 1000), createdAt: row.created_at
     };
 }
@@ -2573,6 +2603,18 @@ app.get('/api/inventory/items', requireAdminSession, (req, res) => {
     }
 });
 
+/** Wire (grams/rupees, camelCase) -> repository patch shape (mg/paise, snake-free) for the SKU-catalogue fields. Keys absent from `body` stay absent so a PATCH can't clobber a field the caller didn't send. */
+function catalogueFieldsFromWire(body) {
+    const patch = {};
+    if (body.skuCode !== undefined) patch.skuCode = body.skuCode || null;
+    if (body.hsnCode !== undefined) patch.hsnCode = body.hsnCode || null;
+    if (body.grossWeightGrams !== undefined) patch.grossWeightMg = body.grossWeightGrams == null ? null : gramsToMg(body.grossWeightGrams);
+    if (body.netWeightGrams !== undefined) patch.netWeightMg = body.netWeightGrams == null ? null : gramsToMg(body.netWeightGrams);
+    if (body.stoneWeightGrams !== undefined) patch.stoneWeightMg = body.stoneWeightGrams == null ? null : gramsToMg(body.stoneWeightGrams);
+    if (body.stoneValueAmount !== undefined) patch.stoneValuePaise = body.stoneValueAmount == null ? null : toPaise(body.stoneValueAmount);
+    return patch;
+}
+
 app.post('/api/inventory/items', requireAdminSession, validateBody(INVENTORY_ITEM_CREATE_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
@@ -2580,24 +2622,46 @@ app.post('/api/inventory/items', requireAdminSession, validateBody(INVENTORY_ITE
             tenantId: context.tenantId,
             name: req.body.name,
             category: req.body.category || null,
-            purity: req.body.purity
+            purity: req.body.purity,
+            ...catalogueFieldsFromWire(req.body)
         });
         res.json({ success: true, id, item: inventoryItemToWire(repo.inventory.getItem(context.tenantId, id)) });
     } catch (err) {
         logError('Error creating inventory item: ' + err.message, err.stack);
-        res.status(500).json({ error: 'Failed to create the inventory item' });
+        const status = /cannot exceed/.test(err.message) ? 400 : 500;
+        res.status(status).json({ error: status === 400 ? err.message : 'Failed to create the inventory item' });
     }
 });
 
 app.patch('/api/inventory/items/:id', requireAdminSession, validateBody(INVENTORY_ITEM_PATCH_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
-        const updated = repo.inventory.updateItem(context.tenantId, req.params.id, req.body || {});
+        const patch = { ...(req.body || {}), ...catalogueFieldsFromWire(req.body || {}) };
+        const updated = repo.inventory.updateItem(context.tenantId, req.params.id, patch);
         if (!updated) return res.status(404).json({ error: 'No inventory item with that id' });
         res.json({ success: true, item: inventoryItemToWire(updated) });
     } catch (err) {
         logError('Error updating inventory item: ' + err.message, err.stack);
-        res.status(500).json({ error: 'Failed to update the inventory item' });
+        const status = /cannot exceed/.test(err.message) ? 400 : 500;
+        res.status(status).json({ error: status === 400 ? err.message : 'Failed to update the inventory item' });
+    }
+});
+
+/**
+ * GET /api/inventory/items/by-sku/:skuCode
+ * Barcode-scan lookup — a scanner (or a phone camera reading the printed
+ * QR/label) types the SKU code into a text field exactly like a keyboard, so
+ * this needs no scanning logic of its own, only a lookup by the value.
+ */
+app.get('/api/inventory/items/by-sku/:skuCode', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const item = repo.inventory.findItemBySku(context.tenantId, req.params.skuCode);
+        if (!item) return res.status(404).json({ error: 'No item with that barcode/SKU' });
+        res.json({ item: inventoryItemToWire(item) });
+    } catch (err) {
+        logError('Error looking up inventory item by SKU: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to look up the item' });
     }
 });
 
@@ -2614,7 +2678,12 @@ app.get('/api/inventory/stock', requireAdminSession, (req, res) => {
         const summary = repo.inventory.itemStockSummary(context.tenantId, { branchId: context.branchId });
         res.json(summary.map(row => ({
             itemId: row.item_id, name: row.name, category: row.category, purity: row.purity,
-            isActive: Boolean(row.is_active), weightGrams: round3(row.balance_mg / 1000)
+            isActive: Boolean(row.is_active), weightGrams: round3(row.balance_mg / 1000),
+            skuCode: row.sku_code, hsnCode: row.hsn_code,
+            grossWeightGrams: mgToGramsOrNull(row.gross_weight_mg),
+            netWeightGrams: mgToGramsOrNull(row.net_weight_mg),
+            stoneWeightGrams: mgToGramsOrNull(row.stone_weight_mg),
+            stoneValueAmount: row.stone_value_paise == null ? null : fromPaise(row.stone_value_paise)
         })));
     } catch (err) {
         logError('Error reading inventory stock summary: ' + err.message, err.stack);
@@ -2655,7 +2724,8 @@ app.post('/api/inventory/lots', requireAdminSession, validateBody(INVENTORY_LOT_
             weightMg: gramsToMg(req.body.weightGrams),
             label: req.body.label || null,
             reason: req.body.reason || null,
-            actorUserId: resolveActorUserId(req.actor)
+            actorUserId: resolveActorUserId(req.actor),
+            hallmarkHuid: req.body.hallmarkHuid || null
         }));
         res.json({ success: true, id: lotId, lot: inventoryLotToWire(repo.inventory.getLot(context.tenantId, lotId)) });
     } catch (err) {

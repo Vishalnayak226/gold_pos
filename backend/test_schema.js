@@ -506,6 +506,47 @@ check('a valid adjustment movement is accepted, and cannot then be edited or del
 });
 
 /* --------------------------------------------------------------------------
+   4c. SKU catalogue mechanics (Phase 5.1) — the CHECK constraints and the
+   hallmark/HUID unique index, exercised via raw SQL for the same reason as
+   4b above: inventoryRepository.js's own guards (assertWeightsConsistent)
+   would otherwise be the only thing ever exercising these, and they are not
+   what is meant to be the backstop.
+   -------------------------------------------------------------------------- */
+
+check('a negative gross weight on an inventory item is refused', () => {
+    refuses(() => db.prepare('UPDATE inventory_items SET gross_weight_mg = -100 WHERE id = ?').run('ITM1'),
+        /CHECK|constraint/i);
+});
+
+check('a negative stone value on an inventory item is refused', () => {
+    refuses(() => db.prepare('UPDATE inventory_items SET stone_value_paise = -1 WHERE id = ?').run('ITM1'),
+        /CHECK|constraint/i);
+});
+
+check('a NULL gross/net/stone weight is accepted — an item is not forced to carry catalogue detail', () => {
+    db.prepare('UPDATE inventory_items SET hsn_code = ? WHERE id = ?').run('7113', 'ITM1');
+    assert.strictEqual(db.prepare("SELECT hsn_code FROM inventory_items WHERE id = 'ITM1'").get().hsn_code, '7113');
+});
+
+check('two lots sharing the same hallmark HUID within a tenant are refused', () => {
+    db.prepare(`INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, created_by_user_id, created_at, hallmark_huid)
+        VALUES (?,?,?,?,?,?,?)`).run('LOT-HUID-1', 'T1', 'B1', 'ITM1', 'U-MGR', NOW, 'HUID-DUP');
+    refuses(() => db.prepare(`INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, created_by_user_id, created_at, hallmark_huid)
+        VALUES (?,?,?,?,?,?,?)`).run('LOT-HUID-2', 'T1', 'B1', 'ITM1', 'U-MGR', NOW, 'HUID-DUP'),
+        /UNIQUE|constraint/i);
+});
+
+check('the HUID uniqueness is scoped per tenant — a second tenant may use the same code', () => {
+    db.prepare('INSERT INTO tenants (id, name, created_at, updated_at) VALUES (?,?,?,?)').run('T2', 'Second Tenant', NOW, NOW);
+    db.prepare('INSERT INTO branches (id, tenant_id, name, created_at, updated_at) VALUES (?,?,?,?,?)').run('B2', 'T2', 'Main', NOW, NOW);
+    db.prepare(`INSERT INTO inventory_items (id, tenant_id, name, purity, is_active, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?)`).run('ITM-T2', 'T2', 'Other Tenant Item', '22K', 1, NOW, NOW);
+    db.prepare(`INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, created_by_user_id, created_at, hallmark_huid)
+        VALUES (?,?,?,?,?,?,?)`).run('LOT-T2-HUID', 'T2', 'B2', 'ITM-T2', 'U-MGR', NOW, 'HUID-DUP');
+    assert.strictEqual(db.prepare("SELECT hallmark_huid FROM inventory_lots WHERE id = 'LOT-T2-HUID'").get().hallmark_huid, 'HUID-DUP');
+});
+
+/* --------------------------------------------------------------------------
    5. Audit is genuinely immutable
    -------------------------------------------------------------------------- */
 

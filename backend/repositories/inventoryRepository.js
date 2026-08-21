@@ -41,24 +41,50 @@ export function getItem(tenantId, itemId) {
 }
 
 /**
- * @param {{tenantId: string, name: string, category?: string, purity: string}} params
+ * Cross-column catalogue invariants that SQLite's ALTER-TABLE CHECK cannot
+ * express (a CHECK added via ADD COLUMN may not reference another column —
+ * see 011_sku_catalogue.sql). Net metal weight and stone weight both
+ * describe a split of the same gross figure, so neither may exceed it.
+ */
+function assertWeightsConsistent({ grossWeightMg, netWeightMg, stoneWeightMg }) {
+    if (grossWeightMg == null) return;
+    if (netWeightMg != null && netWeightMg > grossWeightMg) {
+        throw new Error('Net weight cannot exceed gross weight.');
+    }
+    if (stoneWeightMg != null && stoneWeightMg > grossWeightMg) {
+        throw new Error('Stone weight cannot exceed gross weight.');
+    }
+}
+
+/**
+ * @param {{tenantId: string, name: string, category?: string, purity: string,
+ *   skuCode?: string, hsnCode?: string, grossWeightMg?: number, netWeightMg?: number,
+ *   stoneWeightMg?: number, stoneValuePaise?: number}} params
  * @returns {string} the new item's id
  */
-export function createItem({ tenantId, name, category = null, purity }) {
+export function createItem({
+    tenantId, name, category = null, purity, skuCode = null, hsnCode = null,
+    grossWeightMg = null, netWeightMg = null, stoneWeightMg = null, stoneValuePaise = null
+}) {
+    assertWeightsConsistent({ grossWeightMg, netWeightMg, stoneWeightMg });
     const db = getDb();
     const id = newId('ITM');
     const now = Date.now();
     db.prepare(`
-        INSERT INTO inventory_items (id, tenant_id, name, category, purity, sku_code, is_active, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, NULL, 1, ?, ?)
-    `).run(id, tenantId, name, category, purity, now, now);
+        INSERT INTO inventory_items (
+            id, tenant_id, name, category, purity, sku_code, hsn_code,
+            gross_weight_mg, net_weight_mg, stone_weight_mg, stone_value_paise,
+            is_active, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(id, tenantId, name, category, purity, skuCode, hsnCode,
+        grossWeightMg, netWeightMg, stoneWeightMg, stoneValuePaise, now, now);
     return id;
 }
 
 /**
- * Patches name/category/purity/isActive. Metadata, not a ledger fact, so a
- * plain UPDATE is correct here — nothing about an item's description is
- * append-only.
+ * Patches name/category/purity/isActive/catalogue fields. Metadata, not a
+ * ledger fact, so a plain UPDATE is correct here — nothing about an item's
+ * description is append-only.
  */
 export function updateItem(tenantId, itemId, patch) {
     const db = getDb();
@@ -69,13 +95,31 @@ export function updateItem(tenantId, itemId, patch) {
         name: patch.name !== undefined ? patch.name : existing.name,
         category: patch.category !== undefined ? patch.category : existing.category,
         purity: patch.purity !== undefined ? patch.purity : existing.purity,
-        isActive: patch.isActive !== undefined ? (patch.isActive ? 1 : 0) : existing.is_active
+        isActive: patch.isActive !== undefined ? (patch.isActive ? 1 : 0) : existing.is_active,
+        skuCode: patch.skuCode !== undefined ? patch.skuCode : existing.sku_code,
+        hsnCode: patch.hsnCode !== undefined ? patch.hsnCode : existing.hsn_code,
+        grossWeightMg: patch.grossWeightMg !== undefined ? patch.grossWeightMg : existing.gross_weight_mg,
+        netWeightMg: patch.netWeightMg !== undefined ? patch.netWeightMg : existing.net_weight_mg,
+        stoneWeightMg: patch.stoneWeightMg !== undefined ? patch.stoneWeightMg : existing.stone_weight_mg,
+        stoneValuePaise: patch.stoneValuePaise !== undefined ? patch.stoneValuePaise : existing.stone_value_paise
     };
+    assertWeightsConsistent(next);
     db.prepare(`
-        UPDATE inventory_items SET name = ?, category = ?, purity = ?, is_active = ?, updated_at = ?
+        UPDATE inventory_items SET
+            name = ?, category = ?, purity = ?, is_active = ?, sku_code = ?, hsn_code = ?,
+            gross_weight_mg = ?, net_weight_mg = ?, stone_weight_mg = ?, stone_value_paise = ?,
+            updated_at = ?
         WHERE tenant_id = ? AND id = ?
-    `).run(next.name, next.category, next.purity, next.isActive, Date.now(), tenantId, itemId);
+    `).run(next.name, next.category, next.purity, next.isActive, next.skuCode, next.hsnCode,
+        next.grossWeightMg, next.netWeightMg, next.stoneWeightMg, next.stoneValuePaise,
+        Date.now(), tenantId, itemId);
     return getItem(tenantId, itemId);
+}
+
+/** Looks an item up by its barcode/SKU value — the "scan to find" path. Null when no item carries that code (or it is blank). */
+export function findItemBySku(tenantId, skuCode) {
+    if (!skuCode) return null;
+    return getDb().prepare('SELECT * FROM inventory_items WHERE tenant_id = ? AND sku_code = ?').get(tenantId, skuCode) || null;
 }
 
 /* --------------------------------------------------------------------------
@@ -94,10 +138,10 @@ export function lotBalanceMg(lotId) {
  * in advanceRepository.js: the child row is written here so no lot can exist
  * without the movement that explains its starting weight.
  *
- * @param {{tenantId, branchId, itemId, weightMg: number, label?: string, reason?: string, actorUserId: string, at?: number}} params
+ * @param {{tenantId, branchId, itemId, weightMg: number, label?: string, reason?: string, actorUserId: string, at?: number, hallmarkHuid?: string}} params
  * @returns {{lotId: string, movementId: string}}
  */
-export function openLot({ tenantId, branchId, itemId, weightMg, label = null, reason = null, actorUserId, at = Date.now() }) {
+export function openLot({ tenantId, branchId, itemId, weightMg, label = null, reason = null, actorUserId, at = Date.now(), hallmarkHuid = null }) {
     assertInTransaction('openLot');
     if (!Number.isInteger(weightMg) || weightMg <= 0) {
         throw new Error('openLot: weightMg must be a positive integer (milligrams).');
@@ -105,9 +149,9 @@ export function openLot({ tenantId, branchId, itemId, weightMg, label = null, re
     const db = getDb();
     const lotId = newId('LOT');
     db.prepare(`
-        INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, label, created_by_user_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(lotId, tenantId, branchId, itemId, label, actorUserId, at);
+        INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, label, created_by_user_id, created_at, hallmark_huid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(lotId, tenantId, branchId, itemId, label, actorUserId, at, hallmarkHuid);
 
     const movementId = newId('MOV');
     db.prepare(`
@@ -206,6 +250,8 @@ export function itemStockSummary(tenantId, { branchId = null } = {}) {
 
     return db.prepare(`
         SELECT i.id AS item_id, i.name, i.category, i.purity, i.is_active,
+               i.sku_code, i.hsn_code, i.gross_weight_mg, i.net_weight_mg,
+               i.stone_weight_mg, i.stone_value_paise,
                COALESCE(SUM(m.weight_delta_mg), 0) AS balance_mg
         FROM inventory_items i
         LEFT JOIN inventory_lots l ON ${lotJoin}
