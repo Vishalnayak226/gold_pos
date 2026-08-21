@@ -17,6 +17,8 @@
 import {
     computeInvoiceTotals,
     computeReturnRefund,
+    computeGoldGramsForAmount,
+    computeGoldSchemePayout,
     round3,
     makingChargeFromPercent,
     makingPercentFromAmount,
@@ -1698,6 +1700,65 @@ check('a negative making charge is floored rather than credited', () => {
     const t = computeInvoiceTotals({ metalValue: 1000, makingChargeAmount: -400, taxSlab: 0 });
     near(t.preTaxTotal, 1000, 'the negative making charge does not reduce the bill');
     near(t.totalAmount, 1000, 'total');
+});
+
+group('21. Gold savings schemes (Phase 41, flagged off by default)');
+
+check('an installment locks amount/rate grams, simple division', () => {
+    near(computeGoldGramsForAmount(6875, 6875), 1, '1g at that gram\'s own rate');
+    near(computeGoldGramsForAmount(1000, 1000), 1);
+    near(computeGoldGramsForAmount(0, 1000), 0, 'a zero amount locks zero grams');
+});
+
+check('a zero or unusable rate locks zero grams rather than dividing by it', () => {
+    near(computeGoldGramsForAmount(1000, 0), 0);
+    near(computeGoldGramsForAmount(1000, -5), 0);
+});
+
+check('a full-term maturity credits real grams plus a bonus valued at the SAME average rate', () => {
+    // 11 installments of 1g each = 11g total, 1 bonus installment's worth =
+    // another 1g at the same 1g/installment average — 12g total, valued at
+    // today's rate.
+    const r = computeGoldSchemePayout({
+        totalGramsLocked: 11, installmentsPaid: 11, bonusInstallments: 1,
+        penaltyPercent: 0, currentRatePerGram: 7000
+    });
+    near(r.bonusGrams, 1);
+    near(r.penaltyGrams, 0);
+    near(r.payoutGrams, 12);
+    near(r.payoutAmount, 84000, '12g × ₹7,000');
+});
+
+check('an early closure gets no bonus and pays the penalty in grams before conversion', () => {
+    // 5g locked, a 10% early-closure penalty = 0.5g forfeited, 4.5g paid out.
+    const r = computeGoldSchemePayout({
+        totalGramsLocked: 5, installmentsPaid: 5, bonusInstallments: 0,
+        penaltyPercent: 10, currentRatePerGram: 1000
+    });
+    near(r.bonusGrams, 0);
+    near(r.penaltyGrams, 0.5);
+    near(r.payoutGrams, 4.5);
+    near(r.payoutAmount, 4500);
+});
+
+check('a penalty percentage above 100 is clamped, never forfeiting more than everything', () => {
+    const r = computeGoldSchemePayout({
+        totalGramsLocked: 5, installmentsPaid: 5, penaltyPercent: 250, currentRatePerGram: 1000
+    });
+    near(r.penaltyGrams, 5);
+    near(r.payoutGrams, 0);
+    near(r.payoutAmount, 0);
+});
+
+check('an uneven average per installment still bonuses fairly', () => {
+    // Two installments locking 1g and 3g (a rate move between payments) = 4g
+    // over 2 installments, average 2g — a 1-installment bonus is 2g, not 1g.
+    const r = computeGoldSchemePayout({
+        totalGramsLocked: 4, installmentsPaid: 2, bonusInstallments: 1,
+        currentRatePerGram: 1000
+    });
+    near(r.bonusGrams, 2);
+    near(r.payoutGrams, 6);
 });
 
 /* ==========================================================================

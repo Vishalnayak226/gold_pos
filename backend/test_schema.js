@@ -585,6 +585,76 @@ check('a negative rows_pruned is refused', () => {
 });
 
 /* --------------------------------------------------------------------------
+   5d. Gold savings schemes (Phase 41) — terms snapshot immutable, installments
+   append-only, matching the pattern every other money-adjacent table here uses.
+   -------------------------------------------------------------------------- */
+
+db.prepare(`INSERT INTO gold_schemes
+    (id, tenant_id, name, installment_count, bonus_installments, default_grace_days, early_closure_penalty_bp, is_active, created_at)
+    VALUES ('SCH1','T1','Standard Gold Scheme',11,1,30,0,1,?)`).run(NOW);
+db.prepare(`INSERT INTO customers (id, tenant_id, phone, full_name, created_at, updated_at)
+    VALUES ('CUST-SCHEME','T1','9123456780','Scheme Customer',?,?)`).run(NOW, NOW);
+
+const insertEnrollment = (overrides = {}) => db.prepare(`
+    INSERT INTO gold_scheme_enrollments
+        (id, tenant_id, branch_id, scheme_id, customer_id, installment_count, bonus_installments,
+         default_grace_days, early_closure_penalty_bp, status, created_by_user_id, enrolled_at, business_date)
+    VALUES (@id, @tenantId, @branchId, @schemeId, @customerId, @installmentCount, @bonusInstallments,
+            @defaultGraceDays, @earlyClosurePenaltyBp, @status, @actorUserId, @enrolledAt, @businessDate)
+`).run({
+    id: 'SEN1', tenantId: 'T1', branchId: 'B1', schemeId: 'SCH1', customerId: 'CUST-SCHEME',
+    installmentCount: 11, bonusInstallments: 1, defaultGraceDays: 30, earlyClosurePenaltyBp: 0,
+    status: 'active', actorUserId: 'U-MGR', enrolledAt: NOW, businessDate: TODAY,
+    ...overrides
+});
+
+check('an enrollment can be inserted, and cannot be deleted', () => {
+    insertEnrollment();
+    refuses(() => db.prepare('DELETE FROM gold_scheme_enrollments WHERE id = ?').run('SEN1'), /append-only/);
+});
+
+check('status may change, but the terms snapshot may not', () => {
+    db.prepare("UPDATE gold_scheme_enrollments SET status = 'matured' WHERE id = ?").run('SEN1');
+    assert.strictEqual(db.prepare('SELECT status FROM gold_scheme_enrollments WHERE id = ?').get('SEN1').status, 'matured');
+
+    refuses(() => db.prepare('UPDATE gold_scheme_enrollments SET installment_count = 99 WHERE id = ?').run('SEN1'),
+        /only status and advance_entry_id/);
+
+    db.prepare("UPDATE gold_scheme_enrollments SET status = 'active' WHERE id = ?").run('SEN1');
+});
+
+check('an unknown enrollment status is refused', () => {
+    refuses(() => insertEnrollment({ id: 'SEN2', status: 'cancelled' }), /CHECK|constraint/i);
+});
+
+check('an installment locks its own facts, and cannot then be edited or deleted', () => {
+    db.prepare(`INSERT INTO gold_scheme_installments
+        (id, tenant_id, enrollment_id, installment_number, amount_paise, rate_paise_per_g_locked,
+         gold_grams_locked_mg, payment_method, actor_user_id, created_at, business_date)
+        VALUES ('SIN1','T1','SEN1',1,100000,687500,145,'cash','U-MGR',?,?)`).run(NOW, TODAY);
+
+    refuses(() => db.prepare('UPDATE gold_scheme_installments SET amount_paise = 1 WHERE id = ?').run('SIN1'),
+        /append-only/);
+    refuses(() => db.prepare('DELETE FROM gold_scheme_installments WHERE id = ?').run('SIN1'), /append-only/);
+});
+
+check('two installments cannot share the same number on one enrollment', () => {
+    refuses(() => db.prepare(`INSERT INTO gold_scheme_installments
+        (id, tenant_id, enrollment_id, installment_number, amount_paise, rate_paise_per_g_locked,
+         gold_grams_locked_mg, payment_method, actor_user_id, created_at, business_date)
+        VALUES ('SIN2','T1','SEN1',1,50000,687500,72,'cash','U-MGR',?,?)`).run(NOW, TODAY),
+        /UNIQUE|constraint/i);
+});
+
+check('a zero-amount installment is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO gold_scheme_installments
+        (id, tenant_id, enrollment_id, installment_number, amount_paise, rate_paise_per_g_locked,
+         gold_grams_locked_mg, payment_method, actor_user_id, created_at, business_date)
+        VALUES ('SIN3','T1','SEN1',2,0,687500,1,'cash','U-MGR',?,?)`).run(NOW, TODAY),
+        /CHECK|constraint/i);
+});
+
+/* --------------------------------------------------------------------------
    5c. Cash shifts (Phase 5.3) — one open shift per branch, and a closed
    shift is terminal. Exercised via raw SQL, the same reasoning as 4b: the
    repository's own guards (getOpenShift/status checks) would otherwise be

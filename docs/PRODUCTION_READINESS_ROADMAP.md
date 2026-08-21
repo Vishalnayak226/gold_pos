@@ -764,15 +764,59 @@ customer's invoice. `[needs design decision: wastage model]`
 
 ### Phase 6 — Gold savings schemes (6–10 weeks after the foundation)
 
-`SCHEME_MODULE_PLAN.md` contains useful discovery but proposes more JSON financial files. Rebase it on Phase 1:
+**Engine built 2026-08-21 (Phase 41, unit 6 of 6 — the largest of the six, built last), flagged
+off by default.** The owner decided not to wait 6–10 weeks of legal/CA review before writing the
+engine — `goldSchemeEnabled` (default `false`, so the routes 404 as though the module never
+existed) gates all of it. `SCHEME_MODULE_PLAN.md` contains useful discovery but proposed more JSON
+financial files; rebased on the Phase 1 SQL model as this line already instructed:
 
-- Installments are payment orders and append-only entries, never array appends.
-- Gold/gram locks reference immutable approved rate snapshots.
-- Maturity, bonus, default, closure and redemption are state machines with approval/reversal.
-- Identity, consent, reminders, receipts, branch/staff audit, reconciliation and refunds reuse platform modules.
-- Indian legal/CA review covers customer-money treatment, advertising, terms, receipts, cancellation/refund, bonus, nomination and state-specific applicability.
+- **Installments are append-only entries, never array appends** — `gold_scheme_installments`,
+  trigger-enforced immutable, matching `audit_events`/`inventory_movements`/`old_gold_exchanges`.
+- **Gold-gram locks reference the rate in force at payment time**, stored on the installment row
+  itself (`rate_paise_per_g_locked`), never re-derived later.
+- **Maturity, default, and closure are a state machine** (`gold_scheme_enrollments.status`:
+  `active → matured | closed_early | defaulted`) **with a transition history**
+  (`gold_scheme_transitions`) via the same conditional-UPDATE `transition()` pattern
+  `advanceRepository.js` already uses — a double-tapped "Mature" button matches zero rows the
+  second time rather than double-crediting the payout. **Bonus is genuinely a decided design, not
+  left unbuilt**: `computeGoldSchemePayout()` (`frontend/js/lib/billingMath.js`) values the bonus in
+  GRAMS — `bonusInstallments` × the enrollment's own average grams-per-installment — then converts
+  the whole accumulated total (real + bonus) to ₹ at the maturity-day rate; an early closure earns
+  no bonus and forfeits `earlyClosurePenaltyPercent` of its grams before conversion. **Reversal**
+  is not built — a settled enrollment (`matured`/`closed_early`) is terminal, matching the "no
+  code-level undo, correct through the same route" posture `invoices.delivery_status` is the one
+  deliberate exception to elsewhere in this codebase; revisit if a real incident needs it.
+- **Redemption reuses the platform's existing advance/credit machinery — zero new logic.**
+  Maturity and closure both post an ORDINARY `advance_entries` deposit (the same mechanism old-gold
+  exchange, Unit 4 of this phase, already reuses), so the payout is spendable against a sale
+  immediately through the Billing Desk's already-existing Apply Advance button.
+- **The legal-approved terms version is stored with each enrollment** — literally: `installment_
+  count`/`bonus_installments`/`default_grace_days`/`early_closure_penalty_bp` are snapshotted from
+  `gold_schemes` onto `gold_scheme_enrollments` at enroll time (trigger-enforced immutable
+  thereafter), so a later change to Settings' placeholder terms can never retroactively alter an
+  enrollment already in progress — the exit criterion this line always asked for, built even though
+  today's "terms" are an engineering placeholder rather than a legally reviewed product.
+- **PLACEHOLDER TERMS, EXPLICITLY NOT A REVIEWED PRODUCT.** Defaults: 11 installments, 1 bonus
+  installment (a typical Indian "11 + 1 free" structure), 30-day default grace, 0% early-closure
+  penalty — all retunable in Settings, all still gated on **Indian legal/CA review of customer-money
+  treatment, advertising, terms, receipts, cancellation/refund, bonus, nomination and
+  state-specific applicability** before `goldSchemeEnabled` is ever turned on for a live tenant.
+- **Identity, audit and reconciliation reuse platform modules**, as this line asked: `customers`
+  for identity, `audit.record()` for every enroll/installment/settle/default action, `users.
+  isApprover()` gating every money-moving action the same way a posted advance deposit already is.
+  **Not reused/not built this pass**: consent capture, reminders and receipts specific to a scheme
+  enrollment — the platform's existing customer-communication surfaces were judged out of scope for
+  an engine that cannot legally be turned on yet regardless.
 
-**Exit:** all installments reconcile; maturity/redemption cannot double-post; tenant/customer isolation tests pass; the legal-approved terms version is stored with each enrollment.
+**Exit criteria, revisited**: all installments reconcile (asserted directly — `test_schema.js`'s
+append-only checks plus a full HTTP enroll→pay×N→mature flow in `test_http.js`); maturity/
+redemption cannot double-post (the conditional-status-UPDATE transition, tested explicitly);
+tenant/customer isolation (every query scoped by `tenant_id`, matching every other table in this
+schema — not given its own dedicated cross-tenant test this pass, unlike old-gold's, since no
+route here differs from the existing scoping pattern in a way that would need one); the
+legal-approved terms version is stored with each enrollment (done, see above — "legal-approved" is
+aspirational until the review happens, but the storage mechanism exists). Full detail:
+`docs/LEDGER.md` Phase 41.
 
 ### Phase 7 — SaaS scale and mobile (ongoing)
 

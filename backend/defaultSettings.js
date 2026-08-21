@@ -141,7 +141,20 @@ export const DEFAULT_SETTINGS = {
        figure is a tax/company-law and insurer question. See
        docs/AUDIT_AND_PII.md §5 and backend/auditRetention.js. */
     auditRetentionEnabled: false,
-    auditRetentionDays: 2555
+    auditRetentionDays: 2555,
+    /* Gold savings schemes (backend/services/goldSchemeService.js). Off by
+       default — the routes 404 as though the module never existed. Terms
+       below are an ENGINEERING PLACEHOLDER (an "11 installments + 1 free"
+       structure typical of Indian gold-scheme practice), retunable per
+       scheme, not a legally reviewed product — real terms and Indian
+       legal/CA review of customer-money treatment, advertising,
+       cancellation and nomination rules still gate enabling this for a
+       live tenant. See PRODUCTION_READINESS_ROADMAP.md Phase 6. */
+    goldSchemeEnabled: false,
+    goldSchemeInstallmentCount: 11,
+    goldSchemeBonusInstallments: 1,
+    goldSchemeDefaultGraceDays: 30,
+    goldSchemeEarlyClosurePenaltyPercent: 0
 };
 
 /**
@@ -222,7 +235,12 @@ export const SETTINGS_FIELD_RULES = {
     publicUrl: { type: 'string', maxLength: 300 },
     razorpayKeyId: { type: 'string', maxLength: 200 },
     auditRetentionEnabled: { type: 'boolean' },
-    auditRetentionDays: { type: 'integer', min: 1, max: 36500 }
+    auditRetentionDays: { type: 'integer', min: 1, max: 36500 },
+    goldSchemeEnabled: { type: 'boolean' },
+    goldSchemeInstallmentCount: { type: 'integer', min: 1, max: 60 },
+    goldSchemeBonusInstallments: { type: 'integer', min: 0, max: 12 },
+    goldSchemeDefaultGraceDays: { type: 'integer', min: 1, max: 365 },
+    goldSchemeEarlyClosurePenaltyPercent: { type: 'number', min: 0, max: 100 }
 };
 
 /**

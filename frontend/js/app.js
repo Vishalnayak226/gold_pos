@@ -15,6 +15,7 @@ import { QuotesHoldsManager } from './components/QuotesHoldsManager.js';
 import { CustomerAccountsManager } from './components/CustomerAccountsManager.js';
 import { AuditTrail } from './components/AuditTrail.js';
 import { SettingsManager } from './components/SettingsManager.js';
+import { SchemeDesk } from './components/SchemeDesk.js';
 
 document.addEventListener('DOMContentLoaded', () => {
     initAdminAuth();
@@ -33,6 +34,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.customerAccountsManager = new CustomerAccountsManager();
     window.auditTrail = new AuditTrail();
     window.settingsManager = new SettingsManager();
+    window.schemeDesk = new SchemeDesk();
     if (isAdminAuthenticated()) {
         window.dashboard.refresh();
         window.reprintDesk.refresh();
@@ -40,6 +42,9 @@ document.addEventListener('DOMContentLoaded', () => {
         window.advancesManager.refresh();
         window.customerAccountsManager.refresh();
         window.settingsManager.refresh();
+        // Off by default — this call is what shows the nav button at all,
+        // via checkEnabled()'s own 404-probe against the (flagged) routes.
+        window.schemeDesk.refresh();
     }
 
     initNavigation();
@@ -364,6 +369,9 @@ function initNavigation() {
             }
             if (targetId === 'customer-accounts-tab' && window.customerAccountsManager && isAdminAuthenticated()) {
                 window.customerAccountsManager.refresh();
+            }
+            if (targetId === 'gold-schemes-tab' && window.schemeDesk && isAdminAuthenticated()) {
+                window.schemeDesk.refresh();
             }
             if (targetId === 'audit-tab' && window.auditTrail && isAdminAuthenticated()) {
                 window.auditTrail.refresh();

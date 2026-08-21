@@ -336,6 +336,46 @@ export class SettingsManager {
                     <span class="text-muted-small">Lowering this is a destructive action and requires confirmation — it can create duplicate invoice numbers.</span>
                 </div>
             </div>
+            <h3 class="settings-section-title" style="margin-top:30px;">Gold Savings Schemes</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Off by default. Terms below are an engineering placeholder — an "11 installments +
+                1 free" structure typical of Indian gold-scheme practice — <strong>not a legally
+                reviewed product.</strong> Real terms and Indian legal/CA review of customer-money
+                treatment, advertising, cancellation and nomination rules still gate enabling this
+                for a live tenant. Changing these terms only affects customers who enroll AFTER the
+                change — an existing enrollment keeps the terms it started with.
+            </p>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-scheme-enabled">Offer Gold Schemes</label>
+                    <select id="set-scheme-enabled" class="form-control">
+                        <option value="false"${s.goldSchemeEnabled ? '' : ' selected'}>No</option>
+                        <option value="true"${s.goldSchemeEnabled ? ' selected' : ''}>Yes</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="set-scheme-installments">Installment Count</label>
+                    <input type="number" id="set-scheme-installments" class="form-control"
+                           value="${Number(s.goldSchemeInstallmentCount) || 11}" step="1" min="1" max="60">
+                </div>
+                <div class="form-group">
+                    <label for="set-scheme-bonus">Bonus Installments</label>
+                    <input type="number" id="set-scheme-bonus" class="form-control"
+                           value="${Number(s.goldSchemeBonusInstallments) || 0}" step="1" min="0" max="12">
+                </div>
+            </div>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-scheme-grace">Default Grace (days)</label>
+                    <input type="number" id="set-scheme-grace" class="form-control"
+                           value="${Number(s.goldSchemeDefaultGraceDays) || 30}" step="1" min="1" max="365">
+                </div>
+                <div class="form-group">
+                    <label for="set-scheme-penalty">Early Closure Penalty (%)</label>
+                    <input type="number" id="set-scheme-penalty" class="form-control"
+                           value="${Number(s.goldSchemeEarlyClosurePenaltyPercent) || 0}" step="0.5" min="0" max="100">
+                </div>
+            </div>
             <button type="button" id="save-billing-btn" class="btn btn-primary">Save Billing Settings</button>
         `;
     }
@@ -368,7 +408,12 @@ export class SettingsManager {
                 defaultDiscountPercent: discountPct,
                 adminPin: document.getElementById('set-admin-pin').value.trim() || null,
                 invoicePrefix: document.getElementById('set-invoice-prefix').value || 'GOLD',
-                invoiceSeqStart: requestedSeq
+                invoiceSeqStart: requestedSeq,
+                goldSchemeEnabled: document.getElementById('set-scheme-enabled').value === 'true',
+                goldSchemeInstallmentCount: parseInt(document.getElementById('set-scheme-installments').value, 10) || 11,
+                goldSchemeBonusInstallments: parseInt(document.getElementById('set-scheme-bonus').value, 10) || 0,
+                goldSchemeDefaultGraceDays: parseInt(document.getElementById('set-scheme-grace').value, 10) || 30,
+                goldSchemeEarlyClosurePenaltyPercent: parseFloat(document.getElementById('set-scheme-penalty').value) || 0
             };
 
             if (requestedSeq < currentSeq) {

@@ -1811,6 +1811,138 @@ try {
         assert.equal(stored.reviewedBy.role, 'manager');
     });
 
+    await check('gold savings schemes are off by default — the routes answer as though they never existed', async () => {
+        const response = await request('/api/gold-schemes/enrollments', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ customerPhone: '9222333444' })
+        });
+        assert.equal(response.status, 404);
+    });
+
+    await check('enabling gold schemes: enroll, pay installments, mature into a redeemable credit', async () => {
+        const schemePhone = '9222333444';
+        assert.equal((await postSettings({
+            goldSchemeEnabled: true, goldSchemeInstallmentCount: 3, goldSchemeBonusInstallments: 1,
+            goldSchemeDefaultGraceDays: 30, goldSchemeEarlyClosurePenaltyPercent: 10,
+            overrideGoldPrice: { active: true, price24K: 0, price22K: 1000, price18K: 0 }
+        })).status, 200);
+
+        try {
+            const cashierSession = await loginAdmin(request, { pin: '4321' });
+            const refusedEnroll = await request('/api/gold-schemes/enrollments', {
+                method: 'POST',
+                headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ customerPhone: schemePhone, customerName: 'Scheme Customer' })
+            });
+            assert.equal(refusedEnroll.status, 403);
+
+            const enrolled = await request('/api/gold-schemes/enrollments', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ customerPhone: schemePhone, customerName: 'Scheme Customer' })
+            });
+            assert.equal(enrolled.status, 200);
+            const { enrollment } = await enrolled.json();
+            assert.equal(enrollment.status, 'active');
+            assert.equal(enrollment.installmentCount, 3);
+            assert.equal(enrollment.bonusInstallments, 1);
+
+            const payInstallment = () => request(`/api/gold-schemes/enrollments/${enrollment.id}/installments`, {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: 1000, paymentMethod: 'cash' })
+            });
+
+            const first = await payInstallment();
+            assert.equal(first.status, 200);
+            const firstBody = await first.json();
+            assert.equal(firstBody.installment.installmentNumber, 1);
+            assert.equal(firstBody.installment.gramsLocked, 1, '₹1,000 at ₹1,000/g locks exactly 1g');
+
+            await payInstallment();
+
+            const tooEarly = await request(`/api/gold-schemes/enrollments/${enrollment.id}/mature`, {
+                method: 'POST', headers: adminHeaders
+            });
+            assert.equal(tooEarly.status, 409, 'only 2 of 3 installments paid — maturity must be refused');
+
+            const third = await payInstallment();
+            assert.equal((await third.json()).installment.installmentNumber, 3);
+
+            const installmentsList = await request(`/api/gold-schemes/enrollments/${enrollment.id}/installments`, {
+                headers: adminHeaders
+            });
+            assert.equal((await installmentsList.json()).results.length, 3);
+
+            const matured = await request(`/api/gold-schemes/enrollments/${enrollment.id}/mature`, {
+                method: 'POST', headers: adminHeaders
+            });
+            assert.equal(matured.status, 200, JSON.stringify(await matured.clone().json().catch(() => null)));
+            const maturedBody = await matured.json();
+            // 3 installments × 1g = 3g, average 1g/installment, 1 bonus
+            // installment = +1g, 4g total, credited at the pinned ₹1,000/g.
+            assert.equal(maturedBody.payout.bonusGrams, 1);
+            assert.equal(maturedBody.payout.payoutGrams, 4);
+            assert.equal(maturedBody.payout.payoutAmount, 4000);
+            assert.equal(maturedBody.enrollment.status, 'matured');
+
+            const posted = ledger.advances().find(e => e.id === maturedBody.payout.advanceEntryId);
+            assert.ok(posted, 'maturity must name the advance entry it produced');
+            assert.equal(posted.amount, 4000);
+            assert.equal(posted.status, 'approved');
+
+            // Already matured — a second maturity attempt must be refused, not
+            // double-credit.
+            const again = await request(`/api/gold-schemes/enrollments/${enrollment.id}/mature`, {
+                method: 'POST', headers: adminHeaders
+            });
+            assert.equal(again.status, 409);
+
+            // A separate enrollment, closed early: 1 installment (1g), 10%
+            // penalty, no bonus — 0.9g credited at ₹1,000/g = ₹900.
+            const earlyPhone = '9222333455';
+            const enrolled2 = await request('/api/gold-schemes/enrollments', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ customerPhone: earlyPhone, customerName: 'Early Closer' })
+            });
+            const enrollment2 = (await enrolled2.json()).enrollment;
+            await request(`/api/gold-schemes/enrollments/${enrollment2.id}/installments`, {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: 1000, paymentMethod: 'cash' })
+            });
+            const closedEarly = await request(`/api/gold-schemes/enrollments/${enrollment2.id}/close-early`, {
+                method: 'POST', headers: adminHeaders
+            });
+            assert.equal(closedEarly.status, 200);
+            const closedBody = await closedEarly.json();
+            assert.equal(closedBody.payout.bonusGrams, 0, 'an early closure earns no bonus');
+            assert.equal(closedBody.payout.payoutGrams, 0.9);
+            assert.equal(closedBody.payout.payoutAmount, 900);
+            assert.equal(closedBody.enrollment.status, 'closed_early');
+
+            // A third enrollment, never paid: too soon to default.
+            const enrolled3 = await request('/api/gold-schemes/enrollments', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ customerPhone: '9222333466', customerName: 'Fresh Enrollment' })
+            });
+            const enrollment3 = (await enrolled3.json()).enrollment;
+            const tooSoonDefault = await request(`/api/gold-schemes/enrollments/${enrollment3.id}/default`, {
+                method: 'POST', headers: adminHeaders
+            });
+            assert.equal(tooSoonDefault.status, 409, 'a fresh enrollment is not yet overdue for its grace period');
+        } finally {
+            await postSettings({
+                goldSchemeEnabled: false, goldSchemeInstallmentCount: 11, goldSchemeBonusInstallments: 1,
+                goldSchemeDefaultGraceDays: 30, goldSchemeEarlyClosurePenaltyPercent: 0,
+                overrideGoldPrice: { active: false, price24K: 0, price22K: 0, price18K: 0 }
+            });
+        }
+    });
+
     await check('a rejected PIN is still rejected once operators exist', async () => {
         const response = await request('/api/admin/login', {
             method: 'POST',

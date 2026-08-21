@@ -50,6 +50,7 @@ import * as repo from './repositories/index.js';
 import * as saleService from './services/saleService.js';
 import * as returnService from './services/returnService.js';
 import * as advanceService from './services/advanceService.js';
+import * as goldSchemeService from './services/goldSchemeService.js';
 import * as paymentService from './services/paymentService.js';
 import { importLegacyJson, collectSource, formatReport } from './importLegacyJson.js';
 // Shared invoice arithmetic — the exact module the Billing Desk renders its
@@ -2406,6 +2407,112 @@ app.post('/api/advances', requireAdminSession, (req, res) => {
     } catch (err) {
         logError('Error saving advance deposit transaction: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to submit advance deposit' });
+    }
+});
+
+/**
+ * Gold savings schemes — FLAGGED OFF by default (settings.goldSchemeEnabled).
+ * Every handler answers 404 when the module is off, via the service's own
+ * disabledResult(), so these behave as though they never existed. Placeholder
+ * terms — see backend/defaultSettings.js and PRODUCTION_READINESS_ROADMAP.md
+ * Phase 6.
+ */
+const goldSchemeDeps = (req) => ({
+    getActiveGoldRates,
+    getSettings: readSettings,
+    isValidPhone,
+    actorUserId: resolveActorUserId(req.actor),
+    actorLabel: (req.actor && req.actor.name) || 'counter',
+    ipAddress: req.ip
+});
+
+app.post('/api/gold-schemes/enrollments', requireAdminSession, (req, res) => {
+    try {
+        const result = goldSchemeService.enroll({
+            customerPhone: req.body && req.body.customerPhone,
+            customerName: req.body && req.body.customerName
+        }, goldSchemeDeps(req));
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        res.json({ success: true, enrollment: result.enrollment });
+    } catch (err) {
+        logError('Error enrolling in a gold scheme: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to enroll in a gold scheme' });
+    }
+});
+
+app.get('/api/gold-schemes/enrollments', requireAdminSession, (req, res) => {
+    try {
+        if (readSettings().goldSchemeEnabled !== true) {
+            return res.status(404).json({ error: 'Gold savings schemes are not enabled for this store.' });
+        }
+        const status = typeof req.query.status === 'string' ? req.query.status : null;
+        res.json({ results: goldSchemeService.listEnrollments({ status, limit: 200 }, goldSchemeDeps(req)) });
+    } catch (err) {
+        logError('Error listing gold scheme enrollments: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list gold scheme enrollments' });
+    }
+});
+
+app.get('/api/gold-schemes/enrollments/:id/installments', requireAdminSession, (req, res) => {
+    try {
+        if (readSettings().goldSchemeEnabled !== true) {
+            return res.status(404).json({ error: 'Gold savings schemes are not enabled for this store.' });
+        }
+        const installments = goldSchemeService.getInstallments(req.params.id);
+        if (installments === null) return res.status(404).json({ error: 'No such enrollment.' });
+        res.json({ results: installments });
+    } catch (err) {
+        logError('Error listing gold scheme installments: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list installments' });
+    }
+});
+
+app.post('/api/gold-schemes/enrollments/:id/installments', requireAdminSession, (req, res) => {
+    try {
+        const result = goldSchemeService.recordInstallment(req.params.id, {
+            amount: req.body && req.body.amount,
+            paymentMethod: req.body && req.body.paymentMethod
+        }, goldSchemeDeps(req));
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        res.json({ success: true, installment: result.installment });
+    } catch (err) {
+        logError('Error recording a gold scheme installment: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to record installment' });
+    }
+});
+
+app.post('/api/gold-schemes/enrollments/:id/mature', requireAdminSession, (req, res) => {
+    try {
+        const result = goldSchemeService.matureEnrollment(req.params.id, goldSchemeDeps(req));
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        res.json({ success: true, enrollment: result.enrollment, payout: result.payout });
+    } catch (err) {
+        logError('Error maturing a gold scheme enrollment: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to mature enrollment' });
+    }
+});
+
+app.post('/api/gold-schemes/enrollments/:id/close-early', requireAdminSession, (req, res) => {
+    try {
+        const result = goldSchemeService.closeEarlyEnrollment(req.params.id, goldSchemeDeps(req));
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        res.json({ success: true, enrollment: result.enrollment, payout: result.payout });
+    } catch (err) {
+        logError('Error closing a gold scheme enrollment early: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to close enrollment early' });
+    }
+});
+
+app.post('/api/gold-schemes/enrollments/:id/default', requireAdminSession, (req, res) => {
+    try {
+        const result = goldSchemeService.markDefaulted(req.params.id, {
+            ...goldSchemeDeps(req), note: req.body && req.body.note
+        });
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        res.json({ success: true, enrollment: result.enrollment });
+    } catch (err) {
+        logError('Error marking a gold scheme enrollment defaulted: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to mark enrollment defaulted' });
     }
 });
 

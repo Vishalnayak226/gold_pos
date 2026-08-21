@@ -73,6 +73,11 @@
                 <button class="nav-btn" data-target="cash-shifts-tab">Cash Shifts</button>
                 <button class="nav-btn" data-target="quotes-holds-tab">Quotes &amp; Holds</button>
                 <button class="nav-btn" data-target="customer-accounts-tab">Customer Logins</button>
+                <!-- Off by default (settings.goldSchemeEnabled) — SchemeDesk.js
+                     shows this only once it confirms the module is enabled,
+                     the same "never existed until turned on" contract every
+                     other flagged module in this build follows. -->
+                <button class="nav-btn" data-target="gold-schemes-tab" id="gold-schemes-nav-btn" style="display:none;">Gold Schemes</button>
                 <button class="nav-btn" data-target="audit-tab">Audit Trail</button>
                 <button class="nav-btn" data-target="settings-tab">Settings</button>
                 <button class="nav-btn" data-target="diagnostics-tab">Diagnostics</button>
@@ -164,6 +169,16 @@
                     </div>
                     <div class="panel-body">
                         <p>Loading cash shifts...</p>
+                    </div>
+                </section>
+
+                <!-- Gold Schemes Tab -->
+                <section id="gold-schemes-tab" class="tab-panel">
+                    <div class="panel-header">
+                        <h1>Gold Schemes</h1>
+                    </div>
+                    <div class="panel-body">
+                        <p>Loading gold schemes...</p>
                     </div>
                 </section>
 

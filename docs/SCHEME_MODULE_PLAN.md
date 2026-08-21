@@ -1,8 +1,12 @@
 # Gold Savings Scheme Module — Plan & Build Checklist (Phase 20 series)
 
-**Status:** Planned, not started. **Created:** 2026-08-07.
-Companion to `docs/PROJECT_PLAN.md` (§5.15). Build order and exit criteria live
-here; I tick items in this file as they land.
+**Status:** Engine built 2026-08-21 (Phase 41), flagged off by default. **Created:** 2026-08-07.
+Companion to `docs/PROJECT_PLAN.md` (§5.15). This document remains the DISCOVERY record — the
+feature inventory below is still useful reference — but is no longer the live build checklist:
+what actually shipped (schema, service, routes, `SchemeDesk.js`, tests) is described in
+`docs/PRODUCTION_READINESS_ROADMAP.md` Phase 6 and `docs/LEDGER.md` Phase 41, rebased on the
+Phase-1 SQL model rather than the JSON-file design this plan's discovery predates. Placeholder
+terms only — real terms and Indian legal/CA review still gate enabling this for a live tenant.
 
 ---
 

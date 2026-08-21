@@ -162,6 +162,62 @@ function clampMakingPercent(percent) {
     return pct;
 }
 
+/**
+ * Gold-gram equivalent an installment payment locks, at the rate in force
+ * the moment it was paid. Simple division — the store's own already-resolved
+ * per-purity rate (activeRates.price22K, matching every other place in this
+ * codebase that locks a rate) — kept as a named function rather than inline
+ * arithmetic because "how a scheme installment converts to grams" is exactly
+ * the kind of formula a future reader should be able to find and test in one
+ * place, not re-derive at each call site.
+ */
+export function computeGoldGramsForAmount(amountRupees, ratePerGram) {
+    const rate = num(ratePerGram);
+    if (!(rate > 0)) return 0;
+    return round3(Math.max(0, num(amountRupees)) / rate);
+}
+
+/**
+ * What a scheme enrollment is worth at maturity or early closure.
+ *
+ * BONUS IS VALUED IN GRAMS, NOT RUPEES: `bonusInstallments` worth of gold at
+ * the enrollment's own AVERAGE per-installment gram rate — not a rupee
+ * amount converted at today's rate — so the bonus scales with what the
+ * customer actually paid in, the same way the real installments already do.
+ * The whole accumulated gram total (real + bonus) is then valued at
+ * `currentRatePerGram` — the maturity-day rate — because that is the rate at
+ * which the accumulated gold is actually being handed back as spendable ₹.
+ *
+ * EARLY CLOSURE gets no bonus and pays a penalty, taken in grams before the
+ * rupee conversion — `penaltyPercent` of the accumulated (non-bonus) grams.
+ *
+ * @param {object} args
+ * @param {number} args.totalGramsLocked sum of every installment's locked grams
+ * @param {number} args.installmentsPaid how many installments were actually paid
+ * @param {number} [args.bonusInstallments] scheme terms — 0 for an early closure
+ * @param {number} [args.penaltyPercent] scheme terms — 0 for a full-term maturity
+ * @param {number} args.currentRatePerGram today's rate, for the final conversion
+ */
+export function computeGoldSchemePayout({
+    totalGramsLocked = 0, installmentsPaid = 0, bonusInstallments = 0,
+    penaltyPercent = 0, currentRatePerGram = 0
+} = {}) {
+    const grams = Math.max(0, num(totalGramsLocked));
+    const paid = Math.max(0, Math.trunc(num(installmentsPaid)));
+    const avgGramsPerInstallment = paid > 0 ? grams / paid : 0;
+
+    const bonusGrams = round3(avgGramsPerInstallment * Math.max(0, num(bonusInstallments)));
+    const penaltyGrams = round3(grams * (Math.min(100, Math.max(0, num(penaltyPercent))) / 100));
+    const payoutGrams = round3(Math.max(0, grams - penaltyGrams) + bonusGrams);
+
+    return {
+        bonusGrams,
+        penaltyGrams,
+        payoutGrams,
+        payoutAmount: computeMetalValue(payoutGrams, currentRatePerGram)
+    };
+}
+
 /* ==========================================================================
    Advance ledger arithmetic
 
