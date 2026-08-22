@@ -1792,6 +1792,99 @@ console.log('\n19. SKU catalogue mechanics');
     });
 }
 
+/* ==========================================================================
+   20. Customer master — search, correction, consent, duplicates,
+   anonymisation (roadmap Phase 5.5)
+   ========================================================================== */
+
+console.log('\n20. Customer master');
+
+{
+    const custId1 = repo.customers.ensureCustomerId(context.tenantId, '9991110001', 'Rahul Verma');
+    const custId2 = repo.customers.ensureCustomerId(context.tenantId, '9991110002', 'Priya Nair');
+
+    check('listCustomersPaged() finds a customer by name, phone or email fragment', () => {
+        const byName = repo.customers.listCustomersPaged(context.tenantId, { search: 'Rahul Verma' });
+        assert.ok(byName.rows.some(r => r.id === custId1));
+
+        const byPhone = repo.customers.listCustomersPaged(context.tenantId, { search: '1110002' });
+        assert.ok(byPhone.rows.some(r => r.id === custId2));
+
+        const total = repo.customers.listCustomersPaged(context.tenantId, {}).total;
+        assert.ok(total >= 2);
+    });
+
+    check('adminUpdateCustomer() corrects name/email and stamps consent_updated_at only when consent actually changes', () => {
+        const before = repo.customers.getCustomerById(context.tenantId, custId1);
+        assert.strictEqual(before.marketing_consent, 0);
+        assert.strictEqual(before.consent_updated_at, null);
+
+        const renamed = repo.customers.adminUpdateCustomer(context.tenantId, custId1, { fullName: 'Rahul K. Verma' });
+        assert.strictEqual(renamed.full_name, 'Rahul K. Verma');
+        assert.strictEqual(renamed.consent_updated_at, null, 'a non-consent patch must not touch the consent timestamp');
+
+        const consented = repo.customers.adminUpdateCustomer(context.tenantId, custId1, { marketingConsent: true });
+        assert.strictEqual(consented.marketing_consent, 1);
+        assert.ok(consented.consent_updated_at, 'granting consent must stamp when it happened');
+        assert.strictEqual(consented.full_name, 'Rahul K. Verma', 'an unrelated field must survive the patch');
+    });
+
+    check('adminUpdateCustomer() refuses a phone already used by another customer in the same tenant', () => {
+        assert.throws(() => repo.customers.adminUpdateCustomer(context.tenantId, custId2, { phone: '9991110001' }),
+            /UNIQUE|constraint/i);
+    });
+
+    check('findPossibleDuplicates() flags two records with the same name but different phones', () => {
+        const dupId = repo.customers.ensureCustomerId(context.tenantId, '9991110099', 'rahul k. verma');
+        const groups = repo.customers.findPossibleDuplicates(context.tenantId);
+        const nameGroup = groups.find(g => g.matchedOn === 'name' && g.customerIds.includes(custId1) && g.customerIds.includes(dupId));
+        assert.ok(nameGroup, 'a shared, case-insensitively-matched name across two phones must be flagged');
+    });
+
+    check('anonymiseCustomer() scrubs PII, revokes sessions, and marks the record', () => {
+        const db = repo.unsafeDatabaseHandle();
+        db.prepare('INSERT INTO customer_sessions (id, customer_id, token_hash, issued_at, expires_at) VALUES (?,?,?,?,?)')
+            .run('CSS-ANON-TEST', custId2, 'deadbeef', Date.now(), Date.now() + 1000000);
+
+        const anonymised = repo.customers.anonymiseCustomer(context.tenantId, custId2);
+        assert.strictEqual(anonymised.full_name, 'Anonymised Customer');
+        assert.strictEqual(anonymised.email, null);
+        assert.strictEqual(anonymised.is_anonymised, 1);
+        assert.strictEqual(anonymised.phone, '9991110002', 'phone (the FK/lookup key) is kept, not scrubbed');
+
+        const remainingSessions = db.prepare('SELECT COUNT(*) AS n FROM customer_sessions WHERE customer_id = ?').get(custId2).n;
+        assert.strictEqual(remainingSessions, 0, 'every live session must be revoked');
+    });
+
+    check('listAllCustomers() returns every customer for export, unpaginated', () => {
+        const all = repo.customers.listAllCustomers(context.tenantId);
+        assert.ok(all.length >= 3);
+        assert.ok(all.some(c => c.id === custId1));
+    });
+}
+
+/* ==========================================================================
+   21. Accounting export — invoice rows uncapped by the UI page size
+   (roadmap Phase 5.5)
+   ========================================================================== */
+
+console.log('\n21. Accounting export');
+
+{
+    check('exportRows() returns every matching invoice, ordered chronologically ascending', () => {
+        const rows = repo.invoices.exportRows({ tenantId: context.tenantId });
+        assert.ok(rows.length > 0, 'this suite has already filed invoices by this point');
+        for (let i = 1; i < rows.length; i++) {
+            assert.ok(rows[i].issued_at >= rows[i - 1].issued_at, 'rows must be chronological ascending, not newest-first');
+        }
+    });
+
+    check('exportRows() respects a date filter that excludes everything', () => {
+        const rows = repo.invoices.exportRows({ tenantId: context.tenantId, fromAt: Date.now() + 86400000 });
+        assert.strictEqual(rows.length, 0);
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

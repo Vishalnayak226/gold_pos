@@ -578,6 +578,24 @@ check('the HUID uniqueness is scoped per tenant — a second tenant may use the 
 });
 
 /* --------------------------------------------------------------------------
+   4d. Customer master — marketing consent and anonymisation (Phase 5.5)
+   -------------------------------------------------------------------------- */
+
+check('marketing_consent defaults to 0 (opt-in required, never assumed)', () => {
+    assert.strictEqual(db.prepare("SELECT marketing_consent FROM customers WHERE id = 'C1'").get().marketing_consent, 0);
+});
+
+check('an out-of-range marketing_consent value is refused', () => {
+    refuses(() => db.prepare('UPDATE customers SET marketing_consent = 2 WHERE id = ?').run('C1'),
+        /CHECK|constraint/i);
+});
+
+check('an out-of-range is_anonymised value is refused', () => {
+    refuses(() => db.prepare('UPDATE customers SET is_anonymised = 2 WHERE id = ?').run('C1'),
+        /CHECK|constraint/i);
+});
+
+/* --------------------------------------------------------------------------
    5. Audit is genuinely immutable
    -------------------------------------------------------------------------- */
 

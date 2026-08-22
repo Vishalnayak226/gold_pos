@@ -229,3 +229,145 @@ export function countCustomersWithLogin(tenantId) {
         'SELECT COUNT(*) AS n FROM customers WHERE tenant_id = ? AND password_hash IS NOT NULL'
     ).get(tenantId).n;
 }
+
+/* --------------------------------------------------------------------------
+   Admin-facing customer master (roadmap Phase 5.5): search, correction,
+   marketing consent, duplicate detection, anonymisation. Deliberately
+   separate from toAccount()/saveAccounts() above, which speak the frozen
+   customerAuth.js account shape — nothing here touches that seam.
+   -------------------------------------------------------------------------- */
+
+const MAX_CUSTOMER_PAGE = 200;
+
+/** Paginated, optionally search-filtered customer list for the admin Customers screen. */
+export function listCustomersPaged(tenantId, { search = '', limit = 50, offset = 0 } = {}) {
+    const db = getDb();
+    const where = ['tenant_id = @tenantId'];
+    const params = { tenantId };
+
+    const term = String(search || '').trim();
+    if (term) {
+        const digits = term.replace(/\D/g, '');
+        params.like = `%${term.toLowerCase()}%`;
+        const clauses = ['LOWER(full_name) LIKE @like', 'LOWER(email) LIKE @like'];
+        if (digits) { params.phoneLike = `%${digits}%`; clauses.push('phone LIKE @phoneLike'); }
+        where.push(`(${clauses.join(' OR ')})`);
+    }
+    const whereSql = where.join(' AND ');
+
+    const total = db.prepare(`SELECT COUNT(*) AS n FROM customers WHERE ${whereSql}`).get(params).n;
+    const n = Math.min(MAX_CUSTOMER_PAGE, Math.max(1, Math.trunc(Number(limit)) || 50));
+    const rows = db.prepare(`
+        SELECT * FROM customers WHERE ${whereSql}
+        ORDER BY created_at DESC
+        LIMIT @limit OFFSET @offset
+    `).all({ ...params, limit: n, offset: Math.max(0, Math.trunc(offset) || 0) });
+
+    return { rows, total };
+}
+
+/** Every customer for a tenant, unpaginated — the export path, not the UI list. */
+export function listAllCustomers(tenantId) {
+    return getDb().prepare('SELECT * FROM customers WHERE tenant_id = ? ORDER BY created_at').all(tenantId);
+}
+
+export function getCustomerById(tenantId, customerId) {
+    return getDb().prepare('SELECT * FROM customers WHERE tenant_id = ? AND id = ?').get(tenantId, customerId) || null;
+}
+
+/**
+ * Correction: name/email/phone/marketing consent. Deliberately does not
+ * touch password/session/reset-token columns — those belong to the portal
+ * login flow (customerAuth.js), not a staff-side correction.
+ */
+export function adminUpdateCustomer(tenantId, customerId, patch) {
+    const existing = getCustomerById(tenantId, customerId);
+    if (!existing) return null;
+
+    const next = {
+        fullName: patch.fullName !== undefined ? patch.fullName : existing.full_name,
+        email: patch.email !== undefined ? patch.email : existing.email,
+        phone: patch.phone !== undefined ? patch.phone : existing.phone,
+        marketingConsent: patch.marketingConsent !== undefined ? (patch.marketingConsent ? 1 : 0) : existing.marketing_consent
+    };
+    const now = Date.now();
+    const consentChanged = patch.marketingConsent !== undefined && next.marketingConsent !== existing.marketing_consent;
+
+    getDb().prepare(`
+        UPDATE customers SET full_name = ?, email = ?, phone = ?, marketing_consent = ?,
+               consent_updated_at = ?, updated_at = ?
+        WHERE tenant_id = ? AND id = ?
+    `).run(next.fullName, next.email, next.phone, next.marketingConsent,
+        consentChanged ? now : existing.consent_updated_at, now, tenantId, customerId);
+    return getCustomerById(tenantId, customerId);
+}
+
+/**
+ * Groups of customers that look like the same person under two different
+ * records — same normalised name or same email, but a different phone (the
+ * tenant's actual unique key). Detection only: merging would mean rewriting
+ * customer_id on historical invoices/advances/credit notes, which this
+ * codebase treats as financial records, not customer-master data — flagged
+ * for staff to correct by hand (e.g. retiring the stale record's phone),
+ * not an automated merge.
+ */
+export function findPossibleDuplicates(tenantId) {
+    const db = getDb();
+    const byName = db.prepare(`
+        SELECT LOWER(TRIM(full_name)) AS key, GROUP_CONCAT(id) AS ids, COUNT(*) AS n
+        FROM customers
+        WHERE tenant_id = ? AND TRIM(full_name) <> '' AND is_anonymised = 0
+        GROUP BY LOWER(TRIM(full_name))
+        HAVING COUNT(DISTINCT phone) > 1
+    `).all(tenantId);
+    const byEmail = db.prepare(`
+        SELECT LOWER(TRIM(email)) AS key, GROUP_CONCAT(id) AS ids, COUNT(*) AS n
+        FROM customers
+        WHERE tenant_id = ? AND email IS NOT NULL AND TRIM(email) <> '' AND is_anonymised = 0
+        GROUP BY LOWER(TRIM(email))
+        HAVING COUNT(DISTINCT phone) > 1
+    `).all(tenantId);
+
+    const idsOf = (row) => row.ids.split(',');
+    const groups = [
+        ...byName.map(row => ({ matchedOn: 'name', value: row.key, customerIds: idsOf(row) })),
+        ...byEmail.map(row => ({ matchedOn: 'email', value: row.key, customerIds: idsOf(row) }))
+    ];
+
+    const allIds = [...new Set(groups.flatMap(g => g.customerIds))];
+    if (allIds.length === 0) return [];
+    const placeholders = allIds.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT * FROM customers WHERE id IN (${placeholders})`).all(...allIds);
+    const byId = new Map(rows.map(r => [r.id, r]));
+
+    return groups.map(g => ({ ...g, customers: g.customerIds.map(id => byId.get(id)).filter(Boolean) }));
+}
+
+/**
+ * Anonymises a customer master record: scrubs name/email/login/reset-token
+ * columns to a fixed placeholder, revokes every live session, and marks the
+ * row so the admin UI can label it honestly rather than showing a blank
+ * name as if nobody ever filled it in. Phone is kept — it is the tenant's
+ * FK/lookup key and, unlike name/email, is not itself directly identifying
+ * once detached from a name. Does NOT touch any invoice/credit-note/advance
+ * row: those already carry their own customer_name/customer_phone snapshot
+ * from the moment of sale, which is a financial record this codebase never
+ * rewrites (see this migration's own header).
+ */
+export function anonymiseCustomer(tenantId, customerId) {
+    const existing = getCustomerById(tenantId, customerId);
+    if (!existing) return null;
+    const db = getDb();
+    const now = Date.now();
+
+    db.prepare(`
+        UPDATE customers SET full_name = 'Anonymised Customer', email = NULL,
+               password_hash = NULL, password_salt = NULL, must_change_password = 0,
+               reset_token_hash = NULL, reset_expires_at = 0, reset_attempts = 0,
+               is_anonymised = 1, updated_at = ?
+        WHERE tenant_id = ? AND id = ?
+    `).run(now, tenantId, customerId);
+    db.prepare('DELETE FROM customer_sessions WHERE customer_id = ?').run(customerId);
+
+    return getCustomerById(tenantId, customerId);
+}

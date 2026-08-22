@@ -1079,18 +1079,36 @@ app.post('/api/customer/advances', requireEstablishedCustomer, depositClaimLimit
 
 /**
  * GET /api/customer-accounts
- * Which customers have a portal login, and the state of each. Never returns
- * password hashes, session tokens, or reset codes.
+ * Every customer for this tenant — portal login or walk-in — with login
+ * state where one exists, plus the customer-master fields (id, marketing
+ * consent, anonymised flag) the Customers screen needs for correction and
+ * consent management. Never returns password hashes, session tokens, or
+ * reset codes.
  */
 app.get('/api/customer-accounts', requireAdminSession, (req, res) => {
     try {
-        const accounts = repo.customers.loadAccounts(repo.dataStoreContext().tenantId);
-        res.json(accounts.map(a => ({
-            ...publicAccountView(a),
-            activeSessions: (a.sessions || []).length,
-            lockedUntil: a.lockedUntil || 0,
-            updatedAt: a.updatedAt || 0
-        })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
+        const tenantId = repo.dataStoreContext().tenantId;
+        const accounts = repo.customers.loadAccounts(tenantId);
+        // loadAccounts() speaks customerAuth.js's frozen account shape (keyed
+        // by phone, no row id) — merged here, not there, with the master-record
+        // fields (id, marketing consent, anonymised flag) that shape does not
+        // carry, so this route can serve both the login list and the customer
+        // master screen without either module knowing about the other.
+        const master = new Map(repo.customers.listAllCustomers(tenantId).map(c => [c.phone, c]));
+
+        res.json(accounts.map(a => {
+            const row = master.get(a.phone);
+            return {
+                ...publicAccountView(a),
+                activeSessions: (a.sessions || []).length,
+                lockedUntil: a.lockedUntil || 0,
+                updatedAt: a.updatedAt || 0,
+                id: row ? row.id : null,
+                marketingConsent: row ? Boolean(row.marketing_consent) : false,
+                consentUpdatedAt: row ? (row.consent_updated_at || null) : null,
+                isAnonymised: row ? Boolean(row.is_anonymised) : false
+            };
+        }).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)));
     } catch (err) {
         logError('Failed to list customer accounts: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to list customer logins' });
@@ -2922,6 +2940,241 @@ app.get('/api/inventory/movements', requireAdminSession, (req, res) => {
     } catch (err) {
         logError('Error listing inventory movements: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to list inventory movements' });
+    }
+});
+
+/* ==========================================================================
+   API Routes: Customer Master (roadmap Phase 5.5)
+
+   `customers` (001_initial_schema.sql) is already the customer master —
+   every walk-in gets a row via ensureCustomerId(), not just portal logins.
+   This section is the admin-facing half of it: search, correction,
+   marketing consent, duplicate detection, anonymisation and export.
+   Deliberately separate from customerAuth.js's account shape, which nothing
+   here touches. requireAdminSession only, except anonymise — a one-way,
+   PII-scrubbing action gated behind requireApprover like this codebase
+   gates every other action that cannot be undone by re-submitting a form.
+   ========================================================================== */
+
+function csvCell(value) {
+    const s = value === null || value === undefined ? '' : String(value);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function toCsv(headers, rows) {
+    return [headers, ...rows].map(row => row.map(csvCell).join(',')).join('\r\n');
+}
+
+function customerToWire(row) {
+    return {
+        id: row.id, name: row.full_name, email: row.email, phone: row.phone,
+        marketingConsent: Boolean(row.marketing_consent),
+        consentUpdatedAt: row.consent_updated_at || null,
+        isAnonymised: Boolean(row.is_anonymised),
+        hasPortalLogin: Boolean(row.password_hash),
+        createdAt: row.created_at, updatedAt: row.updated_at
+    };
+}
+
+const CUSTOMER_PATCH_SCHEMA = {
+    fullName: { ...NAME_RULE, minLength: 1 },
+    email: EMAIL_RULE,
+    phone: PHONE_RULE,
+    marketingConsent: { type: 'boolean' }
+};
+
+/** GET /api/customers?search=&limit=&offset= — paginated, search-filtered customer master list. */
+app.get('/api/customers', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const { rows, total } = repo.customers.listCustomersPaged(context.tenantId, {
+            search: req.query.search || '', limit: req.query.limit, offset: req.query.offset
+        });
+        res.json({ customers: rows.map(customerToWire), total, truncated: total > rows.length });
+    } catch (err) {
+        logError('Error listing customers: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to list customers' });
+    }
+});
+
+/**
+ * GET /api/customers/duplicates
+ * Customers that share a normalised name or email but a different phone —
+ * flagged for staff review, never auto-merged (merging would mean rewriting
+ * customer_id on historical invoices/advances/credit notes, which this
+ * codebase treats as a financial record, not customer-master data).
+ */
+app.get('/api/customers/duplicates', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const groups = repo.customers.findPossibleDuplicates(context.tenantId);
+        res.json(groups.map(g => ({
+            matchedOn: g.matchedOn, value: g.value,
+            customers: g.customers.map(customerToWire)
+        })));
+    } catch (err) {
+        logError('Error finding duplicate customers: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to check for duplicate customers' });
+    }
+});
+
+/**
+ * GET /api/customers/export.csv
+ * Customer master data export — the "correction/export" data-portability
+ * half of the roadmap line. Never includes password_hash/salt/reset-token
+ * columns (CLAUDE.md §8: no secret in browser/log/export).
+ */
+app.get('/api/customers/export.csv', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const rows = repo.customers.listAllCustomers(context.tenantId);
+        const headers = ['Customer ID', 'Name', 'Phone', 'Email', 'Marketing Consent', 'Consent Updated', 'Portal Login', 'Anonymised', 'Created'];
+        const csvRows = rows.map(r => [
+            r.id, r.full_name, r.phone, r.email || '',
+            r.marketing_consent ? 'Yes' : 'No',
+            r.consent_updated_at ? new Date(r.consent_updated_at).toISOString() : '',
+            r.password_hash ? 'Yes' : 'No',
+            r.is_anonymised ? 'Yes' : 'No',
+            new Date(r.created_at).toISOString()
+        ]);
+
+        const stamp = new Date().toISOString().slice(0, 10);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="customer-master-${stamp}.csv"`);
+        res.send(toCsv(headers, csvRows));
+    } catch (err) {
+        logError('Error exporting customer master: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to export customer data' });
+    }
+});
+
+app.get('/api/customers/:id', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const customer = repo.customers.getCustomerById(context.tenantId, req.params.id);
+        if (!customer) return res.status(404).json({ error: 'No customer with that id' });
+        res.json({ customer: customerToWire(customer) });
+    } catch (err) {
+        logError('Error reading customer: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to read the customer' });
+    }
+});
+
+app.patch('/api/customers/:id', requireAdminSession, validateBody(CUSTOMER_PATCH_SCHEMA), (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const before = repo.customers.getCustomerById(context.tenantId, req.params.id);
+        if (!before) return res.status(404).json({ error: 'No customer with that id' });
+
+        const updated = repo.customers.adminUpdateCustomer(context.tenantId, req.params.id, req.body || {});
+
+        // Consent is legally meaningful (DPDP-style affirmative marketing
+        // consent) — worth its own audit entry, unlike an ordinary name/email
+        // correction, so the trail can answer "when did this customer opt in".
+        if (req.body.marketingConsent !== undefined && Boolean(before.marketing_consent) !== Boolean(updated.marketing_consent)) {
+            repo.audit.record({
+                tenantId: context.tenantId,
+                action: updated.marketing_consent ? 'CUSTOMER_CONSENT_GRANTED' : 'CUSTOMER_CONSENT_WITHDRAWN',
+                entityType: 'customer', entityId: updated.id,
+                summary: `Marketing consent ${updated.marketing_consent ? 'granted' : 'withdrawn'} for ${updated.full_name}`,
+                actorUserId: resolveActorUserId(req.actor),
+                actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
+                ipAddress: req.ip
+            });
+        }
+        res.json({ success: true, customer: customerToWire(updated) });
+    } catch (err) {
+        logError('Error updating customer: ' + err.message, err.stack);
+        const status = /UNIQUE|constraint/i.test(err.message) ? 400 : 500;
+        res.status(status).json({ error: status === 400 ? 'That phone number is already in use by another customer.' : 'Failed to update the customer' });
+    }
+});
+
+/**
+ * POST /api/customers/:id/anonymise
+ * Legally-appropriate deletion: scrubs the customer master record, never
+ * the ledger (an invoice already carries its own name/phone snapshot from
+ * the moment of sale — see 012_customer_master.sql). One-way, so gated
+ * behind requireApprover and always audited.
+ */
+app.post('/api/customers/:id/anonymise', requireAdminSession, requireApprover, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        const before = repo.customers.getCustomerById(context.tenantId, req.params.id);
+        if (!before) return res.status(404).json({ error: 'No customer with that id' });
+        if (before.is_anonymised) return res.status(400).json({ error: 'This customer record is already anonymised.' });
+
+        const updated = repo.customers.anonymiseCustomer(context.tenantId, req.params.id);
+
+        repo.audit.record({
+            tenantId: context.tenantId,
+            action: 'CUSTOMER_ANONYMISED',
+            entityType: 'customer', entityId: updated.id,
+            summary: `Customer record anonymised (was "${before.full_name}")`,
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
+            ipAddress: req.ip
+        });
+        res.json({ success: true, customer: customerToWire(updated) });
+    } catch (err) {
+        logError('Error anonymising customer: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to anonymise the customer' });
+    }
+});
+
+/* ==========================================================================
+   API Routes: Accounting Export (roadmap Phase 5.5)
+
+   A plain CSV sales register — importable into Tally/Excel, no new
+   dependency. One row per invoice: this app tracks neither a customer's
+   GSTIN/state nor a per-line HSN split (billing is deliberately not wired
+   to the SKU catalogue — see 011_sku_catalogue.sql), so this reports the
+   single tax rate/amount the ledger actually holds rather than fabricating
+   a CGST/SGST or B2B/B2C split it has no basis for.
+   ========================================================================== */
+
+app.get('/api/reports/sales-register.csv', requireAdminSession, (req, res) => {
+    try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+
+        const context = repo.dataStoreContext();
+        const rows = repo.invoices.exportRows({ tenantId: context.tenantId, fromAt: q.from, toAt: q.to, state: req.query.state || null });
+        const tendersByInvoice = new Map();
+        for (const t of repo.invoices.tendersForMany(rows.map(r => r.id))) {
+            if (!tendersByInvoice.has(t.invoice_id)) tendersByInvoice.set(t.invoice_id, []);
+            tendersByInvoice.get(t.invoice_id).push(t.method);
+        }
+
+        const headers = ['Invoice Number', 'Date', 'Business Date', 'State', 'Customer Name', 'Customer Phone',
+            'Metal Value', 'Making Charge', 'Discount', 'Taxable Amount', 'Tax Rate %', 'Tax Amount',
+            'Advance Applied', 'Total Amount', 'Payment Mode'];
+        const csvRows = rows.map(r => [
+            r.invoice_number, new Date(r.issued_at).toISOString(), r.business_date, r.state,
+            r.customer_name, r.customer_phone,
+            fromPaise(r.metal_value_paise), fromPaise(r.making_charge_paise), fromPaise(r.discount_paise),
+            fromPaise(r.taxable_amount_paise), (r.tax_percent_bp / 100).toFixed(2), fromPaise(r.tax_amount_paise),
+            fromPaise(r.applied_advance_paise), fromPaise(r.total_amount_paise),
+            (tendersByInvoice.get(r.id) || []).join('+') || (r.applied_advance_paise > 0 ? 'advance' : '')
+        ]);
+
+        repo.audit.record({
+            tenantId: context.tenantId,
+            action: 'SALES_REGISTER_EXPORTED',
+            entityType: 'report',
+            summary: `Sales register exported (${rows.length} invoice(s))`,
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
+            ipAddress: req.ip
+        });
+
+        const stamp = new Date().toISOString().slice(0, 10);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="sales-register-${stamp}.csv"`);
+        res.send(toCsv(headers, csvRows));
+    } catch (err) {
+        logError('Error exporting sales register: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to export the sales register' });
     }
 });
 

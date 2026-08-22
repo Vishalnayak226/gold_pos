@@ -235,6 +235,25 @@ export function search({ tenantId, q = '', fromAt = null, toAt = null, state = n
     return { rows, total };
 }
 
+const MAX_EXPORT_ROWS = 20000;
+
+/**
+ * Every invoice matching the filter, uncapped by search()'s MAX_PAGE — an
+ * accounting export needs "everything in the date range," not one page of
+ * it. Still bounded (MAX_EXPORT_ROWS) so this cannot become an unbounded
+ * query; 20,000 invoices is far beyond what any single tenant files in one
+ * reporting period today. Ordered chronologically (ascending), matching how
+ * a sales register reads, unlike search()'s newest-first UI ordering.
+ */
+export function exportRows({ tenantId, fromAt = null, toAt = null, state = null }) {
+    const { whereSql, params } = buildInvoiceFilter({ tenantId, fromAt, toAt, state });
+    return getDb().prepare(`
+        SELECT * FROM invoices WHERE ${whereSql}
+        ORDER BY issued_at ASC, rowid ASC
+        LIMIT ${MAX_EXPORT_ROWS}
+    `).all(params);
+}
+
 /**
  * The period's aggregates, summed by the database over the whole matched set.
  *

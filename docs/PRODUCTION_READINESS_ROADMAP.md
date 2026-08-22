@@ -735,18 +735,30 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    only and named on the row, and a refund at or above `refundApprovalThreshold` needs the same
    authority (plus a second factor when the store requires one). **Old-gold exchange: engineering
    built 2026-08-21 (Phase 41), flagged off by default** — `oldGoldExchangeEnabled` (default
-   `false`, so the route 404s as though the route never existed) and `oldGoldDeductionPercent`
-   (default `5`, covering refining loss/margin). `backend/services/oldGoldService.js` values gold a
-   customer trades in and posts the credit as an ORDINARY advance deposit — no new redemption
-   mechanism, the existing advance/credit machinery already wired into `computeInvoiceTotals()`
-   applies it. Owner/manager only, the same authority bar a posted advance deposit already needs.
-   **What this does NOT do, deliberately: no GST/reverse-charge treatment.** Whether buying gold
-   from a customer attracts tax under RCM is still a legal question nobody has answered, and this
-   module computes a valuation only — enabling it for a live tenant still needs that legal sign-off
-   first. Full detail: `docs/LEDGER.md` Phase 41. **General exchanges (non-gold) remain unbuilt and
-   blocked on legal sign-off**, as before.)*
+   `false`, so the route 404s as though it never existed) and `oldGoldDeductionPercent` (default
+   `5`, covering refining loss/margin). `backend/services/oldGoldService.js` values gold a customer
+   trades in and posts the credit as an ORDINARY advance deposit — no new redemption mechanism, the
+   existing advance/credit machinery already wired into `computeInvoiceTotals()` applies it.
+   Owner/manager only, the same authority bar a posted advance deposit already needs. **What this
+   does NOT do, deliberately: no GST/reverse-charge treatment.** Whether buying gold from a customer
+   attracts tax under RCM is still a legal question nobody has answered, and this module computes a
+   valuation only — enabling it for a live tenant still needs that legal sign-off first. Full detail:
+   `docs/LEDGER.md` Phase 41. **General exchanges (non-gold) remain unbuilt and blocked on legal
+   sign-off**, as before.)*
 5. Customer master, consent/communications, accounting exports and tax/reconciliation reports.
-   *(Not started.)*
+   *(**Customer master and accounting export landed 2026-08-21, Phase 43.** `customers` was already
+   the master (every walk-in already got a row); this phase added the admin-facing half — search,
+   correction, marketing consent (explicit opt-in, separate from the existing transactional
+   `notifyEmail`/`notifyPush` prefs), duplicate detection (flagged for manual review, never
+   auto-merged — merging would mean rewriting `customer_id` on historical financial records), CSV
+   export, and anonymisation (`requireApprover`-gated, one-way, scrubs the customer record but never
+   a filed invoice's own name/phone snapshot). **Accounting export landed the same phase**: a plain
+   CSV sales register (`GET /api/reports/sales-register.csv`) — one row per invoice, reporting the
+   single tax rate/amount the ledger holds rather than a fabricated CGST/SGST or B2B/B2C split this
+   app has no basis for tracking. **Still not started: settlement/advance reconciliation,
+   profitability and inventory ageing reports** — deliberately out of scope, per this section's own
+   note not to build dashboard reports before their underlying reconciliation definitions are
+   accepted. See `docs/LEDGER.md` Phase 43.)*
 
 Do not build dashboard charts before their underlying ledger/reconciliation definitions are accepted.
 
