@@ -12,106 +12,46 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Latest commit:** `8bcd784` — "Phase 39: quotes and holds - save a cart without filing it"
-  (2026-08-20), on branch **`phase-21-payment-verification-and-production-guard`**, pushed to
-  `origin` the same day (compare link for the PR that will actually exercise CI:
-  `github.com/Vishalnayak226/gold_pos/compare/develop...phase-21-payment-verification-and-production-guard`).
-- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-20, AND SPLIT BETWEEN TWO CONCURRENT STREAMS OF
-  WORK — READ THIS BEFORE STAGING ANYTHING.** A second session was mid-edit on audit-log
-  retention in this exact tree across Phases 38, 39 and 40: uncommitted new files
-  `backend/auditRetention.js`, `backend/repositories/auditRetentionRepository.js`,
-  `backend/repositories/migrations/007_audit_retention_checkpoints.sql`, and edits to
-  `backend/defaultSettings.js` and `backend/repositories/auditRepository.js` — **none of that is
-  staged, none of it is described by this row, and none of it should be committed by anyone who
-  did not write it.** `git status` before touching `server.js`, `repositories/index.js`,
-  `test_schema.js`, or `test_repositories.js` — Phases 38, 39 and 40 all used `git add -p`-
-  equivalent surgery (reconstructing a "HEAD + only this phase's lines" version, verified to run
-  standalone) to stage their own lines out of files that had both streams' additions merged into
-  one git hunk with no separating context line. If the audit-retention session's work is still
-  sitting uncommitted when you read this, it is very likely still in progress or simply not yet
-  committed by whoever owns it — do not assume it is abandoned or fair game to fold into an
-  unrelated commit.
-- **⚠️ THE WORKING TREE ALSO CARRIES PHASE 40 (INVOICE DELIVERY STATUS), UNCOMMITTED as this row
-  is written.** `npm test` is green (**519 checks** in this phase's own staged state — the actual
-  working tree also carries the other session's additional uncommitted checks on top of that, so
-  a plain `npm test` run right now will report a higher number that is not entirely this phase's).
-  Full 43/43 Playwright e2e re-run — `ReprintDesk.js` has its own dedicated spec. New:
-  `backend/repositories/migrations/010_invoice_delivery.sql`. Modified (staged surgically, see
-  above): `backend/repositories/index.js`, `backend/server.js`, `backend/test_schema.js`,
-  `backend/test_repositories.js`. Modified (entirely this phase, staged normally):
-  `backend/repositories/invoiceRepository.js`, `frontend/js/components/ReprintDesk.js`,
-  `CLAUDE.md`, `docs/LEDGER.md`, `docs/PRODUCTION_READINESS_ROADMAP.md`.
-  - **Closes `PRODUCTION_READINESS_ROADMAP.md` §5 Phase 5.3's line entirely** — split tenders,
-    cash shifts (Phase 38), quotes/holds (Phase 39) and now delivery (Phase 40) are all landed;
-    only reprint predates this run. Full detail: `docs/LEDGER.md` Phase 40.
-- **⚠️ THE WORKING TREE IS DIRTY as of 2026-08-19 — Phase 34's REMAINING FOUR UNITS ARE
-  UNCOMMITTED AND UNREVIEWED.** Nothing is staged. `npm test` is green (**458 checks**, exit 0)
-  on the working tree (`npm run test:e2e` unaffected by today's change — not re-run). New files:
-  `backend/secretVault.js`, `backend/settingsStore.js`, `backend/rotateSecretKey.js`,
-  `backend/verifyAuditChain.js`, `backend/verifyBackup.js`,
-  `backend/repositories/migrations/005_audit_hash_chain.sql`, `docs/RUNBOOKS.md`,
-  `docs/AUDIT_AND_PII.md`. Modified: `server.js`, `adminAuth.js`, `emailReporter.js`,
-  `priceEngine.js`, `productionGuard.js`, `defaultSettings.js`, `auditRepository.js`,
-  `package.json`, `.env.example`, `.gitignore`, `.github/workflows/daily-checks.yml`, four
-  suites and the docs.
-  - **Unit 1 — secrets at rest + key rotation. DONE.** `secretVault.js` (AES-256-GCM, the field's
-    dotted path as AAD so a ciphertext cannot be moved between credentials), `settingsStore.js` as
-    the single door in and out of settings.json (**30 call sites across 8 files moved onto it**),
-    `rotateSecretKey.js`. Production refuses a keyfile fallback and reports the missing key as a
-    numbered blocker via the new `assertVaultKeyReady()`, which had to run **before**
-    `migrateStoredPins()` — the boot order matters, because that is the first thing that reads
-    settings, and it threw a stack trace instead of a refusal until this was split out.
-  - **Unit 2 — audit-trail hardening. MOSTLY DONE.** Migration 005 hash-chains `audit_events`;
-    `GET /api/audit/verify` and `/api/audit/export` (approver-only, and export is itself audited);
-    `verifyAuditChain.js` with `--expect-head`. `docs/AUDIT_AND_PII.md` classifies every field.
-    **Retention is `[needs design decision]` on purpose** — it is a legal question, and deleting
-    audit rows would break both the no-delete trigger and the chain.
-  - **Unit 3 — backup/PITR/restore/runbooks. PARTLY DONE.** `verifyBackup.js` restores the latest
-    snapshot into a temp directory and runs nine checks; both paths were exercised against a real
-    seeded snapshot. `docs/RUNBOOKS.md` carries 11 procedures. **Off-site and true PITR are NOT
-    built** — both need infrastructure or an RPO decision that does not exist yet.
-  - **Unit 4 — CI security scanning. WRITTEN, NEVER RUN.** Three jobs added to
-    `daily-checks.yml` (TruffleHog, Semgrep OSS, `npm sbom`), all chosen to be free on a private
-    repo. **2026-08-19: YAML syntax now verified locally** — PyYAML is available via the `py`
-    launcher (`py -c "import yaml"`), which the prior pass didn't find; all four workflow files
-    parse cleanly and the three new jobs were reviewed by hand (unique job names, matrix syntax,
-    action references). **Still not run** — a YAML parse proves the file is well-formed, not that
-    the jobs succeed on a runner (e.g. whether `semgrep/semgrep`'s container image can run
-    `actions/checkout`, or how TruffleHog behaves on a `schedule`/`workflow_dispatch` trigger with
-    no diff to compare). That needs an actual GitHub Actions run, which still needs a PR.
-  - **2026-08-19: the emailReporter bug above is FIXED.** `computeSummary()` now reads through
-    `backend/repositories/index.js` (`invoices.periodTotals`, `creditNotes.periodTotals`,
-    `advances.periodTotals`/`liabilitySummary`) instead of `readJSON`-ing the retired
-    `sales_*.json`/`returns_*.json`/`advances.json`. Two new checks in `test_repositories.js`
-    §13 poison those JSON files with a planted ₹9,99,999 figure and assert it never reaches the
-    summary. Also fixed in the same pass: `CLAUDE.md` had a ~285-line duplicate of its own §0–§8
-    pasted mid-sentence into itself (likely a bad edit in an earlier session) — deduplicated back
-    to one copy; `git diff --stat` against `HEAD` is now the expected +13/-2, not the ~300-line
-    diff the corruption produced.
-- **The working tree is CLEAN as of 2026-08-17.** Phase 34's first unit is committed in `1c218f6`
-  (19 files: new `backend/cookies.js`, plus `adminAuth.js`, `customerAuth.js`, `server.js`,
-  `backupEngine.js`, `test_http.js`, `test_routes.js`, four `tests/e2e/*.spec.js`,
-  `frontend/js/app.js`, `frontend/customer.html`, `BillingDesk.js`, and the docs/brain).
-  Verified on the committed tree: `npm test` 443/443 and `npm run test:e2e` 43/43 — the e2e run
-  is load-bearing here, not a formality, because this replaced both login transports.
-  See `docs/LEDGER.md` Phase 34.
-  - **Phase 34 is NOT finished.** Four units remain on the same plan
-    (`.claude/plans/luminous-munching-eich.md`): secrets-at-rest encryption + key rotation,
-    audit-trail hardening (retention / PII doc / tamper-evident export),
-    backup/PITR/restore-drill/runbooks, and CI security scanning (SAST, secret-scan,
-    dependency-review, SBOM). The LEDGER row for Phase 34 says "in progress" for that reason.
-  **Nothing on this branch is pushed** — `origin/` has it only as far as `752b925`, so `05f97c4`
-  and `1c218f6` are local-only.
-  Phase 28 is in `82d8b3e`, Phase 29 in `c26800f`, Phase 30 in `49fcbb8`, Phase 31 in `2c1bf50`,
-  Phase 32 in `752b925`, Phase 33 in `05f97c4`, Phase 34's first unit in `1c218f6`. Migration
-  `004_multi_line_invoice_fidelity.sql` is tracked, in `c26800f` — a fresh checkout migrates.
-  - **The CI gate has still never run.** `daily-checks.yml` triggers on `pull_request:
-    branches: ['**']` and on push to main/develop/staging only — so pushing this feature branch
-    does *not* fire it. Opening a PR does. `gh` is not installed on the dev machine; the PR has to
-    be opened from the web UI. Do **not** push to `develop` to force it: `cd-dev.yml` deploys on
-    that branch and will fail at the SSH step, because no VPS is provisioned.
-  - *This section has twice described a tree state that was already wrong. Run `git status`
-    before acting on any claim here.*
+- **Latest commit: `37591f7` — "Phase 43: customer master and accounting exports"** (2026-08-21),
+  on branch **`phase-21-payment-verification-and-production-guard`**, **8 commits ahead of
+  `origin/phase-21-payment-verification-and-production-guard`, not pushed.** The working tree is
+  CLEAN as of 2026-08-22 — verified with `git status` immediately before writing this entry.
+- **What the 8 commits are.** A single prior session's work — six flagged-off Phase 41 units
+  (audit retention, wastage, PITR, old-gold exchange, an incident-response runbook draft, gold
+  savings schemes) plus two neighbouring phases built concurrently in the same tree by other
+  sessions (Phase 42: SKU catalogue metadata; Phase 43: customer master + accounting exports) —
+  had accumulated **uncommitted** across many turns, entangled in shared files (`server.js`,
+  `repositories/index.js`, `defaultSettings.js`, `test_schema.js`, `test_repositories.js`,
+  `test_billing_math.js`, `test_http.js`, `billingMath.js`, `BillingDesk.js`,
+  `SettingsManager.js`, `invoiceRepository.js`, `index.html`, both roadmap docs). Committing "all
+  of it" as one lump would have buried eight independent, individually-flagged, individually-
+  tested units in a single diff nobody could review or revert piece by piece. Reconstructed each
+  as its own commit instead — "HEAD + only that unit's lines" for every shared file, built up
+  commit by commit in the same order the file additions actually landed in — matching this repo's
+  existing one-phase-per-commit convention and its own `docs/LEDGER.md` (which already carried one
+  row per unit): `365a5ef` audit retention → `69bf564` SKU catalogue → `b76c89f` gold schemes →
+  `21d6fd5` incident runbook → `04ade46` old-gold exchange → `fb1ec60` PITR → `1ce17a6` wastage →
+  `37591f7` customer master. Full detail on each: `docs/LEDGER.md`, one row per phase/unit, same
+  order.
+  **All five money/behaviour-changing modules ship flagged off by default** —
+  `auditRetentionEnabled`, `wastageEnabled`, `pitrEnabled`, `oldGoldExchangeEnabled`,
+  `goldSchemeEnabled` are every one `false` out of the box, so this branch is byte-for-byte
+  unaffected until a tenant opts in. The incident-response runbook (unit 5) is a draft, not a
+  toggle. **Still explicitly open, by design**: the real audit/PII retention period, GST/RCM
+  treatment on buying gold from a customer, the incident runbook's containment-authority and
+  CERT-In/DPDP notification questions, and gold savings schemes' full legal/CA review — none of
+  these units manufactures the sign-off it was blocked on.
+  **Verification after the split**: `cd backend && npm test` — 9/9 suites, exit 0, on the fully
+  reassembled tree (billing math, schema, repositories, concurrency, suite, routes, HTTP,
+  production guard, alerting all green). Each commit was also syntax-checked
+  (`node --check`) and, where practical, verified standalone against the money-math and schema
+  suites before being folded into the next. `npm run test:e2e` was **not** re-run this pass —
+  nothing here is new work, only a re-commit of already-tested code, and the prior session's own
+  LEDGER rows already record full e2e passes for the units that touched a form.
+  **Byte-for-byte fidelity**: the reassembled working tree was diffed file-by-file against a
+  snapshot of the original (all-at-once) working tree taken before the split began; every file
+  matched exactly except two trivial prose reflows inside doc comments, fixed to match. No code
+  was rewritten in the process, only redistributed across commits.
 - **Phase 33 (2026-08-17) — the request boundary.** `backend/rateLimit.js` (one bounded keyed
   counter; blanket 600/min per IP on `/api/*` with the probes and the Razorpay webhook exempt, plus
   named limits on registration, password reset, deposit claims, payment orders and the expensive
