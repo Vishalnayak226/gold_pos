@@ -163,6 +163,37 @@ function clampMakingPercent(percent) {
 }
 
 /**
+ * Wastage charge for one line, resolved to ₹ (and, for the weight-uplift
+ * model, extra grams) BEFORE it ever reaches computeInvoiceTotals() — that
+ * function only accepts already-priced ₹ figures, exactly like metal value
+ * and making charge; it never resolves a raw weight itself.
+ *
+ * Three interchangeable models, chosen by `mode` (see defaultSettings.js
+ * `wastageMode`):
+ *   'weight_uplift'         — extra weight billed at the line's own rate, as
+ *                              if the item weighed wastagePercent% more.
+ *   'making_charge_percent' — a percentage of the making charge.
+ *   'separate_line'         — identical arithmetic to making_charge_percent;
+ *                              the two differ only in how the invoice
+ *                              DISPLAYS the charge, never in what it costs.
+ * Anything else (including 'none', the default) returns zero — the safe,
+ * disabled-by-default behaviour.
+ */
+export function computeWastageAmount({
+    mode = 'none', weightGrams = 0, ratePerGram = 0, makingChargeAmount = 0, wastagePercent = 0
+} = {}) {
+    const pct = Math.max(0, num(wastagePercent));
+    if (mode === 'weight_uplift') {
+        const extraWeight = num(weightGrams) * (pct / 100);
+        return { wastageWeightGrams: round2(extraWeight), wastageAmount: computeMetalValue(extraWeight, ratePerGram) };
+    }
+    if (mode === 'making_charge_percent' || mode === 'separate_line') {
+        return { wastageWeightGrams: 0, wastageAmount: round2(num(makingChargeAmount) * (pct / 100)) };
+    }
+    return { wastageWeightGrams: 0, wastageAmount: 0 };
+}
+
+/**
  * Credit for gold a customer trades in ("old-gold exchange").
  *
  * `ratePerGram` is the store's own already-resolved rate for the TESTED
@@ -413,6 +444,7 @@ export function summarizeAdvanceLiability(entries) {
 export function computeInvoiceTotals({
     metalValue = 0,
     makingChargeAmount = 0,
+    wastageAmount = 0,
     discountPercent = 0,
     taxSlab = 0,
     taxMode = 'Exclusive',
@@ -441,7 +473,7 @@ export function computeInvoiceTotals({
      * number of lines. */
     const inputLines = Array.isArray(lines) && lines.length > 0
         ? lines
-        : [{ metalValue, makingChargeAmount, discountPercent }];
+        : [{ metalValue, makingChargeAmount, wastageAmount, discountPercent }];
 
     const normalizedLines = inputLines.map(line => {
         /* Floored at zero. A negative metal value or making charge is not a
@@ -452,15 +484,20 @@ export function computeInvoiceTotals({
          * beneath them. Refusing the sign keeps the two halves reconciled. */
         const lineMetal = Math.max(0, round2((line && line.metalValue) ?? 0));
         const lineMaking = Math.max(0, round2((line && line.makingChargeAmount) ?? 0));
+        // Absent on every caller before wastage existed, so an omitted field
+        // defaults to 0 and this whole function is byte-identical to before —
+        // the "disabled = never existed" contract wastage is built under.
+        const lineWastage = Math.max(0, round2((line && line.wastageAmount) ?? 0));
         // A line without its own discount inherits the invoice's, so passing a
         // bare list of items behaves exactly like the single-line form did.
         const linePct = Math.min(100, Math.max(0,
             num((line && line.discountPercent) ?? discountPercent)
         ));
-        const linePreTax = round2(lineMetal + lineMaking);
+        const linePreTax = round2(lineMetal + lineMaking + lineWastage);
         return {
             metalValue: lineMetal,
             makingChargeAmount: lineMaking,
+            wastageAmount: lineWastage,
             discountPercent: linePct,
             preTaxTotal: linePreTax,
             discountAmount: round2(linePreTax * (linePct / 100))
@@ -469,7 +506,8 @@ export function computeInvoiceTotals({
 
     const grossMetalValue = round2(sum(normalizedLines.map(l => l.metalValue)));
     const grossMakingCharge = round2(sum(normalizedLines.map(l => l.makingChargeAmount)));
-    const preTaxTotal = round2(grossMetalValue + grossMakingCharge);
+    const grossWastageAmount = round2(sum(normalizedLines.map(l => l.wastageAmount)));
+    const preTaxTotal = round2(grossMetalValue + grossMakingCharge + grossWastageAmount);
     const discountAmount = round2(sum(normalizedLines.map(l => l.discountAmount)));
     const afterDiscount = round2(preTaxTotal - discountAmount);
 
@@ -537,8 +575,9 @@ export function computeInvoiceTotals({
      */
     const divisor = mode === 'Inclusive' ? (1 + slab / 100) : 1;
     const netMakingCharge = round2(grossMakingCharge / divisor);
+    const netWastageAmount = round2(grossWastageAmount / divisor);
     const netDiscountAmount = round2(discountAmount / divisor);
-    const netMetalValue = round2(taxableAmount - netMakingCharge + netDiscountAmount);
+    const netMetalValue = round2(taxableAmount - netMakingCharge - netWastageAmount + netDiscountAmount);
 
     return {
         preTaxTotal,
@@ -553,11 +592,13 @@ export function computeInvoiceTotals({
         components: {
             metalValue: netMetalValue,
             makingChargeAmount: netMakingCharge,
+            wastageAmount: netWastageAmount,
             discountAmount: netDiscountAmount,
             // The gross, as-quoted figures, kept for the cart/catalogue side of
             // the UI which must keep showing what the cashier actually typed.
             grossMetalValue,
-            grossMakingCharge
+            grossMakingCharge,
+            grossWastageAmount
         },
         // Per-line breakdown, allocated out of the header figures above so the
         // rows always sum back to them. A single-line invoice gets a one-entry
@@ -597,6 +638,7 @@ function allocateLines(normalizedLines, { taxableAmount, taxAmount, divisor }) {
         // they are carved down by the same divisor and metal absorbs the
         // residual, keeping metal + making − discount === taxable per line.
         const netMaking = round2(line.makingChargeAmount / divisor);
+        const netWastage = round2((line.wastageAmount || 0) / divisor);
         const netDiscount = round2(line.discountAmount / divisor);
         return {
             lineNumber: i + 1,
@@ -604,11 +646,13 @@ function allocateLines(normalizedLines, { taxableAmount, taxAmount, divisor }) {
             // per-line return is re-priced from.
             grossMetalValue: line.metalValue,
             grossMakingCharge: line.makingChargeAmount,
+            grossWastageAmount: line.wastageAmount || 0,
             discountPercent: line.discountPercent,
             preTaxTotal: line.preTaxTotal,
             // Net of tax, for printing beside a tax line.
-            metalValue: round2(lineTaxable - netMaking + netDiscount),
+            metalValue: round2(lineTaxable - netMaking - netWastage + netDiscount),
             makingChargeAmount: netMaking,
+            wastageAmount: netWastage,
             discountAmount: netDiscount,
             taxableAmount: lineTaxable,
             taxAmount: lineTax,
@@ -654,6 +698,12 @@ export function saleLines(sale) {
             metalValue: round2(line.grossMetalValue ?? line.metalValue),
             makingChargePercent: num(line.makingChargePercent),
             makingChargeAmount: round2(line.grossMakingCharge ?? line.makingChargeAmount),
+            // Absent on every invoice filed before wastage existed, so a legacy
+            // line reads as 'none'/0 — identical to a line where wastage was
+            // simply never enabled.
+            wastageMode: line.wastageMode || 'none',
+            wastageWeightGrams: round3(line.wastageWeightGrams || 0),
+            wastageAmount: round2(line.grossWastageAmount ?? line.wastageAmount ?? 0),
             discountPercent: num(line.discountPercent ?? sale.discountPercent),
             lineTotal: round2(line.lineTotal)
         }));
@@ -668,6 +718,9 @@ export function saleLines(sale) {
         metalValue: round2(sale.metalValue),
         makingChargePercent: num(sale.makingChargePercent),
         makingChargeAmount: round2(sale.makingChargeAmount),
+        wastageMode: sale.wastageMode || 'none',
+        wastageWeightGrams: round3(sale.wastageWeightGrams || 0),
+        wastageAmount: round2(sale.wastageAmount || 0),
         discountPercent: num(sale.discountPercent),
         lineTotal: round2(num(sale.totalAmount) + num(sale.appliedAdvance))
     }];
@@ -829,6 +882,7 @@ export function computeReturnRefund({
         lines: lines.map(l => ({
             metalValue: l.metalValue,
             makingChargeAmount: l.makingChargeAmount,
+            wastageAmount: l.wastageAmount,
             discountPercent: l.discountPercent
         })),
         discountPercent: sale.discountPercent,
@@ -860,9 +914,14 @@ export function computeReturnRefund({
         // invoice's, because GST is levied on the document.
         const metalValue = computeMetalValue(returnWeight, line.goldPricePerGram);
         const makingChargeAmount = round2(line.makingChargeAmount * fraction);
+        // Wastage scales with the same share of the line going back, whichever
+        // model priced it — a weight uplift or a making-charge percentage both
+        // collapse to "this much of the line's wastage charge" once resolved to ₹.
+        const wastageAmount = round2((line.wastageAmount || 0) * fraction);
         const totals = computeInvoiceTotals({
             metalValue,
             makingChargeAmount,
+            wastageAmount,
             discountPercent: line.discountPercent,
             taxSlab: sale.taxPercent,
             taxMode: sale.taxMode
@@ -871,6 +930,7 @@ export function computeReturnRefund({
         components = {
             metalValue: totals.components.metalValue,
             makingChargeAmount: totals.components.makingChargeAmount,
+            wastageAmount: totals.components.wastageAmount,
             discountAmount: totals.components.discountAmount,
             taxableAmount: totals.taxableAmount,
             taxAmount: totals.taxAmount

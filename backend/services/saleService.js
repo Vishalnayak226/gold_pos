@@ -29,9 +29,11 @@ import {
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
 import {
-    computeInvoiceTotals, computeMetalValue, normalizeTaxMode,
+    computeInvoiceTotals, computeMetalValue, computeWastageAmount, normalizeTaxMode,
     fromPaise, round2, round3, toPaise
 } from '../../frontend/js/lib/billingMath.js';
+
+const WASTAGE_MODES = ['weight_uplift', 'making_charge_percent', 'separate_line'];
 
 const VALID_PURITIES = ['24K', '22K', '18K'];
 const PURITY_RATE_KEY = { '24K': 'price24K', '22K': 'price22K', '18K': 'price18K' };
@@ -75,7 +77,7 @@ function basisPoints(percent) {
  *
  * @returns {{ok: true, line: object}|{ok: false, status?: number, error: string}}
  */
-function priceLine(raw, index, activeRates) {
+function priceLine(raw, index, activeRates, settings) {
     const where = `Line ${index + 1}`;
     if (!raw || typeof raw !== 'object') {
         return { ok: false, status: 400, error: `${where} is not a valid item.` };
@@ -115,6 +117,29 @@ function priceLine(raw, index, activeRates) {
         };
     }
 
+    /* WASTAGE IS A STORE-WIDE POLICY, NOT A CLIENT-SUPPLIED FIGURE.
+       Same posture as the tax slab and tax mode above: when
+       settings.wastageEnabled is true, every line is charged using the
+       tenant's configured mode and percentage — never a value the request
+       body proposes — so a tampered payload cannot invent or inflate a
+       wastage charge. Off (the default) leaves every line at
+       mode 'none' / 0 / 0, identical to a build that never had wastage. */
+    let wastageMode = 'none';
+    let wastageWeightGrams = 0;
+    let wastageAmount = 0;
+    if (settings && settings.wastageEnabled === true) {
+        wastageMode = WASTAGE_MODES.includes(settings.wastageMode) ? settings.wastageMode : 'weight_uplift';
+        const wastage = computeWastageAmount({
+            mode: wastageMode,
+            weightGrams,
+            ratePerGram,
+            makingChargeAmount: round2(makingChargeAmount),
+            wastagePercent: settings.wastagePercent
+        });
+        wastageWeightGrams = wastage.wastageWeightGrams;
+        wastageAmount = wastage.wastageAmount;
+    }
+
     return {
         ok: true,
         line: {
@@ -127,6 +152,9 @@ function priceLine(raw, index, activeRates) {
             metalValue: computeMetalValue(weightGrams, ratePerGram),
             makingChargePercent,
             makingChargeAmount: round2(makingChargeAmount),
+            wastageMode,
+            wastageWeightGrams,
+            wastageAmount,
             discountPercent,
             /* What the cashier's screen quoted for this line, kept only to
                detect and log a disagreement — never persisted as money. The
@@ -233,7 +261,7 @@ export function createSale(input, deps) {
 
     const saleLineItems = [];
     for (const [i, raw] of requested.entries()) {
-        const priced = priceLine(raw, i, activeRates);
+        const priced = priceLine(raw, i, activeRates, settings);
         if (!priced.ok) return { ok: false, status: priced.status || 400, error: priced.error };
         saleLineItems.push(priced.line);
     }
@@ -300,6 +328,7 @@ export function createSale(input, deps) {
                 lines: saleLineItems.map(l => ({
                     metalValue: l.metalValue,
                     makingChargeAmount: l.makingChargeAmount,
+                    wastageAmount: l.wastageAmount,
                     discountPercent: l.discountPercent
                 })),
                 discountPercent: invoiceDiscountPercent,
@@ -440,6 +469,9 @@ export function createSale(input, deps) {
                     metalValuePaise: toPaise(allocated.grossMetalValue),
                     makingChargeBp: basisPoints(line.makingChargePercent),
                     makingChargePaise: toPaise(allocated.grossMakingCharge),
+                    wastageMode: line.wastageMode,
+                    wastageWeightMg: weightMilligrams(line.wastageWeightGrams),
+                    wastageAmountPaise: toPaise(allocated.grossWastageAmount),
                     discountBp: basisPoints(allocated.discountPercent),
                     // The line's gross discount, matching the gross metal and
                     // making figures beside it. `allocated.discountAmount` is

@@ -1410,6 +1410,54 @@ try {
         assert.equal(sale.totalAmount, 1030);
     });
 
+    await check('wastage is off by default — a sale prices identically to before it existed', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                purity: '22K', weightGrams: 2, makingChargeAmount: 0, discountPercent: 0, totalAmount: 0
+            })
+        });
+        const { sale } = await response.json();
+        assert.equal(sale.lines[0].wastageMode, 'none');
+        assert.equal(sale.lines[0].wastageAmount, 0);
+        assert.equal(sale.totalAmount, 2060, '2g × ₹1,000 + 3% GST, untouched by a disabled feature');
+    });
+
+    await check('enabling wastage charges every line uniformly from settings, never from the request', async () => {
+        assert.equal((await postSettings({
+            wastageEnabled: true, wastageMode: 'weight_uplift', wastagePercent: 5
+        })).status, 200);
+
+        let response;
+        try {
+            response = await request('/api/sales', {
+                method: 'POST',
+                headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    purity: '22K', weightGrams: 2, makingChargeAmount: 0, discountPercent: 0,
+                    // A tampered payload proposing its own wastage figures — the
+                    // server must ignore both and use the settings-configured
+                    // model instead.
+                    wastageMode: 'separate_line', wastageAmount: 999999,
+                    totalAmount: 0
+                })
+            });
+        } finally {
+            await postSettings({ wastageEnabled: false, wastageMode: 'weight_uplift', wastagePercent: 0 });
+        }
+
+        assert.equal(response.status, 200);
+        const { sale } = await response.json();
+        // 5% of 2g = 0.1g extra, priced at the same ₹1,000/g line rate = ₹100 —
+        // the request's proposed 'separate_line'/999999 must be ignored entirely.
+        assert.equal(sale.lines[0].wastageMode, 'weight_uplift');
+        assert.equal(sale.lines[0].wastageWeightGrams, 0.1);
+        assert.equal(sale.lines[0].wastageAmount, 100);
+        // 2g metal (₹2,000) + ₹100 wastage = ₹2,100 pre-tax, 3% GST = ₹63.
+        assert.equal(sale.totalAmount, 2163);
+    });
+
     await check('one bad line refuses the whole invoice and names which line', async () => {
         const before = readData('settings.json').invoiceSeqStart;
         const response = await request('/api/sales', {

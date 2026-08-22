@@ -765,12 +765,19 @@ sale), and to three screens. It was made affordable by two decisions worth reusi
   (`saleLines()`), so every invoice already on disk stayed reprintable and returnable and no reader
   needed changing to keep working.
 
-**Wastage** appears in the SKU-catalogue list above and **exists nowhere in the code** — no field,
-no helper, no setting, no test. It was named in `CLAUDE.md` §2 as money math requiring test coverage
-before it was ever built, which has been corrected (2026-08-12). It is an unscoped catalogue
-attribute, and it needs a product decision before it is anything else: whether wastage is a weight
-uplift, a percentage of making charge, or a separate charged line, and whether it prints on the
-customer's invoice. `[needs design decision: wastage model]`
+**Wastage: built 2026-08-21 (Phase 41), flagged off by default.** `[needs design decision: wastage
+model]` is resolved as "build all three, selectable per tenant" (owner decision, 2026-08-21) rather
+than picking one: `wastageEnabled` (default `false`, so an existing or new install prices exactly as
+before), `wastageMode` (`weight_uplift` | `making_charge_percent` | `separate_line`) and
+`wastagePercent` in settings. `computeWastageAmount()` (`frontend/js/lib/billingMath.js`) resolves
+the charge to ₹ before it ever reaches `computeInvoiceTotals()`, which accepts it at the same tier as
+making charge — additive to every existing caller (a line without `wastageAmount` behaves exactly as
+before, asserted in `test_billing_math.js` §19). `invoice_lines` gained `wastage_mode`/
+`wastage_weight_mg`/`wastage_amount_paise` (migration 013, additive). Wastage is a STORE-WIDE
+POLICY, never a client-supplied figure — `backend/services/saleService.js#priceLine()` computes it
+from settings for every line, ignoring anything a request proposes, the same posture as the tax
+slab. Shown on the Billing Desk summary only when enabled; configured under Settings → Tax & Invoice
+Numbering → Wastage. Full detail: `docs/LEDGER.md` Phase 41.
 
 ### Phase 6 — Gold savings schemes (6–10 weeks after the foundation)
 

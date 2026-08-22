@@ -336,6 +336,34 @@ export class SettingsManager {
                     <span class="text-muted-small">Lowering this is a destructive action and requires confirmation — it can create duplicate invoice numbers.</span>
                 </div>
             </div>
+            <h3 class="settings-section-title" style="margin-top:30px;">Wastage</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Off by default — every invoice prices exactly as it does today until this is turned on.
+                When enabled, EVERY line on EVERY invoice is charged uniformly using the mode and
+                percentage below; a cashier cannot set it per item.
+            </p>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-wastage-enabled">Charge Wastage</label>
+                    <select id="set-wastage-enabled" class="form-control">
+                        <option value="false"${s.wastageEnabled ? '' : ' selected'}>No</option>
+                        <option value="true"${s.wastageEnabled ? ' selected' : ''}>Yes</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="set-wastage-mode">Wastage Model</label>
+                    <select id="set-wastage-mode" class="form-control">
+                        <option value="weight_uplift"${s.wastageMode === 'weight_uplift' || !s.wastageMode ? ' selected' : ''}>Extra weight (% of item weight)</option>
+                        <option value="making_charge_percent"${s.wastageMode === 'making_charge_percent' ? ' selected' : ''}>% of making charge (folded into Making Charges)</option>
+                        <option value="separate_line"${s.wastageMode === 'separate_line' ? ' selected' : ''}>% of making charge (own line on the invoice)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="set-wastage-percent">Wastage (%)</label>
+                    <input type="number" id="set-wastage-percent" class="form-control"
+                           value="${Number(s.wastagePercent) || 0}" step="0.5" min="0" max="25">
+                </div>
+            </div>
             <h3 class="settings-section-title" style="margin-top:30px;">Old-Gold Exchange</h3>
             <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
                 Off by default. When on, the Billing Desk can weigh, test and credit gold a customer
@@ -432,6 +460,9 @@ export class SettingsManager {
                 adminPin: document.getElementById('set-admin-pin').value.trim() || null,
                 invoicePrefix: document.getElementById('set-invoice-prefix').value || 'GOLD',
                 invoiceSeqStart: requestedSeq,
+                wastageEnabled: document.getElementById('set-wastage-enabled').value === 'true',
+                wastageMode: document.getElementById('set-wastage-mode').value,
+                wastagePercent: parseFloat(document.getElementById('set-wastage-percent').value) || 0,
                 oldGoldExchangeEnabled: document.getElementById('set-oldgold-enabled').value === 'true',
                 oldGoldDeductionPercent: parseFloat(document.getElementById('set-oldgold-deduction').value) || 0,
                 goldSchemeEnabled: document.getElementById('set-scheme-enabled').value === 'true',

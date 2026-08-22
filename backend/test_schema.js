@@ -284,6 +284,37 @@ check('an invoice line with an unsupported purity is refused', () => {
         .run('IL2', 'INV-1', 2, '14K', 1000, 687500, 100, 100, 100), /CHECK|constraint/i);
 });
 
+check('an invoice line defaults to no wastage, and an unknown wastage_mode is refused', () => {
+    db.prepare(`INSERT INTO invoice_lines
+        (id, invoice_id, line_number, purity, weight_mg, rate_paise_per_g, metal_value_paise,
+         taxable_amount_paise, line_total_paise) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run('IL-WASTAGE-DEFAULT', 'INV-1', 3, '22K', 1000, 687500, 100, 100, 100);
+    const row = db.prepare('SELECT wastage_mode, wastage_weight_mg, wastage_amount_paise FROM invoice_lines WHERE id = ?')
+        .get('IL-WASTAGE-DEFAULT');
+    assert.strictEqual(row.wastage_mode, 'none');
+    assert.strictEqual(row.wastage_weight_mg, 0);
+    assert.strictEqual(row.wastage_amount_paise, 0);
+
+    refuses(() => db.prepare(`INSERT INTO invoice_lines
+        (id, invoice_id, line_number, purity, weight_mg, rate_paise_per_g, metal_value_paise,
+         taxable_amount_paise, line_total_paise, wastage_mode) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run('IL-WASTAGE-BAD', 'INV-1', 4, '22K', 1000, 687500, 100, 100, 100, 'purchased'),
+        /CHECK|constraint/i);
+});
+
+check('a negative wastage weight or amount is refused', () => {
+    refuses(() => db.prepare(`INSERT INTO invoice_lines
+        (id, invoice_id, line_number, purity, weight_mg, rate_paise_per_g, metal_value_paise,
+         taxable_amount_paise, line_total_paise, wastage_mode, wastage_weight_mg) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run('IL-WASTAGE-NEGW', 'INV-1', 5, '22K', 1000, 687500, 100, 100, 100, 'weight_uplift', -1),
+        /CHECK|constraint/i);
+    refuses(() => db.prepare(`INSERT INTO invoice_lines
+        (id, invoice_id, line_number, purity, weight_mg, rate_paise_per_g, metal_value_paise,
+         taxable_amount_paise, line_total_paise, wastage_mode, wastage_amount_paise) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+        .run('IL-WASTAGE-NEGA', 'INV-1', 6, '22K', 1000, 687500, 100, 100, 100, 'making_charge_percent', -1),
+        /CHECK|constraint/i);
+});
+
 check('a line cannot reference an invoice that does not exist', () => {
     refuses(() => db.prepare(`INSERT INTO invoice_lines
         (id, invoice_id, line_number, purity, weight_mg, rate_paise_per_g, metal_value_paise,

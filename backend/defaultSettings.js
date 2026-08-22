@@ -142,6 +142,17 @@ export const DEFAULT_SETTINGS = {
        docs/AUDIT_AND_PII.md §5 and backend/auditRetention.js. */
     auditRetentionEnabled: false,
     auditRetentionDays: 2555,
+    /* Wastage. Off by default: no invoice line has ever carried a wastage
+       charge, and disabled means it still never will — every line prices
+       exactly as it did before this existed. When enabled, EVERY line is
+       charged uniformly using this store-wide mode and percentage; a sale
+       request can never supply its own (backend/services/saleService.js).
+       'weight_uplift' bills extra grams; 'making_charge_percent' and
+       'separate_line' both charge a percentage of the making charge and
+       differ only in how the invoice DISPLAYS the line, never in cost. */
+    wastageEnabled: false,
+    wastageMode: "weight_uplift",
+    wastagePercent: 0,
     /* Point-in-time recovery: frequent local snapshots (backend/pitr.js). Off
        by default — the once-nightly backup stays the only recovery point
        until this is turned on. pitrIntervalMinutes below 5 has no effect: the
@@ -251,6 +262,9 @@ export const SETTINGS_FIELD_RULES = {
     razorpayKeyId: { type: 'string', maxLength: 200 },
     auditRetentionEnabled: { type: 'boolean' },
     auditRetentionDays: { type: 'integer', min: 1, max: 36500 },
+    wastageEnabled: { type: 'boolean' },
+    wastageMode: { type: 'enum', values: ['weight_uplift', 'making_charge_percent', 'separate_line'] },
+    wastagePercent: { type: 'number', min: 0, max: 25 },
     pitrEnabled: { type: 'boolean' },
     // Below 5 has no effect (the scheduler's own tick is fixed at 5 minutes)
     // but is not refused outright — a tenant lowering it from, say, 15 to 5

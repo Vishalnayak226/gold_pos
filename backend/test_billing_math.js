@@ -17,6 +17,7 @@
 import {
     computeInvoiceTotals,
     computeReturnRefund,
+    computeWastageAmount,
     computeOldGoldCredit,
     computeGoldGramsForAmount,
     computeGoldSchemePayout,
@@ -1701,6 +1702,98 @@ check('a negative making charge is floored rather than credited', () => {
     const t = computeInvoiceTotals({ metalValue: 1000, makingChargeAmount: -400, taxSlab: 0 });
     near(t.preTaxTotal, 1000, 'the negative making charge does not reduce the bill');
     near(t.totalAmount, 1000, 'total');
+});
+
+group('19. Wastage (Phase 41, flagged off by default)');
+
+check('mode "none" (the default) charges nothing, regardless of the percentage', () => {
+    const w = computeWastageAmount({ mode: 'none', weightGrams: 10, ratePerGram: 7500, makingChargeAmount: 6000, wastagePercent: 5 });
+    near(w.wastageAmount, 0, 'wastageAmount');
+    near(w.wastageWeightGrams, 0, 'wastageWeightGrams');
+});
+
+check('weight_uplift bills extra grams at the line\'s own rate', () => {
+    // 10g @ ₹7,500, 5% uplift = 0.5g extra = ₹3,750.
+    const w = computeWastageAmount({ mode: 'weight_uplift', weightGrams: 10, ratePerGram: 7500, wastagePercent: 5 });
+    near(w.wastageWeightGrams, 0.5, 'wastageWeightGrams');
+    near(w.wastageAmount, 3750, 'wastageAmount');
+});
+
+check('making_charge_percent and separate_line are the same arithmetic — a percentage of making charge', () => {
+    // 8% of ₹6,000 making charge = ₹480.
+    for (const mode of ['making_charge_percent', 'separate_line']) {
+        const w = computeWastageAmount({ mode, makingChargeAmount: 6000, wastagePercent: 8 });
+        near(w.wastageAmount, 480, `wastageAmount (${mode})`);
+        near(w.wastageWeightGrams, 0, `wastageWeightGrams (${mode})`);
+    }
+});
+
+check('disabled (wastageAmount omitted) leaves computeInvoiceTotals byte-identical to before wastage existed', () => {
+    const withoutWastage = computeInvoiceTotals(EXCL_BASE);
+    const withZeroWastage = computeInvoiceTotals({ ...EXCL_BASE, wastageAmount: 0 });
+    for (const key of ['preTaxTotal', 'discountAmount', 'taxableAmount', 'taxAmount', 'totalAmount']) {
+        near(withoutWastage[key], withZeroWastage[key], key);
+    }
+    near(withoutWastage.components.metalValue, withZeroWastage.components.metalValue, 'components.metalValue');
+});
+
+check('a wastage charge adds into the pre-tax total at the same tier as making charge', () => {
+    const t = computeInvoiceTotals({
+        metalValue: 75000, makingChargeAmount: 6000, wastageAmount: 480, taxSlab: 0, taxMode: 'Exclusive'
+    });
+    near(t.preTaxTotal, 81480, 'preTaxTotal');
+    near(t.totalAmount, 81480, 'totalAmount');
+    near(t.components.grossWastageAmount, 480, 'components.grossWastageAmount');
+});
+
+check('the rows still sum to the header with wastage present, at every slab, in both modes', () => {
+    const lines = [
+        { metalValue: 75000, makingChargeAmount: 6000, wastageAmount: 480, discountPercent: 0 },
+        { metalValue: 30000, makingChargeAmount: 3000, wastageAmount: 0, discountPercent: 7.5 }
+    ];
+    for (const taxMode of ['Exclusive', 'Inclusive']) {
+        for (const taxSlab of [0, 3, 5, 12, 18, 28]) {
+            const t = computeInvoiceTotals({ lines, taxSlab, taxMode });
+            const where = `${taxMode} @ ${taxSlab}%`;
+            near(round2(t.lines.reduce((s, l) => s + l.taxableAmount, 0)), t.taxableAmount, `taxable sum, ${where}`);
+            near(round2(t.lines.reduce((s, l) => s + l.taxAmount, 0)), t.taxAmount, `tax sum, ${where}`);
+            near(round2(t.lines.reduce((s, l) => s + l.lineTotal, 0)), t.totalBeforeAdvance, `total sum, ${where}`);
+            // metal + making + wastage − discount === taxable, per line — the
+            // generalised form of the identity computeInvoiceTotals documents.
+            for (const l of t.lines) {
+                near(round2(l.metalValue + l.makingChargeAmount + l.wastageAmount - l.discountAmount),
+                    l.taxableAmount, `line ${l.lineNumber} metal+making+wastage-discount==taxable, ${where}`);
+            }
+        }
+    }
+});
+
+check('a one-line invoice with wastage prices identically whether wastage is a scalar arg or a one-item lines[] array', () => {
+    const scalar = computeInvoiceTotals({ metalValue: 75000, makingChargeAmount: 6000, wastageAmount: 480, taxSlab: 3, taxMode: 'Exclusive' });
+    const asLine = computeInvoiceTotals({ lines: [{ metalValue: 75000, makingChargeAmount: 6000, wastageAmount: 480 }], taxSlab: 3, taxMode: 'Exclusive' });
+    for (const key of ['preTaxTotal', 'taxableAmount', 'taxAmount', 'totalAmount']) {
+        near(scalar[key], asLine[key], key);
+    }
+});
+
+check('a returned line refunds its share of the wastage charge too', () => {
+    // A 10g line, 5% weight-uplift wastage already resolved to ₹3,750 at filing
+    // time, half the weight now comes back — half the wastage should too.
+    const sale = {
+        lines: [{
+            lineNumber: 1, weightGrams: 10, goldPricePerGram: 7500,
+            grossMetalValue: 75000, grossMakingCharge: 6000, grossWastageAmount: 3750,
+            discountPercent: 0, taxableAmount: 84750, taxAmount: 0, lineTotal: 84750
+        }],
+        metalValue: 75000, makingChargeAmount: 6000, discountPercent: 0,
+        taxPercent: 0, taxMode: 'Exclusive',
+        taxableAmount: 84750, taxAmount: 0,
+        appliedAdvance: 0, totalAmount: 84750
+    };
+    const result = computeReturnRefund({ sale, returnWeightGrams: 5 });
+    if (!result.ok) throw new Error(result.error);
+    near(result.components.wastageAmount, 1875, 'half the wastage charge should be refunded');
+    near(result.refundAmount, 42375, 'half the whole line, wastage included');
 });
 
 group('20. Old-gold exchange credit (Phase 41, flagged off by default)');

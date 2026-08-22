@@ -1,6 +1,7 @@
 import { logTelemetry, adminFetch, getActor } from '../app.js';
 import {
     computeInvoiceTotals,
+    computeWastageAmount,
     makingChargeFromPercent,
     makingPercentFromAmount,
     normalizeTaxMode,
@@ -57,6 +58,14 @@ export class BillingDesk {
         this.makingChargeAmount = 0;
         this.taxSlab = 3; // Default 3% GST
         this.taxMode = 'Exclusive'; // Default
+        // Off by default, matching backend/defaultSettings.js — a cart prices
+        // identically to before wastage existed until Settings turns it on.
+        // Store-wide policy, never a per-line cashier input, so the server
+        // (backend/services/saleService.js) and this preview compute it from
+        // the SAME settings rather than the cart trusting its own guess.
+        this.wastageEnabled = false;
+        this.wastageMode = 'weight_uplift';
+        this.wastagePercent = 0;
         // Off by default, matching backend/defaultSettings.js — the panel
         // stays hidden until Settings turns this on.
         this.oldGoldExchangeEnabled = false;
@@ -144,6 +153,10 @@ export class BillingDesk {
                 }
                 
                 this.taxMode = normalizeTaxMode(settings.taxMode);
+
+                this.wastageEnabled = settings.wastageEnabled === true;
+                this.wastageMode = settings.wastageMode || 'weight_uplift';
+                this.wastagePercent = Number(settings.wastagePercent) || 0;
 
                 this.oldGoldExchangeEnabled = settings.oldGoldExchangeEnabled === true;
                 const oldGoldPanel = document.getElementById('old-gold-exchange-panel');
@@ -352,6 +365,10 @@ export class BillingDesk {
                             <div class="summary-row">
                                 <span>Making Charges (<span id="sum-making-percent">10</span>%)<span class="sum-net-note"></span>:</span>
                                 <span id="sum-making-amount">₹0.00</span>
+                            </div>
+                            <div class="summary-row" id="summary-wastage-row" style="display: none;">
+                                <span>Wastage<span class="sum-net-note"></span>:</span>
+                                <span id="sum-wastage-amount">₹0.00</span>
                             </div>
                             <div class="summary-row" id="summary-discount-row" style="display: none;">
                                 <span>Discount (<span id="sum-discount-percent">0</span>%)<span class="sum-net-note"></span>:</span>
@@ -1043,7 +1060,16 @@ export class BillingDesk {
         const totals = computeInvoiceTotals({
             lines: lines.map(l => ({
                 metalValue: l.metalValue,
-                makingChargeAmount: l.makingChargeAmount
+                makingChargeAmount: l.makingChargeAmount,
+                // Same formula, same inputs, as backend/services/saleService.js's
+                // priceLine() — so what the cashier previews is what the server
+                // will actually charge, not merely a client-side guess at it.
+                wastageAmount: this.wastageEnabled
+                    ? computeWastageAmount({
+                        mode: this.wastageMode, weightGrams: l.weightGrams, ratePerGram: l.goldPricePerGram,
+                        makingChargeAmount: l.makingChargeAmount, wastagePercent: this.wastagePercent
+                    }).wastageAmount
+                    : 0
             })),
             discountPercent: this.discountPercent,
             taxSlab: this.taxSlab,
@@ -1090,6 +1116,8 @@ export class BillingDesk {
         const sumMetal = document.getElementById('sum-metal-value');
         const sumMakingPct = document.getElementById('sum-making-percent');
         const sumMakingAmt = document.getElementById('sum-making-amount');
+        const sumWastageRow = document.getElementById('summary-wastage-row');
+        const sumWastageAmt = document.getElementById('sum-wastage-amount');
         const sumTaxSlab = document.getElementById('sum-tax-slab');
         const sumTaxMode = document.getElementById('sum-tax-mode');
         const sumTaxAmt = document.getElementById('sum-tax-amount');
@@ -1111,6 +1139,16 @@ export class BillingDesk {
             sumMakingPct.textContent = percents.length === 1 ? percents[0] : '—';
         }
         if (sumMakingAmt) sumMakingAmt.textContent = money(components.makingChargeAmount);
+
+        // Shown only when the store has wastage turned on AND there is a cart
+        // to charge it against — same "no row when there is nothing to say"
+        // rule the discount and advance rows already follow.
+        if (this.wastageEnabled && lines.length > 0 && sumWastageRow && sumWastageAmt) {
+            sumWastageAmt.textContent = money(components.wastageAmount);
+            sumWastageRow.style.display = 'flex';
+        } else if (sumWastageRow) {
+            sumWastageRow.style.display = 'none';
+        }
 
         // Only inclusive pricing restates its lines, so only inclusive pricing
         // needs to say so on the invoice.

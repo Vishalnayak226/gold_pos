@@ -60,14 +60,16 @@ export function insertLine(line) {
     getDb().prepare(`
         INSERT INTO invoice_lines (
             id, invoice_id, line_number, description, purity, weight_mg, rate_paise_per_g, rate_source,
-            metal_value_paise, making_charge_bp, making_charge_paise, discount_bp, discount_paise,
-            taxable_amount_paise, tax_amount_paise, line_total_paise
+            metal_value_paise, making_charge_bp, making_charge_paise,
+            wastage_mode, wastage_weight_mg, wastage_amount_paise,
+            discount_bp, discount_paise, taxable_amount_paise, tax_amount_paise, line_total_paise
         ) VALUES (
             @id, @invoiceId, @lineNumber, @description, @purity, @weightMg, @ratePaisePerG, @rateSource,
-            @metalValuePaise, @makingChargeBp, @makingChargePaise, @discountBp, @discountPaise,
-            @taxableAmountPaise, @taxAmountPaise, @lineTotalPaise
+            @metalValuePaise, @makingChargeBp, @makingChargePaise,
+            @wastageMode, @wastageWeightMg, @wastageAmountPaise,
+            @discountBp, @discountPaise, @taxableAmountPaise, @taxAmountPaise, @lineTotalPaise
         )
-    `).run(line);
+    `).run({ wastageMode: 'none', wastageWeightMg: 0, wastageAmountPaise: 0, ...line });
     return line.id;
 }
 
@@ -396,6 +398,10 @@ export function toLegacySale(invoice, lines, extra = {}) {
             makingChargePercent: round2(row.making_charge_bp / 100),
             makingChargeAmount: fromPaise(row.making_charge_paise),
             grossMakingCharge: fromPaise(row.making_charge_paise),
+            wastageMode: row.wastage_mode || 'none',
+            wastageWeightGrams: round3((row.wastage_weight_mg || 0) / 1000),
+            wastageAmount: fromPaise(row.wastage_amount_paise || 0),
+            grossWastageAmount: fromPaise(row.wastage_amount_paise || 0),
             discountPercent: round2(row.discount_bp / 100),
             discountAmount: fromPaise(row.discount_paise),
             taxableAmount: fromPaise(row.taxable_amount_paise),
