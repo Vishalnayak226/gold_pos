@@ -12,6 +12,23 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
+- **Phase 44 was completed 2026-08-24 and committed from the shared working tree on 2026-08-25.** Migration 016,
+  billing-linked sale/return/void lot movements, SKU auto-fill, return exchange, same-day void,
+  the verified filesystem off-site backup destination, and four explicitly-defined management
+  reports are described in the newest `docs/LEDGER.md` row. Full `npm test` is green across all
+  nine suites; migration safety is 16/16; `npm audit` reports 0 vulnerabilities; Playwright is
+  44/44 green, including the new catalogue→sale→exchange→void→reports browser journey. The report
+  definitions are operational, not statutory, and still need merchant/accountant acceptance.
+  Off-site copy still needs a real remote mount and recovery
+  drill; whole-archive encryption is not implemented.
+- **Concurrent work is present; do not stage it as Phase 44.** Another session changed
+  `backend/adminAuth.js`, `frontend/customer.html`, `licensing_server/package-lock.json`,
+  `licensing_server/package.json`, `licensing_server/server.js`, and added `frontend/js/adminAlertOverride.js`,
+  `frontend/js/customer-app.js` and `frontend/js/customerAlertOverride.js` while this phase was
+  being built. `docs/SECURITY_AUDIT.md` is also an untracked user file. None was removed,
+  rewritten or intentionally included in Phase 44. The shared PIN-hardening change raised new PINs
+  to 6–8 digits; stale four-digit fixtures in `test_http.js`/`test_suite.js` were updated so the
+  combined tree could be verified.
 - **Latest commit: `37591f7` — "Phase 43: customer master and accounting exports"** (2026-08-21),
   on branch **`phase-21-payment-verification-and-production-guard`**, **8 commits ahead of
   `origin/phase-21-payment-verification-and-production-guard`, not pushed.** The working tree is

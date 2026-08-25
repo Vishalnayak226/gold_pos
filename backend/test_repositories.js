@@ -1885,6 +1885,136 @@ console.log('\n21. Accounting export');
     });
 }
 
+/* ==========================================================================
+   22. Billing-linked inventory, exchange/void, and management reports
+   ========================================================================== */
+
+console.log('\n22. Billing-linked inventory and management reports');
+
+{
+    const itemId = repo.inventory.createItem({
+        tenantId: context.tenantId, name: 'Costed Test Chain', category: 'Chains',
+        purity: '22K', skuCode: 'BILL-SKU-1', netWeightMg: 10000, grossWeightMg: 10000
+    });
+    const { lotId } = repo.inTransaction(() => repo.inventory.openLot({
+        tenantId: context.tenantId, branchId: context.branchId, itemId,
+        weightMg: 10000, actorUserId: context.ownerUserId, unitCostPaisePerG: 500000
+    }));
+
+    const stockSale = saleService.createSale({
+        customerName: 'Exchange Customer', customerPhone: '9888800001',
+        lines: [{ purity: '22K', weightGrams: 5, inventoryItemId: itemId, inventoryLotId: lotId }]
+    }, DEPS);
+
+    check('a catalogue-linked sale decrements its exact lot in the invoice transaction', () => {
+        assert.equal(stockSale.ok, true);
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 5000);
+        const row = repo.invoices.linesFor(repo.invoices.findByNumber(context.tenantId, stockSale.invoiceId).id)[0];
+        assert.equal(row.inventory_item_id, itemId);
+        assert.equal(row.inventory_lot_id, lotId);
+        const movement = repo.inventory.documentSaleMovementsForInvoice(row.invoice_id)[0];
+        assert.equal(movement.weight_delta_mg, -5000);
+    });
+
+    check('selling more than a lot has is refused without changing stock', () => {
+        const before = repo.inventory.lotBalanceMg(lotId);
+        const refused = saleService.createSale({
+            lines: [{ purity: '22K', weightGrams: 6, inventoryItemId: itemId, inventoryLotId: lotId }]
+        }, DEPS);
+        assert.equal(refused.ok, false);
+        assert.equal(refused.code, 'INSUFFICIENT_STOCK');
+        assert.equal(repo.inventory.lotBalanceMg(lotId), before);
+
+        const splitAcrossLines = saleService.createSale({
+            lines: [
+                { purity: '22K', weightGrams: 3, inventoryItemId: itemId, inventoryLotId: lotId },
+                { purity: '22K', weightGrams: 3, inventoryItemId: itemId, inventoryLotId: lotId }
+            ]
+        }, DEPS);
+        assert.equal(splitAcrossLines.ok, false);
+        assert.equal(splitAcrossLines.code, 'INSUFFICIENT_STOCK');
+        assert.equal(splitAcrossLines.status, 409);
+        assert.equal(repo.inventory.lotBalanceMg(lotId), before,
+            'two lines sharing one lot must reserve their combined weight or write nothing');
+    });
+
+    const exchange = returnService.createReturn({
+        invoiceId: stockSale.invoiceId, weightGrams: 2, refundMode: 'exchange'
+    }, DEPS);
+
+    check('an exchange return restores stock and issues a marked customer credit', () => {
+        assert.equal(exchange.ok, true);
+        assert.equal(exchange.return.refundMode, 'exchange');
+        assert.equal(exchange.return.isExchange, true);
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 7000);
+        assert.ok(exchange.advanceCredit);
+    });
+
+    check('the exchange credit binds once to its replacement invoice', () => {
+        const replacement = saleService.createSale({
+            customerName: 'Exchange Customer', customerPhone: '9888800001',
+            purity: '22K', weightGrams: 1, appliedAdvance: 100,
+            exchangeCreditNoteId: exchange.returnId
+        }, DEPS);
+        assert.equal(replacement.ok, true);
+        const note = repo.creditNotes.findByNumber(context.tenantId, exchange.returnId);
+        assert.equal(note.exchange_invoice_id, repo.invoices.findByNumber(context.tenantId, replacement.invoiceId).id);
+
+        const reused = saleService.createSale({
+            customerName: 'Exchange Customer', customerPhone: '9888800001',
+            purity: '22K', weightGrams: 1, appliedAdvance: 100,
+            exchangeCreditNoteId: exchange.returnId
+        }, DEPS);
+        assert.equal(reused.ok, false);
+        assert.equal(reused.status, 409);
+    });
+
+    check('same-day void appends a stock reversal and marks, rather than erases, the invoice', () => {
+        const sale = saleService.createSale({
+            lines: [{ purity: '22K', weightGrams: 1, inventoryItemId: itemId, inventoryLotId: lotId }]
+        }, DEPS);
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 6000);
+        const result = saleService.voidSale(sale.invoiceId, 'Cashier selected wrong customer', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(result.ok, true);
+        assert.equal(result.sale.state, 'cancelled');
+        assert.equal(repo.inventory.lotBalanceMg(lotId), 7000);
+        assert.equal(repo.invoices.findByNumber(context.tenantId, sale.invoiceId).state, 'cancelled');
+    });
+
+    check('reconciliation compares counter tenders to the already advance-net invoice payable', () => {
+        const deposit = advanceService.recordDeposit({
+            customerName: 'Reconciliation Customer', customerPhone: '9888800002',
+            amount: 100, paymentMethod: 'Cash', referenceId: 'REPORT-ADVANCE-1'
+        }, DEPS);
+        assert.equal(deposit.success, true);
+        const sale = saleService.createSale({
+            customerName: 'Reconciliation Customer', customerPhone: '9888800002',
+            purity: '22K', weightGrams: 1, appliedAdvance: 100,
+            tenders: [{ method: 'cash' }]
+        }, DEPS);
+        assert.equal(sale.ok, true, sale.error);
+        const report = repo.reports.reconciliation({ tenantId: context.tenantId });
+        assert.equal(report.issues.some(row => row.invoice_number === sale.invoiceId), false,
+            'total_amount_paise is already net of advance and must not have advance subtracted twice');
+    });
+
+    check('profitability and ageing reports use the lot cost and current movement-derived stock', () => {
+        const profit = repo.reports.profitability({ tenantId: context.tenantId });
+        const costed = profit.rows.find(row => row.invoiceNumber === stockSale.invoiceId);
+        assert.ok(costed);
+        assert.equal(costed.netWeightMg, 3000, 'the 2g return must reduce the sold weight from 5g to 3g');
+        assert.equal(costed.costPaise, 1500000);
+        assert.ok(profit.totals.costCoveragePercent > 0);
+
+        const ageing = repo.reports.ageing({ tenantId: context.tenantId, branchId: context.branchId });
+        const agedLot = ageing.rows.find(row => row.lotId === lotId);
+        assert.equal(agedLot.balanceMg, 7000);
+        assert.equal(agedLot.costValuePaise, 3500000);
+    });
+}
+
 /* -------------------------------------------------------------------------- */
 
 repo.closeDb();

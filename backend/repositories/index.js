@@ -35,6 +35,7 @@ export * as inventory from './inventoryRepository.js';
 export * as cashShifts from './cashShiftRepository.js';
 export * as saleDrafts from './saleDraftRepository.js';
 export * as organisation from './organisationRepository.js';
+export * as reports from './reportRepository.js';
 
 export { inTransaction, inTransactionNow, backupTo, checkpointAndCopy, closeDb, DB_FILE, migrationStatus };
 export { businessDate, financialYear, businessDateBounds, documentNumber } from './calendar.js';

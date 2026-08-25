@@ -5,29 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gold Business POS</title>
     <link rel="stylesheet" href="css/app.css">
-    <script>
-        // Custom UI Alert Override
-        window.alert = function(message) {
-            if (document.getElementById('custom-alert-box')) return;
-            
-            const isSuccess = message.toLowerCase().includes('success');
-            const icon = isSuccess ? '✓' : '!';
-            const iconBg = isSuccess ? '#dcfce7' : '#f1f5f9';
-            const iconColor = isSuccess ? '#166534' : '#334155';
-
-            const overlay = document.createElement('div');
-            overlay.id = 'custom-alert-box';
-            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(15,23,42,0.8);display:flex;align-items:center;justify-content:center;z-index:999999;backdrop-filter:blur(2px);';
-            overlay.innerHTML = `
-                <div style="background:#ffffff; border-radius:8px; padding:25px; width:90%; max-width:400px; box-shadow:0 10px 25px rgba(0,0,0,0.2); text-align:center; border:1px solid #cbd5e1; font-family:'Outfit',sans-serif;">
-                    <div style="width:40px; height:40px; border-radius:50%; background:${iconBg}; color:${iconColor}; display:flex; align-items:center; justify-content:center; margin:0 auto 15px; font-weight:bold; font-size:20px;">${icon}</div>
-                    <p style="color:#1e293b; font-size:14px; line-height:1.5; margin-bottom:20px; font-weight:500;">${message}</p>
-                    <button style="background:#0f172a; color:#fff; border:none; padding:10px 25px; border-radius:6px; cursor:pointer; font-weight:600; width:100%; font-family:'Outfit',sans-serif;" onclick="document.getElementById('custom-alert-box').remove()">OK</button>
-                </div>
-            `;
-            document.body.appendChild(overlay);
-        };
-    </script>
+    <script src="js/adminAlertOverride.js"></script>
 </head>
 <body>
     <!-- Admin Login Screen -->
@@ -70,6 +48,7 @@
                 <button class="nav-btn" data-target="returns-tab">Returns &amp; Refunds</button>
                 <button class="nav-btn" data-target="advances-tab">Customer Advances</button>
                 <button class="nav-btn" data-target="inventory-tab">Inventory</button>
+                <button class="nav-btn" data-target="reports-tab">Management Reports</button>
                 <button class="nav-btn" data-target="cash-shifts-tab">Cash Shifts</button>
                 <button class="nav-btn" data-target="quotes-holds-tab">Quotes &amp; Holds</button>
                 <button class="nav-btn" data-target="customer-accounts-tab">Customers</button>
@@ -160,6 +139,13 @@
                     <div class="panel-body">
                         <p>Loading inventory...</p>
                     </div>
+                </section>
+
+                <section id="reports-tab" class="tab-panel">
+                    <div class="panel-header">
+                        <h1>Settlement, Reconciliation, Profitability &amp; Ageing</h1>
+                    </div>
+                    <div class="panel-body"><p>Loading reports…</p></div>
                 </section>
 
                 <!-- Cash Shifts Tab -->

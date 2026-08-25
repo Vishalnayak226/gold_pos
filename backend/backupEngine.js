@@ -10,9 +10,11 @@ import path from 'path';
 import cron from 'node-cron';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import crypto from 'crypto';
 import { logError, logTelemetry, DATA_DIR } from './db.js';
 import { DB_FILE, checkpointAndCopy } from './repositories/connection.js';
 import { raiseAlert } from './alerting.js';
+import { readSettings } from './settingsStore.js';
 
 const BACKEND_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -71,7 +73,9 @@ export function createBackup() {
         // use, rather than re-implementing the checks here.
         verifyLatestBackupAsync();
 
-        return { success: true, folder: `backup_${todayStr}` };
+        const offsite = shipOffsite(targetBackupDir);
+
+        return { success: true, folder: `backup_${todayStr}`, offsite };
     } catch (err) {
         logError('Daily backup execution failed: ' + err.message, err.stack);
         raiseAlert({
@@ -80,6 +84,106 @@ export function createBackup() {
             message: 'The nightly database backup failed: ' + err.message
         });
         return { success: false, error: err.message };
+    }
+}
+
+/** Hashes one copied file for source/destination verification. */
+function fileSha256(filepath) {
+    const hash = crypto.createHash('sha256');
+    hash.update(fs.readFileSync(filepath));
+    return hash.digest('hex');
+}
+
+/**
+ * Copies the completed nightly snapshot to a mounted/synchronised destination
+ * and verifies every copied file byte-for-byte by SHA-256.  Transport (SMB,
+ * rclone, encrypted disk, NAS) is an operator concern; this process only sees
+ * a filesystem path and therefore stores no cloud credential.
+ */
+export function shipOffsite(localBackupDir) {
+    const settings = readSettings();
+    if (settings.offsiteBackupEnabled !== true) return { enabled: false };
+
+    const configured = process.env.GOLD_POS_OFFSITE_BACKUP_DIR || settings.offsiteBackupPath;
+    let staging = null;
+    try {
+        if (!configured || !String(configured).trim()) throw new Error('Off-site backup is enabled but no destination path is configured.');
+        const destinationRoot = path.resolve(String(configured).trim());
+        const localRoot = path.resolve(BACKUPS_DIR);
+        const dataRoot = path.resolve(DATA_DIR);
+        const relativeToLocal = path.relative(localRoot, destinationRoot);
+        const relativeToData = path.relative(dataRoot, destinationRoot);
+        if (relativeToLocal === '' || (!relativeToLocal.startsWith('..') && !path.isAbsolute(relativeToLocal))) {
+            throw new Error('Off-site destination must not be inside the local backup directory.');
+        }
+        if (relativeToData === '' || (!relativeToData.startsWith('..') && !path.isAbsolute(relativeToData))) {
+            throw new Error('Off-site destination must not be inside the live data directory.');
+        }
+
+        fs.mkdirSync(destinationRoot, { recursive: true });
+        const folder = path.basename(localBackupDir);
+        const target = path.join(destinationRoot, folder);
+        staging = path.join(destinationRoot, `.${folder}.${process.pid}.${Date.now()}.tmp`);
+        fs.mkdirSync(staging, { recursive: true });
+        const manifest = [];
+        for (const name of fs.readdirSync(localBackupDir)) {
+            const source = path.join(localBackupDir, name);
+            if (!fs.statSync(source).isFile()) continue;
+            const copied = path.join(staging, name);
+            fs.copyFileSync(source, copied);
+            const sourceHash = fileSha256(source);
+            const copiedHash = fileSha256(copied);
+            if (sourceHash !== copiedHash) throw new Error(`Hash verification failed for ${name}.`);
+            manifest.push({ name, bytes: fs.statSync(copied).size, sha256: copiedHash });
+        }
+        fs.writeFileSync(path.join(staging, 'manifest.json'), JSON.stringify({
+            createdAt: new Date().toISOString(), sourceFolder: folder, files: manifest
+        }, null, 2));
+
+        // Publish only after every file and hash is complete. A repeat run for
+        // the same date keeps the previous good directory until the verified
+        // staging directory is ready, so a copy failure can never leave an old
+        // manifest beside partially refreshed data.
+        let previous = null;
+        if (fs.existsSync(target)) {
+            previous = path.join(destinationRoot, `.${folder}.${process.pid}.${Date.now()}.previous`);
+            fs.renameSync(target, previous);
+        }
+        try {
+            fs.renameSync(staging, target);
+            staging = null;
+        } catch (promotionError) {
+            if (previous && fs.existsSync(previous) && !fs.existsSync(target)) {
+                fs.renameSync(previous, target);
+                previous = null;
+            }
+            throw promotionError;
+        }
+        if (previous) fs.rmSync(previous, { recursive: true, force: true });
+
+        pruneOffsite(destinationRoot, Number(settings.offsiteBackupRetentionDays) || 30);
+        logTelemetry('BACKUP_OFFSITE_SUCCESS', 0, `Dir: ${target}`);
+        return { enabled: true, success: true, destination: target, verifiedFiles: manifest.length };
+    } catch (err) {
+        if (staging && fs.existsSync(staging)) {
+            try { fs.rmSync(staging, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        }
+        logError('Off-site backup failed: ' + err.message, err.stack);
+        raiseAlert({
+            code: 'BACKUP_OFFSITE_FAILED', severity: 'critical',
+            message: 'The local backup succeeded but its off-site copy failed: ' + err.message
+        });
+        return { enabled: true, success: false, error: err.message };
+    }
+}
+
+function pruneOffsite(destinationRoot, retentionDays) {
+    const cutoff = Date.now() - retentionDays * 86400000;
+    for (const name of fs.readdirSync(destinationRoot)) {
+        if (!/^backup_\d{4}-\d{2}-\d{2}$/.test(name)) continue;
+        const candidate = path.join(destinationRoot, name);
+        const stat = fs.statSync(candidate);
+        if (stat.isDirectory() && stat.mtimeMs < cutoff) fs.rmSync(candidate, { recursive: true, force: true });
     }
 }
 

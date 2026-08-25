@@ -28,14 +28,16 @@ export function insertCreditNote(note) {
             id, tenant_id, branch_id, credit_note_number, financial_year, sequence_value,
             invoice_id, customer_id, customer_name, customer_phone,
             refund_mode, refund_amount_paise, closes_invoice, advance_entry_id,
-            itemised, note, idempotency_key, created_by_user_id, issued_at, business_date
+            itemised, is_exchange, exchange_invoice_id,
+            note, idempotency_key, created_by_user_id, issued_at, business_date
         ) VALUES (
             @id, @tenantId, @branchId, @creditNoteNumber, @financialYear, @sequenceValue,
             @invoiceId, @customerId, @customerName, @customerPhone,
             @refundMode, @refundAmountPaise, @closesInvoice, @advanceEntryId,
-            @itemised, @note, @idempotencyKey, @createdByUserId, @issuedAt, @businessDate
+            @itemised, @isExchange, @exchangeInvoiceId,
+            @note, @idempotencyKey, @createdByUserId, @issuedAt, @businessDate
         )
-    `).run(note);
+    `).run({ isExchange: 0, exchangeInvoiceId: null, ...note });
     return note.id;
 }
 
@@ -63,6 +65,16 @@ export function attachAdvanceEntry(creditNoteId, advanceEntryId) {
     assertInTransaction('attachAdvanceEntry');
     getDb().prepare('UPDATE credit_notes SET advance_entry_id = ? WHERE id = ?')
         .run(advanceEntryId, creditNoteId);
+}
+
+/** Links a return-exchange credit to the replacement invoice that consumed it. */
+export function attachExchangeInvoice(creditNoteId, invoiceId) {
+    assertInTransaction('attachExchangeInvoice');
+    const result = getDb().prepare(`
+        UPDATE credit_notes SET exchange_invoice_id = ?
+        WHERE id = ? AND is_exchange = 1 AND exchange_invoice_id IS NULL
+    `).run(invoiceId, creditNoteId);
+    if (result.changes !== 1) throw new Error('Exchange credit is invalid or has already been used.');
 }
 
 /* --------------------------------------------------------------------------
@@ -339,7 +351,9 @@ export function toLegacyReturn(note, context = {}) {
            `created_by_user_id`, never copied from a request body. */
         actor: context.actor !== undefined ? context.actor : actorForUserId(note.created_by_user_id),
         refundAmount: fromPaise(note.refund_amount_paise),
-        refundMode: note.refund_mode,
+        refundMode: note.is_exchange === 1 ? 'exchange' : note.refund_mode,
+        isExchange: note.is_exchange === 1,
+        exchangeInvoiceId: note.exchange_invoice_id || null,
         /* Whether this return exhausted the LINE, as distinct from the invoice.
            Derived from the line's own running counter rather than stored: it is
            a statement about where the line stands now, and the counter is the

@@ -222,6 +222,8 @@ export class ReprintDesk {
                 <td class="text-right">
                     <button type="button" class="btn btn-secondary btn-sm reprint-open-btn"
                             data-invoice="${escapeHtml(sale.id)}">Open</button>
+                    ${sale.state !== 'cancelled' ? `<button type="button" class="btn btn-secondary btn-sm void-invoice-btn"
+                            data-invoice="${escapeHtml(sale.id)}">Void</button>` : ''}
                 </td>
             </tr>
         `).join('');
@@ -259,6 +261,39 @@ export class ReprintDesk {
                 btn.getAttribute('data-invoice'), btn.getAttribute('data-delivered') === '1'
             ));
         });
+        resultsEl.querySelectorAll('.void-invoice-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.voidInvoice(btn.getAttribute('data-invoice')));
+        });
+    }
+
+    async voidInvoice(invoiceNumber) {
+        const reason = window.prompt(
+            `Cancel ${invoiceNumber}? This is only allowed on the same business date and restores linked stock.\n\nEnter a reason (at least 5 characters):`
+        );
+        if (reason === null) return;
+        if (reason.trim().length < 5) {
+            alert('Enter a cancellation reason of at least 5 characters.');
+            return;
+        }
+        if (!window.confirm(`Permanently mark ${invoiceNumber} CANCELLED? Filed rows remain in the audit trail.`)) return;
+        try {
+            const res = await adminFetch(`/api/sales/${encodeURIComponent(invoiceNumber)}/void`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason: reason.trim() })
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                alert(body.error || 'The invoice could not be cancelled.');
+                return;
+            }
+            const index = this.results.findIndex(sale => sale.id === invoiceNumber);
+            if (index >= 0) this.results[index] = body.sale;
+            this.renderResults(this.lastSearchData || { truncated: false, total: this.results.length });
+            logTelemetry(`Cancelled invoice ${invoiceNumber}.`);
+        } catch (err) {
+            alert('Could not reach the server. Nothing was cancelled.');
+        }
     }
 
     /** Flips an invoice's delivery status. Reversible on purpose — see the route's own comment for why. */
@@ -367,6 +402,7 @@ export class ReprintDesk {
             <div class="reprint-controls" style="display:flex; gap:10px; align-items:center; margin:20px 0;">
                 <button type="button" id="reprint-print-btn" class="btn btn-primary">PRINT DUPLICATE</button>
                 <button type="button" id="reprint-close-btn" class="btn btn-secondary">Close</button>
+                ${sale.state === 'cancelled' ? `<strong style="color:var(--color-danger);">CANCELLED — ${escapeHtml(sale.cancelReason || '')}</strong>` : ''}
                 <span class="text-muted-small">
                     Filed ${escapeHtml(formatWhen(sale.timestamp))}${sale.goldRateSource ? ` · rate source: ${escapeHtml(sale.goldRateSource)}` : ''}${
                         // Who billed it. Shown on the desk's control strip, not

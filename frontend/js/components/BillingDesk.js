@@ -77,6 +77,8 @@ export class BillingDesk {
         this.customerAdvanceBalance = 0;
         this.customerPhone = '';
         this.customerName = '';
+        this.inventorySelection = null;
+        this.exchangeCreditNoteId = null;
 
         /* THE CART. Items already added to this invoice, in order.
            Empty for the common single-item sale: the entry form's own contents
@@ -213,6 +215,22 @@ export class BillingDesk {
                     <form id="billing-form">
                         <div class="form-section">
                             <h3>1. Gold Metal Valuation</h3>
+                            <div class="form-group-row">
+                                <div class="form-group" style="flex:2;">
+                                    <label for="billing-sku">Barcode / SKU</label>
+                                    <input type="text" id="billing-sku" class="form-control" maxlength="64"
+                                           placeholder="Scan or type a catalogue SKU">
+                                </div>
+                                <div class="form-group" style="align-self:end;">
+                                    <button type="button" id="billing-sku-lookup" class="btn btn-secondary">Find item</button>
+                                </div>
+                                <div class="form-group" id="billing-lot-group" style="display:none; flex:2;">
+                                    <label for="billing-lot">Stock lot</label>
+                                    <select id="billing-lot" class="form-control"></select>
+                                </div>
+                            </div>
+                            <p id="billing-sku-status" class="text-muted-small" style="margin:-4px 0 10px;"></p>
+                            <div id="billing-exchange-banner" class="text-muted-small" style="display:none; margin-bottom:10px; padding:9px 11px; border:1px solid #f59e0b; background:#fffbeb; border-radius:6px;"></div>
                             <div class="form-group-row">
                                 <div class="form-group">
                                     <label for="gold-purity">Purity</label>
@@ -480,9 +498,26 @@ export class BillingDesk {
 
         if (!form) return;
 
+        const skuInput = document.getElementById('billing-sku');
+        document.getElementById('billing-sku-lookup')?.addEventListener('click', () => this.lookupSku());
+        skuInput?.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            this.lookupSku();
+        });
+        skuInput?.addEventListener('input', () => {
+            if (!skuInput.value.trim()) this.clearInventorySelection();
+        });
+        document.getElementById('billing-lot')?.addEventListener('change', (event) => {
+            if (this.inventorySelection) this.inventorySelection.lotId = event.target.value;
+        });
+
         // Purity changes
         puritySelect.addEventListener('change', (e) => {
             this.selectedPurity = e.target.value;
+            if (this.inventorySelection && this.inventorySelection.item.purity !== PURITY_BY_KEY[this.selectedPurity]) {
+                this.clearInventorySelection('Catalogue link cleared because the purity was changed.');
+            }
             this.updateGoldRateDisplay();
             this.recalculate();
         });
@@ -858,6 +893,8 @@ export class BillingDesk {
             purityKey: this.selectedPurity,
             purity: PURITY_BY_KEY[this.selectedPurity],
             description: String(document.getElementById('item-description')?.value || '').trim(),
+            inventoryItemId: this.inventorySelection?.item.id || null,
+            inventoryLotId: this.inventorySelection?.lotId || null,
             weightGrams: weight,
             goldPricePerGram: rate,
             metalValue: round2(weight * rate),
@@ -890,6 +927,9 @@ export class BillingDesk {
         const descInput = document.getElementById('item-description');
         if (weightInput) weightInput.value = '';
         if (descInput) descInput.value = '';
+        const skuInput = document.getElementById('billing-sku');
+        if (skuInput) skuInput.value = '';
+        this.clearInventorySelection();
         if (weightInput) weightInput.focus();
 
         this.renderCart();
@@ -1266,7 +1306,9 @@ export class BillingDesk {
                 weightGrams: l.weightGrams,
                 goldPricePerGram: l.goldPricePerGram,
                 makingChargePercent: l.makingChargePercent,
-                makingChargeAmount: l.makingChargeAmount
+                makingChargeAmount: l.makingChargeAmount,
+                inventoryItemId: l.inventoryItemId || null,
+                inventoryLotId: l.inventoryLotId || null
             })),
             discountPercent: this.discountPercent,
             appliedAdvance: this.appliedAdvance,
@@ -1288,7 +1330,8 @@ export class BillingDesk {
                 : this.tenders
                     .filter(t => Number(t.amount) > 0)
                     .map(t => ({ method: t.method, amount: round2(t.amount), reference: t.reference })),
-            totalAmount: this.totalAmount
+            totalAmount: this.totalAmount,
+            exchangeCreditNoteId: this.exchangeCreditNoteId
         };
 
         try {
@@ -1337,6 +1380,8 @@ export class BillingDesk {
         // A filed invoice takes its items and its payment split with it — the
         // next customer must not inherit either.
         this.cart = [];
+        this.inventorySelection = null;
+        this.exchangeCreditNoteId = null;
         this.tenders = [{ method: 'cash', amount: 0, reference: '', amountEdited: false }];
         this.renderCart();
         this.renderTenderRows();
@@ -1360,6 +1405,80 @@ export class BillingDesk {
         if (previewPhone) previewPhone.textContent = '-';
 
         this.clearAdvance();
+        this.clearInventorySelection();
+        const exchangeBanner = document.getElementById('billing-exchange-banner');
+        if (exchangeBanner) exchangeBanner.style.display = 'none';
         this.recalculate();
+    }
+
+    /** Resolves a scanner value to catalogue metadata and an exact on-hand lot. */
+    async lookupSku() {
+        const input = document.getElementById('billing-sku');
+        const status = document.getElementById('billing-sku-status');
+        const sku = String(input?.value || '').trim();
+        if (!sku) {
+            this.clearInventorySelection('Scan or type a SKU first.');
+            return;
+        }
+        if (status) status.textContent = 'Looking up catalogue item…';
+        try {
+            const res = await adminFetch(`/api/inventory/items/by-sku/${encodeURIComponent(sku)}`);
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(body.error || 'SKU not found.');
+            if (!body.item?.isActive) throw new Error('This catalogue item is inactive.');
+            const lots = Array.isArray(body.lots) ? body.lots.filter(lot => Number(lot.weightGrams) > 0) : [];
+            if (lots.length === 0) throw new Error('This item has no stock on hand at this branch.');
+
+            this.inventorySelection = { item: body.item, lots, lotId: lots[0].id };
+            const purityKey = Object.keys(PURITY_BY_KEY).find(key => PURITY_BY_KEY[key] === body.item.purity);
+            if (purityKey) {
+                this.selectedPurity = purityKey;
+                document.getElementById('gold-purity').value = purityKey;
+            }
+            document.getElementById('item-description').value = body.item.name || '';
+            const nominalWeight = body.item.netWeightGrams ?? body.item.grossWeightGrams;
+            if (nominalWeight != null) document.getElementById('gold-weight').value = Number(nominalWeight).toFixed(3);
+
+            const lotGroup = document.getElementById('billing-lot-group');
+            const lotSelect = document.getElementById('billing-lot');
+            lotGroup.style.display = 'block';
+            lotSelect.innerHTML = lots.map(lot => `
+                <option value="${escapeHtml(lot.id)}">
+                    ${escapeHtml(lot.label || lot.hallmarkHuid || lot.id)} — ${Number(lot.weightGrams).toFixed(3)} g on hand
+                </option>`).join('');
+            if (status) status.textContent = `${body.item.name} · ${body.item.purity}${body.item.hsnCode ? ` · HSN ${body.item.hsnCode}` : ''}`;
+            this.updateGoldRateDisplay();
+            this.recalculate();
+        } catch (err) {
+            this.clearInventorySelection(err.message || 'Could not look up that SKU.');
+        }
+    }
+
+    clearInventorySelection(message = '') {
+        this.inventorySelection = null;
+        const lotGroup = document.getElementById('billing-lot-group');
+        const lotSelect = document.getElementById('billing-lot');
+        const status = document.getElementById('billing-sku-status');
+        if (lotGroup) lotGroup.style.display = 'none';
+        if (lotSelect) lotSelect.innerHTML = '';
+        if (status) status.textContent = message;
+    }
+
+    /** Starts the replacement-sale half of a filed return exchange. */
+    async startExchange(record) {
+        this.exchangeCreditNoteId = record.id;
+        this.customerName = record.customerName || '';
+        this.customerPhone = record.customerPhone || '';
+        const name = document.getElementById('customer-name');
+        const phone = document.getElementById('customer-phone');
+        if (name) name.value = this.customerName;
+        if (phone) phone.value = this.customerPhone;
+        const banner = document.getElementById('billing-exchange-banner');
+        if (banner) {
+            banner.style.display = 'block';
+            banner.textContent = `Exchange credit ${record.id}: ${money(record.refundAmount)}. Add the replacement item, then Apply Advance before saving.`;
+        }
+        if (this.customerPhone) await this.lookupCustomerAdvance(this.customerPhone);
+        document.querySelector('.nav-btn[data-target="sales-tab"]')?.click();
     }
 }

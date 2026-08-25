@@ -24,7 +24,7 @@
  */
 
 import {
-    inTransaction, invoices, creditNotes, advances, sequences, rates, audit, customers,
+    inTransaction, invoices, creditNotes, advances, sequences, rates, audit, customers, inventory,
     dataStoreContext, businessDate, financialYear, documentNumber
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
@@ -107,6 +107,12 @@ function priceLine(raw, index, activeRates, settings) {
         return { ok: false, status: 400, error: `${where} has a discount outside 0–100%.` };
     }
 
+    const inventoryItemId = String(raw.inventoryItemId || '').trim() || null;
+    const inventoryLotId = String(raw.inventoryLotId || '').trim() || null;
+    if ((inventoryItemId && !inventoryLotId) || (!inventoryItemId && inventoryLotId)) {
+        return { ok: false, status: 400, error: `${where} must identify both its catalogue item and stock lot.` };
+    }
+
     const rateKey = PURITY_RATE_KEY[raw.purity];
     const ratePerGram = Number(activeRates[rateKey]);
     if (!Number.isFinite(ratePerGram) || ratePerGram <= 0) {
@@ -145,6 +151,8 @@ function priceLine(raw, index, activeRates, settings) {
         line: {
             lineNumber: index + 1,
             description: String(raw.description || '').trim().slice(0, 120),
+            inventoryItemId,
+            inventoryLotId,
             purity: raw.purity,
             weightGrams,
             goldPricePerGram: ratePerGram,
@@ -252,7 +260,9 @@ export function createSale(input, deps) {
             makingChargeAmount: input.makingChargeAmount,
             makingChargePercent: input.makingChargePercent,
             discountPercent: input.discountPercent,
-            description: input.description
+            description: input.description,
+            inventoryItemId: input.inventoryItemId,
+            inventoryLotId: input.inventoryLotId
         }];
 
     if (requested.length > MAX_INVOICE_LINES) {
@@ -304,6 +314,35 @@ export function createSale(input, deps) {
 
     try {
         return inTransaction(() => {
+            /* Catalogue-linked lines reserve their exact lot under the same
+               BEGIN IMMEDIATE lock as the invoice.  A scan is convenience;
+               these checks are the authority, so a stale browser cannot sell
+               a disabled item, another branch's lot, or weight that is no
+               longer on hand. */
+            const reservedByLot = new Map();
+            for (const line of saleLineItems) {
+                if (!line.inventoryLotId) continue;
+                const item = inventory.getItem(context.tenantId, line.inventoryItemId);
+                const lot = inventory.getLot(context.tenantId, line.inventoryLotId);
+                if (!item || item.is_active !== 1) {
+                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s catalogue item is no longer active.`);
+                }
+                if (!lot || lot.item_id !== item.id || lot.branch_id !== context.branchId) {
+                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s stock lot is unavailable at this branch.`);
+                }
+                if (item.purity !== line.purity) {
+                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s purity no longer matches its catalogue item.`);
+                }
+                const requestedMg = weightMilligrams(line.weightGrams);
+                const reservedMg = (reservedByLot.get(lot.id) || 0) + requestedMg;
+                if (lot.balance_mg < reservedMg) {
+                    throw new DomainRefusal(409,
+                        `Lines using lot ${lot.id} need ${round3(reservedMg / 1000)}g in total, but it has only ${round3(lot.balance_mg / 1000)}g on hand.`,
+                        'INSUFFICIENT_STOCK');
+                }
+                reservedByLot.set(lot.id, reservedMg);
+            }
+
             /* THE BALANCE CHECK LIVES INSIDE THE TRANSACTION, and that is the
                "reserve funds safely during checkout" requirement in one line.
                `BEGIN IMMEDIATE` takes the write lock before this read, so two
@@ -390,6 +429,20 @@ export function createSale(input, deps) {
             const invoiceNumber = documentNumber(prefix, sequenceValue, fy);
             const invoiceId = newId('INV');
 
+            let exchangeNote = null;
+            if (input.exchangeCreditNoteId) {
+                exchangeNote = creditNotes.findByNumber(context.tenantId, String(input.exchangeCreditNoteId).trim());
+                if (!exchangeNote || exchangeNote.is_exchange !== 1 || exchangeNote.exchange_invoice_id) {
+                    throw new DomainRefusal(409, 'That exchange credit is invalid or has already been used.');
+                }
+                if (!customerPhone || exchangeNote.customer_phone !== customerPhone) {
+                    throw new DomainRefusal(400, 'The replacement sale must use the same customer phone as the exchange return.');
+                }
+                if (!(appliedAdvanceRequested > 0)) {
+                    throw new DomainRefusal(400, 'Apply some of the exchange credit before filing the replacement invoice.');
+                }
+            }
+
             // Provenance of the rates this invoice was priced at. A single
             // source when every line agrees, 'auto+manual' when they do not —
             // enough for an audit to notice a mixed invoice, with the per-line
@@ -457,11 +510,14 @@ export function createSale(input, deps) {
                `test_billing_math.js` §16. */
             saleLineItems.forEach((line, i) => {
                 const allocated = totals.lines[i];
+                const invoiceLineId = newId('ILN');
                 invoices.insertLine({
-                    id: newId('ILN'),
+                    id: invoiceLineId,
                     invoiceId,
                     lineNumber: line.lineNumber,
                     description: line.description || `${line.purity} gold`,
+                    inventoryItemId: line.inventoryItemId,
+                    inventoryLotId: line.inventoryLotId,
                     purity: line.purity,
                     weightMg: weightMilligrams(line.weightGrams),
                     ratePaisePerG: ratePaisePerGram(line.goldPricePerGram),
@@ -482,6 +538,20 @@ export function createSale(input, deps) {
                     taxAmountPaise: toPaise(allocated.taxAmount),
                     lineTotalPaise: toPaise(allocated.lineTotal)
                 });
+
+                if (line.inventoryLotId) {
+                    inventory.recordDocumentMovement({
+                        tenantId: context.tenantId,
+                        lotId: line.inventoryLotId,
+                        movementType: 'sale',
+                        weightDeltaMg: -weightMilligrams(line.weightGrams),
+                        invoiceId,
+                        invoiceLineId,
+                        reason: `Sale ${invoiceNumber}`,
+                        actorUserId,
+                        at: now
+                    });
+                }
             });
 
             /* The advance redemption, in the same transaction as the invoice it
@@ -549,6 +619,8 @@ export function createSale(input, deps) {
                 invoiceId, actorUserId, now,
                 payablePaise: toPaise(serverTotal)
             });
+
+            if (exchangeNote) creditNotes.attachExchangeInvoice(exchangeNote.id, invoiceId);
 
             audit.record({
                 tenantId: context.tenantId,
@@ -623,6 +695,119 @@ export function createSale(input, deps) {
             }),
             totalCorrected: false, rateCorrected: false
         };
+    }
+}
+
+/**
+ * Same-business-date void.  Nothing is erased: the invoice changes state,
+ * redeemed customer credit gets an opposite entry, and each sale stock
+ * movement gets a linked void movement in one transaction.
+ */
+export function voidSale(invoiceNumber, reason, deps = {}) {
+    const context = dataStoreContext();
+    const actorUserId = deps.actorUserId || context.ownerUserId;
+    const cleanNumber = String(invoiceNumber || '').trim();
+    const cleanReason = String(reason || '').trim();
+    if (!cleanNumber) return { ok: false, status: 400, error: 'Invoice number is required.' };
+    if (cleanReason.length < 5 || cleanReason.length > 300) {
+        return { ok: false, status: 400, error: 'Cancellation reason must be 5–300 characters.' };
+    }
+
+    try {
+        return inTransaction(() => {
+            const header = invoices.findByNumber(context.tenantId, cleanNumber);
+            if (!header) throw new DomainRefusal(404, `No filed invoice ${cleanNumber} exists.`);
+            if (header.state !== 'issued') {
+                throw new DomainRefusal(409, 'Only an issued invoice with no returns can be cancelled.');
+            }
+            const now = Date.now();
+            if (header.business_date !== businessDate(now)) {
+                throw new DomainRefusal(409,
+                    'Only a sale from the current business date can be voided. Use a return/credit note for an earlier sale.');
+            }
+
+            const priorReturns = creditNotes.summarizeForInvoice(header.id);
+            if (priorReturns.count > 0 || priorReturns.returnedWeightGrams > 0) {
+                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.');
+            }
+
+            for (const movement of inventory.documentSaleMovementsForInvoice(header.id)) {
+                inventory.recordDocumentMovement({
+                    tenantId: context.tenantId,
+                    lotId: movement.lot_id,
+                    movementType: 'void',
+                    weightDeltaMg: Math.abs(movement.weight_delta_mg),
+                    invoiceId: header.id,
+                    invoiceLineId: movement.invoice_line_id,
+                    reversesMovementId: movement.id,
+                    reason: `Void ${cleanNumber}: ${cleanReason}`,
+                    actorUserId,
+                    at: now
+                });
+            }
+
+            const advanceTender = invoices.tendersFor(header.id).find(row => row.method === 'advance' && row.advance_entry_id);
+            if (advanceTender) {
+                const redemption = advances.findEntryById(advanceTender.advance_entry_id);
+                if (!redemption || redemption.status !== 'posted') {
+                    throw new DomainRefusal(409, 'The invoice advance redemption is not in a reversible state.');
+                }
+                advances.insertEntry({
+                    id: newId('REV'),
+                    tenantId: context.tenantId,
+                    branchId: context.branchId,
+                    accountId: redemption.account_id,
+                    entryType: 'reversal',
+                    amountPaise: Math.abs(redemption.amount_paise),
+                    status: 'posted',
+                    paymentMethod: 'other',
+                    referenceId: null,
+                    source: 'counter',
+                    lockedRate22kPaisePerG: redemption.locked_rate_22k_paise_per_g,
+                    invoiceId: header.id,
+                    creditNoteId: null,
+                    reversesEntryId: redemption.id,
+                    idempotencyKey: null,
+                    createdByUserId: actorUserId,
+                    approvedByUserId: actorUserId,
+                    approvedAt: now,
+                    reviewNote: `Void ${cleanNumber}: ${cleanReason}`,
+                    createdAt: now,
+                    businessDate: businessDate(now)
+                });
+            }
+
+            invoices.cancelInvoice(header.id, { actorUserId, reason: cleanReason, at: now });
+            audit.record({
+                tenantId: context.tenantId,
+                branchId: context.branchId,
+                actorUserId,
+                actorLabel: deps.actorLabel || 'counter',
+                action: 'SALE_VOIDED',
+                entityType: 'invoice',
+                entityId: header.id,
+                summary: `Invoice ${cleanNumber} cancelled`,
+                detail: { invoiceNumber: cleanNumber, reason: cleanReason },
+                ipAddress: deps.ipAddress || null,
+                occurredAt: now
+            });
+
+            const cancelled = invoices.findById(header.id);
+            return {
+                ok: true,
+                invoiceId: cleanNumber,
+                sale: invoices.toLegacySale(cancelled, invoices.linesFor(header.id), {
+                    tenders: invoices.tendersFor(header.id), actor: deps.actor || null
+                })
+            };
+        });
+    } catch (err) {
+        if (err instanceof DomainRefusal) return { ok: false, status: err.status, error: err.message, code: err.code };
+        if (isUniqueViolation(err)) {
+            return { ok: false, status: 409, error: 'This invoice has already been cancelled.' };
+        }
+        logError('Sale void failed and was rolled back: ' + err.message, err.stack);
+        return { ok: false, status: 500, error: 'Failed to cancel invoice: ' + err.message };
     }
 }
 

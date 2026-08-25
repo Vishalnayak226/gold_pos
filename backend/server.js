@@ -20,7 +20,7 @@ import { initPitrScheduler } from './pitr.js';
 import { assertProductionReady, assertVaultKeyReady } from './productionGuard.js';
 import { checkForUpdates, applyPendingUpdate, initUpdateScheduler } from './updateEngine.js';
 import {
-    requireAdminSession, requireApprover, verifyAdminPin, createAdminSession, destroyAdminSession,
+    requireAdminSession, requireApprover, requireRole, verifyAdminPin, createAdminSession, destroyAdminSession,
     loginRateLimiter, recordLoginResult, roleCanApprove, listOperators, OWNER_ACTOR,
     ensureAuthSalt, hashPin, migrateStoredPins,
     generateTotpSecret, verifyTotp, totpEnrolmentUri, generateRecoveryCodes, consumeRecoveryCode,
@@ -236,6 +236,32 @@ const expensiveAdminLimiter = createRateLimiter({
     message: 'This operation is rate limited. Please wait before running it again.'
 });
 
+/* Public and unauthenticated: the cost is CPU (QRCode.toDataURL) per request,
+   so this is a straight DoS control, not an abuse-of-a-feature one. */
+const qrLimiter = createRateLimiter({
+    name: 'qrcode',
+    windowMs: 60 * 1000, max: 60,
+    message: 'Too many QR code requests. Please slow down.'
+});
+
+/** Payment verification: each call makes an upstream Razorpay HTTPS lookup we
+    do not own the quota for. Keyed per customer, not per IP, because the
+    session already names who is calling. */
+const paymentVerifyLimiter = createRateLimiter({
+    name: 'payment-verify',
+    windowMs: HOUR_MS, max: 60,
+    message: 'Too many payment verification attempts. Please wait a few minutes.',
+    keyOf: req => req.customerPhone || req.ip
+});
+
+/** License activation: public, and each call is a round trip to the central
+    licensing server's own control plane. */
+const licenseActivateLimiter = createRateLimiter({
+    name: 'license-activate',
+    windowMs: HOUR_MS, max: 20,
+    message: 'Too many activation attempts. Please wait a few minutes and try again.'
+});
+
 // Browser hardening. This frontend is normally same-origin; deployments that
 // intentionally split it onto another origin must list that exact origin (or
 // origins, comma-separated) in CORS_ORIGINS.
@@ -315,10 +341,20 @@ app.use(helmet({
             objectSrc: ["'none'"],
             frameAncestors: ["'none'"],
             formAction: ["'self'"],
-            scriptSrc: ["'self'", "'unsafe-inline'", 'https://checkout.razorpay.com'],
-            // Inline handlers remain in the legacy HTML. Keep them working
-            // while still enforcing the rest of the CSP boundary.
-            scriptSrcAttr: ["'unsafe-inline'"],
+            // 'unsafe-inline' removed 2026-08-24 (security audit C5): every
+            // inline <script> block and onclick="" attribute in index.html
+            // and customer.html was moved into frontend/js/ files (see
+            // js/adminAlertOverride.js, js/customerAlertOverride.js,
+            // js/customer-app.js), so there is nothing left that needs it —
+            // and removing it is what turns the C4 stored-XSS finding (a
+            // server-supplied string reaching alert()'s innerHTML) from
+            // "executes" into "inert markup the browser refuses to run".
+            // scriptSrcAttr is left unset so it falls back to this list.
+            scriptSrc: ["'self'", 'https://checkout.razorpay.com'],
+            // styleSrc keeps 'unsafe-inline': both pages use style="" on
+            // essentially every element (a deliberate no-build-step,
+            // no-CSS-framework choice — see CLAUDE.md §0), and unlike script
+            // injection, injected CSS cannot execute code on its own.
             styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
             fontSrc: ["'self'", 'https://fonts.gstatic.com'],
             imgSrc: ["'self'", 'data:', 'https:'],
@@ -803,16 +839,20 @@ app.post('/api/customer/register', customerLoginRateLimiter, registerLimiter, va
         const pwError = validatePasswordStrength(password);
         if (pwError) return res.status(400).json({ error: pwError });
 
-        if (accountExists(phone)) {
+        /* SAME response for both negative cases, deliberately (security audit
+           H4): ACCOUNT_EXISTS and CLAIM_REQUIRES_STORE used to answer with
+           distinct codes and wording, which let anyone probe a phone number
+           and learn whether it belonged to a customer at all — and, for one
+           that did, whether it already had a portal login. A registration
+           endpoint has no reason to be more revealing than a login endpoint,
+           which already answers both "wrong password" and "no such account"
+           identically. The single message below still tells a genuine
+           customer what to do in either case, without confirming which one
+           applied to their number. */
+        if (accountExists(phone) || phoneHasStoreHistory(phone)) {
             return res.status(409).json({
-                error: 'ACCOUNT_EXISTS',
-                message: 'An account already exists for this mobile number. Please sign in, or use "Forgot password".'
-            });
-        }
-        if (phoneHasStoreHistory(phone)) {
-            return res.status(409).json({
-                error: 'CLAIM_REQUIRES_STORE',
-                message: 'This mobile number already has records with the store. For your security, please ask the store to set up your login at the counter.'
+                error: 'REGISTRATION_BLOCKED',
+                message: 'This mobile number cannot be self-registered. If you already have a login, sign in or use "Forgot password". If not, ask the store to set one up for you at the counter.'
             });
         }
 
@@ -1084,8 +1124,12 @@ app.post('/api/customer/advances', requireEstablishedCustomer, depositClaimLimit
  * consent, anonymised flag) the Customers screen needs for correction and
  * consent management. Never returns password hashes, session tokens, or
  * reset codes.
+ *
+ * MANAGER-OR-OWNER (security audit C3): this lists every customer phone
+ * number the tenant has, which a cashier session has no operational need to
+ * enumerate wholesale.
  */
-app.get('/api/customer-accounts', requireAdminSession, (req, res) => {
+app.get('/api/customer-accounts', requireAdminSession, requireRole('owner', 'manager'), (req, res) => {
     try {
         const tenantId = repo.dataStoreContext().tenantId;
         const accounts = repo.customers.loadAccounts(tenantId);
@@ -1125,8 +1169,12 @@ app.get('/api/customer-accounts', requireAdminSession, (req, res) => {
  *
  * Resetting an existing account signs all of that customer's devices out, so
  * it is confirmation-gated the same way lowering the invoice sequence is.
+ *
+ * MANAGER-OR-OWNER (security audit C3): this can reset any customer's portal
+ * password and sign every one of their devices out — a cashier session
+ * should not be able to take over a customer's account single-handed.
  */
-app.post('/api/customer-accounts/issue-login', requireAdminSession, (req, res) => {
+app.post('/api/customer-accounts/issue-login', requireAdminSession, requireRole('owner', 'manager'), (req, res) => {
     try {
         const { phone, name, email, confirmDestructive } = req.body || {};
         if (!isValidPhone(phone)) {
@@ -1201,13 +1249,13 @@ app.get('/api/gold-price', (req, res) => {
  * POST /api/gold-price/sync
  * Manually triggers a remote API price fetch/update
  */
-app.post('/api/gold-price/sync', requireAdminSession, expensiveAdminLimiter, async (req, res) => {
+app.post('/api/gold-price/sync', requireAdminSession, requireRole('owner', 'manager'), expensiveAdminLimiter, async (req, res) => {
     try {
         const updatedRates = await syncGoldPrice();
         res.json({ success: true, rates: updatedRates });
     } catch (err) {
         logError('Manual gold price sync API failed: ' + err.message, err.stack);
-        res.status(500).json({ error: 'Sync failed: ' + err.message });
+        res.status(500).json({ error: 'Sync failed. Please retry.', requestId: req.id });
     }
 });
 
@@ -1266,7 +1314,13 @@ function preserveWriteOnlyValue(requested, current) {
     return requested === undefined || requested === null ? current : requested;
 }
 
-const OPERATOR_PIN_PATTERN = /^\d{4,8}$/;
+// Raised from 4 to 6 minimum digits 2026-08-24 (security audit H1): a 4-digit
+// PIN is only a 10,000-value keyspace. Only gates a PIN being SET here — a
+// PIN already on disk from before this change still verifies at login
+// (ADMIN_LOGIN_SCHEMA imposes no length beyond the transport max), so no
+// existing operator is locked out by this; it only raises the bar for what a
+// NEW or CHANGED PIN may be.
+const OPERATOR_PIN_PATTERN = /^\d{6,8}$/;
 
 /**
  * Validates an inbound operator roster and restores the PINs the browser was
@@ -1282,8 +1336,14 @@ const OPERATOR_PIN_PATTERN = /^\d{4,8}$/;
  * people sharing one does not merely weaken a credential, it makes the
  * attribution on every invoice they file a coin toss — which is the exact
  * problem the roster exists to remove.
+ *
+ * `callerRole` is who is submitting this save. POST /api/settings is now
+ * owner-gated (security audit C1), so in practice this is always 'owner' —
+ * but the check stays here too, in the function that actually writes a role
+ * onto disk, as defence-in-depth against a future route that reaches this
+ * without that gate.
  */
-function mergeOperators(incoming, current, authSalt) {
+function mergeOperators(incoming, current, authSalt, callerRole) {
     if (incoming === undefined) return { ok: true, operators: current.operators || [] };
     if (!Array.isArray(incoming)) {
         return { ok: false, error: 'Operators must be a list.' };
@@ -1321,6 +1381,9 @@ function mergeOperators(incoming, current, authSalt) {
         if (!OPERATOR_ROLES.includes(role)) {
             return { ok: false, error: `"${name}" has an unknown role. Use one of: ${OPERATOR_ROLES.join(', ')}.` };
         }
+        if (role === 'owner' && String(callerRole || '').toLowerCase() !== 'owner') {
+            return { ok: false, error: `Only the store owner may create or edit an owner-role operator (attempted for "${name}").` };
+        }
 
         const id = String(raw.id || '').trim() || newId('OP');
         if (seenIds.has(id)) return { ok: false, error: 'Two operators cannot share an id.' };
@@ -1343,7 +1406,7 @@ function mergeOperators(incoming, current, authSalt) {
         } else {
             const pin = String(raw.pin).trim();
             if (!OPERATOR_PIN_PATTERN.test(pin)) {
-                return { ok: false, error: `"${name}"'s PIN must be 4 to 8 digits.` };
+                return { ok: false, error: `"${name}"'s PIN must be 6 to 8 digits.` };
             }
             pinHash = hashPin(pin, authSalt);
         }
@@ -1425,9 +1488,14 @@ app.get('/api/settings', requireAdminSession, (req, res) => {
 
 /**
  * POST /api/settings
- * Updates system configurations.
+ * Updates system configurations. OWNER ONLY (security audit C1): this route
+ * can rewrite the operator roster (including granting itself `owner`), zero
+ * the GST slab, repoint the Razorpay keys, or disable refund-approval MFA —
+ * `requireAdminSession` alone proves someone is signed in, not that they are
+ * trusted with the whole system, so a cashier or manager session must not
+ * reach the handler at all.
  */
-app.post('/api/settings', requireAdminSession, (req, res) => {
+app.post('/api/settings', requireAdminSession, requireRole('owner'), (req, res) => {
     try {
         const currentSettings = readSettings();
 
@@ -1472,7 +1540,7 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         // The operator roster carries login credentials and decides who can
         // approve money, so it is validated before anything is written rather
         // than merged through and trusted.
-        const roster = mergeOperators(req.body.operators, currentSettings, authSalt);
+        const roster = mergeOperators(req.body.operators, currentSettings, authSalt, req.actor.role);
         if (!roster.ok) {
             return res.status(400).json({ error: roster.error });
         }
@@ -1535,7 +1603,7 @@ app.post('/api/settings', requireAdminSession, (req, res) => {
         if (req.body.adminPin !== undefined && req.body.adminPin !== null && String(req.body.adminPin).trim() !== '') {
             const newPin = String(req.body.adminPin).trim();
             if (!OPERATOR_PIN_PATTERN.test(newPin)) {
-                return res.status(400).json({ error: 'The store master PIN must be 4 to 8 digits.' });
+                return res.status(400).json({ error: 'The store master PIN must be 6 to 8 digits.' });
             }
             newSettings.adminPinHash = hashPin(newPin, authSalt);
         } else {
@@ -1914,12 +1982,15 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             makingChargeAmount: req.body.makingChargeAmount,
             makingChargePercent: req.body.makingChargePercent,
             description: req.body.description,
+            inventoryItemId: req.body.inventoryItemId,
+            inventoryLotId: req.body.inventoryLotId,
             discountPercent: numDiscountPercent,
             customerName,
             customerPhone,
             appliedAdvance: numAppliedAdvance,
             clientTotal: numTotal,
             tenders: req.body.tenders,
+            exchangeCreditNoteId: req.body.exchangeCreditNoteId || null,
             idempotencyKey: req.get('Idempotency-Key') || req.body.idempotencyKey || null
         }, {
             getActiveGoldRates,
@@ -1954,7 +2025,28 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         });
     } catch (err) {
         logError('Error saving sale transaction: ' + err.message, err.stack);
-        res.status(500).json({ error: 'Failed to process sale transaction: ' + err.message });
+        res.status(500).json({ error: 'Failed to process sale transaction. Please retry.', requestId: req.id });
+    }
+});
+
+/**
+ * POST /api/sales/:invoiceNumber/void
+ * Same-day cancellation. Approver-only because it reverses filed stock and
+ * customer credit; older sales use the credit-note return path instead.
+ */
+app.post('/api/sales/:invoiceNumber/void', requireAdminSession, requireApprover, (req, res) => {
+    try {
+        const result = saleService.voidSale(req.params.invoiceNumber, (req.body || {}).reason, {
+            actorUserId: resolveActorUserId(req.actor),
+            actor: req.actor,
+            actorLabel: (req.actor && req.actor.name) || 'counter',
+            ipAddress: req.ip
+        });
+        if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+        res.json({ success: true, invoiceId: result.invoiceId, sale: result.sale });
+    } catch (err) {
+        logError('Error cancelling invoice: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to cancel the invoice' });
     }
 });
 
@@ -1979,7 +2071,7 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
       Return Desk previews with and this route re-runs authoritatively.
    ========================================================================== */
 
-const REFUND_MODES = ['cash', 'gold'];
+const REFUND_MODES = ['cash', 'gold', 'exchange'];
 
 /**
  * GET /api/returns?from=&to=&limit=
@@ -2664,8 +2756,9 @@ app.post('/api/advances/:id/reject', requireAdminSession, requireApprover, (req,
    No route here creates a `purchase` or `transfer` movement — the roadmap's
    own P2 section gates vendor/purchase and branch transfer behind a legal/
    business definition (GST reverse-charge, inter-GSTIN accounting) that has
-   not been made. Stock only ever enters via an opening-balance lot or moves
-   via an adjustment — see 006_lot_inventory.sql for the full reasoning.
+   not been made. Stock enters via an opening-balance lot; linked sales,
+   returns and same-day voids post document movements through the service
+   transaction — see migrations 006 and 016 for the full reasoning.
    Every write is requireAdminSession only (no requireApprover): the
    movement itself is the audit trail, matching this feature's "straight-
    forward CRUD-and-ledger" scope rather than advance_entries' approval
@@ -2711,7 +2804,8 @@ const INVENTORY_LOT_OPEN_SCHEMA = {
     // BIS assigns one HUID per physical article, so this is meaningful only
     // when the lot being opened represents a single piece — see
     // 011_sku_catalogue.sql.
-    hallmarkHuid: { type: 'string', maxLength: 32 }
+    hallmarkHuid: { type: 'string', maxLength: 32 },
+    unitCostPerGram: { type: 'number', min: 0, max: 100000000 }
 };
 
 const INVENTORY_ADJUST_SCHEMA = {
@@ -2745,6 +2839,7 @@ function inventoryLotToWire(row) {
     return {
         id: row.id, branchId: row.branch_id, itemId: row.item_id, label: row.label,
         hallmarkHuid: row.hallmark_huid || null,
+        unitCostPerGram: row.unit_cost_paise_per_g == null ? null : fromPaise(row.unit_cost_paise_per_g),
         weightGrams: round3(row.balance_mg / 1000), createdAt: row.created_at
     };
 }
@@ -2754,6 +2849,7 @@ function inventoryMovementToWire(row) {
         id: row.id, branchId: row.branch_id, itemId: row.item_id, lotId: row.lot_id,
         movementType: row.movement_type, weightDeltaGrams: round3(row.weight_delta_mg / 1000),
         reason: row.reason, actorUserId: row.actor_user_id,
+        invoiceId: row.invoice_id || null, creditNoteId: row.credit_note_id || null,
         createdAt: row.created_at, businessDate: row.business_date
     };
 }
@@ -2824,7 +2920,10 @@ app.get('/api/inventory/items/by-sku/:skuCode', requireAdminSession, (req, res) 
         const context = repo.dataStoreContext();
         const item = repo.inventory.findItemBySku(context.tenantId, req.params.skuCode);
         if (!item) return res.status(404).json({ error: 'No item with that barcode/SKU' });
-        res.json({ item: inventoryItemToWire(item) });
+        const lots = repo.inventory.listLots(context.tenantId, {
+            branchId: context.branchId, itemId: item.id
+        }).filter(lot => lot.balance_mg > 0);
+        res.json({ item: inventoryItemToWire(item), lots: lots.map(inventoryLotToWire) });
     } catch (err) {
         logError('Error looking up inventory item by SKU: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to look up the item' });
@@ -2873,9 +2972,9 @@ app.get('/api/inventory/lots', requireAdminSession, (req, res) => {
 
 /**
  * POST /api/inventory/lots
- * Opens a new lot with its opening-balance movement — the only way stock
- * enters this system today (see the section header above for why there is
- * no purchase-receiving route yet).
+ * Opens a new lot with its opening-balance movement — the only intake path
+ * today (see the section header above for why there is no purchase-receiving
+ * route yet). Billing owns the sale/return/void movement paths.
  */
 app.post('/api/inventory/lots', requireAdminSession, validateBody(INVENTORY_LOT_OPEN_SCHEMA), (req, res) => {
     try {
@@ -2891,7 +2990,8 @@ app.post('/api/inventory/lots', requireAdminSession, validateBody(INVENTORY_LOT_
             label: req.body.label || null,
             reason: req.body.reason || null,
             actorUserId: resolveActorUserId(req.actor),
-            hallmarkHuid: req.body.hallmarkHuid || null
+            hallmarkHuid: req.body.hallmarkHuid || null,
+            unitCostPaisePerG: req.body.unitCostPerGram == null ? null : toPaise(req.body.unitCostPerGram)
         }));
         res.json({ success: true, id: lotId, lot: inventoryLotToWire(repo.inventory.getLot(context.tenantId, lotId)) });
     } catch (err) {
@@ -3119,6 +3219,61 @@ app.post('/api/customers/:id/anonymise', requireAdminSession, requireApprover, (
     } catch (err) {
         logError('Error anonymising customer: ' + err.message, err.stack);
         res.status(500).json({ error: 'Failed to anonymise the customer' });
+    }
+});
+
+/* ==========================================================================
+   API Routes: Management Reports
+
+   Definitions travel with each response. These are operational management
+   views, not invented statutory books: settlement is tender/refund flow,
+   reconciliation is exception-based, profitability is gross contribution on
+   costed lots, and ageing is days since lot opening.
+   ========================================================================== */
+
+app.get('/api/reports/settlement', requireAdminSession, (req, res) => {
+    try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+        const context = repo.dataStoreContext();
+        res.json(repo.reports.settlement({ tenantId: context.tenantId, fromAt: q.from, toAt: q.to }));
+    } catch (err) {
+        logError('Settlement report failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to build settlement report' });
+    }
+});
+
+app.get('/api/reports/reconciliation', requireAdminSession, (req, res) => {
+    try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+        const context = repo.dataStoreContext();
+        res.json(repo.reports.reconciliation({ tenantId: context.tenantId, fromAt: q.from, toAt: q.to }));
+    } catch (err) {
+        logError('Reconciliation report failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to build reconciliation report' });
+    }
+});
+
+app.get('/api/reports/profitability', requireAdminSession, (req, res) => {
+    try {
+        const q = parseLedgerQuery(req.query);
+        if (!q.ok) return res.status(400).json({ error: q.error });
+        const context = repo.dataStoreContext();
+        res.json(repo.reports.profitability({ tenantId: context.tenantId, fromAt: q.from, toAt: q.to }));
+    } catch (err) {
+        logError('Profitability report failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to build profitability report' });
+    }
+});
+
+app.get('/api/reports/ageing', requireAdminSession, (req, res) => {
+    try {
+        const context = repo.dataStoreContext();
+        res.json(repo.reports.ageing({ tenantId: context.tenantId, branchId: context.branchId }));
+    } catch (err) {
+        logError('Inventory ageing report failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'Failed to build inventory ageing report' });
     }
 });
 
@@ -3667,7 +3822,7 @@ app.post('/api/payment/order', requireEstablishedCustomer, paymentOrderLimiter, 
         });
     } catch (err) {
         logError('Error creating Razorpay order: ' + err.message, err.stack);
-        res.status(500).json({ error: 'Failed to create payment order: ' + err.message });
+        res.status(500).json({ error: 'Failed to create payment order. Please retry.', requestId: req.id });
     }
 });
 
@@ -3701,8 +3856,10 @@ app.post('/api/payment/order', requireEstablishedCustomer, paymentOrderLimiter, 
  * payment was actually captured for this order's amount, and logs the deposit
  * in advances.json. Customer-session-gated, and the deposit is always credited
  * to the *session's* phone — the body can no longer name whose account gets it.
+ * Rate-limited (security audit H2): each call makes an upstream Razorpay
+ * HTTPS lookup, so an unthrottled loop burns the gateway's own quota.
  */
-app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => {
+app.post('/api/payment/verify', requireEstablishedCustomer, paymentVerifyLimiter, async (req, res) => {
     try {
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
         const customerPhone = req.customerPhone;
@@ -3872,7 +4029,7 @@ app.post('/api/payment/verify', requireEstablishedCustomer, async (req, res) => 
         });
     } catch (err) {
         logError('Error verifying Razorpay payment: ' + err.message, err.stack);
-        res.status(500).json({ error: 'Verification failed: ' + err.message });
+        res.status(500).json({ error: 'Verification failed. Please retry.', requestId: req.id });
     }
 });
 
@@ -4059,7 +4216,7 @@ app.post('/api/payment/webhook', async (req, res) => {
  * Manually triggers an immediate rolling database snapshot (same routine
  * the 1:00 AM cron uses).
  */
-app.post('/api/backup/run', requireAdminSession, expensiveAdminLimiter, (req, res) => {
+app.post('/api/backup/run', requireAdminSession, requireRole('owner', 'manager'), expensiveAdminLimiter, (req, res) => {
     try {
         const result = createBackup();
         res.json(result);
@@ -4076,7 +4233,7 @@ app.post('/api/backup/run', requireAdminSession, expensiveAdminLimiter, (req, re
  * verify their SMTP configuration. Gracefully reports back if SMTP or a
  * recipient address isn't configured — never throws for that case.
  */
-app.post('/api/reports/send-now', requireAdminSession, expensiveAdminLimiter, async (req, res) => {
+app.post('/api/reports/send-now', requireAdminSession, requireRole('owner', 'manager'), expensiveAdminLimiter, async (req, res) => {
     try {
         const period = req.body.period === 'Monthly' ? 'Monthly' : 'Daily';
         const result = await sendSummaryReport(period);
@@ -4099,13 +4256,20 @@ app.post('/api/reports/send-now', requireAdminSession, expensiveAdminLimiter, as
  * GET /api/qrcode?data=<text>
  * Renders a real, scannable QR code (PNG data URL) for arbitrary text —
  * used by the customer portal to encode a UPI payment deep link. Public:
- * the customer portal has no admin session to attach.
+ * the customer portal has no admin session to attach. Rate-limited and
+ * length-capped (security audit H3): unauthenticated and previously
+ * unbounded, so `data` was a free CPU-exhaustion lever — a UPI deep link is
+ * well under 200 characters, so that is the cap, not a tuned limit.
  */
-app.get('/api/qrcode', async (req, res) => {
+const QRCODE_MAX_DATA_LENGTH = 200;
+app.get('/api/qrcode', qrLimiter, async (req, res) => {
     try {
         const data = req.query.data;
         if (!data || typeof data !== 'string') {
             return res.status(400).json({ error: 'Query parameter "data" is required' });
+        }
+        if (data.length > QRCODE_MAX_DATA_LENGTH) {
+            return res.status(400).json({ error: `Query parameter "data" must be at most ${QRCODE_MAX_DATA_LENGTH} characters.` });
         }
         const dataUrl = await QRCode.toDataURL(data, { margin: 1, width: 300 });
         res.json({ dataUrl });
@@ -4139,8 +4303,10 @@ app.get('/api/license/status', (req, res) => {
 /**
  * POST /api/license/activate
  * Triggers an online sync to activate a new or existing license key configuration.
+ * Public and unauthenticated (there is no session before a license is
+ * active), so it is rate-limited against control-plane spam.
  */
-app.post('/api/license/activate', async (req, res) => {
+app.post('/api/license/activate', licenseActivateLimiter, async (req, res) => {
     try {
         const { licenseKey } = req.body;
         if (!licenseKey) {
@@ -4154,7 +4320,8 @@ app.post('/api/license/activate', async (req, res) => {
             res.status(400).json({ success: false, error: syncResult.error });
         }
     } catch (err) {
-        res.status(500).json({ error: 'License activation failed: ' + err.message });
+        logError('License activation failed: ' + err.message, err.stack);
+        res.status(500).json({ error: 'License activation failed. Please retry.', requestId: req.id });
     }
 });
 
@@ -4168,7 +4335,7 @@ app.post('/api/license/activate', async (req, res) => {
  * verified `security`-channel releases auto-apply, anything else newer is
  * just recorded as pending for manual review.
  */
-app.post('/api/admin/update/check', requireAdminSession, async (req, res) => {
+app.post('/api/admin/update/check', requireAdminSession, requireRole('owner'), async (req, res) => {
     try {
         await checkForUpdates();
         const license = readJSON(path.join(DATA_DIR, 'license.json'), {});
@@ -4185,7 +4352,7 @@ app.post('/api/admin/update/check', requireAdminSession, async (req, res) => {
  * channel — security releases already auto-applied and never sit pending).
  * This is the human-approval gate for non-urgent releases.
  */
-app.post('/api/admin/update/apply', requireAdminSession, async (req, res) => {
+app.post('/api/admin/update/apply', requireAdminSession, requireRole('owner'), async (req, res) => {
     try {
         const result = await applyPendingUpdate();
         if (result.success) {
@@ -4208,7 +4375,7 @@ app.post('/api/admin/update/apply', requireAdminSession, async (req, res) => {
  * Level 1 Diagnostics: Returns unencrypted technical logs (latency, CPU, memory, error logs).
  * Strictly contains zero customer-identifiable information.
  */
-app.get('/api/diagnostics/telemetry', requireAdminSession, (req, res) => {
+app.get('/api/diagnostics/telemetry', requireAdminSession, requireRole('owner'), (req, res) => {
     try {
         const telemetryLogFile = path.join(__dirname, 'logs/telemetry.log');
         const errorLogFile = path.join(__dirname, 'logs/error.log');
@@ -4254,7 +4421,7 @@ app.get('/api/diagnostics/telemetry', requireAdminSession, (req, res) => {
  * Level 2 Diagnostics: Pulls database files encrypted with Developer's RSA-4096 Public Key.
  * Requires user request confirmation (simulated here). Decryptable only offline by developer.
  */
-app.get('/api/diagnostics/export', requireAdminSession, expensiveAdminLimiter, (req, res) => {
+app.get('/api/diagnostics/export', requireAdminSession, requireRole('owner'), expensiveAdminLimiter, (req, res) => {
     try {
         const context = repo.dataStoreContext();
 
@@ -4318,7 +4485,7 @@ app.get('/api/diagnostics/export', requireAdminSession, expensiveAdminLimiter, (
  * Level-2 developer key — decryptable only offline via
  * developer_blackbox_keys/analyze_blackbox.js. Never ships to tenants.
  */
-app.get('/api/diagnostics/blackbox-export', requireAdminSession, expensiveAdminLimiter, (req, res) => {
+app.get('/api/diagnostics/blackbox-export', requireAdminSession, requireRole('owner'), expensiveAdminLimiter, (req, res) => {
     try {
         const envelope = exportBlackBoxEnvelope();
         res.json({

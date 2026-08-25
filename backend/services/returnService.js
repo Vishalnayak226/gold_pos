@@ -23,14 +23,14 @@
  */
 
 import {
-    inTransaction, invoices, creditNotes, advances, sequences, audit, customers,
+    inTransaction, invoices, creditNotes, advances, sequences, audit, customers, inventory,
     dataStoreContext, businessDate, financialYear, documentNumber
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
 import { computeReturnRefund, round2, round3, toPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
 
-export const REFUND_MODES = ['cash', 'gold'];
+export const REFUND_MODES = ['cash', 'gold', 'exchange'];
 
 /** The number printed on a credit note: CN-000001-26. */
 export const CREDIT_NOTE_PREFIX = 'CN';
@@ -67,7 +67,7 @@ export function createReturn(input, deps) {
         return { ok: false, status: 400, error: 'An invoice number is required to file a return.' };
     }
     if (!REFUND_MODES.includes(input.refundMode)) {
-        return { ok: false, status: 400, error: 'Refund mode must be either "cash" or "gold".' };
+        return { ok: false, status: 400, error: 'Refund mode must be cash, gold credit, or exchange credit.' };
     }
     const weightGrams = Number(input.weightGrams);
     if (!Number.isFinite(weightGrams) || weightGrams <= 0) {
@@ -90,7 +90,7 @@ export function createReturn(input, deps) {
     // Gold credit has to land in somebody's account, and every customer ledger
     // here is keyed on phone. A walk-in "Cash Sale" filed without one can still
     // be refunded — in cash, over the counter, which is how it was paid.
-    if (input.refundMode === 'gold' && !deps.isValidPhone(header.customer_phone)) {
+    if (input.refundMode !== 'cash' && !deps.isValidPhone(header.customer_phone)) {
         return {
             ok: false, status: 400,
             error: 'This invoice has no customer phone number on it, so there is no account to credit. Refund it as cash, or re-file the sale against a customer.'
@@ -195,11 +195,16 @@ export function createReturn(input, deps) {
                 customerId: header.customer_id,
                 customerName: header.customer_name || 'Cash Sale',
                 customerPhone: header.customer_phone || '',
-                refundMode: input.refundMode,
+                // Exchange is financially a posted customer credit.  Keep the
+                // original constrained refund vocabulary on disk and mark the
+                // workflow separately so old readers still understand it.
+                refundMode: input.refundMode === 'exchange' ? 'gold' : input.refundMode,
                 refundAmountPaise: toPaise(refund.refundAmount),
                 closesInvoice: refund.closesInvoice ? 1 : 0,
                 advanceEntryId: null,
                 itemised: refund.itemised ? 1 : 0,
+                isExchange: input.refundMode === 'exchange' ? 1 : 0,
+                exchangeInvoiceId: null,
                 note: String(input.note || '').trim().slice(0, 300),
                 idempotencyKey: input.idempotencyKey || null,
                 createdByUserId: actorUserId,
@@ -234,8 +239,23 @@ export function createReturn(input, deps) {
             invoices.applyReturnToLine(originalLine.id, Math.round(refund.weightGrams * 1000));
             invoices.setState(header.id, refund.closesInvoice ? 'returned' : 'partially_returned');
 
+            if (originalLine.inventory_lot_id) {
+                inventory.recordDocumentMovement({
+                    tenantId: context.tenantId,
+                    lotId: originalLine.inventory_lot_id,
+                    movementType: 'return',
+                    weightDeltaMg: Math.round(refund.weightGrams * 1000),
+                    invoiceId: header.id,
+                    invoiceLineId: originalLine.id,
+                    creditNoteId,
+                    reason: `Return ${creditNoteNumber}`,
+                    actorUserId,
+                    at: now
+                });
+            }
+
             let creditEntry = null;
-            if (input.refundMode === 'gold') {
+            if (input.refundMode !== 'cash') {
                 const customerId = header.customer_id
                     || customers.ensureCustomerId(context.tenantId, header.customer_phone, header.customer_name);
                 const accountId = advances.ensureAccount({

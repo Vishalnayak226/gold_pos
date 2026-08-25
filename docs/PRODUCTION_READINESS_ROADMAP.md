@@ -124,10 +124,9 @@ The right order is:
 - Product/SKU catalogue: barcode/QR, category, purity, HSN, hallmark/HUID, gross/net/stone weights, stone value, wastage, making policy, images, price tags.
 - Lot inventory and immutable stock movements for purchase, sale, return, repair, transfer, adjustment, and physical count.
   *(**Opening-balance and adjustment/physical-count movements landed 2026-08-20, Phase 37** — see
-  the Phase 5 §2 note further down for full detail. **Purchase, sale, return, repair and transfer
-  movements are not started** — purchase and transfer stay gated on the legal/business definition
-  named two lines below, and sale/return/repair integration is a deliberately separate, unstarted
-  pass into the billing flow.)*
+  the Phase 5 §2 note further down for full detail. **Sale, return and same-day void movements
+  landed 2026-08-24, Phase 44** and commit atomically with their invoice/credit note. Purchase and
+  transfer stay gated on the legal/business definition named two lines below; repair is still open.)*
 - Multi-line invoices, split tender, cash/card/UPI/bank/advance allocation, quotes, hold/resume, reprint, delivery.
   *(**Multi-line invoices, split tender and the allocation vocabulary landed 2026-08-12; reprint
   shipped in Phase 22.** Quotes, hold/resume and delivery are not started.)*
@@ -138,7 +137,9 @@ The right order is:
   amount unless an owner or manager authorises it, checked against the amount the SERVER priced rather
   than one the client proposed, and additionally requiring the second factor when
   `requireMfaForApprovers` is on. 0 disables it, which is the previous behaviour and the default.
-  Exchange and void/cancel are not started.)*
+  **Return exchange and same-day void/cancel landed 2026-08-24, Phase 44:** exchange credit binds
+  once to its replacement invoice; void is approver-gated and uses append-only stock/advance
+  reversals rather than erasing the invoice.)*
 - Customer master with consent/preferences, deduplication, correction/export and legally appropriate deletion/anonymisation.
 - Vendor/purchase, branch transfer, old-gold workflows only after legal/business definition.
 - Cash drawer and shift close/count/variance, staff permissions/commissions, daily closing.
@@ -152,8 +153,8 @@ The right order is:
   matched set**, so a revenue tile cannot silently understate a month once it outgrows one page. A
   per-customer advance rollup (`GET /api/advances/customers`) replaced the client-side collapse of
   the full ledger, since a customer's spendable balance is their whole history and cannot be
-  computed from a page. Accounting export, settlement reconciliation, profitability and ageing are
-  not started.)*
+  computed from a page. Accounting export arrived in Phase 43; explicitly-defined settlement,
+  reconciliation, gross profitability and inventory ageing operational reports arrived in Phase 44.)*
 
 ## 4. Target architecture
 
@@ -366,10 +367,9 @@ The right order is:
 - Product/SKU catalogue: barcode/QR, category, purity, HSN, hallmark/HUID, gross/net/stone weights, stone value, wastage, making policy, images, price tags.
 - Lot inventory and immutable stock movements for purchase, sale, return, repair, transfer, adjustment, and physical count.
   *(**Opening-balance and adjustment/physical-count movements landed 2026-08-20, Phase 37** — see
-  the Phase 5 §2 note further down for full detail. **Purchase, sale, return, repair and transfer
-  movements are not started** — purchase and transfer stay gated on the legal/business definition
-  named two lines below, and sale/return/repair integration is a deliberately separate, unstarted
-  pass into the billing flow.)*
+  the Phase 5 §2 note further down for full detail. **Sale, return and same-day void movements
+  landed 2026-08-24, Phase 44** and commit atomically with their invoice/credit note. Purchase and
+  transfer stay gated on the legal/business definition named two lines below; repair is still open.)*
 - Multi-line invoices, split tender, cash/card/UPI/bank/advance allocation, quotes, hold/resume, reprint, delivery.
   *(**Multi-line invoices, split tender and the allocation vocabulary landed 2026-08-12; reprint
   shipped in Phase 22.** Quotes, hold/resume and delivery are not started.)*
@@ -380,7 +380,9 @@ The right order is:
   amount unless an owner or manager authorises it, checked against the amount the SERVER priced rather
   than one the client proposed, and additionally requiring the second factor when
   `requireMfaForApprovers` is on. 0 disables it, which is the previous behaviour and the default.
-  Exchange and void/cancel are not started.)*
+  **Return exchange and same-day void/cancel landed 2026-08-24, Phase 44:** exchange credit binds
+  once to its replacement invoice; void is approver-gated and uses append-only stock/advance
+  reversals rather than erasing the invoice.)*
 - Customer master with consent/preferences, deduplication, correction/export and legally appropriate deletion/anonymisation.
 - Vendor/purchase, branch transfer, old-gold workflows only after legal/business definition.
 - Cash drawer and shift close/count/variance, staff permissions/commissions, daily closing.
@@ -394,8 +396,8 @@ The right order is:
   matched set**, so a revenue tile cannot silently understate a month once it outgrows one page. A
   per-customer advance rollup (`GET /api/advances/customers`) replaced the client-side collapse of
   the full ledger, since a customer's spendable balance is their whole history and cannot be
-  computed from a page. Accounting export, settlement reconciliation, profitability and ageing are
-  not started.)*
+  computed from a page. Accounting export arrived in Phase 43; explicitly-defined settlement,
+  reconciliation, gross profitability and inventory ageing operational reports arrived in Phase 44.)*
 
 ## 4. Target architecture
 
@@ -613,7 +615,7 @@ The estimates are planning ranges for a small experienced team. Recalibrate afte
   context object, so a reported error id is one grep. **Still open on this line:** metrics and
   critical-flow traces.)*
 - [x] Alert on payment/webhook failures, ledger imbalance, backup failure, stale rates, error/latency, capacity, TLS expiry and control-plane failure. *(Closed 2026-08-19, Phase 35 — `backend/alerting.js`, one choke point (`raiseAlert()`) all eight signals funnel through: log always, email best-effort via the existing `emailReporter.js` transport, per-code 30-minute cooldown so a standing misconfiguration sends one email per window rather than one per event. **Payment/webhook**: hooked into the existing failure paths in the webhook route and `paymentService.js`. **Ledger imbalance**: new `invoiceRepository.js#findLineDrift()` (the line-sums-to-header invariant, checked live) plus the existing audit chain verification and readiness probe. **Backup failure**: alerts on `createBackup()` failure, and — since a file that copied is not proof it restores — spawns `verifyBackup.js` after every nightly backup and alerts on a failed restore; a separate daily freshness check catches the cron not firing at all. **Stale rates / capacity / control-plane**: rate-sync age, `fs.statfsSync` disk-free ratio, and the licensing-server catch blocks in `licenseChecker.js`/`updateEngine.js`. **TLS expiry**: no-ops unless `settings.publicUrl` is `https://` — correctly dormant, since no VPS/domain is provisioned yet (this doc's own note, above); activates the moment one is. Verified: `backend/test_alerting.js` (16 checks, `npm test` suite 9) plus a real local boot exercising `CONTROL_PLANE_UNREACHABLE` and the post-backup verify spawn against the actual tenant data — see `docs/LEDGER.md` Phase 35.)*
-- [ ] Encrypted off-site backup and point-in-time recovery; automated isolated restore; monthly restore drill. *(**Two of the four closed 2026-08-17, Phase 34.** **Automated isolated restore: done** — `backend/verifyBackup.js` (`npm run backup:verify`) restores the latest snapshot into a temp directory and runs nine checks against it: files present, ledger present, SQLite `integrity_check`, migrations fully applied, business records actually there, **every invoice still summing to its own lines**, the audit chain verifying, and — the one that matters most now — whether the restored `settings.json` can be DECRYPTED on this host. It never touches the live install and exits non-zero on any failure, so it is usable as a scheduled job. Both paths were exercised against a real seeded snapshot: a clean one verifies 9/9, and one sealed with an unavailable key fails on exactly that check with an intact ledger. **Monthly restore drill: done** — procedure, failure-meaning table and a drill log in `docs/RUNBOOKS.md` §4. **Point-in-time recovery: mechanism built 2026-08-21 (Phase 41), flagged off by default.** `backend/pitr.js` picks the lower-risk of the two named approaches — frequent snapshots, reusing `checkpointAndCopy()` rather than hand-rolling WAL-frame archiving — gated by `pitrEnabled` (default `false`), `pitrIntervalMinutes` (default `15`, matching this section's own already-stated ≤15-minute RPO target) and `pitrRetentionHours` (default `24`). A snapshot restores and verifies with the EXISTING `npm run backup:verify -- --backup <dir>` — no new verification code needed, because the PITR snapshot layout deliberately matches a nightly one exactly. **Still open: off-site** — this closes only the "how often" half; shipping the archive off the machine has no destination (needs a VPS or object store, neither provisioned) and is a follow-on once one exists. A disk failure that takes the data directory still takes every snapshot with it. **Partly closed: "encrypted"** — the credentials inside a snapshot are now ciphertext, so a stolen backup yields no keys, but the archive as a whole is not encrypted. **A trap worth knowing:** snapshots deliberately carry sealed secrets and never the key, so a restore onto a host without `GOLD_POS_SECRET_KEY` produces an intact ledger nobody can log into. Called out in the drill runbook.)*
+- [ ] Encrypted off-site backup and point-in-time recovery; automated isolated restore; monthly restore drill. *(**Automated isolated restore and the monthly drill closed 2026-08-17, Phase 34.** `backend/verifyBackup.js` (`npm run backup:verify`) restores into a temp directory and checks integrity, migrations, business rows, invoice/line agreement, the audit chain and secret decryptability without touching the live install. **Point-in-time recovery landed 2026-08-21, Phase 41**, flagged off by default and reusing `checkpointAndCopy()`. **An off-site destination mechanism landed 2026-08-24, Phase 44:** every nightly/manual snapshot can be copied to a configured mounted or synchronised filesystem path (`GOLD_POS_OFFSITE_BACKUP_DIR` or Settings), every file is SHA-256 verified, a manifest is written, retention is independent, and failure raises `BACKUP_OFFSITE_FAILED`. This deliberately keeps NAS/SMB/rclone/cloud credentials outside the POS. The checkbox remains open because deployment still needs a real remote destination and recovery drill, and the whole archive is not encrypted — only the credentials inside `settings.json` are sealed. A restore host must still have the matching `GOLD_POS_SECRET_KEY`.)*
 - [x] Migration compatibility gates, canary/pilot release, rollback and post-deploy synthetic checks. *(Closed 2026-08-19, Phase 36. **Migration compatibility gate**: `backend/repositories/migrate.js#checkMigrationSafety()` (`npm run migrate:check-safety`, own CI job in `daily-checks.yml`) statically scans every migration on disk for a destructive DDL pattern — `DROP TABLE`/`DROP COLUMN`/rename — comment-stripped so an explanatory comment can't trip it. Needs no database; enforces the additive/backward-compatible rule CLAUDE.md §1 already states but nothing previously checked. **Canary/pilot release**: a release manifest gains `rolloutPercent` (1-100, default 100, part of the signed payload); `backend/updateEngine.js#isInRolloutCohort()` deterministically hashes `licenseKey:version` so a tenant's cohort membership is stable and widening a rollout (republishing the same version at a higher percentage — `GET /api/releases/latest` now prefers the most-recently-published entry on a version tie) only ever adds tenants, never drops one already auto-applying. Only meaningful on the security channel, the only one ever auto-applied. **Rollback**: `deploy/remote-deploy.sh` now records `.rollback-sha` (the commit it was about to move off of) before every normal deploy; a new `--rollback` flag resets to that commit instead of the branch tip. All three `cd-*.yml` workflows call it automatically when the post-deploy smoke test fails, then still fail the job — a rollback restores service, it does not make a bad build good. **Post-deploy synthetic checks**: already substantially covered before this phase — `GET /api/ready` (polled by every `cd-*.yml` smoke test) runs a real query and confirms zero pending/drifted migrations, not just a process-alive check; left as-is rather than risk writing synthetic test data into a live tenant's ledger. Verified: `backend/test_schema.js` (+3, the safety gate against fixtures and the real on-disk migrations), `backend/test_suite.js` Test 12 (+1, cohort determinism/monotonicity/per-tenant independence), a real local licensing-server boot (publish at 10%, confirm `rolloutPercent` round-trips through the signed payload, republish at 100%, confirm the widened entry wins, confirm out-of-range rejection), and the rollback shell logic exercised end-to-end against a throwaway local git repo (deploy A→B records `.rollback-sha`, `--rollback` correctly returns to A). **Not verified: the SSH/GitHub-Environment wiring itself** — same as the Phase 34 CI security-scanning jobs, this needs a real pull request and (for the deploy workflows specifically) a real VPS, neither of which exists yet (§7).)*
 - [ ] Protected branches, reviewed PRs, signed provenance, artifact retention, scoped secrets and dual approval for fleet auto-updates.
 - [ ] Exercise existing GitHub deploy paths on real sandbox, including forced failure/rollback.
@@ -652,26 +654,28 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    endpoint) with the item's HSN/weight detail alongside it, and an Edit action lets catalogue
    detail be added to an item after creation. **Wastage landed 2026-08-21, Phase 41** (built
    concurrently with this phase, in the same shared tree) — see the note below, now resolved.
-   **Still not wired: this catalogue into the sale/invoice flow** — a Billing Desk line is still
-   typed by staff exactly as before; auto-filling a line from a catalogue item, or decrementing
-   stock on sale, would touch `computeInvoiceTotals` and needs its own dedicated pass, same
-   boundary Phase 37 already drew for stock. See `docs/LEDGER.md` Phase 41 and Phase 42.)*
+    **Wired into billing 2026-08-24, Phase 44:** the Billing Desk resolves a barcode/SKU, fills the
+    catalogue purity/name/nominal weight, requires an exact positive-stock lot, and files those item
+    and lot references on the invoice line. The server revalidates the active item, branch, purity
+    and live lot balance inside the invoice transaction; the scan is convenience, never authority.
+    See `docs/LEDGER.md` Phases 41, 42 and 44.)*
 2. Lot inventory, purchase receiving, adjustments/counts and branch transfer.
    *(**Lot inventory and adjustments/counts landed 2026-08-20, Phase 37** — the ungated half of
    this line. `inventory_items` (catalogue metadata), `inventory_lots` (a distinguishable batch of
    an item) and `inventory_movements` (append-only, trigger-enforced, exactly like
    `advance_entries`) via `backend/repositories/inventoryRepository.js`, `GET`/`POST
    /api/inventory/*`, and a new Inventory tab (`frontend/js/components/InventoryManager.js`).
-   Stock only ever enters through an `opening_balance` movement (opening a new lot) or changes
-   through an `adjustment` (a physical count, breakage, or correction) — refused if it would take
-   a lot negative. **Purchase receiving and branch transfer are still NOT built** — the P2 section
+    Stock intake still enters through an `opening_balance`; an `adjustment` records physical count,
+    breakage or correction and is refused if it would take a lot negative. **Sale, return and
+    same-day void movements landed 2026-08-24, Phase 44:** a second trigger-enforced append-only
+    document ledger preserves migration 006's constrained physical-count history; stock views sum
+    both streams, and invoice/credit-note/stock writes share one transaction. **Purchase receiving
+    and branch transfer are still NOT built** — the P2 section
    below gates both behind a legal/business definition (GST reverse-charge treatment for buying
    from a vendor or a customer, inter-GSTIN accounting for moving stock between branches) that has
    never been made; this migration's own header comment names the gap explicitly so a future
-   change does not reinvent a `purchase`/`transfer` movement type without it. **Not wired into the
-   sale/invoice flow** — a sale does not decrement stock yet; doing so would touch
-   `computeInvoiceTotals`, which the "Cost note" below calls the most-tested function in the tree,
-   and deserves its own pass. Verified: `test_schema.js` +4 (the CHECK constraints, via raw SQL
+    change does not reinvent a `purchase`/`transfer` movement type without it. The original Phase 37
+    slice was verified by `test_schema.js` +4 (the CHECK constraints, via raw SQL
    bypassing the repository's own guards), `test_repositories.js` +11 (lot lifecycle, the
    negative-balance refusal, and a LEFT JOIN bug caught and fixed before it shipped — an item with
    zero lots in a branch-filtered stock query was silently dropped instead of reported at zero), a
@@ -743,8 +747,12 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    does NOT do, deliberately: no GST/reverse-charge treatment.** Whether buying gold from a customer
    attracts tax under RCM is still a legal question nobody has answered, and this module computes a
    valuation only — enabling it for a live tenant still needs that legal sign-off first. Full detail:
-   `docs/LEDGER.md` Phase 41. **General exchanges (non-gold) remain unbuilt and blocked on legal
-   sign-off**, as before.)*
+    `docs/LEDGER.md` Phase 41. **Ordinary return exchange and same-day void landed 2026-08-24,
+    Phase 44.** Exchange files an ordinary credit note plus a marked customer credit and binds that
+    note once to the replacement invoice; the return restores its exact source lot. Void is
+    owner/manager-gated, reasoned, limited to the same business date and an untouched issued invoice,
+    and appends stock/advance reversals before marking (never deleting) the invoice. Live use still
+    needs the merchant's return/cancellation policy and legal sign-off.)*
 5. Customer master, consent/communications, accounting exports and tax/reconciliation reports.
    *(**Customer master and accounting export landed 2026-08-21, Phase 43.** `customers` was already
    the master (every walk-in already got a row); this phase added the admin-facing half — search,
@@ -755,12 +763,16 @@ Deliver vertical slices with stock, money, audit, reporting and permissions toge
    a filed invoice's own name/phone snapshot). **Accounting export landed the same phase**: a plain
    CSV sales register (`GET /api/reports/sales-register.csv`) — one row per invoice, reporting the
    single tax rate/amount the ledger holds rather than a fabricated CGST/SGST or B2B/B2C split this
-   app has no basis for tracking. **Still not started: settlement/advance reconciliation,
-   profitability and inventory ageing reports** — deliberately out of scope, per this section's own
-   note not to build dashboard reports before their underlying reconciliation definitions are
-   accepted. See `docs/LEDGER.md` Phase 43.)*
+    app has no basis for tracking. **Settlement, reconciliation, gross profitability and inventory
+    ageing landed 2026-08-24, Phase 44.** Every response and the Management Reports screen carries
+    its exact definition: settlement is filed counter tenders less cash-like refunds with voided
+    tenders separated; reconciliation is exception-based across counter-payable invoices and paid
+    gateway-order advance credits; profitability is net-of-GST remaining sale value less linked-lot
+    cost with explicit cost coverage; ageing is positive on-hand weight bucketed by days since lot
+    opening. These are operational management tables, not fabricated statutory books. See
+    `docs/LEDGER.md` Phases 43 and 44.)*
 
-Do not build dashboard charts before their underlying ledger/reconciliation definitions are accepted.
+Do not add dashboard charts or statutory labels beyond the explicit Phase 44 definitions without merchant/accountant acceptance.
 
 #### Cost note: what "multi-line sale" actually cost, and what is left
 
@@ -913,7 +925,7 @@ Every financial feature is done only when its state diagram and rules are approv
 3. **Hosting:** managed SaaS, dedicated tenant instances, or both.
 4. **Offline:** acceptable v1 outage procedure or funded offline-first program.
 5. **Staff:** roles, approval limits, shifts/cash responsibility and MFA.
-6. ~~**Scope:** simple bullion-weight billing or full jewellery SKU/stone/hallmark inventory.~~ **Decided 2026-08-11 (owner): simple bullion-weight billing. There is no SKU concept.** The Catalogue domain in §4 — products, variants, lots, barcodes, stock movements/counts/transfers — is out of scope, as is the "stock" leg of the Phase 1 single-transaction item. Revisit only if inventory is reintroduced.
+6. ~~**Scope:** simple bullion-weight billing or full jewellery SKU/stone/hallmark inventory.~~ **Originally decided 2026-08-11: simple bullion-weight billing; subsequently reintroduced by the owner.** Lot inventory arrived in Phase 37, SKU/hallmark metadata in Phase 42, and barcode-to-billing plus sale/return/void movements in Phase 44. Purchase receiving, repair and branch transfer remain separate decisions.
 7. **Payments:** auto-capture, refund authority, manual UPI verification and settlement owner.
 8. **Scheme:** entity, branch rules, installment/maturity/bonus/refund/default terms and legal jurisdiction.
 9. **Data:** retention, support-access consent, backup geography and export/offboarding.

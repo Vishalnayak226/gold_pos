@@ -45,8 +45,9 @@ function formatAmountOrDash(amount) {
  * Also carries the SKU-catalogue slice (roadmap Phase 5.1) that 006 reserved
  * `sku_code` for: barcode/HSN/gross-net-stone weight on the item (the
  * design's nominal figures), hallmark/HUID on the lot (BIS assigns one per
- * physical article, not per design). None of it feeds billing or stock —
- * see backend/repositories/migrations/011_sku_catalogue.sql.
+ * physical article, not per design). Billing can now resolve a barcode/SKU,
+ * bind an exact lot, and post sale/return/void movements atomically with the
+ * financial document. See migrations 011 and 016.
  */
 export class InventoryManager {
     constructor() {
@@ -66,9 +67,9 @@ export class InventoryManager {
         container.innerHTML = `
             <p style="font-size:13px; color:var(--color-text-muted); margin-bottom:18px; max-width:70ch;">
                 Track what is physically on the shelf, lot by lot. Stock enters through an
-                <strong>opening balance</strong> and changes through an <strong>adjustment</strong>
-                (a physical count, breakage, or a correction) — every movement is permanent and
-                the balance is always derivable from history.
+                <strong>opening balance</strong>, leaves through a linked <strong>sale</strong>, and
+                returns through a filed return or same-day void. Physical-count adjustments remain
+                append-only, so every balance is derivable from movement history.
             </p>
 
             <div class="advances-toolbar">
@@ -153,6 +154,10 @@ export class InventoryManager {
                     <div class="form-group">
                         <label for="lot-huid">Hallmark HUID</label>
                         <input type="text" id="lot-huid" class="form-control" maxlength="32" placeholder="If this lot is one piece">
+                    </div>
+                    <div class="form-group">
+                        <label for="lot-unit-cost">Cost / gram (₹)</label>
+                        <input type="number" id="lot-unit-cost" class="form-control" min="0" step="0.01" placeholder="Optional; enables profit report">
                     </div>
                 </div>
                 <div style="display:flex; gap:10px;">
@@ -379,6 +384,8 @@ export class InventoryManager {
         const weightGrams = parseFloat(document.getElementById('lot-weight').value);
         const label = document.getElementById('lot-label').value.trim();
         const hallmarkHuid = document.getElementById('lot-huid').value.trim();
+        const unitCostRaw = document.getElementById('lot-unit-cost').value;
+        const unitCostPerGram = unitCostRaw === '' ? null : Number(unitCostRaw);
         if (!itemId) { statusEl.textContent = 'Choose an item.'; return; }
         if (!(weightGrams > 0)) { statusEl.textContent = 'Weight must be a positive number of grams.'; return; }
 
@@ -386,7 +393,11 @@ export class InventoryManager {
             const res = await adminFetch('/api/inventory/lots', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ itemId, weightGrams, label: label || undefined, hallmarkHuid: hallmarkHuid || undefined })
+                body: JSON.stringify({
+                    itemId, weightGrams, label: label || undefined,
+                    hallmarkHuid: hallmarkHuid || undefined,
+                    unitCostPerGram
+                })
             });
             const body = await res.json();
             if (!res.ok) { statusEl.textContent = body.message || body.error || 'Failed to open the lot.'; return; }
@@ -395,6 +406,7 @@ export class InventoryManager {
             document.getElementById('lot-weight').value = '';
             document.getElementById('lot-label').value = '';
             document.getElementById('lot-huid').value = '';
+            document.getElementById('lot-unit-cost').value = '';
             document.getElementById('new-lot-form').style.display = 'none';
             await this.refresh();
         } catch (err) {
@@ -479,7 +491,7 @@ export class InventoryManager {
                         ${lots.length === 0
                             ? '<p style="font-size:12px; color:var(--color-text-muted); margin:0;">No lots yet for this item.</p>'
                             : `<table class="advances-table" style="margin:0;">
-                                <thead><tr><th>Lot</th><th>Label</th><th>Hallmark HUID</th><th class="text-right">Weight</th><th>Opened</th><th></th></tr></thead>
+                                <thead><tr><th>Lot</th><th>Label</th><th>Hallmark HUID</th><th class="text-right">Weight</th><th class="text-right">Cost/g</th><th>Opened</th><th></th></tr></thead>
                                 <tbody>
                                     ${lots.map(l => `
                                         <tr>
@@ -487,6 +499,7 @@ export class InventoryManager {
                                             <td>${escapeHtml(l.label || '—')}</td>
                                             <td style="font-family:monospace; font-size:12px;">${escapeHtml(l.hallmarkHuid || '—')}</td>
                                             <td class="text-right">${formatGrams(l.weightGrams)}</td>
+                                            <td class="text-right">${formatAmountOrDash(l.unitCostPerGram)}</td>
                                             <td style="white-space:nowrap;">${formatWhen(l.createdAt)}</td>
                                             <td>
                                                 <details>
@@ -553,7 +566,10 @@ export class InventoryManager {
         tbody.innerHTML = this.movements.map(m => `
             <tr>
                 <td style="white-space:nowrap;">${formatWhen(m.createdAt)}</td>
-                <td>${m.movementType === 'opening_balance' ? 'Opening balance' : 'Adjustment'}</td>
+                <td>${escapeHtml({
+                    opening_balance: 'Opening balance', adjustment: 'Adjustment',
+                    sale: 'Sale', return: 'Return', void: 'Void reversal'
+                }[m.movementType] || m.movementType)}</td>
                 <td class="text-right" style="color:${m.weightDeltaGrams < 0 ? 'var(--color-danger)' : 'inherit'};">${m.weightDeltaGrams > 0 ? '+' : ''}${formatGrams(m.weightDeltaGrams)}</td>
                 <td style="color:var(--color-text-muted);">${escapeHtml(m.reason || '—')}</td>
             </tr>

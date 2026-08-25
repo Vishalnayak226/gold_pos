@@ -16,6 +16,7 @@ import { CustomerAccountsManager } from './components/CustomerAccountsManager.js
 import { AuditTrail } from './components/AuditTrail.js';
 import { SettingsManager } from './components/SettingsManager.js';
 import { SchemeDesk } from './components/SchemeDesk.js';
+import { ReportsDesk } from './components/ReportsDesk.js';
 
 document.addEventListener('DOMContentLoaded', () => {
     initAdminAuth();
@@ -35,6 +36,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.auditTrail = new AuditTrail();
     window.settingsManager = new SettingsManager();
     window.schemeDesk = new SchemeDesk();
+    window.reportsDesk = new ReportsDesk();
     if (isAdminAuthenticated()) {
         window.dashboard.refresh();
         window.reprintDesk.refresh();
@@ -360,6 +362,9 @@ function initNavigation() {
             }
             if (targetId === 'inventory-tab' && window.inventoryManager && isAdminAuthenticated()) {
                 window.inventoryManager.refresh();
+            }
+            if (targetId === 'reports-tab' && window.reportsDesk && isAdminAuthenticated()) {
+                window.reportsDesk.refresh();
             }
             if (targetId === 'cash-shifts-tab' && window.cashShiftManager && isAdminAuthenticated()) {
                 window.cashShiftManager.refresh();

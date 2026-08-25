@@ -42,6 +42,8 @@ process.env.GOLD_POS_LOGS_DIR = path.join(TEST_ROOT, 'logs');
 // pitr.js resolves this once at import — set before any dynamic import of it,
 // same reason as DATA_DIR/LOGS_DIR above, or Test 13 litters backend/backups/pitr.
 process.env.GOLD_POS_PITR_DIR = path.join(TEST_ROOT, 'pitr');
+process.env.GOLD_POS_BACKUPS_DIR = path.join(TEST_ROOT, 'backups');
+process.env.GOLD_POS_OFFSITE_BACKUP_DIR = path.join(TEST_ROOT, 'offsite');
 fs.mkdirSync(process.env.GOLD_POS_DATA_DIR, { recursive: true });
 fs.mkdirSync(process.env.GOLD_POS_LOGS_DIR, { recursive: true });
 
@@ -403,7 +405,7 @@ async function testAdminPinHashing() {
     // An existing tenant: plaintext master PIN and a plaintext operator PIN.
     const settings = {
         adminPin: '9182',
-        operators: [{ id: 'OP-T8', name: 'Test Cashier', role: 'cashier', pin: '5150', active: true }]
+        operators: [{ id: 'OP-T8', name: 'Test Cashier', role: 'cashier', pin: '515051', active: true }]
     };
 
     assert.strictEqual(auth.migratePinsToHashes(settings), true, 'the first pass should change something');
@@ -413,7 +415,7 @@ async function testAdminPinHashing() {
     assert.match(settings.adminPinHash, /^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]+$/);
 
     // Both credentials still work, which is the whole point of the migration.
-    const asOperator = auth.resolveActor('5150', settings);
+    const asOperator = auth.resolveActor('515051', settings);
     assert.ok(asOperator, 'the operator PIN must still authenticate after hashing');
     assert.strictEqual(asOperator.actor.name, 'Test Cashier');
     assert.strictEqual(asOperator.actor.role, 'cashier');
@@ -744,6 +746,55 @@ async function testPitrScheduler() {
     console.log('✅ Test 13 Passed: PITR is off by default, snapshots on enable, and prunes on schedule.');
 }
 
+async function testOffsiteBackupCopy() {
+    console.log('\nRunning Test 14: verified off-site backup destination...');
+    const { shipOffsite } = await import('./backupEngine.js');
+    const { readSettings, writeSettings } = await import('./settingsStore.js');
+    const localRoot = process.env.GOLD_POS_BACKUPS_DIR;
+    const offsiteRoot = process.env.GOLD_POS_OFFSITE_BACKUP_DIR;
+    const localSnapshot = path.join(localRoot, 'backup_2026-08-24');
+    fs.mkdirSync(localSnapshot, { recursive: true });
+    fs.writeFileSync(path.join(localSnapshot, 'goldpos.db'), 'isolated ledger fixture');
+    fs.writeFileSync(path.join(localSnapshot, 'settings.json'), '{"fixture":true}');
+
+    const stale = path.join(offsiteRoot, 'backup_2025-01-01');
+    fs.mkdirSync(stale, { recursive: true });
+    const sixtyDaysAgo = (Date.now() - 60 * 86400000) / 1000;
+    fs.utimesSync(stale, sixtyDaysAgo, sixtyDaysAgo);
+    writeSettings({
+        ...readSettings(),
+        offsiteBackupEnabled: true,
+        offsiteBackupPath: offsiteRoot,
+        offsiteBackupRetentionDays: 30
+    });
+
+    const copied = shipOffsite(localSnapshot);
+    assert.strictEqual(copied.success, true, copied.error);
+    assert.strictEqual(copied.verifiedFiles, 2);
+    const manifestPath = path.join(offsiteRoot, 'backup_2026-08-24', 'manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    assert.deepStrictEqual(manifest.files.map(row => row.name).sort(), ['goldpos.db', 'settings.json']);
+    assert.ok(manifest.files.every(row => /^[a-f0-9]{64}$/.test(row.sha256)));
+    assert.strictEqual(fs.existsSync(stale), false, 'expired off-site snapshots must be pruned');
+
+    const published = path.dirname(manifestPath);
+    fs.writeFileSync(path.join(published, 'stale-from-prior-copy.json'), 'must disappear');
+    fs.writeFileSync(path.join(localSnapshot, 'goldpos.db'), 'refreshed isolated ledger fixture');
+    const refreshed = shipOffsite(localSnapshot);
+    assert.strictEqual(refreshed.success, true, refreshed.error);
+    assert.strictEqual(fs.existsSync(path.join(published, 'stale-from-prior-copy.json')), false,
+        'a verified repeat must replace the dated snapshot, not merge into stale files');
+    assert.strictEqual(fs.readFileSync(path.join(published, 'goldpos.db'), 'utf8'),
+        'refreshed isolated ledger fixture');
+
+    process.env.GOLD_POS_OFFSITE_BACKUP_DIR = path.join(localRoot, 'nested-destination');
+    const refused = shipOffsite(localSnapshot);
+    assert.strictEqual(refused.success, false);
+    assert.match(refused.error, /local backup directory/i);
+    process.env.GOLD_POS_OFFSITE_BACKUP_DIR = offsiteRoot;
+    console.log('✅ Test 14 Passed: off-site files are verified, manifested, retained, and kept outside local backups.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -759,6 +810,7 @@ try {
     await testSecretVault();
     await testRolloutCohort();
     await testPitrScheduler();
+    await testOffsiteBackupCopy();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');

@@ -417,6 +417,10 @@ export class ReturnDesk {
                             <input type="radio" name="return-mode" value="gold" style="width:auto; margin:0;" ${hasPhone ? '' : 'disabled'}>
                             <span>Gold — credited to their account</span>
                         </label>
+                        <label style="display:flex; align-items:center; gap:8px; font-weight:500; cursor:${hasPhone ? 'pointer' : 'not-allowed'}; opacity:${hasPhone ? '1' : '0.55'};">
+                            <input type="radio" name="return-mode" value="exchange" style="width:auto; margin:0;" ${hasPhone ? '' : 'disabled'}>
+                            <span>Exchange — credit now, bill replacement next</span>
+                        </label>
                     </div>
                     ${hasPhone ? '' : `<p class="text-muted-small" style="color:var(--color-warning); margin-top:4px;">
                         This invoice carries no customer phone number, so there is no account to
@@ -518,7 +522,8 @@ export class ReturnDesk {
         }
         if (fileBtn) fileBtn.disabled = false;
 
-        const isGold = this.selectedMode() === 'gold';
+        const mode = this.selectedMode();
+        const isCredit = mode === 'gold' || mode === 'exchange';
         const rows = refund.itemised ? `
             <div class="summary-row">
                 <span>Metal returned (${escapeHtml(refund.purity)} @ ${money(refund.goldPricePerGram)}/g):</span>
@@ -558,12 +563,14 @@ export class ReturnDesk {
                 ${rows}
                 <div class="invoice-divider"></div>
                 <div class="summary-row grand-total">
-                    <span>REFUND ${isGold ? '(GOLD CREDIT)' : '(CASH)'}:</span>
+                    <span>REFUND ${mode === 'exchange' ? '(EXCHANGE CREDIT)' : isCredit ? '(GOLD CREDIT)' : '(CASH)'}:</span>
                     <span>${money(refund.refundAmount)}</span>
                 </div>
                 <p class="text-muted-small" style="margin:10px 0 0;">
-                    ${isGold
-                        ? 'Credited to the customer\'s advance account and visible on their phone immediately. It can be redeemed against a future bill.'
+                    ${isCredit
+                        ? (mode === 'exchange'
+                            ? 'Credited to the customer account now. After filing, Billing Desk opens for the replacement invoice; apply this credit there.'
+                            : 'Credited to the customer\'s advance account and visible on their phone immediately. It can be redeemed against a future bill.')
                         : 'Pay this out from the till. Nothing is credited to the customer\'s account.'}
                     ${/* The item is named only on an invoice that HAS several —
                           on a single-item bill "item 1" is noise, and the
@@ -608,7 +615,7 @@ export class ReturnDesk {
             ? ` (item ${line.lineNumber}: ${line.description || line.purity})`
             : '';
         const confirmed = window.confirm(
-            `Refund ${money(preview.refundAmount)} as ${mode === 'gold' ? 'GOLD CREDIT' : 'CASH'} ` +
+            `Refund ${money(preview.refundAmount)} as ${mode === 'exchange' ? 'EXCHANGE CREDIT' : mode === 'gold' ? 'GOLD CREDIT' : 'CASH'} ` +
             `for ${grams(preview.weightGrams)} returned against ${sale.id}${itemLabel}?\n\n` +
             `This is filed to the ledger and cannot be undone from this screen.`
         );
@@ -640,6 +647,9 @@ export class ReturnDesk {
             document.getElementById('return-results').innerHTML = '';
             this.renderCreditNote(data.return);
             this.refresh();
+            if (mode === 'exchange' && window.billingDesk) {
+                await window.billingDesk.startExchange(data.return);
+            }
         } catch (err) {
             alert('Could not reach the server to file the return. Nothing was saved — please retry.');
         } finally {
@@ -656,7 +666,10 @@ export class ReturnDesk {
             ? `<img src="${escapeHtml(this.company.logo)}" alt="" style="max-height:80px; margin:0 auto 10px auto; display:block;">`
             : `<h2>${escapeHtml(this.company.name || 'UNIVERSAL GOLD POS')}</h2>`;
 
-        const isGold = record.refundMode === 'gold';
+        const isGold = record.refundMode === 'gold' || record.refundMode === 'exchange';
+        const refundLabel = record.refundMode === 'exchange'
+            ? 'EXCHANGE CREDIT'
+            : record.refundMode === 'gold' ? 'GOLD CREDIT' : 'CASH';
 
         container.style.display = 'block';
         container.innerHTML = `
@@ -745,7 +758,7 @@ export class ReturnDesk {
                         </div>`}
                         <div class="invoice-divider"></div>
                         <div class="summary-row grand-total">
-                            <span>REFUNDED (${isGold ? 'GOLD CREDIT' : 'CASH'}):</span>
+                            <span>REFUNDED (${refundLabel}):</span>
                             <span>${money(record.refundAmount)}</span>
                         </div>
                     </div>
@@ -800,9 +813,11 @@ export class ReturnDesk {
                 <td>${escapeHtml(r.customerName || 'Cash Sale')}</td>
                 <td>${escapeHtml(r.actor ? r.actor.name : '—')}</td>
                 <td class="text-right">${grams(r.weightGrams)}</td>
-                <td>${r.refundMode === 'gold'
-                    ? '<span style="color:#b45309; font-weight:600;">GOLD CREDIT</span>'
-                    : '<span style="color:#0f766e; font-weight:600;">CASH</span>'}</td>
+                <td>${r.refundMode === 'exchange'
+                    ? '<span style="color:#7c3aed; font-weight:600;">EXCHANGE CREDIT</span>'
+                    : r.refundMode === 'gold'
+                        ? '<span style="color:#b45309; font-weight:600;">GOLD CREDIT</span>'
+                        : '<span style="color:#0f766e; font-weight:600;">CASH</span>'}</td>
                 <td class="text-right">${money(r.refundAmount)}</td>
                 <td class="text-right">
                     <button type="button" class="btn btn-secondary btn-sm return-reprint-btn"

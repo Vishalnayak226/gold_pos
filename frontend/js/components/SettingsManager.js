@@ -632,6 +632,23 @@ export class SettingsManager {
             </div>
             <p class="text-muted-small">A saved SMTP Password is never sent to this screen. Leave the field blank to keep it, or enter a replacement.</p>
             ${this.renderResetAvailabilityNotice(smtp)}
+            <h3 class="settings-section-title" style="margin-top:24px;">Off-site Backup Destination</h3>
+            <label style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">
+                <input type="checkbox" id="set-offsite-enabled" ${s.offsiteBackupEnabled ? 'checked' : ''}>
+                Copy each nightly snapshot off this machine
+            </label>
+            <div class="form-group-row">
+                <div class="form-group" style="flex:3;">
+                    <label for="set-offsite-path">Mounted / synchronised directory</label>
+                    <input type="text" id="set-offsite-path" class="form-control" value="${escapeHtmlAttr(s.offsiteBackupPath || '')}"
+                           placeholder="e.g. Z:\\GoldPOS or /mnt/encrypted-backups">
+                </div>
+                <div class="form-group">
+                    <label for="set-offsite-retention">Retention (days)</label>
+                    <input type="number" id="set-offsite-retention" class="form-control" min="1" max="3650" value="${Number(s.offsiteBackupRetentionDays) || 30}">
+                </div>
+            </div>
+            <p class="text-muted-small">Use a NAS/SMB mount, encrypted removable disk, or an rclone/sync-mounted cloud folder. The copy is SHA-256 verified; cloud credentials stay outside the POS.</p>
             <button type="button" id="save-backup-btn" class="btn btn-primary">Save Backup & Email Settings</button>
 
             <h3 class="settings-section-title" style="margin-top:24px;">Manual Actions</h3>
@@ -649,6 +666,9 @@ export class SettingsManager {
             const payload = {
                 reportEmail: document.getElementById('set-report-email').value,
                 alertEmail: document.getElementById('set-alert-email').value,
+                offsiteBackupEnabled: document.getElementById('set-offsite-enabled').checked,
+                offsiteBackupPath: document.getElementById('set-offsite-path').value,
+                offsiteBackupRetentionDays: parseInt(document.getElementById('set-offsite-retention').value) || 30,
                 smtp: {
                     host: document.getElementById('set-smtp-host').value,
                     port: parseInt(document.getElementById('set-smtp-port').value) || 587,
@@ -668,7 +688,9 @@ export class SettingsManager {
             try {
                 const res = await adminFetch('/api/backup/run', { method: 'POST' });
                 const data = await res.json();
-                statusEl.textContent = data.success ? `Backup created: ${data.folder}` : `Backup failed: ${data.error || 'unknown error'}`;
+                statusEl.textContent = data.success
+                    ? `Backup created: ${data.folder}${data.offsite?.enabled ? (data.offsite.success ? `; off-site copy verified (${data.offsite.verifiedFiles} files)` : `; OFF-SITE COPY FAILED: ${data.offsite.error}`) : ''}`
+                    : `Backup failed: ${data.error || 'unknown error'}`;
             } catch (err) {
                 statusEl.textContent = 'Backup failed: connection error.';
             }
@@ -878,7 +900,7 @@ export class SettingsManager {
                 </td>
                 <td>
                     <input type="password" class="form-control staff-pin" data-row="${i}" maxlength="8"
-                           placeholder="${op.pinConfigured ? 'unchanged' : '4–8 digits'}" autocomplete="new-password">
+                           placeholder="${op.pinConfigured ? 'unchanged' : '6–8 digits'}" autocomplete="new-password">
                 </td>
                 <td style="text-align:center;">
                     <input type="checkbox" class="staff-active" data-row="${i}"${op.active !== false ? ' checked' : ''}>

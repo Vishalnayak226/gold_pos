@@ -60,16 +60,22 @@ export function insertLine(line) {
     getDb().prepare(`
         INSERT INTO invoice_lines (
             id, invoice_id, line_number, description, purity, weight_mg, rate_paise_per_g, rate_source,
+            inventory_item_id, inventory_lot_id,
             metal_value_paise, making_charge_bp, making_charge_paise,
             wastage_mode, wastage_weight_mg, wastage_amount_paise,
             discount_bp, discount_paise, taxable_amount_paise, tax_amount_paise, line_total_paise
         ) VALUES (
             @id, @invoiceId, @lineNumber, @description, @purity, @weightMg, @ratePaisePerG, @rateSource,
+            @inventoryItemId, @inventoryLotId,
             @metalValuePaise, @makingChargeBp, @makingChargePaise,
             @wastageMode, @wastageWeightMg, @wastageAmountPaise,
             @discountBp, @discountPaise, @taxableAmountPaise, @taxAmountPaise, @lineTotalPaise
         )
-    `).run({ wastageMode: 'none', wastageWeightMg: 0, wastageAmountPaise: 0, ...line });
+    `).run({
+        inventoryItemId: null, inventoryLotId: null,
+        wastageMode: 'none', wastageWeightMg: 0, wastageAmountPaise: 0,
+        ...line
+    });
     return line.id;
 }
 
@@ -111,6 +117,17 @@ export function setState(invoiceId, state) {
     assertInTransaction('setState');
     const result = getDb().prepare('UPDATE invoices SET state = ? WHERE id = ?').run(state, invoiceId);
     if (result.changes !== 1) throw new Error(`No invoice ${invoiceId} to transition.`);
+}
+
+/** Cancels an issued invoice while preserving every filed money row. */
+export function cancelInvoice(invoiceId, { actorUserId, reason, at = Date.now() }) {
+    assertInTransaction('cancelInvoice');
+    const result = getDb().prepare(`
+        UPDATE invoices
+           SET state = 'cancelled', cancelled_at = ?, cancelled_by_user_id = ?, cancel_reason = ?
+         WHERE id = ? AND state = 'issued'
+    `).run(at, actorUserId, reason, invoiceId);
+    if (result.changes !== 1) throw new Error(`Invoice ${invoiceId} is not eligible for cancellation.`);
 }
 
 /**
@@ -394,6 +411,11 @@ export function toLegacySale(invoice, lines, extra = {}) {
     return {
         id: invoice.invoice_number,
         timestamp: invoice.issued_at,
+        ...(invoice.state === 'cancelled' ? {
+            state: 'cancelled',
+            cancelledAt: invoice.cancelled_at || null,
+            cancelReason: invoice.cancel_reason || ''
+        } : {}),
         customerName: invoice.customer_name,
         customerPhone: invoice.customer_phone || '',
 
@@ -408,6 +430,8 @@ export function toLegacySale(invoice, lines, extra = {}) {
         lines: rows.map(row => ({
             lineNumber: row.line_number,
             description: row.description || '',
+            inventoryItemId: row.inventory_item_id || null,
+            inventoryLotId: row.inventory_lot_id || null,
             purity: row.purity,
             weightGrams: round3(row.weight_mg / 1000),
             goldPricePerGram: fromPaise(row.rate_paise_per_g),

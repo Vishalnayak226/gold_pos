@@ -3,7 +3,7 @@
  * Lot inventory — items (catalogue metadata), lots (a distinguishable batch
  * of an item), and immutable stock movements (roadmap Phase 5.2, the
  * ungated slice — see 006_lot_inventory.sql for what is deliberately absent
- * and why: no vendor/purchase, no branch transfer, no sale integration).
+ * and migration 016 for the later sale/return/void document integration).
  *
  * THE ONE RULE. A lot's on-hand weight is never stored — it is
  * SUM(weight_delta_mg) over that lot's movements, exactly like an advance
@@ -128,7 +128,13 @@ export function findItemBySku(tenantId, skuCode) {
 
 /** SUM(weight_delta_mg) over a lot's movements. 0 for a lot with none (never happens in practice — a lot is always created with its opening movement). */
 export function lotBalanceMg(lotId) {
-    const row = getDb().prepare('SELECT COALESCE(SUM(weight_delta_mg), 0) AS balance FROM inventory_movements WHERE lot_id = ?').get(lotId);
+    const row = getDb().prepare(`
+        SELECT COALESCE(SUM(weight_delta_mg), 0) AS balance FROM (
+            SELECT weight_delta_mg FROM inventory_movements WHERE lot_id = ?
+            UNION ALL
+            SELECT weight_delta_mg FROM inventory_document_movements WHERE lot_id = ?
+        )
+    `).get(lotId, lotId);
     return row.balance;
 }
 
@@ -141,7 +147,7 @@ export function lotBalanceMg(lotId) {
  * @param {{tenantId, branchId, itemId, weightMg: number, label?: string, reason?: string, actorUserId: string, at?: number, hallmarkHuid?: string}} params
  * @returns {{lotId: string, movementId: string}}
  */
-export function openLot({ tenantId, branchId, itemId, weightMg, label = null, reason = null, actorUserId, at = Date.now(), hallmarkHuid = null }) {
+export function openLot({ tenantId, branchId, itemId, weightMg, label = null, reason = null, actorUserId, at = Date.now(), hallmarkHuid = null, unitCostPaisePerG = null }) {
     assertInTransaction('openLot');
     if (!Number.isInteger(weightMg) || weightMg <= 0) {
         throw new Error('openLot: weightMg must be a positive integer (milligrams).');
@@ -149,9 +155,11 @@ export function openLot({ tenantId, branchId, itemId, weightMg, label = null, re
     const db = getDb();
     const lotId = newId('LOT');
     db.prepare(`
-        INSERT INTO inventory_lots (id, tenant_id, branch_id, item_id, label, created_by_user_id, created_at, hallmark_huid)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(lotId, tenantId, branchId, itemId, label, actorUserId, at, hallmarkHuid);
+        INSERT INTO inventory_lots (
+            id, tenant_id, branch_id, item_id, label, created_by_user_id,
+            created_at, hallmark_huid, unit_cost_paise_per_g
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(lotId, tenantId, branchId, itemId, label, actorUserId, at, hallmarkHuid, unitCostPaisePerG);
 
     const movementId = newId('MOV');
     db.prepare(`
@@ -162,6 +170,58 @@ export function openLot({ tenantId, branchId, itemId, weightMg, label = null, re
     `).run(movementId, tenantId, branchId, itemId, lotId, weightMg, reason, actorUserId, at, businessDate(at));
 
     return { lotId, movementId };
+}
+
+/**
+ * Appends a sale/return/void movement caused by a filed document.  The caller
+ * owns the surrounding sale/return/void transaction, so stock and money can
+ * never commit independently.
+ */
+export function recordDocumentMovement({
+    tenantId, lotId, movementType, weightDeltaMg, invoiceId, invoiceLineId,
+    creditNoteId = null, reversesMovementId = null, reason = null,
+    actorUserId, at = Date.now()
+}) {
+    assertInTransaction('recordDocumentMovement');
+    if (!['sale', 'return', 'void'].includes(movementType)) {
+        throw new Error(`Unsupported inventory document movement ${movementType}.`);
+    }
+    if (!Number.isInteger(weightDeltaMg) || weightDeltaMg === 0) {
+        throw new Error('Document movement weight must be a non-zero integer (milligrams).');
+    }
+
+    const db = getDb();
+    const lot = db.prepare('SELECT * FROM inventory_lots WHERE id = ? AND tenant_id = ?').get(lotId, tenantId);
+    if (!lot) throw new Error(`No lot ${lotId} exists for this tenant.`);
+    if (movementType === 'sale' && weightDeltaMg >= 0) throw new Error('A sale movement must reduce stock.');
+    if (movementType !== 'sale' && weightDeltaMg <= 0) throw new Error(`${movementType} must restore stock.`);
+
+    const currentBalance = lotBalanceMg(lotId);
+    if (currentBalance + weightDeltaMg < 0) {
+        throw new Error(`Lot ${lotId} has only ${currentBalance}mg available; ${Math.abs(weightDeltaMg)}mg was requested.`);
+    }
+
+    const id = newId('DMV');
+    db.prepare(`
+        INSERT INTO inventory_document_movements (
+            id, tenant_id, branch_id, item_id, lot_id, movement_type,
+            weight_delta_mg, reason, invoice_id, invoice_line_id,
+            credit_note_id, reverses_movement_id, actor_user_id, created_at,
+            business_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, tenantId, lot.branch_id, lot.item_id, lotId, movementType,
+        weightDeltaMg, reason, invoiceId, invoiceLineId, creditNoteId,
+        reversesMovementId, actorUserId, at, businessDate(at));
+    return id;
+}
+
+/** Sale movements for an invoice, used to create exact void reversals. */
+export function documentSaleMovementsForInvoice(invoiceId) {
+    return getDb().prepare(`
+        SELECT * FROM inventory_document_movements
+        WHERE invoice_id = ? AND movement_type = 'sale'
+        ORDER BY created_at, rowid
+    `).all(invoiceId);
 }
 
 /**
@@ -210,7 +270,11 @@ export function getLot(tenantId, lotId) {
     return getDb().prepare(`
         SELECT l.*, COALESCE(SUM(m.weight_delta_mg), 0) AS balance_mg
         FROM inventory_lots l
-        LEFT JOIN inventory_movements m ON m.lot_id = l.id
+        LEFT JOIN (
+            SELECT lot_id, weight_delta_mg FROM inventory_movements
+            UNION ALL
+            SELECT lot_id, weight_delta_mg FROM inventory_document_movements
+        ) m ON m.lot_id = l.id
         WHERE l.tenant_id = ? AND l.id = ?
         GROUP BY l.id
     `).get(tenantId, lotId) || null;
@@ -231,7 +295,11 @@ export function listLots(tenantId, { branchId = null, itemId = null } = {}) {
     return db.prepare(`
         SELECT l.*, COALESCE(SUM(m.weight_delta_mg), 0) AS balance_mg
         FROM inventory_lots l
-        LEFT JOIN inventory_movements m ON m.lot_id = l.id
+        LEFT JOIN (
+            SELECT lot_id, weight_delta_mg FROM inventory_movements
+            UNION ALL
+            SELECT lot_id, weight_delta_mg FROM inventory_document_movements
+        ) m ON m.lot_id = l.id
         WHERE ${clauses.join(' AND ')}
         GROUP BY l.id
         ORDER BY l.created_at DESC
@@ -255,7 +323,11 @@ export function itemStockSummary(tenantId, { branchId = null } = {}) {
                COALESCE(SUM(m.weight_delta_mg), 0) AS balance_mg
         FROM inventory_items i
         LEFT JOIN inventory_lots l ON ${lotJoin}
-        LEFT JOIN inventory_movements m ON m.lot_id = l.id
+        LEFT JOIN (
+            SELECT lot_id, weight_delta_mg FROM inventory_movements
+            UNION ALL
+            SELECT lot_id, weight_delta_mg FROM inventory_document_movements
+        ) m ON m.lot_id = l.id
         WHERE i.tenant_id = ?
         GROUP BY i.id
         ORDER BY i.name
@@ -277,7 +349,17 @@ export function listMovements(tenantId, { branchId = null, itemId = null, lotId 
     params.push(n);
 
     return db.prepare(`
-        SELECT * FROM inventory_movements
+        SELECT * FROM (
+            SELECT id, tenant_id, branch_id, item_id, lot_id, movement_type,
+                   weight_delta_mg, reason, actor_user_id, created_at, business_date,
+                   NULL AS invoice_id, NULL AS invoice_line_id, NULL AS credit_note_id
+              FROM inventory_movements
+            UNION ALL
+            SELECT id, tenant_id, branch_id, item_id, lot_id, movement_type,
+                   weight_delta_mg, reason, actor_user_id, created_at, business_date,
+                   invoice_id, invoice_line_id, credit_note_id
+              FROM inventory_document_movements
+        )
         WHERE ${clauses.join(' AND ')}
         ORDER BY created_at DESC
         LIMIT ?

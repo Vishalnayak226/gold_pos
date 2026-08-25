@@ -161,6 +161,13 @@ export const DEFAULT_SETTINGS = {
     pitrEnabled: false,
     pitrIntervalMinutes: 15,
     pitrRetentionHours: 24,
+    /* Nightly off-site copy. The destination is a mounted/synchronised
+       directory (NAS, encrypted removable disk, rclone mount, SMB volume).
+       Keeping transport outside the POS avoids storing cloud credentials or
+       adding a provider SDK; the copied snapshot is hash-verified here. */
+    offsiteBackupEnabled: false,
+    offsiteBackupPath: "",
+    offsiteBackupRetentionDays: 30,
     /* Old-gold exchange (backend/services/oldGoldService.js). Off by default
        — the route answers 404, exactly as if it never existed. The credit
        posts as an ordinary advance deposit; no GST/RCM treatment is computed
@@ -271,6 +278,9 @@ export const SETTINGS_FIELD_RULES = {
     // in stages should not be blocked at the boundary itself.
     pitrIntervalMinutes: { type: 'integer', min: 5, max: 1440 },
     pitrRetentionHours: { type: 'integer', min: 1, max: 720 },
+    offsiteBackupEnabled: { type: 'boolean' },
+    offsiteBackupPath: { type: 'string', maxLength: 1000 },
+    offsiteBackupRetentionDays: { type: 'integer', min: 1, max: 3650 },
     oldGoldExchangeEnabled: { type: 'boolean' },
     oldGoldDeductionPercent: { type: 'number', min: 0, max: 100 },
     goldSchemeEnabled: { type: 'boolean' },

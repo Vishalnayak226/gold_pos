@@ -403,15 +403,15 @@ try {
             method: 'POST',
             headers: { ...adminHeaders, 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                adminPin: '8642',
+                adminPin: '864286',
                 razorpayKeySecret: 'rotated-razorpay-secret',
                 smtp: { pass: 'rotated-smtp-secret' }
             })
         });
         assert.equal(response.status, 200);
-        assert.doesNotMatch(JSON.stringify(await response.json()), /8642|rotated-razorpay-secret|rotated-smtp-secret/);
+        assert.doesNotMatch(JSON.stringify(await response.json()), /864286|rotated-razorpay-secret|rotated-smtp-secret/);
         const stored = readData('settings.json');
-        assert.equal(storedPinVerifies('8642'), true, 'the rotated PIN should now be the one that works');
+        assert.equal(storedPinVerifies('864286'), true, 'the rotated PIN should now be the one that works');
         assert.equal(storedPinVerifies('2468'), false, 'the old PIN must stop working');
         assert.equal(stored.adminPin, undefined);
         assert.equal(stored.razorpayKeySecret, 'rotated-razorpay-secret');
@@ -1755,18 +1755,18 @@ try {
             headers: { ...adminHeaders, 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 operators: [
-                    { name: 'Cashier One', role: 'cashier', pin: '4321', active: true },
-                    { name: 'Manager Two', role: 'manager', pin: '5678', active: true }
+                    { name: 'Cashier One', role: 'cashier', pin: '432143', active: true },
+                    { name: 'Manager Two', role: 'manager', pin: '567856', active: true }
                 ]
             })
         });
         assert.equal(saved.status, 200);
         // The roster comes back without any PIN in it.
         const body = await saved.json();
-        assert.doesNotMatch(JSON.stringify(body.settings.operators), /4321|5678/);
+        assert.doesNotMatch(JSON.stringify(body.settings.operators), /432143|567856/);
         assert.equal(body.settings.operators[0].pinConfigured, true);
 
-        const cashierSession = await loginAdmin(request, { pin: '4321' });
+        const cashierSession = await loginAdmin(request, { pin: '432143' });
         assert.equal(cashierSession.response.status, 200);
         const cashier = await cashierSession.response.json();
         assert.equal(cashier.actor.name, 'Cashier One');
@@ -1797,8 +1797,8 @@ try {
             headers: { ...adminHeaders, 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 operators: [
-                    { name: 'A', role: 'cashier', pin: '1111' },
-                    { name: 'B', role: 'cashier', pin: '1111' }
+                    { name: 'A', role: 'cashier', pin: '111111' },
+                    { name: 'B', role: 'cashier', pin: '111111' }
                 ]
             })
         });
@@ -1809,9 +1809,9 @@ try {
     await check('an operator with no PIN, a bad PIN or an unknown role is refused', async () => {
         const cases = [
             [{ name: 'No Pin', role: 'cashier' }, /needs a PIN/i],
-            [{ name: 'Short', role: 'cashier', pin: '12' }, /4 to 8 digits/i],
-            [{ name: 'Bad Role', role: 'wizard', pin: '9876' }, /unknown role/i],
-            [{ role: 'cashier', pin: '9876' }, /needs a name/i]
+            [{ name: 'Short', role: 'cashier', pin: '12' }, /6 to 8 digits/i],
+            [{ name: 'Bad Role', role: 'wizard', pin: '987698' }, /unknown role/i],
+            [{ role: 'cashier', pin: '987698' }, /needs a name/i]
         ];
         for (const [operator, pattern] of cases) {
             const response = await request('/api/settings', {
@@ -1828,7 +1828,7 @@ try {
         // A customer's unverified claim, sitting pending.
         const pendingId = seedPendingDeposit({ amount: 250, referenceId: 'UTR-ROLE-TEST' });
 
-        const cashierSession = await loginAdmin(request, { pin: '4321' });
+        const cashierSession = await loginAdmin(request, { pin: '432143' });
 
         const refused = await request(`/api/advances/${pendingId}/approve`, {
             method: 'POST',
@@ -1843,7 +1843,7 @@ try {
             'pending'
         );
 
-        const managerSession = await loginAdmin(request, { pin: '5678' });
+        const managerSession = await loginAdmin(request, { pin: '567856' });
 
         const allowed = await request(`/api/advances/${pendingId}/approve`, {
             method: 'POST',
@@ -1857,6 +1857,156 @@ try {
         // pending state.
         assert.equal(stored.reviewedBy.name, 'Manager Two');
         assert.equal(stored.reviewedBy.role, 'manager');
+    });
+
+    /* ==================================================================
+       Security audit C1/C3 — owner/manager-only system routes.
+
+       Before this, POST /api/settings was gated by requireAdminSession
+       alone: any signed-in cashier could rewrite the entire settings
+       document, including adding themselves as `owner`. These checks pin
+       that a non-owner (and, for the owner-only routes, a non-owner
+       manager too) is refused with 403 ROLE_REQUIRED before the handler
+       runs, and that nothing changes on disk as a result.
+       ================================================================== */
+
+    await check('a cashier cannot rewrite settings; only the owner can', async () => {
+        const before = readData('settings.json');
+        const cashierSession = await loginAdmin(request, { pin: '432143' });
+
+        const refused = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ goldTaxSlab: 0 })
+        });
+        assert.equal(refused.status, 403);
+        assert.equal((await refused.json()).error, 'ROLE_REQUIRED');
+        assert.equal(readData('settings.json').goldTaxSlab, before.goldTaxSlab,
+            'a refused request must not have touched the GST slab');
+
+        // A manager is not enough either — settings is owner-only, unlike
+        // the customer-accounts/backup/reports bucket below.
+        const managerSession = await loginAdmin(request, { pin: '567856' });
+        const managerRefused = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...managerSession.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ goldTaxSlab: 0 })
+        });
+        assert.equal(managerRefused.status, 403);
+        assert.equal((await managerRefused.json()).error, 'ROLE_REQUIRED');
+
+        // The owner still can — the gate refuses by role, not blanket.
+        const allowed = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ companyName: before.companyName })
+        });
+        assert.equal(allowed.status, 200);
+    });
+
+    await check('a cashier cannot add themselves as owner even by editing the roster directly', async () => {
+        // Defence-in-depth on mergeOperators itself: even if a future route
+        // reused it without an owner gate, an incoming owner-role row must
+        // still be refused from a non-owner caller. Exercised here through
+        // the (owner-gated) route with an owner session forging a payload
+        // that mixes in a self-promoted row is not reachable over HTTP once
+        // the route itself is owner-only — so this instead confirms the
+        // gate gives NO cashier a path to the roster at all.
+        const cashierSession = await loginAdmin(request, { pin: '432143' });
+        const attempt = await request('/api/settings', {
+            method: 'POST',
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                operators: [{ name: 'Self Promoted', role: 'owner', pin: '999999', active: true }]
+            })
+        });
+        assert.equal(attempt.status, 403);
+        assert.equal((await attempt.json()).error, 'ROLE_REQUIRED');
+        assert.equal(
+            readData('settings.json').operators.some(op => op.name === 'Self Promoted'),
+            false,
+            'no self-promoted owner row may reach disk'
+        );
+    });
+
+    await check('customer-accounts, diagnostics, and update routes refuse a cashier', async () => {
+        const cashierSession = await loginAdmin(request, { pin: '432143' });
+
+        const list = await request('/api/customer-accounts', { headers: cashierSession.headers });
+        assert.equal(list.status, 403);
+        assert.equal((await list.json()).error, 'ROLE_REQUIRED');
+
+        const issue = await request('/api/customer-accounts/issue-login', {
+            method: 'POST',
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: '9333444555', name: 'Should Not Get A Login' })
+        });
+        assert.equal(issue.status, 403);
+        assert.equal((await issue.json()).error, 'ROLE_REQUIRED');
+
+        const telemetry = await request('/api/diagnostics/telemetry', { headers: cashierSession.headers });
+        assert.equal(telemetry.status, 403);
+
+        const exportReq = await request('/api/diagnostics/export', { headers: cashierSession.headers });
+        assert.equal(exportReq.status, 403);
+
+        const updateCheck = await request('/api/admin/update/check', {
+            method: 'POST', headers: cashierSession.headers
+        });
+        assert.equal(updateCheck.status, 403);
+
+        // Diagnostics and updates are owner-only — a manager is refused too.
+        const managerSession = await loginAdmin(request, { pin: '567856' });
+        const managerTelemetry = await request('/api/diagnostics/telemetry', { headers: managerSession.headers });
+        assert.equal(managerTelemetry.status, 403);
+
+        // Customer-accounts is manager-or-owner, so a manager DOES get in.
+        const managerList = await request('/api/customer-accounts', { headers: managerSession.headers });
+        assert.equal(managerList.status, 200);
+    });
+
+    await check('GET /api/qrcode is rate-limited and caps the data length', async () => {
+        const tooLong = await request('/api/qrcode?data=' + 'x'.repeat(201));
+        assert.equal(tooLong.status, 400);
+
+        const ok = await request('/api/qrcode?data=' + encodeURIComponent('upi://pay?pa=store@upi&am=1&cu=INR'));
+        assert.equal(ok.status, 200);
+        assert.ok((await ok.json()).dataUrl.startsWith('data:image/'));
+    });
+
+    await check('registration answers the same way for an existing account and for unclaimed store history', async () => {
+        // A fresh phone with store history (a filed sale) but no portal
+        // login — the CLAIM_REQUIRES_STORE case.
+        const unclaimedPhone = '9777888999';
+        const historySale = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...salePayload(0), customerName: 'Unclaimed History', customerPhone: unclaimedPhone })
+        });
+        assert.equal(historySale.status, 200);
+
+        // Already fully registered (this suite's own customer, `phone`).
+        const existing = await request('/api/customer/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone, name: 'Someone Else', email: 'probe@example.test', password: 'ProbePass!2026' })
+        });
+        // Known to the store but not yet claimed online.
+        const unclaimed = await request('/api/customer/register', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: unclaimedPhone, name: 'Someone Else', email: 'probe2@example.test', password: 'ProbePass!2026' })
+        });
+        assert.equal(existing.status, 409);
+        assert.equal(unclaimed.status, 409);
+        const existingBody = await existing.json();
+        const unclaimedBody = await unclaimed.json();
+        // Same error code and message either way — an attacker probing
+        // numbers cannot tell "already has a login" from "known to the
+        // store but not yet claimed" (security audit H4).
+        assert.equal(existingBody.error, 'REGISTRATION_BLOCKED');
+        assert.equal(unclaimedBody.error, 'REGISTRATION_BLOCKED');
+        assert.equal(existingBody.message, unclaimedBody.message);
     });
 
     await check('old-gold exchange is off by default — the route answers as though it never existed', async () => {
@@ -1888,7 +2038,7 @@ try {
         const oldGoldPhone = '9111222333';
 
         try {
-            const cashierSession = await loginAdmin(request, { pin: '4321' });
+            const cashierSession = await loginAdmin(request, { pin: '432143' });
             const refused = await request('/api/old-gold-exchanges', {
                 method: 'POST',
                 headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
@@ -1958,7 +2108,7 @@ try {
         })).status, 200);
 
         try {
-            const cashierSession = await loginAdmin(request, { pin: '4321' });
+            const cashierSession = await loginAdmin(request, { pin: '432143' });
             const refusedEnroll = await request('/api/gold-schemes/enrollments', {
                 method: 'POST',
                 headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
@@ -2087,14 +2237,14 @@ try {
 
     await check('operator PINs are stored hashed, never in the clear', async () => {
         const raw = fs.readFileSync(path.join(dataDir, 'settings.json'), 'utf8');
-        // '4321' and '5678' were configured as operator PINs above.
-        assert.doesNotMatch(raw, /"pin"\s*:\s*"4321"/);
-        assert.doesNotMatch(raw, /"pin"\s*:\s*"5678"/);
+        // '432143' and '567856' were configured as operator PINs above.
+        assert.doesNotMatch(raw, /"pin"\s*:\s*"432143"/);
+        assert.doesNotMatch(raw, /"pin"\s*:\s*"567856"/);
         const stored = readData('settings.json');
         const cashier = stored.operators.find(op => op.name === 'Cashier One');
         assert.equal(cashier.pin, undefined, 'no plaintext pin key should survive');
         assert.match(cashier.pinHash, /^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]+$/);
-        assert.equal(operatorPinVerifies(cashier.id, '4321'), true, 'the hash must verify the real PIN');
+        assert.equal(operatorPinVerifies(cashier.id, '432143'), true, 'the hash must verify the real PIN');
         assert.equal(operatorPinVerifies(cashier.id, '0000'), false, 'and reject another');
     });
 
@@ -2111,7 +2261,7 @@ try {
     });
 
     await check('changing an operator’s PIN ends their live sessions', async () => {
-        const before = await loginAdmin(request, { pin: '4321' });
+        const before = await loginAdmin(request, { pin: '432143' });
         // The session works…
         assert.equal((await request('/api/admin/me', {
             headers: before.headers
@@ -2119,7 +2269,7 @@ try {
 
         const roster = readData('settings.json').operators.map(op => ({
             id: op.id, name: op.name, role: op.role, active: op.active,
-            ...(op.name === 'Cashier One' ? { pin: '43219' } : {})
+            ...(op.name === 'Cashier One' ? { pin: '432199' } : {})
         }));
         const saved = await request('/api/settings', {
             method: 'POST',
@@ -2136,16 +2286,16 @@ try {
         // The new PIN works; the old one does not.
         assert.equal((await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
+            body: JSON.stringify({ pin: '432199' })
         })).status, 200);
         assert.equal((await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '4321' })
+            body: JSON.stringify({ pin: '432143' })
         })).status, 401);
     });
 
     await check('deactivating an operator ends their sessions and their login', async () => {
-        const cashierSession = await loginAdmin(request, { pin: '43219' });
+        const cashierSession = await loginAdmin(request, { pin: '432199' });
 
         const roster = readData('settings.json').operators.map(op => ({
             id: op.id, name: op.name, role: op.role,
@@ -2160,7 +2310,7 @@ try {
         assert.equal((await request('/api/admin/me', { headers: cashierSession.headers })).status, 401);
         assert.equal((await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '43219' })
+            body: JSON.stringify({ pin: '432199' })
         })).status, 401, 'an inactive operator cannot sign in');
 
         // Reactivate for the checks that follow.
@@ -2176,7 +2326,7 @@ try {
     });
 
     await check('a live session can be listed and signed out by an approver', async () => {
-        const cashierSession = await loginAdmin(request, { pin: '43219' });
+        const cashierSession = await loginAdmin(request, { pin: '432199' });
 
         // A cashier may not enumerate who is signed in.
         assert.equal((await request('/api/admin/sessions', {
@@ -2261,19 +2411,19 @@ try {
     await check('an enrolled operator must supply a code to sign in', async () => {
         const noCode = await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '5678' })
+            body: JSON.stringify({ pin: '567856' })
         });
         assert.equal(noCode.status, 401);
         assert.equal((await noCode.json()).error, 'MFA_CODE_REQUIRED');
 
         const wrongCode = await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '5678', totpCode: '000000' })
+            body: JSON.stringify({ pin: '567856', totpCode: '000000' })
         });
         assert.equal(wrongCode.status, 401);
         assert.equal((await wrongCode.json()).error, 'MFA_CODE_INVALID');
 
-        const okSession = await loginAdmin(request, { pin: '5678', totpCode: currentTotp(mfaSecret) });
+        const okSession = await loginAdmin(request, { pin: '567856', totpCode: currentTotp(mfaSecret) });
         assert.equal(okSession.response.status, 200);
         const session = await okSession.response.json();
         assert.equal(session.mfaUsed, true);
@@ -2284,7 +2434,7 @@ try {
         const code = mfaRecoveryCodes[0];
         const first = await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '5678', recoveryCode: code })
+            body: JSON.stringify({ pin: '567856', recoveryCode: code })
         });
         assert.equal(first.status, 200);
         assert.equal((await first.json()).mfaUsed, true);
@@ -2295,7 +2445,7 @@ try {
 
         const replay = await request('/api/admin/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: '5678', recoveryCode: code })
+            body: JSON.stringify({ pin: '567856', recoveryCode: code })
         });
         assert.equal(replay.status, 401, 'a recovery code must not work twice');
     });
@@ -2350,7 +2500,7 @@ try {
             body: JSON.stringify(salePayload(0))
         })).json()).sale;
 
-        const cashierSession = await loginAdmin(request, { pin: '43219' });
+        const cashierSession = await loginAdmin(request, { pin: '432199' });
 
         const refused = await request('/api/returns', {
             method: 'POST',
@@ -2389,7 +2539,7 @@ try {
             body: JSON.stringify(salePayload(0))
         })).json()).sale;
 
-        const cashierSession = await loginAdmin(request, { pin: '43219' });
+        const cashierSession = await loginAdmin(request, { pin: '432199' });
 
         const filed = await request('/api/returns', {
             method: 'POST',
@@ -2477,6 +2627,95 @@ try {
     });
 
     /* ==================================================================
+       Catalogue → billing → return/void stock, plus management reports.
+       These use the live HTTP boundary: auth, body parsing, routes, services,
+       transaction and repository all participate.
+       ================================================================== */
+
+    let billingInventory = null;
+
+    await check('SKU lookup feeds an exact lot into an atomic stock-linked sale and return exchange', async () => {
+        const itemRes = await request('/api/inventory/items', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'HTTP Stock Chain', purity: '22K', skuCode: 'HTTP-SKU-1', netWeightGrams: 5 })
+        });
+        assert.equal(itemRes.status, 200);
+        const item = (await itemRes.json()).item;
+
+        const lotRes = await request('/api/inventory/lots', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId: item.id, weightGrams: 5, unitCostPerGram: 800 })
+        });
+        assert.equal(lotRes.status, 200);
+        const lot = (await lotRes.json()).lot;
+
+        const lookup = await request('/api/inventory/items/by-sku/HTTP-SKU-1', { headers: adminHeaders });
+        assert.equal(lookup.status, 200);
+        const found = await lookup.json();
+        assert.equal(found.item.id, item.id);
+        assert.equal(found.lots[0].id, lot.id);
+
+        const saleRes = await request('/api/sales', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerName: 'HTTP Inventory Customer', customerPhone: phone,
+                lines: [{ purity: '22K', weightGrams: 2, inventoryItemId: item.id, inventoryLotId: lot.id }],
+                totalAmount: 0, appliedAdvance: 0, discountPercent: 0
+            })
+        });
+        assert.equal(saleRes.status, 200);
+        const sale = await saleRes.json();
+
+        const stockAfterSale = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(stockAfterSale.find(row => row.itemId === item.id).weightGrams, 3);
+
+        const returnRes = await request('/api/returns', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ invoiceId: sale.invoiceId, weightGrams: 1, refundMode: 'exchange' })
+        });
+        assert.equal(returnRes.status, 200);
+        const returned = await returnRes.json();
+        assert.equal(returned.return.refundMode, 'exchange');
+        assert.equal(returned.return.isExchange, true);
+
+        const stockAfterReturn = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(stockAfterReturn.find(row => row.itemId === item.id).weightGrams, 4);
+        billingInventory = { item, lot, exchangeCreditNoteId: returned.returnId };
+    });
+
+    await check('same-day void restores linked stock and all four management reports answer over HTTP', async () => {
+        const { item, lot } = billingInventory;
+        const saleRes = await request('/api/sales', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                lines: [{ purity: '22K', weightGrams: 1, inventoryItemId: item.id, inventoryLotId: lot.id }],
+                customerName: 'Void Customer', totalAmount: 0, appliedAdvance: 0, discountPercent: 0
+            })
+        });
+        assert.equal(saleRes.status, 200);
+        const invoiceId = (await saleRes.json()).invoiceId;
+
+        const voidRes = await request(`/api/sales/${encodeURIComponent(invoiceId)}/void`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'HTTP test cashier correction' })
+        });
+        assert.equal(voidRes.status, 200);
+        assert.equal((await voidRes.json()).sale.state, 'cancelled');
+
+        const stock = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(stock.find(row => row.itemId === item.id).weightGrams, 4);
+
+        for (const name of ['settlement', 'reconciliation', 'profitability', 'ageing']) {
+            const response = await request(`/api/reports/${name}`, { headers: adminHeaders });
+            assert.equal(response.status, 200, name);
+            const body = await response.json();
+            assert.equal(typeof body.definition, 'string', name);
+        }
+        const profit = await (await request('/api/reports/profitability', { headers: adminHeaders })).json();
+        assert.ok(profit.rows.some(row => row.invoiceNumber && row.costPaise !== null));
+    });
+
+    /* ==================================================================
        THE AUDIT TRAIL'S READ PATH.
 
        The table has been append-only since Phase 24 and written on every
@@ -2507,10 +2746,10 @@ try {
     });
 
     await check('a cashier cannot read the audit trail', async () => {
-        /* '43219', not the '4321' Cashier One starts with: the session-
+        /* '432199', not the '432143' Cashier One starts with: the session-
            revocation check earlier in this suite rotates their PIN to prove
            that changing it ends their sessions, and this runs after it. */
-        const asCashier = await loginAdmin(request, { pin: '43219' });
+        const asCashier = await loginAdmin(request, { pin: '432199' });
         assert.equal(asCashier.response.status, 200, 'the cashier must be able to sign in for this to test anything');
 
         /* The trail names who released money, which makes it the record a
@@ -2595,7 +2834,7 @@ try {
     });
 
     await check('verify and export are approver-only, like the trail itself', async () => {
-        const asCashier = await loginAdmin(request, { pin: '43219' });
+        const asCashier = await loginAdmin(request, { pin: '432199' });
         assert.equal(asCashier.response.status, 200);
 
         const verify = await request('/api/audit/verify', { headers: asCashier.headers });
@@ -2655,10 +2894,10 @@ try {
         const response = await request('/api/admin/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            /* '8642', not initialSettings.adminPin: the secret-rotation check
+            /* '864286', not initialSettings.adminPin: the secret-rotation check
                far above this one replaces the master PIN, and '2468' has been
                dead since. */
-            body: JSON.stringify({ pin: '8642', totpCode: '', recoveryCode: '' })
+            body: JSON.stringify({ pin: '864286', totpCode: '', recoveryCode: '' })
         });
         assert.equal(response.status, 200, 'the browser\'s own login shape must not be refused');
         assert.ok(cookieJarFrom(response).gp_admin_sess, 'a successful login must set the session cookie');

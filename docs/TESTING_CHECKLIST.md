@@ -280,7 +280,7 @@ more than it took.*
 - [ ] **Admin PIN is masked.** The Admin PIN box shows `••••••••`, not the real PIN. Edit Company Name only and Save, then log out and log back in with your *existing* PIN → it still works (saving an unrelated field must not overwrite the PIN with the mask).
   Result: _____  Notes: ______________________________________________
 
-- [ ] Type a new PIN over the mask (e.g. `4321`) → Save → log out → the new PIN works and the old one does not. Set it back afterwards.
+- [ ] Type a new PIN over the mask (e.g. `432198` — 6 digits minimum since 2026-08-24) → Save → log out → the new PIN works and the old one does not. Set it back afterwards.
   Result: _____  Notes: ______________________________________________
 
 ---
@@ -687,9 +687,10 @@ person clicking through can confirm.
   `Signed in: Store Owner (owner)`.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Add two people — one **Cashier** with PIN `4321`, one **Manager** with PIN `8765` — and Save.
-  The PIN boxes go blank and their placeholders change to `unchanged`; the two names persist on a
-  page reload.
+- [ ] Add two people — one **Cashier** with PIN `432198`, one **Manager** with PIN `876543` (operator
+  PINs need 6-8 digits since 2026-08-24; a 4-digit entry is refused with "must be 6 to 8 digits") —
+  and Save. The PIN boxes go blank and their placeholders change to `unchanged`; the two names
+  persist on a page reload.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Save again **without retyping either PIN** → both still work at the lock screen. (This is the
@@ -700,7 +701,7 @@ person clicking through can confirm.
   **master PIN** → refused. Leave a new person's PIN **blank** → refused, naming them.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Log out, sign in with `4321` → sidebar reads `Signed in: <name> (cashier)`. Bill a sale, then
+- [ ] Log out, sign in with `432198` → sidebar reads `Signed in: <name> (cashier)`. Bill a sale, then
   open **Reprint Invoice** and find it → the control strip above the sheet says `billed by <name>
   (cashier)`. Print it → that line does **not** appear on the paper.
   Result: _____  Notes: ______________________________________________
@@ -908,6 +909,68 @@ person clicking through can confirm.
   Result: _____  Notes: ______________________________________________
 
 - [ ] Set the limit back to 0 → a cashier can refund any amount again (the original behaviour).
+  Result: _____  Notes: ______________________________________________
+
+---
+
+## 22. Billing-linked inventory, exchanges/voids, off-site backup and management reports *(added 2026-08-24)*
+
+### 22a. SKU to invoice to stock
+
+- [ ] Inventory → create an active item with a unique SKU/barcode, purity and nominal net weight;
+  open a costed lot. In Billing, scan/type the SKU → name, purity and weight fill automatically and
+  the exact positive-stock lot is selectable.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] File the sale → the invoice line retains the item/lot link and the lot drops by exactly the
+  billed weight. Try to file more than the remaining lot → 409/refused, with no invoice number or
+  stock movement consumed.
+  Result: _____  Notes: ______________________________________________
+
+### 22b. Return exchange and void/cancel
+
+- [ ] Return part of that linked line using **Exchange credit** → the credit note says EXCHANGE
+  CREDIT, the exact source lot increases by the returned weight, and Billing opens for the same
+  customer with the exchange-credit banner. Apply Advance and file the replacement → the exchange
+  note links once to that invoice; attempting to reuse it is refused.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] File a fresh linked sale and use Reprint → Void with an Owner/Manager and a meaningful reason
+  on the same business date → invoice remains visible as cancelled, stock is restored by a new void
+  movement and any redeemed advance is restored by a reversal. A prior-day or partly returned sale
+  must refuse void and direct staff to the return flow.
+  Result: _____  Notes: ______________________________________________
+
+### 22c. Off-site destination
+
+- [ ] Settings → Backup & Email → enable off-site copy and choose a mounted/synchronised directory
+  outside both the live data and local backup trees. Create Backup Now → local backup succeeds, the
+  off-site status says verified, and the destination contains the dated folder plus `manifest.json`
+  with a SHA-256 entry for every copied file.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Temporarily make the destination unavailable → local backup still reports its own success,
+  off-site status explicitly fails, and `BACKUP_OFFSITE_FAILED` reaches the configured alert path.
+  Restore the destination and run again. Confirm retention removes only matching old `backup_*`
+  folders in that destination.
+  Result: _____  Notes: ______________________________________________
+
+### 22d. Management report definitions
+
+- [ ] Management Reports → Settlement for a known period → active counter tenders, tenders retained
+  on voids, refunds/credits and net settlement agree with filed documents; advance tender is not
+  counted as new counter cash.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Reconciliation → a correctly tendered invoice (including one partly paid by advance) is clean;
+  a tender mismatch, tender on a void or paid gateway order without an equal posted advance credit
+  appears as an exception.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Profitability → a costed linked lot shows remaining net-of-GST revenue after returns less lot
+  cost; a manual/uncosted line is labeled uncosted and lowers cost coverage instead of inventing a
+  margin. Ageing → only positive on-hand lots appear in the correct opening-date bucket, with cost
+  value only for costed lots.
   Result: _____  Notes: ______________________________________________
 
 ---
