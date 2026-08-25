@@ -7,7 +7,6 @@
 
 import 'dotenv/config';
 import express from 'express';
-import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -118,8 +117,72 @@ const app = express();
 // authenticateAdmin's brute-force lockout to key per real caller instead of
 // locking every user out globally (same reasoning as backend/server.js).
 app.set('trust proxy', 'loopback');
-app.use(cors());
+/* NO CORS MIDDLEWARE (security audit H8). `cors()` with no options reflects
+   ANY origin as allowed — every consumer of this server is either
+   server-to-server (the POS backend's licenseChecker.js) or same-origin (the
+   admin panel served below), neither of which needs a CORS grant at all, so
+   the previous blanket allowance bought nothing and only widened who a
+   browser would let read a response from here. */
+// A handful of headers, not a helmet() dependency (this is a JSON API with
+// one inline admin panel, not a page that needs a full CSP directive list —
+// see backend/package.json's dependency-budget note in CLAUDE.md §0).
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    next();
+});
 app.use(express.json());
+
+/**
+ * Per-IP rate limiter (security audit H8: no rate limiting anywhere on this
+ * server). Same fixed-window-counter shape as backend/rateLimit.js's
+ * createRateLimiter; duplicated (not imported) because this is a separate
+ * deployable with its own package.json and dependency budget — see the
+ * createBoundedMap note further down for why. Built on createBoundedMap,
+ * which is a hoisted function declaration, so calling it here ahead of its
+ * own textual definition is safe.
+ */
+function createRateLimiter({ windowMs, max, message }) {
+    const counters = createBoundedMap({ ttlMs: windowMs });
+    return function limiter(req, res, next) {
+        const now = Date.now();
+        const key = req.ip || 'unknown';
+        let entry = counters.get(key);
+        if (!entry) entry = counters.set(key, { count: 0, resetAt: now + windowMs }, now);
+        entry.count += 1;
+        if (entry.count > max) {
+            const retryAfterSeconds = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+            res.setHeader('Retry-After', String(retryAfterSeconds));
+            return res.status(429).json({ error: 'RATE_LIMITED', message, retryAfterSeconds });
+        }
+        return next();
+    };
+}
+
+// Blanket per-IP ceiling, high enough that a legitimate tenant fleet polling
+// this server never trips it — a stop on runaway/scripted traffic, not a
+// quota. /api/health is exempt: monitoring polls it by design. Registered
+// before every route below, which is what makes it apply to all of them —
+// Express walks middleware in registration order, so a limiter added after
+// a route is defined would never see that route's requests.
+const apiRateLimiter = createRateLimiter({
+    windowMs: 60 * 1000, max: 300,
+    message: 'Too many requests. Please slow down and try again shortly.'
+});
+app.use((req, res, next) => {
+    if (req.path === '/api/health') return next();
+    return apiRateLimiter(req, res, next);
+});
+
+// License verification is unauthenticated and, unlike the other public
+// routes here, its response shape distinguishes an unknown key from a
+// known one — so an unthrottled caller could both spam the control plane
+// and enumerate valid license keys (security audit H6).
+const licenseVerifyLimiter = createRateLimiter({
+    windowMs: 60 * 60 * 1000, max: 30,
+    message: 'Too many verification attempts from this address. Please wait and try again.'
+});
 
 /**
  * GET /api/health
@@ -168,7 +231,7 @@ class DatabaseAdapter {
  * POST /api/license/verify
  * Validates a client's license and returns an RSA-signed verification payload.
  */
-app.post('/api/license/verify', async (req, res) => {
+app.post('/api/license/verify', licenseVerifyLimiter, async (req, res) => {
     try {
         const { licenseKey, systemFingerprint } = req.body;
         if (!licenseKey) {
@@ -292,14 +355,94 @@ app.get('/api/releases/latest', (req, res) => {
 // client's own admin PIN, plus a timing-safe comparison (a naive `!==`
 // string compare leaks a byte-by-byte timing signal) and a loud startup
 // warning if the well-known default was never changed.
-if (ADMIN_SECRET === 'MASTER-ADMIN-SECRET-12345') {
+const ADMIN_SECRET_IS_DEFAULT = ADMIN_SECRET === 'MASTER-ADMIN-SECRET-12345';
+const IS_PRODUCTION = (process.env.NODE_ENV === 'production') || (process.env.ENV_NAME === 'production');
+if (ADMIN_SECRET_IS_DEFAULT) {
+    /* FAIL CLOSED IN PRODUCTION (security audit C2). A warning that does not
+       stop the process is not a control — this default is documented in the
+       repo, so anyone who can reach this port already knows it. Mirrors the
+       fail-closed posture backend/productionGuard.js already takes for the
+       POS admin PIN: refuse to boot rather than run with a known-public
+       credential guarding fleet-wide code publishing. Non-production
+       environments (local dev, a fresh install before ADMIN_SECRET is set)
+       still boot, with a loud warning. */
+    if (IS_PRODUCTION) {
+        console.error('[Licensing Server] REFUSING TO START: ADMIN_SECRET is still the documented default (MASTER-ADMIN-SECRET-12345) and NODE_ENV/ENV_NAME is "production". This token can publish signed releases that auto-apply to every tenant — set a real secret via the ADMIN_SECRET env var before deploying.');
+        process.exit(1);
+    }
     console.warn('[Licensing Server] WARNING: ADMIN_SECRET is still the documented default. This token can publish code releases that auto-apply to every tenant — set a real secret via the ADMIN_SECRET env var before any real deployment.');
 }
 
 const MAX_FAILED_ADMIN_ATTEMPTS = 5;
 const BASE_ADMIN_LOCKOUT_MS = 30 * 1000;
 const MAX_ADMIN_LOCKOUT_MS = 15 * 60 * 1000;
-const failedAdminAttempts = new Map(); // ip -> { count, lockedUntil }
+
+/* Bounded, not a plain Map (security audit H7). A plain Map here only ever
+   shed an entry on a SUCCESSFUL admin auth, so every source that failed once
+   and never came back — one request from any new IP is enough — stayed
+   resident for the life of the process: unbounded growth, indistinguishable
+   from a memory leak. Same fix backend/rateLimit.js's createBoundedMap
+   applies to the POS server's own login lockout; duplicated here in full
+   (not imported) because this is a separate deployable with its own
+   package.json and dependency budget (CLAUDE.md §0) — importing across that
+   boundary would pull backend/db.js's whole module graph in for 25 lines. */
+function createBoundedMap({ maxEntries = 20000, ttlMs }) {
+    const entries = new Map();
+    let nextSweepAt = 0;
+    function sweep(now) {
+        for (const [key, value] of entries) {
+            if (value.expiresAt <= now) entries.delete(key);
+        }
+        if (entries.size > maxEntries) {
+            const excess = entries.size - maxEntries;
+            let dropped = 0;
+            for (const key of entries.keys()) {
+                entries.delete(key);
+                if (++dropped >= excess) break;
+            }
+        }
+        nextSweepAt = now + ttlMs;
+    }
+    return {
+        get(key) {
+            const entry = entries.get(key);
+            if (!entry) return undefined;
+            if (entry.expiresAt <= Date.now()) { entries.delete(key); return undefined; }
+            return entry;
+        },
+        set(key, entry, now = Date.now()) {
+            entry.expiresAt = now + ttlMs;
+            entries.set(key, entry);
+            if (now >= nextSweepAt || entries.size > maxEntries) sweep(now);
+            return entry;
+        },
+        delete(key) { return entries.delete(key); }
+    };
+}
+
+const failedAdminAttempts = createBoundedMap({ ttlMs: 24 * 60 * 60 * 1000, maxEntries: 10000 }); // ip -> { count, lockedUntil }
+
+/**
+ * Append-only audit trail for admin actions (security audit C2): who
+ * published what, when, from where. There was none before — a leaked or
+ * brute-forced ADMIN_SECRET could publish a fleet-wide release with no
+ * record of it happening. Plain newline-delimited JSON, matching the
+ * lightweight-on-purpose posture of the rest of this file (no DB here).
+ */
+const adminAuditLogFile = path.join(DATA_DIR, 'admin_audit.log');
+function auditAdminAction(req, action, detail) {
+    const line = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        ip: req.ip || 'unknown',
+        action,
+        detail
+    });
+    try {
+        fs.appendFileSync(adminAuditLogFile, line + '\n');
+    } catch (err) {
+        console.error('[Licensing Server] Failed to write admin audit log entry:', err.message);
+    }
+}
 
 function timingSafeStringEqual(a, b) {
     const bufA = Buffer.from(String(a));
@@ -454,6 +597,7 @@ app.post('/api/admin/releases', authenticateAdmin, (req, res) => {
         }
         fs.writeFileSync(configFile, JSON.stringify(config, null, 2));
 
+        auditAdminAction(req, 'PUBLISH_RELEASE', { version, channel, downloadUrl, rolloutPercent: rolloutPct });
         res.json({ success: true, release: manifest });
     } catch (err) {
         console.error('Publish release error:', err);
@@ -829,5 +973,8 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, '127.0.0.1', () => {
     console.log(`[Licensing Server] Control panel running on http://localhost:${PORT}`);
-    console.log(`[Licensing Server] Admin token: ${ADMIN_SECRET}`);
+    // Never the secret itself (it used to be printed here) — stdout ends up
+    // in log files and terminal scrollback far more casually than
+    // settings.json ever does, and this token can publish fleet-wide code.
+    console.log(`[Licensing Server] Admin authentication is ${ADMIN_SECRET_IS_DEFAULT ? 'using the DEFAULT secret — set ADMIN_SECRET before deploying' : 'configured'}.`);
 });

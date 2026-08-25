@@ -113,6 +113,57 @@ existing endpoints.
   injection; node-cron `3.x` → `4.x` clears a transitive `uuid` buffer bounds
   check. Both are major-version bumps and were verified against this
   codebase's actual usage before landing; no application code changed.
+- **`POST /api/settings` now requires the owner role.** It was previously
+  gated only by "any signed-in operator", so any cashier session could
+  rewrite the entire settings document in one request — including adding a
+  new operator with role `owner`, at which point they held full control of
+  the system. Settings management, the diagnostics screens, and applying a
+  code update are now owner-only; issuing/resetting a customer's portal
+  login, running a backup, sending a report, and syncing the gold price now
+  require owner or manager. A cashier attempting any of these gets a clear
+  "this action needs the owner role" message instead of a silent success.
+- **The admin `alert()` dialog no longer executes injected markup.** It
+  built its popup with `innerHTML`, unlike the customer portal's equivalent
+  dialog, which already used `textContent` for exactly this reason. Any
+  server-supplied string reaching an admin `alert()` — an operator name, an
+  error detail, a customer name from a lookup — is now rendered as inert
+  text. The content-security-policy no longer permits inline scripts at all
+  (`'unsafe-inline'` removed from `script-src`), closing off the other half
+  of that class of attack.
+- **Operator and master PINs must now be 6–8 digits, not 4–8**, when set or
+  changed through Settings → Staff & Roles or Settings → Billing. A PIN set
+  before this change keeps working at the lock screen; the new floor only
+  applies going forward. A tenant-wide lockout was also added alongside the
+  existing per-address one: 100 failed admin sign-ins from any mix of
+  addresses within 15 minutes locks out every admin sign-in attempt for 5
+  minutes, closing the gap where spreading guesses across many source
+  addresses evaded the existing per-address cooldown entirely.
+- **`GET /api/qrcode` and `POST /api/payment/verify` are now rate-limited**,
+  and the QR endpoint's input is capped at 200 characters. Both were public
+  (or customer-session) routes with no limiter and, for the QR endpoint, no
+  bound on the size of the text it would encode.
+- **Customer self-registration no longer reveals which phone numbers the
+  store already knows.** It used to answer with a different error for "this
+  number already has a login" versus "this number has store history but no
+  login yet", which let anyone enumerate the customer base one guess at a
+  time. Both cases now get the same response.
+- **Server error responses on the money and licensing routes no longer
+  include the raw exception text.** A handful of routes echoed
+  `err.message` straight into the JSON body on a 500; the browser now gets a
+  generic message and a request id to quote, and the full detail still goes
+  to the server's own error log.
+- **The licensing server refuses to start in production with its default
+  admin token.** `ADMIN_SECRET` ships with a documented placeholder value —
+  previously this only produced a startup warning, and that token can
+  publish signed releases every tenant auto-applies. It now exits
+  immediately under `NODE_ENV=production` (or `ENV_NAME=production`) unless
+  a real secret is configured, mirroring how the POS backend itself already
+  refuses to start with the default admin PIN. Every release publish is now
+  appended to an audit log (who, what, when, from where); the admin token is
+  no longer printed to the server's own startup log; its failed-attempt
+  lockout can no longer grow without bound under a sustained flood; the
+  blanket `cors()` middleware — which allowed any origin — was removed, since
+  nothing this server serves is meant to be fetched cross-origin.
 
 ### Added
 

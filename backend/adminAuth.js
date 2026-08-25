@@ -326,6 +326,54 @@ const MAX_LOCKOUT_MS = 15 * 60 * 1000; // capped at 15 minutes
    escalation policy below is unchanged — only the storage is shared. */
 const failedAttempts = createBoundedMap({ ttlMs: 24 * 60 * 60 * 1000, maxEntries: 10000 });
 
+/* GLOBAL BREAKER, ON TOP OF THE PER-IP ONE.
+   Per-IP throttling is beaten by spreading guesses across many source
+   addresses — a botnet or any IP-rotation capability empties a 4-8 digit PIN
+   keyspace in minutes without any single IP ever crossing MAX_FAILED_ATTEMPTS.
+   This counts failed admin logins tenant-wide, independent of source, and
+   locks out ALL sign-in attempts for a short window once the aggregate
+   crosses a threshold no legitimate run of typos should reach — a busy shop
+   with several tills mistyping a PIN now and again will not come close to
+   it, but a scripted distributed attempt will.
+
+   Deliberately a plain fixed window rather than createBoundedMap: there is
+   exactly one counter, tenant-wide, not one per key, so nothing here is
+   unbounded. */
+const GLOBAL_MAX_FAILURES = 100;
+const GLOBAL_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const GLOBAL_LOCKOUT_MS = 5 * 60 * 1000; // 5 minutes
+let globalFailureWindow = { count: 0, windowStart: 0, lockedUntil: 0 };
+
+function currentGlobalFailureWindow(now) {
+    if (now - globalFailureWindow.windowStart > GLOBAL_WINDOW_MS) {
+        globalFailureWindow = { count: 0, windowStart: now, lockedUntil: 0 };
+    }
+    return globalFailureWindow;
+}
+
+/** Remaining ms of a tenant-wide lockout, or 0 if none is in effect. */
+export function getGlobalLoginLockoutRemaining() {
+    const now = Date.now();
+    const win = currentGlobalFailureWindow(now);
+    return win.lockedUntil > now ? win.lockedUntil - now : 0;
+}
+
+function recordGlobalFailedLogin() {
+    const now = Date.now();
+    const win = currentGlobalFailureWindow(now);
+    win.count += 1;
+    if (win.count >= GLOBAL_MAX_FAILURES) {
+        win.lockedUntil = now + GLOBAL_LOCKOUT_MS;
+    }
+}
+
+// Test seam, mirroring createRateLimiter's .reset(): lets a suite start from
+// a known state rather than depending on whatever earlier checks in the same
+// process already spent.
+export function resetGlobalLoginLockout() {
+    globalFailureWindow = { count: 0, windowStart: 0, lockedUntil: 0 };
+}
+
 /**
  * Checks whether a given source key is currently locked out from login attempts.
  * Returns the remaining lockout time in ms, or 0 if not locked.
@@ -518,6 +566,13 @@ export function consumeRecoveryCode(code, authSalt, storedHashes) {
  * the actual verifyAdminPin() call performed by the route handler.
  */
 export function loginRateLimiter(req, res, next) {
+    const globalRemaining = getGlobalLoginLockoutRemaining();
+    if (globalRemaining > 0) {
+        return res.status(429).json({
+            error: 'TOO_MANY_ATTEMPTS',
+            message: `Too many failed PIN attempts across all sign-ins. Try again in ${Math.ceil(globalRemaining / 1000)}s.`
+        });
+    }
     const key = req.ip || 'unknown';
     const remaining = getLoginLockoutRemaining(key);
     if (remaining > 0) {
@@ -532,8 +587,12 @@ export function loginRateLimiter(req, res, next) {
 
 export function recordLoginResult(req, success) {
     const key = req._loginRateLimitKey || req.ip || 'unknown';
-    if (success) clearFailedLogins(key);
-    else recordFailedLogin(key);
+    if (success) {
+        clearFailedLogins(key);
+    } else {
+        recordFailedLogin(key);
+        recordGlobalFailedLogin();
+    }
 }
 
 /**
@@ -791,4 +850,34 @@ export function requireApprover(req, res, next) {
         });
     }
     next();
+}
+
+/**
+ * Express middleware, layered AFTER requireAdminSession: rejects the request
+ * unless the signed-in actor holds one of the given roles.
+ *
+ * Distinct from requireApprover, which gates a MONEY action any manager-or-
+ * owner may take. This gates SYSTEM-level actions — rewriting settings,
+ * resetting a customer's portal login, pulling a diagnostics export, applying
+ * a code update — where the caller states exactly which role(s) qualify,
+ * rather than relying on the blanket "any authenticated operator" that
+ * requireAdminSession alone leaves in place. Added for security-audit finding
+ * C1: POST /api/settings had no role check at all, so any cashier session
+ * could add itself as `owner` and take the whole system over in one request.
+ */
+export function requireRole(...allowedRoles) {
+    const allowed = allowedRoles.map(r => String(r).trim().toLowerCase());
+    return function (req, res, next) {
+        if (!req.actor) {
+            return res.status(401).json({ error: 'ADMIN_SESSION_REQUIRED', message: 'Admin authentication required.' });
+        }
+        if (!allowed.includes(String(req.actor.role || '').toLowerCase())) {
+            logTelemetry('ROLE_DENIED', 0, `${req.actor.name} (${req.actor.role}) at ${req.path}, needs one of: ${allowed.join(', ')}`);
+            return res.status(403).json({
+                error: 'ROLE_REQUIRED',
+                message: `This action needs the ${allowed.join(' or ')} role. ${req.actor.name} is signed in as ${req.actor.role}.`
+            });
+        }
+        next();
+    };
 }
