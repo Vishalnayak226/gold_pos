@@ -38,6 +38,8 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { resolveKey } from './secretVault.js';
+import { decryptFile, ENCRYPTED_EXTENSION } from './backupCrypto.js';
 
 const args = process.argv.slice(2);
 const has = (flag) => args.includes(flag);
@@ -59,7 +61,14 @@ function record(ok, label, detail = '') {
    Pick the snapshot
    --------------------------------------------------------------------------- */
 
-const backupsRoot = path.join(process.cwd(), 'backups');
+// Same override convention as backupEngine.js's BACKUPS_DIR and alerting.js's
+// backupsDirPath() — must match exactly, since this picks among what that
+// module writes. Falling back to a plain process.cwd()-relative default meant
+// an operator who redirects backups elsewhere had the post-backup restore
+// drill silently checking the wrong (or a stale) location.
+const backupsRoot = path.resolve(
+    process.env.GOLD_POS_BACKUPS_DIR || process.env.GOLDPOS_BACKUPS_DIR || path.join(process.cwd(), 'backups')
+);
 let source = valueOf('--backup');
 
 if (!source) {
@@ -100,13 +109,38 @@ say('');
 let repo = null;
 try {
     const entries = fs.readdirSync(source);
+    // Whole-archive encryption (backupCrypto.js) writes every file as
+    // `<name>.enc`; decrypt those back to their original name here. A file
+    // with no `.enc` suffix is copied as-is, which is what keeps a
+    // pre-encryption snapshot still sitting on disk restoring exactly as it
+    // did before (CLAUDE.md §1 — additive, backward-compatible).
+    let vaultKey = null;
+    let decryptError = null;
     for (const name of entries) {
         const from = path.join(source, name);
-        if (fs.statSync(from).isFile()) fs.copyFileSync(from, path.join(restoreData, name));
+        if (!fs.statSync(from).isFile()) continue;
+        if (name.endsWith(ENCRYPTED_EXTENSION)) {
+            const originalName = name.slice(0, -ENCRYPTED_EXTENSION.length);
+            try {
+                if (!vaultKey) ({ key: vaultKey } = resolveKey(restoreData));
+                decryptFile(from, path.join(restoreData, originalName), vaultKey, originalName);
+            } catch (err) {
+                decryptError = decryptError || err;
+            }
+        } else {
+            fs.copyFileSync(from, path.join(restoreData, name));
+        }
     }
     record(entries.length > 0, 'the snapshot contains files', `${entries.length} copied`);
 
-    const dbName = entries.find(n => n.endsWith('.db'));
+    const wasEncrypted = entries.some(n => n.endsWith(ENCRYPTED_EXTENSION));
+    if (wasEncrypted) {
+        record(!decryptError, 'the encrypted archive decrypts with the current key',
+            decryptError ? decryptError.message : 'every .enc file opened cleanly');
+    }
+
+    const restoredEntries = fs.readdirSync(restoreData);
+    const dbName = restoredEntries.find(n => n.endsWith('.db'));
     record(Boolean(dbName), 'the snapshot contains the SQLite ledger',
         dbName || 'NO .db FILE — this snapshot cannot restore a ledger');
     if (!dbName) throw new Error('no ledger in snapshot');

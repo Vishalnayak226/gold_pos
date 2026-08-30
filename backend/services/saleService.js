@@ -28,6 +28,7 @@ import {
     dataStoreContext, businessDate, financialYear, documentNumber
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
+import { raiseAlert } from '../alerting.js';
 import {
     computeInvoiceTotals, computeMetalValue, computeWastageAmount, normalizeTaxMode,
     fromPaise, round2, round3, toPaise
@@ -206,6 +207,9 @@ function priceLine(raw, index, activeRates, settings) {
  * @param {{id: string, name: string, role: string}} [deps.actor] echoed onto the record
  * @param {string} [deps.actorLabel]
  * @param {string} [deps.ipAddress]
+ * @param {(discountPercent: number) => {ok: boolean, status?: number, error?: string}} [deps.authorizeDiscount]
+ *        the store's discount-approval threshold, applied to the server's own priced discount —
+ *        same shape as returnService.js's `authorizeRefund`.
  * @returns {{ok: true, sale: object, invoiceId: string, totalCorrected: boolean,
  *            rateCorrected: boolean, duplicate?: boolean}
  *         |{ok: false, status: number, error: string, code?: string}}
@@ -290,6 +294,36 @@ export function createSale(input, deps) {
 
     if (appliedAdvanceRequested > 0 && !customerPhone) {
         return { ok: false, status: 400, error: 'Customer phone is required when redeeming an advance.' };
+    }
+
+    /* EXTREME-DISCOUNT GUARD. Checked against the server's own priced lines —
+       never a client claim — same posture as the rate/total corrections below.
+       0 disables the control (see defaultSettings.js). Applied before the
+       transaction starts, same as every other pre-transaction refusal in this
+       function, so a refused sale never allocates an invoice number. */
+    const discountThreshold = Number(settings.discountApprovalThreshold) || 0;
+    if (discountThreshold > 0) {
+        const maxDiscountPercent = saleLineItems.reduce(
+            (max, l) => Math.max(max, l.discountPercent), invoiceDiscountPercent
+        );
+        if (maxDiscountPercent >= discountThreshold) {
+            // Always raised, independent of whether it's ultimately approved — an
+            // approved extreme discount is still worth an operational record.
+            raiseAlert({
+                code: 'EXTREME_DISCOUNT_APPLIED',
+                severity: 'warning',
+                message: `A ${maxDiscountPercent}% discount was applied by `
+                    + `${(deps.actor && deps.actor.name) || deps.actorLabel || 'counter'} `
+                    + `(this store's approval threshold is ${discountThreshold}%).`,
+                details: { discountPercent: maxDiscountPercent, threshold: discountThreshold }
+            });
+            if (deps.authorizeDiscount) {
+                const permitted = deps.authorizeDiscount(maxDiscountPercent);
+                if (!permitted.ok) {
+                    return { ok: false, status: permitted.status || 403, error: permitted.error };
+                }
+            }
+        }
     }
 
     // The cashier quoted a rate on screen, per line. If any of them moved
@@ -731,7 +765,7 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
                 throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.');
             }
 
-            for (const movement of inventory.documentSaleMovementsForInvoice(header.id)) {
+            for (const movement of inventory.documentSaleMovementsForInvoice(context.tenantId, header.id)) {
                 inventory.recordDocumentMovement({
                     tenantId: context.tenantId,
                     lotId: movement.lot_id,

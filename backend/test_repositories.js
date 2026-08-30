@@ -1912,7 +1912,7 @@ console.log('\n22. Billing-linked inventory and management reports');
         const row = repo.invoices.linesFor(repo.invoices.findByNumber(context.tenantId, stockSale.invoiceId).id)[0];
         assert.equal(row.inventory_item_id, itemId);
         assert.equal(row.inventory_lot_id, lotId);
-        const movement = repo.inventory.documentSaleMovementsForInvoice(row.invoice_id)[0];
+        const movement = repo.inventory.documentSaleMovementsForInvoice(context.tenantId, row.invoice_id)[0];
         assert.equal(movement.weight_delta_mg, -5000);
     });
 
