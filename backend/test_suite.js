@@ -11,6 +11,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 // Mock DB helpers to avoid polluting live databases
@@ -795,6 +796,71 @@ async function testOffsiteBackupCopy() {
     console.log('✅ Test 14 Passed: off-site files are verified, manifested, retained, and kept outside local backups.');
 }
 
+async function testBackupArchiveEncryption() {
+    console.log('\nRunning Test 15: whole-archive backup encryption...');
+    const backupCrypto = await import('./backupCrypto.js');
+
+    // --- pure round trip, no key infrastructure involved --------------------
+    const keyA = crypto.randomBytes(32);
+    const keyB = crypto.randomBytes(32);
+    const cryptoFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-backupcrypto-'));
+    const plainPath = path.join(cryptoFixtureDir, 'goldpos.db');
+    const encPath = plainPath + backupCrypto.ENCRYPTED_EXTENSION;
+    const decPath = path.join(cryptoFixtureDir, 'goldpos.decrypted.db');
+    const original = crypto.randomBytes(4096); // stand-in for a checkpointed SQLite file's bytes
+    fs.writeFileSync(plainPath, original);
+
+    backupCrypto.encryptFile(plainPath, encPath, keyA, 'goldpos.db');
+    const cipherBytes = fs.readFileSync(encPath);
+    assert.ok(cipherBytes.subarray(0, 5).toString('ascii') === 'GPBK1', 'an encrypted file is self-describing');
+    assert.ok(!cipherBytes.equals(original), 'the ciphertext must not equal the plaintext bytes');
+
+    backupCrypto.decryptFile(encPath, decPath, keyA, 'goldpos.db');
+    assert.ok(fs.readFileSync(decPath).equals(original), 'decrypting must recover the exact original bytes');
+
+    assert.throws(() => backupCrypto.decryptFile(encPath, decPath, keyB, 'goldpos.db'), /Could not decrypt/,
+        'a wrong key must throw rather than write garbage');
+    assert.throws(() => backupCrypto.decryptFile(encPath, decPath, keyA, 'settings.json'), /Could not decrypt/,
+        'a ciphertext bound to one filename must not open under another (AAD binding)');
+    fs.rmSync(cryptoFixtureDir, { recursive: true, force: true });
+
+    // --- end to end: createBackup() -> encrypted snapshot -> verifyBackup.js
+    // restore drill, the exact tool the nightly job spawns after every backup.
+    //
+    // Deliberately reuses whatever key is ALREADY active for this suite's
+    // shared DATA_DIR (earlier tests — testOffsiteBackupCopy among them —
+    // have already sealed real settings.json secrets under it via
+    // settingsStore.js), rather than forcing a fresh GOLD_POS_SECRET_KEY:
+    // rotating the key mid-suite would leave those already-sealed secrets
+    // undecryptable under the new one and break an unrelated later reader
+    // (shipOffsite()'s own readSettings() call, inside createBackup() itself).
+    const vault = await import('./secretVault.js');
+    const { key: activeKey } = vault.resolveKey(process.env.GOLD_POS_DATA_DIR);
+
+    const { createBackup } = await import('./backupEngine.js');
+    const result = createBackup();
+    assert.strictEqual(result.success, true, result.error);
+    const folder = path.join(process.env.GOLD_POS_BACKUPS_DIR, result.folder);
+    const files = fs.readdirSync(folder).filter(f => fs.statSync(path.join(folder, f)).isFile());
+    assert.ok(files.length > 0, 'the backup snapshot must contain files');
+    assert.ok(files.every(f => f.endsWith(backupCrypto.ENCRYPTED_EXTENSION)),
+        `every backup file must be encrypted, got: ${files.join(', ')}`);
+
+    // The restore drill runs as a separate process with its own fresh temp
+    // restore directory, so — same as production — it needs the vault key
+    // handed to it explicitly; the dev-keyfile fallback sits inside DATA_DIR
+    // by design (secretVault.js's header) and is never available to it.
+    const verify = spawnSync(process.execPath, ['verifyBackup.js', '--backup', folder, '--quiet'], {
+        cwd: __dirname,
+        env: { ...process.env, GOLD_POS_SECRET_KEY: activeKey.toString('hex') }
+    });
+    assert.strictEqual(verify.status, 0,
+        `verifyBackup.js must restore and pass its checks against an encrypted snapshot `
+        + `(stdout: ${verify.stdout}, stderr: ${verify.stderr})`);
+
+    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, and the restore drill still passes against them.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -811,6 +877,7 @@ try {
     await testRolloutCohort();
     await testPitrScheduler();
     await testOffsiteBackupCopy();
+    await testBackupArchiveEncryption();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');

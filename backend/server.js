@@ -589,7 +589,8 @@ app.get('/api/admin/me', requireAdminSession, (req, res) => {
         mfaUsed: req.adminSession.mfaUsed === true,
         // So the desk can explain a refusal before the cashier hits it.
         requireMfaForApprovers: settings.requireMfaForApprovers === true,
-        refundApprovalThreshold: round2(settings.refundApprovalThreshold || 0)
+        refundApprovalThreshold: round2(settings.refundApprovalThreshold || 0),
+        discountApprovalThreshold: round2(settings.discountApprovalThreshold || 0)
     });
 });
 
@@ -1974,6 +1975,9 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
            of that unit — the counter lived in settings.json behind a
            read-modify-write, so a failed write silently reissued a number that
            was already on a customer's slip. */
+        const discountSettings = billingSettings();
+        const discountThreshold = round2(discountSettings.discountApprovalThreshold || 0);
+
         const result = saleService.createSale({
             lines: Array.isArray(req.body.lines) && req.body.lines.length > 0 ? req.body.lines : null,
             purity: req.body.purity,
@@ -2003,7 +2007,25 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
             actorUserId: resolveActorUserId(req.actor),
             actor: req.actor,
             actorLabel: (req.actor && req.actor.name) || 'counter',
-            ipAddress: req.ip
+            ipAddress: req.ip,
+            /* THE DISCOUNT APPROVAL THRESHOLD, same shape as /api/returns'
+               authorizeRefund below — a cashier may bill ordinary discounts all
+               day, and only crossing the threshold makes this an approver's
+               decision. 0 disables the control (the previous behaviour). */
+            authorizeDiscount: (discountPercent) => {
+                if (!(discountThreshold > 0) || discountPercent < discountThreshold) return { ok: true };
+                if (!roleCanApprove(req.actor.role)) {
+                    logTelemetry('DISCOUNT_APPROVAL_DENIED', 0,
+                        `${req.actor.name} (${req.actor.role}) attempted a ${discountPercent}% discount`);
+                    return {
+                        ok: false,
+                        status: 403,
+                        error: `A ${discountPercent}% discount needs a manager or the owner to authorise it `
+                            + `(this store's limit is ${discountThreshold}%). ${req.actor.name} is signed in as ${req.actor.role}.`
+                    };
+                }
+                return { ok: true };
+            }
         });
 
         if (!result.ok) {
@@ -3229,9 +3251,23 @@ app.post('/api/customers/:id/anonymise', requireAdminSession, requireApprover, (
    views, not invented statutory books: settlement is tender/refund flow,
    reconciliation is exception-based, profitability is gross contribution on
    costed lots, and ageing is days since lot opening.
+
+   FLAGGED OFF BY DEFAULT (settings.managementReportsEnabled). These four
+   reports are operational, not statutory, and wait on merchant/accountant
+   acceptance before a tenant relies on them — same "never existed until
+   turned on" contract as wastage/old-gold/gold-schemes. Does NOT cover
+   /api/reports/sales-register.csv below, which is the pre-existing Phase 5.5
+   accounting export and unrelated to this sign-off gate.
    ========================================================================== */
 
-app.get('/api/reports/settlement', requireAdminSession, (req, res) => {
+function requireManagementReportsEnabled(req, res, next) {
+    if (readSettings().managementReportsEnabled !== true) {
+        return res.status(404).json({ error: 'Management reports are not enabled for this store.' });
+    }
+    next();
+}
+
+app.get('/api/reports/settlement', requireAdminSession, requireManagementReportsEnabled, (req, res) => {
     try {
         const q = parseLedgerQuery(req.query);
         if (!q.ok) return res.status(400).json({ error: q.error });
@@ -3243,7 +3279,7 @@ app.get('/api/reports/settlement', requireAdminSession, (req, res) => {
     }
 });
 
-app.get('/api/reports/reconciliation', requireAdminSession, (req, res) => {
+app.get('/api/reports/reconciliation', requireAdminSession, requireManagementReportsEnabled, (req, res) => {
     try {
         const q = parseLedgerQuery(req.query);
         if (!q.ok) return res.status(400).json({ error: q.error });
@@ -3255,7 +3291,7 @@ app.get('/api/reports/reconciliation', requireAdminSession, (req, res) => {
     }
 });
 
-app.get('/api/reports/profitability', requireAdminSession, (req, res) => {
+app.get('/api/reports/profitability', requireAdminSession, requireManagementReportsEnabled, (req, res) => {
     try {
         const q = parseLedgerQuery(req.query);
         if (!q.ok) return res.status(400).json({ error: q.error });
@@ -3267,7 +3303,7 @@ app.get('/api/reports/profitability', requireAdminSession, (req, res) => {
     }
 });
 
-app.get('/api/reports/ageing', requireAdminSession, (req, res) => {
+app.get('/api/reports/ageing', requireAdminSession, requireManagementReportsEnabled, (req, res) => {
     try {
         const context = repo.dataStoreContext();
         res.json(repo.reports.ageing({ tenantId: context.tenantId, branchId: context.branchId }));

@@ -47,6 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // Off by default — this call is what shows the nav button at all,
         // via checkEnabled()'s own 404-probe against the (flagged) routes.
         window.schemeDesk.refresh();
+        window.reportsDesk.refresh();
     }
 
     initNavigation();

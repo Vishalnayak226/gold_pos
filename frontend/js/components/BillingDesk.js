@@ -1380,7 +1380,6 @@ export class BillingDesk {
         // A filed invoice takes its items and its payment split with it — the
         // next customer must not inherit either.
         this.cart = [];
-        this.inventorySelection = null;
         this.exchangeCreditNoteId = null;
         this.tenders = [{ method: 'cash', amount: 0, reference: '', amountEdited: false }];
         this.renderCart();

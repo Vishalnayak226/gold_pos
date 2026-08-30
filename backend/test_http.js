@@ -601,6 +601,14 @@ try {
         assert.equal(readData('settings.json').goldTaxSlab, 3);
     });
 
+    await check('an out-of-range discount approval threshold is refused', async () => {
+        for (const value of [-1, 101, 'abc']) {
+            const response = await postSettings({ discountApprovalThreshold: value });
+            assert.equal(response.status, 400, `threshold ${JSON.stringify(value)} must be refused`);
+        }
+        assert.equal(readData('settings.json').discountApprovalThreshold, 0);
+    });
+
     await check('an object invoice prefix cannot reach a permanent invoice number', async () => {
         // {} stamped "[object Object]-000011-26" into the ledger; an object with
         // a non-callable toString threw on EVERY sale until settings were
@@ -2222,6 +2230,29 @@ try {
         }
     });
 
+    await check('management reports are off by default — the routes answer as though they never existed', async () => {
+        for (const kind of ['settlement', 'reconciliation', 'profitability', 'ageing']) {
+            const response = await request(`/api/reports/${kind}`, { headers: adminHeaders });
+            assert.equal(response.status, 404, `${kind} report should 404 while disabled`);
+        }
+        // The pre-existing Phase 5.5 accounting-export CSV is unrelated to this
+        // sign-off gate and must not be swept in by it.
+        const csv = await request('/api/reports/sales-register.csv', { headers: adminHeaders });
+        assert.notEqual(csv.status, 404, 'the accounting-export CSV must not be gated by managementReportsEnabled');
+    });
+
+    await check('enabling management reports makes them reachable', async () => {
+        try {
+            assert.equal((await postSettings({ managementReportsEnabled: true })).status, 200);
+            for (const kind of ['settlement', 'reconciliation', 'profitability', 'ageing']) {
+                const response = await request(`/api/reports/${kind}`, { headers: adminHeaders });
+                assert.equal(response.status, 200, `${kind} report should be reachable once enabled`);
+            }
+        } finally {
+            await postSettings({ managementReportsEnabled: false });
+        }
+    });
+
     await check('a rejected PIN is still rejected once operators exist', async () => {
         const response = await request('/api/admin/login', {
             method: 'POST',
@@ -2566,6 +2597,62 @@ try {
             });
             assert.equal(response.status, 400, `threshold ${bad} should be refused`);
         }
+    });
+
+    /* M1 — extreme-discount guard. refundApprovalThreshold above guards money
+       leaving the till; nothing guarded a give-away SALE, so a cashier could
+       apply a 100% discount with nothing flagging it. Same threshold shape,
+       mirrored onto saleService.js's own priced discount. */
+    await check('a sale discount at or above the threshold needs an approver', async () => {
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discountApprovalThreshold: 50 })
+        });
+
+        const cashierSession = await loginAdmin(request, { pin: '432199' });
+
+        const refused = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...salePayload(0), discountPercent: 60 })
+        });
+        assert.equal(refused.status, 403);
+        const body = await refused.json();
+        assert.match(body.error, /60%/, 'the message should name the attempted discount');
+        assert.match(body.error, /50%/, 'the message should name the store limit');
+
+        // The owner may.
+        const allowed = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...salePayload(0), discountPercent: 60 })
+        });
+        assert.equal(allowed.status, 200);
+    });
+
+    await check('a sale discount below the threshold is still a cashier’s to make', async () => {
+        // Threshold set, but the discount below stays under it.
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discountApprovalThreshold: 50 })
+        });
+        const cashierSession = await loginAdmin(request, { pin: '432199' });
+
+        const filed = await request('/api/sales', {
+            method: 'POST',
+            headers: { ...cashierSession.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...salePayload(0), discountPercent: 10 })
+        });
+        assert.equal(filed.status, 200);
+
+        // Back to disabled so later checks behave as before.
+        await request('/api/settings', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ discountApprovalThreshold: 0 })
+        });
     });
 
     /* ==================================================================

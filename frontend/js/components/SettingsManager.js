@@ -427,6 +427,21 @@ export class SettingsManager {
                            value="${Number(s.goldSchemeEarlyClosurePenaltyPercent) || 0}" step="0.5" min="0" max="100">
                 </div>
             </div>
+            <h3 class="settings-section-title" style="margin-top:30px;">Management Reports</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Off by default. Settlement, Reconciliation, Gross Profitability and Inventory Ageing
+                are operational views built on this ledger, not statutory books — turn them on once
+                you and your accountant have accepted their definitions (shown on every report).
+            </p>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-reports-enabled">Enable Management Reports</label>
+                    <select id="set-reports-enabled" class="form-control">
+                        <option value="false"${s.managementReportsEnabled ? '' : ' selected'}>No</option>
+                        <option value="true"${s.managementReportsEnabled ? ' selected' : ''}>Yes</option>
+                    </select>
+                </div>
+            </div>
             <button type="button" id="save-billing-btn" class="btn btn-primary">Save Billing Settings</button>
         `;
     }
@@ -469,7 +484,8 @@ export class SettingsManager {
                 goldSchemeInstallmentCount: parseInt(document.getElementById('set-scheme-installments').value, 10) || 11,
                 goldSchemeBonusInstallments: parseInt(document.getElementById('set-scheme-bonus').value, 10) || 0,
                 goldSchemeDefaultGraceDays: parseInt(document.getElementById('set-scheme-grace').value, 10) || 30,
-                goldSchemeEarlyClosurePenaltyPercent: parseFloat(document.getElementById('set-scheme-penalty').value) || 0
+                goldSchemeEarlyClosurePenaltyPercent: parseFloat(document.getElementById('set-scheme-penalty').value) || 0,
+                managementReportsEnabled: document.getElementById('set-reports-enabled').value === 'true'
             };
 
             if (requestedSeq < currentSeq) {
@@ -960,8 +976,8 @@ export class SettingsManager {
 
             <h3 class="settings-section-title" style="margin-top:30px;">Controls on releasing money</h3>
             <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
-                Two limits on the actions that move money out of the store. Both are off by default,
-                so nothing changes until you set them.
+                Limits on the actions that move money out of the store, or give it away. All are off
+                by default, so nothing changes until you set them.
             </p>
             <div class="form-group-row">
                 <div class="form-group">
@@ -972,6 +988,16 @@ export class SettingsManager {
                         A refund at or above this amount is refused for a Cashier. <strong>0 means no
                         limit</strong> — any signed-in person can refund any amount, which is how the
                         till has always worked.
+                    </span>
+                </div>
+                <div class="form-group">
+                    <label for="set-discount-threshold">Discount needing an Owner/Manager (%)</label>
+                    <input type="number" id="set-discount-threshold" class="form-control" min="0" max="100" step="5"
+                           value="${Number(s.discountApprovalThreshold) || 0}">
+                    <span class="text-muted-small">
+                        A sale with a line or invoice discount at or above this percent is refused for a
+                        Cashier, and always logged as an alert. <strong>0 means no limit</strong> — any
+                        signed-in person can apply any discount, which is how the till has always worked.
                     </span>
                 </div>
                 <div class="form-group">
@@ -1081,6 +1107,11 @@ export class SettingsManager {
                 alert('The refund limit must be zero or a positive amount.');
                 return;
             }
+            const discountThreshold = Number(document.getElementById('set-discount-threshold').value);
+            if (!Number.isFinite(discountThreshold) || discountThreshold < 0 || discountThreshold > 100) {
+                alert('The discount limit must be between 0 and 100.');
+                return;
+            }
             const requireMfa = document.getElementById('set-require-mfa').value === 'true';
             // A store that turns this on with nobody enrolled locks itself out of
             // its own approvals, so it is caught here rather than at the counter.
@@ -1096,7 +1127,11 @@ export class SettingsManager {
                 return;
             }
             this.saveSettings(
-                { refundApprovalThreshold: threshold, requireMfaForApprovers: requireMfa },
+                {
+                    refundApprovalThreshold: threshold,
+                    discountApprovalThreshold: discountThreshold,
+                    requireMfaForApprovers: requireMfa
+                },
                 'Money controls saved.'
             );
         });

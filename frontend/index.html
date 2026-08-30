@@ -48,7 +48,10 @@
                 <button class="nav-btn" data-target="returns-tab">Returns &amp; Refunds</button>
                 <button class="nav-btn" data-target="advances-tab">Customer Advances</button>
                 <button class="nav-btn" data-target="inventory-tab">Inventory</button>
-                <button class="nav-btn" data-target="reports-tab">Management Reports</button>
+                <!-- Off by default (settings.managementReportsEnabled) — ReportsDesk.js
+                     shows this only once it confirms the module is enabled, same
+                     "never existed until turned on" contract as Gold Schemes below. -->
+                <button class="nav-btn" data-target="reports-tab" id="reports-nav-btn" style="display:none;">Management Reports</button>
                 <button class="nav-btn" data-target="cash-shifts-tab">Cash Shifts</button>
                 <button class="nav-btn" data-target="quotes-holds-tab">Quotes &amp; Holds</button>
                 <button class="nav-btn" data-target="customer-accounts-tab">Customers</button>

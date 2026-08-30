@@ -18,6 +18,7 @@ function gramsMg(value) {
 
 export class ReportsDesk {
     constructor() {
+        this.enabled = false;
         this.render();
         this.wire();
     }
@@ -29,19 +30,27 @@ export class ReportsDesk {
         const first = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
         const today = now.toISOString().slice(0, 10);
         host.innerHTML = `
-            <div class="advances-toolbar">
-                <select id="management-report-kind" class="form-control">
-                    <option value="settlement">Settlement</option>
-                    <option value="reconciliation">Reconciliation exceptions</option>
-                    <option value="profitability">Gross profitability</option>
-                    <option value="ageing">Inventory ageing</option>
-                </select>
-                <input type="date" id="management-report-from" class="form-control" value="${first}">
-                <input type="date" id="management-report-to" class="form-control" value="${today}">
-                <button type="button" id="management-report-run" class="btn btn-primary">Run report</button>
+            <div id="reports-disabled-notice" style="display:none;" class="text-muted-small">
+                Management Reports are not enabled for this store. These four reports (Settlement,
+                Reconciliation, Gross Profitability, Inventory Ageing) are operational views, not
+                statutory books, and wait on merchant/accountant sign-off — turn them on under
+                Settings → Management Reports once that's done.
             </div>
-            <div id="management-report-output" style="margin-top:18px;">
-                <p class="text-muted-small">Choose a report and run it. Each result states the definition used.</p>
+            <div id="reports-desk-body" style="display:none;">
+                <div class="advances-toolbar">
+                    <select id="management-report-kind" class="form-control">
+                        <option value="settlement">Settlement</option>
+                        <option value="reconciliation">Reconciliation exceptions</option>
+                        <option value="profitability">Gross profitability</option>
+                        <option value="ageing">Inventory ageing</option>
+                    </select>
+                    <input type="date" id="management-report-from" class="form-control" value="${first}">
+                    <input type="date" id="management-report-to" class="form-control" value="${today}">
+                    <button type="button" id="management-report-run" class="btn btn-primary">Run report</button>
+                </div>
+                <div id="management-report-output" style="margin-top:18px;">
+                    <p class="text-muted-small">Choose a report and run it. Each result states the definition used.</p>
+                </div>
             </div>`;
     }
 
@@ -54,7 +63,25 @@ export class ReportsDesk {
         });
     }
 
+    /** Confirms the module is on before showing anything, and toggles the nav button to match. */
+    async checkEnabled() {
+        try {
+            const res = await adminFetch('/api/reports/ageing');
+            this.enabled = res.status !== 404;
+        } catch {
+            this.enabled = false;
+        }
+        const navBtn = document.getElementById('reports-nav-btn');
+        if (navBtn) navBtn.style.display = this.enabled ? 'block' : 'none';
+        const notice = document.getElementById('reports-disabled-notice');
+        const body = document.getElementById('reports-desk-body');
+        if (notice) notice.style.display = this.enabled ? 'none' : 'block';
+        if (body) body.style.display = this.enabled ? 'block' : 'none';
+        return this.enabled;
+    }
+
     async refresh() {
+        if (!(await this.checkEnabled())) return;
         const kind = document.getElementById('management-report-kind')?.value || 'settlement';
         const from = document.getElementById('management-report-from')?.value || '';
         const to = document.getElementById('management-report-to')?.value || '';

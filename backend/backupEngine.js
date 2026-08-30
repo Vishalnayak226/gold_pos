@@ -15,6 +15,8 @@ import { logError, logTelemetry, DATA_DIR } from './db.js';
 import { DB_FILE, checkpointAndCopy } from './repositories/connection.js';
 import { raiseAlert } from './alerting.js';
 import { readSettings } from './settingsStore.js';
+import { resolveKey } from './secretVault.js';
+import { encryptFile, ENCRYPTED_EXTENSION } from './backupCrypto.js';
 
 const BACKEND_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -58,6 +60,20 @@ export function createBackup() {
         // safety net uses (connection.js:checkpointAndCopy), not fs.copyFileSync.
         if (fs.existsSync(DB_FILE)) {
             checkpointAndCopy(path.join(targetBackupDir, path.basename(DB_FILE)));
+        }
+
+        // WHOLE-ARCHIVE ENCRYPTION. Everything copied above is plaintext on disk
+        // right now — the SQLite ledger and every JSON document, not just the
+        // credentials sealed inside settings.json (secretVault.js). Encrypt the
+        // whole snapshot with that same vault key before it, or its off-site
+        // copy shipped below, ever sits unprotected. A failure here throws into
+        // this function's own catch, same as any other backup failure.
+        const { key: archiveKey } = resolveKey(DATA_DIR);
+        for (const name of fs.readdirSync(targetBackupDir)) {
+            const plainPath = path.join(targetBackupDir, name);
+            if (!fs.statSync(plainPath).isFile() || name.endsWith(ENCRYPTED_EXTENSION)) continue;
+            encryptFile(plainPath, plainPath + ENCRYPTED_EXTENSION, archiveKey, name);
+            fs.rmSync(plainPath);
         }
 
         logTelemetry('BACKUP_CREATE_SUCCESS', Date.now() - startTime, `Dir: backup_${todayStr}`);
