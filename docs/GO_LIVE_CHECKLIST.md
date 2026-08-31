@@ -264,6 +264,9 @@ them by hand is the single easiest thing to get wrong.
 
 ### A6 — Wire up GitHub
 
+- [x] **Done 2026-09-01, via `gh` CLI** (repo is public, `gh` was already
+      authenticated as the repo owner) rather than the manual UI steps below —
+      left here as reference/for future re-verification.
 - [ ] **Where:** github.com/Vishalnayak226/gold_pos → **Settings** →
       *Secrets and variables* → **Actions**.
 
@@ -274,9 +277,11 @@ them by hand is the single easiest thing to get wrong.
 | Secret | `VPS_SSH_KEY` | **entire** contents of the private key file from A4, including the `-----BEGIN/END OPENSSH PRIVATE KEY-----` lines |
 | Variable *(Variables tab, not Secrets)* | `PIPELINE_DOMAIN` | `luminapos.in` — bare domain, no `https://`, no subdomain |
 
-- [ ] **Where:** same Settings page → **Environments** → New environment.
+- [x] **Where:** same Settings page → **Environments** → New environment.
       Exact lowercase names — the workflows reference them by name and fail if
-      missing. **On `minimal` you only need `production`:**
+      missing. **On `minimal` you only need `production`:** **done 2026-09-01
+      — `production` environment exists with `Vishalnayak226` as the sole
+      required reviewer, confirmed via the API response.**
 
 | Environment | Profile | Protection |
 |---|---|---|

@@ -26,11 +26,15 @@ This document contains key architectural details, non-negotiable design guidelin
   `gold_pos_ci`) encrypted with an unintended literal-`""` passphrase, silently breaking
   unattended use; repaired in place, no regeneration needed. Full detail: `docs/LEDGER.md`
   2026-09-01 (second row), `docs/GO_LIVE_CHECKLIST.md` A0–A5, A7.
-  **Next up, not done yet:** commit+push `deploy/ecosystem.base.cjs` (currently only manually
-  patched directly on the VPS's two checkouts, not yet in git); A6 (GitHub Actions secrets —
-  `VPS_HOST`=`139.59.37.153`, `VPS_USER`=`deploy`, `VPS_SSH_KEY`=`gold_pos_ci` private key,
-  variable `PIPELINE_DOMAIN`=`luminapos.in`, plus a `production` environment with the user as
-  required reviewer) — needs the user's GitHub UI, can't be done from here.
+  **Since resolved, same session:** `deploy/ecosystem.base.cjs` committed and pushed (`1ca9738`),
+  both VPS checkouts `git reset --hard` to match and restarted from the clean tree. **A6 also
+  done**, via `gh` CLI (repo is public, already authenticated as owner) rather than the manual UI:
+  `VPS_HOST`/`VPS_USER`/`VPS_SSH_KEY` secrets, `PIPELINE_DOMAIN` variable, `production` environment
+  with `Vishalnayak226` as sole required reviewer — all confirmed via `gh secret list`/
+  `gh variable list`/the environment API response.
+  **Still open:** A7's CI-driven verification (push to `main`, watch `cd-live.yml` pause for
+  approval — the infra-reachability half is already proven manually, see above); A8/Track C (real
+  Razorpay/PIN/rate-provider config to actually bring `app.luminapos.in` up).
 - **2026-09-01: security-audit follow-up (L1, L3, L2 closed) committed and
   merged to `main`, plus two pre-existing `npm test` failures fixed.** Security work:
   `backend/cryptoHelper.js`/`backend/blackBoxLogger.js` now refuse to auto-generate a fresh RSA
