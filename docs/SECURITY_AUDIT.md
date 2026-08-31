@@ -52,7 +52,7 @@ That single hole chains into full financial/system takeover; it is the #1 thing 
 | M1 | MEDIUM | No approval/alert for extreme invoice discounts | **OPEN** — not addressed this pass |
 | M2+ | MEDIUM/LOW | No rate limiters on many admin/customer endpoints (table below) | **PARTIALLY ADDRESSED** — the endpoints named in C3/H2/H3/H6 above are covered; the remaining rows in the matrix are still open |
 | L1 | INFO | Dev private keys auto-generated into repo workspace | **FIXED 2026-08-30** — `cryptoHelper.js`/`blackBoxLogger.js` refuse to mint a new keypair when `NODE_ENV=production` and the shipped public key is missing |
-| L2 | INFO | Licensing server binds 127.0.0.1 only; nginx exposure unproven | **OPEN** — genuinely blocked on infrastructure, not code (no VPS/domain provisioned, CLAUDE.md §7); proof step is `docs/GO_LIVE_CHECKLIST.md` A7 |
+| L2 | INFO | Licensing server binds 127.0.0.1 only; nginx exposure unproven | **FIXED 2026-09-01** — proven end-to-end against the real VPS/domain: `https://license.luminapos.in/api/health` answers over real DNS/TLS/Nginx/ufw |
 | L3 | INFO | trust-proxy scope | **FIXED 2026-08-30** — warning comment added at the `app.set('trust proxy', ...)` call site so a future widening can't happen without reading the H1 caveat |
 
 ---
@@ -294,6 +294,9 @@ Equal PINs → equal hashes is safe *only because* duplicates are refused outrig
 
 **Still open 2026-08-30 — genuinely infrastructure-gated, not a code fix.** The bind address itself (`127.0.0.1`, hardcoded, not configurable) already makes the raw port unreachable from outside the host regardless of firewall state, so the only thing actually unproven is that Nginx+TLS terminates and proxies correctly end-to-end. That proof already has a home: `docs/GO_LIVE_CHECKLIST.md` **A7 — "Prove it works end to end"** hits `https://license.<domain>/api/health` through the real reverse proxy once a VPS and domain exist. There is nothing to build here until Track A of that checklist is run; do not fabricate a substitute check against infrastructure that doesn't exist yet.
 
+**FIXED 2026-09-01 — proven for real, on the actual VPS.** `deploy/provision-pipeline.sh --profile minimal` run against a real DigitalOcean droplet (`luminapos.in`, BLR1): DNS resolved, `ufw` enabled (OpenSSH + Nginx Full only), Nginx vhost rendered, and `certbot --nginx` issued real Let's Encrypt certificates for both `app.luminapos.in` and `license.luminapos.in`. `curl https://license.luminapos.in/api/health` (from outside the VPS) returned `{"status":"ok","version":"1.0.0","env":"live"}` — real DNS, real TLS, real Nginx, real firewall, no shortcuts. `app.luminapos.in` correctly answers a clean `502` (Nginx's own page, no stack trace) rather than exposing anything, since `gold-pos-live` is intentionally not up yet pending real Razorpay/PIN/rate-provider config (`docs/GO_LIVE_CHECKLIST.md` §9) — that gap is Track C/tenant config, not this finding. Finding closed; `docs/GO_LIVE_CHECKLIST.md` A7 can be ticked on the same evidence.
+**Bonus catch during this run**: provisioning a real box surfaced a real bug neither `verify-nginx-proxy.sh` nor any local test could — PM2's `cwd` (the checkout root) didn't match where `provision-pipeline.sh` writes each app's `.env` (the module subdirectory), so `dotenv/config`'s default `process.cwd()` lookup silently found nothing and both apps ran on defaults (`licensing-live` kept the placeholder `ADMIN_SECRET`, exactly what C2's fail-closed check exists to catch — and did: it refused to start rather than run exposed with the default). Fixed at the one choke point both apps share, `deploy/ecosystem.base.cjs`, via `DOTENV_CONFIG_PATH` — see `docs/LEDGER.md` 2026-09-01.
+
 ### L3 — trust-proxy scope
 
 `app.set('trust proxy', 'loopback')` is correct for same-host nginx. Do not widen it to remote LBs/CDNs without hardening H1 first (real client IPs also mean per-IP lockouts are per-attacker).
@@ -328,9 +331,9 @@ Equal PINs → equal hashes is safe *only because* duplicates are refused outrig
 | 6 | Add limiters: `/api/qrcode`, `/api/payment/verify`, `/api/license/activate`, unthrottled admin writes | H2,H3,H4,H6 | **Done 2026-08-24** — H4 fixed by unifying the response instead (limiters don't address enumeration); `/api/license/verify` also limited (H6) |
 | 7 | Generic 500 bodies on the leaky routes | H5 | **Done 2026-08-24** — the 5 confirmed sites; `/api/diagnostics/telemetry`'s log tail is now owner-gated (C3) rather than redacted |
 | 8 | Bounded map + rate limiter on licensing `failedAdminAttempts` | H7 | **Done 2026-08-24** |
-| 9 | Strip dev private keys from shipped builds; firewall/reachability proof for licensing public path | L1,L2 | **L1 done 2026-08-30** (refuse-to-generate guard); **L2 blocked on infra** — see L2 note above |
+| 9 | Strip dev private keys from shipped builds; firewall/reachability proof for licensing public path | L1,L2 | **L1 done 2026-08-30** (refuse-to-generate guard); **L2 done 2026-09-01** — proven against the real VPS, see L2 note above |
 
-**Not addressed this pass:** M1 (extreme-discount alerting — needs a threshold/product decision), M3–M5 (already accepted trade-offs / low severity, no action needed), L2 (deployment-time proof — no VPS/domain to prove it against yet). L1 and L3 closed 2026-08-30 — see their sections above.
+**Not addressed:** M1 (extreme-discount alerting — needs a threshold/product decision), M3–M5 (already accepted trade-offs / low severity, no action needed). L1 and L3 closed 2026-08-30, L2 closed 2026-09-01 — see their sections above.
 
 ---
 

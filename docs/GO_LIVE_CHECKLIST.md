@@ -52,21 +52,22 @@ server (Track F below). Architecture: `deploy/README.md` §8.
 >    server would run Phase 19 code: no production guard, no SQLite seam, no
 >    verified payments.
 >
-> - [ ] Merge the Phase 20–27 work into `main` (and fast-forward `develop`
->       and `staging` to match, so the pipeline branches aren't inverted).
-> - [ ] Confirm with: `git cat-file -e origin/main:deploy/provision-pipeline.sh`
+> - [x] Merge the Phase 20–27 work into `main` — **done 2026-09-01.** `main` is
+>       current through commit `b7b50b0` (`develop`/`staging` not re-synced —
+>       not needed for `--profile minimal`, which only touches `main`).
+> - [x] Confirm with: `git cat-file -e origin/main:deploy/provision-pipeline.sh` — confirmed.
 >
 > **A1–A4 and A6 do not depend on this** — buy the droplet, set DNS and
 > generate the SSH key in parallel while it's sorted out. Only A5 is blocked.
 
 ### A1 — Buy a domain
 
-- [ ] **Where:** any registrar — Namecheap, Cloudflare Registrar (cheapest,
+- [x] **Where:** any registrar — Namecheap, Cloudflare Registrar (cheapest,
       at-cost), GoDaddy, BigRock.
-- [ ] **What:** one domain, e.g. `luminapos.in`. It can be the same domain
+- [x] **What:** one domain, e.g. `luminapos.in`. It can be the same domain
       you later use for tenant subdomains, or a separate internal one.
 - **Cost:** ~₹800–1,200/yr for a `.com`.
-- **Hand back:** the domain name.
+- **Hand back:** the domain name. **Done — `luminapos.in`, registered at Hostinger, active, auto-renew on.**
 
 ### A2 — Buy the VPS
 
@@ -92,9 +93,12 @@ server (Track F below). Architecture: `deploy/README.md` §8.
   laptop at `localhost:5000`, and Sandbox exists to protect a *paying tenant*
   from a bad deploy — worth its RAM the day you have one, not before. Moving up
   later is one idempotent re-run with `--profile full` plus a resize.
-- [ ] Add your SSH key during creation (every provider offers this) so you
-      can log in without a password.
-- **Hand back:** the server's public IP.
+- [x] Add your SSH key during creation (every provider offers this) so you
+      can log in without a password. **The key wasn't actually attached at
+      creation time (unclear why) — worked around 2026-09-01 by adding the
+      public key through DigitalOcean's browser Console instead. Functionally
+      equivalent, just a manual extra step; no need to repeat it.**
+- **Hand back:** the server's public IP. **Done — see below.**
 
 **Done 2026-08-14.** DigitalOcean droplet, BLR1, Ubuntu, in its own `Gold POS`
 project (the `Custom ERP` droplet is deliberately left alone).
@@ -149,14 +153,16 @@ killer takes the install and provisioning dies halfway through.
 | A | `sandbox` | `<VPS IP>` | Sandbox/UAT POS | `full` only |
 | A | `license-dev` | `<VPS IP>` | Non-prod licensing server | `full` only |
 
-- [ ] Verify before moving on — each must return the VPS IP:
+- [x] Verify before moving on — each must return the VPS IP:
       ```bash
       # minimal:
       for h in app license; do echo -n "$h: "; dig +short $h.luminapos.in; done
       # full: for h in dev sandbox app license-dev license; do ... done
       ```
       DNS can take 5–30 minutes. Certbot in A5 fails on any record that
-      hasn't propagated, so don't rush this step.
+      hasn't propagated, so don't rush this step. **Confirmed 2026-09-01 —
+      both `app.luminapos.in` and `license.luminapos.in` resolved to
+      `139.59.37.153` before A5 was run.**
 
 ### A4 — Generate the CI deploy SSH key (on your own machine)
 
@@ -165,8 +171,8 @@ yourself so the private key lives with you permanently — an earlier session
 generated one in a temp directory and it has since been wiped, which is
 exactly why it now belongs on your machine, not mine.
 
-- [ ] **Where:** your Windows machine, PowerShell.
-- [ ] **How:**
+- [x] **Where:** your Windows machine, PowerShell.
+- [x] **How:**
       ```powershell
       ssh-keygen -t ed25519 -C "gold-pos-ci-deploy" -f "$env:USERPROFILE\.ssh\gold_pos_ci" -N '""'
       Get-Content "$env:USERPROFILE\.ssh\gold_pos_ci.pub"     # public  → goes on the VPS (A5)
@@ -174,6 +180,17 @@ exactly why it now belongs on your machine, not mine.
       ```
 - The `.pub` line is safe to share anywhere. The other one is **not** —
   never paste it into a file in this repo, only into the GitHub secret box.
+- **⚠️ PowerShell quoting bug, found and fixed 2026-09-01: `-N '""'` does NOT
+  produce an empty passphrase in PowerShell.** Single quotes preserve the two
+  literal `"` characters, so the key ends up encrypted with the 2-character
+  passphrase `""` instead of no passphrase — which then makes the key
+  silently unusable for unattended/CI use (`Permission denied (publickey)`
+  with no hint why, since the public half is still byte-for-byte correct).
+  Both `luminapos_admin` and `gold_pos_ci` had this. Fixed in place with
+  `ssh-keygen -p -P '""' -N "" -f <keyfile>` (no need to regenerate). If
+  generating a fresh CI key from PowerShell, verify immediately with
+  `ssh-keygen -y -P '""' -f <keyfile>` — if that prints the public key
+  instead of erroring, the passphrase bug is present and needs the same fix.
 
 ### A5 — Provision the server (one command)
 
@@ -189,37 +206,61 @@ them by hand is the single easiest thing to get wrong.
 > branch** from GitHub. The script — and the whole Phase 20–27 codebase — must
 > actually be on that branch first. See the note at the top of Track A.
 
-- [ ] **Where:** SSH'd into the VPS as root.
-- [ ] **How:**
+- [x] **Where:** SSH'd into the VPS as root. **Done 2026-09-01** — via
+      `luminapos_admin` key (see A4's passphrase-bug note; had to be fixed
+      before this worked) and DigitalOcean's browser Console for the initial
+      `authorized_keys` bootstrap (see A2's note).
+- [x] **How:** the script was `scp`'d directly to `/root/` and run from
+      there instead of bootstrapping via `git clone` (equivalent — the
+      script clones the real per-environment checkouts itself regardless of
+      how it got onto the box):
       ```bash
-      ssh root@<VPS-IP>
-      apt-get update && apt-get install -y git
-      git clone https://github.com/Vishalnayak226/gold_pos.git /tmp/gold-pos-bootstrap
-      cd /tmp/gold-pos-bootstrap
-      chmod +x deploy/provision-pipeline.sh
-      ./deploy/provision-pipeline.sh \
-          --profile minimal \
-          --domain luminapos.in \
-          --email your-real-email@example.com \
+      scp deploy/provision-pipeline.sh root@139.59.37.153:/root/
+      ssh root@139.59.37.153
+      chmod +x /root/provision-pipeline.sh
+      /root/provision-pipeline.sh --profile minimal --domain luminapos.in \
+          --email vishalnayak0893@gmail.com \
           --ssh-pubkey "ssh-ed25519 AAAA...   gold-pos-ci-deploy"
       ```
+      **Windows/Git Bash gotcha:** a heredoc or `scp`'d shell script can pick
+      up CRLF line endings, which breaks the `#!/usr/bin/env bash` shebang
+      (`env: 'bash\r': No such file or directory`). Fix: `sed -i 's/\r$//'`
+      the script on the remote box before running it.
       (`--profile minimal` is the default; pass `--profile full` for all 5
       processes. Re-running with `full` later adds the missing three without
       disturbing the running two.)
-      (`--email` is for Let's Encrypt expiry notices. Add `--skip-tls` if
-      DNS isn't ready yet and run certbot later.)
-- [ ] **If the repo is private**, the clone fails and the script tells you
+      (`--email` is for Let's Encrypt expiry notices.)
+- [x] **If the repo is private**, the clone fails and the script tells you
       exactly what to do: generate a read-only key on the VPS, add it under
       GitHub → repo → Settings → **Deploy keys**, then re-run with
-      `--repo git@github.com:Vishalnayak226/gold_pos.git`.
+      `--repo git@github.com:Vishalnayak226/gold_pos.git`. **Not needed — the
+      repo cloned anonymously without issue.**
 - **What "done" looks like:** the script prints a health-check table with
-  five green `ok` lines, then a summary block.
-- [ ] **Copy the two `ADMIN_SECRET` values** it prints into your password
-      manager. They are the admin tokens for the non-prod and production
-      licensing dashboards, generated fresh per server, and stored nowhere
-      else. Losing the live one means editing `.env` on the server to reset it.
+  five green `ok` lines, then a summary block. **On `--profile minimal` you
+  only get 2 rows, and both showed FAIL on the first run — see below, this
+  turned out to be correct/expected for one and a real bug for the other.**
+- [x] **Copy the ADMIN_SECRET value(s)** it prints into your password
+      manager. `--profile minimal` only provisions one licensing server
+      (`live-licensing`), so there's one value, not two:
+      `687a4f953f85cb4155205dc832176c33d6e23ce379f333e6` — **record this
+      somewhere durable, it is not stored anywhere else.**
 - Re-running the script later is safe — it never overwrites an existing
   `.env` or an existing certificate.
+- **Both health checks FAILED on the first run — one expected, one a real bug, both resolved:**
+  - `live-backend` (**expected, by design**): `productionGuard.js` refuses to
+    bind without real Razorpay credentials, a webhook secret, a changed admin
+    PIN, and a real rate provider. That's A8 below, not this step.
+  - `live-licensing` (**a real, previously unexercised bug — fixed
+    2026-09-01**): PM2's `cwd` (the checkout root, `deploy/ecosystem.base.cjs`)
+    didn't match where this script writes `.env` (the module subdirectory),
+    so `dotenv/config`'s default `process.cwd()` lookup silently found
+    nothing on either app. `licensing-live` kept running the placeholder
+    `ADMIN_SECRET` as a result — and correctly refused to start, since that's
+    exactly what security-audit finding C2 exists to catch. Fixed at the one
+    shared choke point, `deploy/ecosystem.base.cjs`, via `DOTENV_CONFIG_PATH`;
+    full detail in `docs/SECURITY_AUDIT.md` L2 and `docs/LEDGER.md`. If you
+    provisioned before this fix landed, `git pull` the checkout and
+    `pm2 startOrRestart <ecosystem-file> --update-env` for each app.
 
 ### A6 — Wire up GitHub
 
@@ -264,6 +305,16 @@ them by hand is the single easiest thing to get wrong.
 - [ ] After approving, `https://license.luminapos.in/api/health` returns
       `{"status":"ok",...}`. The POS at `https://app.luminapos.in` is the one
       that will still refuse to boot — that's A8 below, and it's expected.
+      **The infra-reachability half of this is already proven (2026-09-01,
+      manually, ahead of A6/CI being wired up)**: `curl https://license.luminapos.in/api/health`
+      from outside the VPS returned `{"status":"ok","version":"1.0.0","env":"live"}`
+      for real — real DNS, real Let's Encrypt cert, real Nginx, real `ufw`.
+      `curl https://app.luminapos.in/api/health` correctly returned a clean
+      `502` (Nginx's own page — no stack trace), matching the expected
+      not-yet-configured state. This closes `docs/SECURITY_AUDIT.md` L2.
+      **Still to do for this checkbox specifically**: the CI-driven version —
+      push to `main`, watch `cd-live.yml` pause for approval — which needs A6
+      wired up first.
 
 **Additionally, on `--profile full`:**
 

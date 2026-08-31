@@ -12,7 +12,26 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **2026-09-01: security-audit follow-up (L1, L3 closed; L2 locally provable) committed and
+- **2026-09-01: first real VPS provisioning run — `docs/GO_LIVE_CHECKLIST.md` Track A5 done
+  against `luminapos.in` (DigitalOcean, `--profile minimal`), closing security-audit L2 for real.**
+  `https://license.luminapos.in/api/health` answers over real DNS/TLS/Nginx/ufw, verified by curl
+  from outside the VPS. `app.luminapos.in` correctly 502s (Track C/A8 — real Razorpay/PIN/rate
+  config — not done, not this session's scope). Found and fixed a real bug along the way, not
+  specific to this box: `deploy/ecosystem.base.cjs`'s PM2 `cwd` didn't match where
+  `provision-pipeline.sh` writes each app's `.env`, so `dotenv/config`'s default `process.cwd()`
+  lookup silently found nothing on either app — `licensing-live` was running the placeholder
+  `ADMIN_SECRET` until this was fixed via `DOTENV_CONFIG_PATH` in the one shared ecosystem-config
+  choke point. **This fix is committed locally but not yet pushed — see below.** Also fixed: a
+  PowerShell `-N '""'` quoting bug that left both local deploy SSH keys (`luminapos_admin`,
+  `gold_pos_ci`) encrypted with an unintended literal-`""` passphrase, silently breaking
+  unattended use; repaired in place, no regeneration needed. Full detail: `docs/LEDGER.md`
+  2026-09-01 (second row), `docs/GO_LIVE_CHECKLIST.md` A0–A5, A7.
+  **Next up, not done yet:** commit+push `deploy/ecosystem.base.cjs` (currently only manually
+  patched directly on the VPS's two checkouts, not yet in git); A6 (GitHub Actions secrets —
+  `VPS_HOST`=`139.59.37.153`, `VPS_USER`=`deploy`, `VPS_SSH_KEY`=`gold_pos_ci` private key,
+  variable `PIPELINE_DOMAIN`=`luminapos.in`, plus a `production` environment with the user as
+  required reviewer) — needs the user's GitHub UI, can't be done from here.
+- **2026-09-01: security-audit follow-up (L1, L3, L2 closed) committed and
   merged to `main`, plus two pre-existing `npm test` failures fixed.** Security work:
   `backend/cryptoHelper.js`/`backend/blackBoxLogger.js` now refuse to auto-generate a fresh RSA
   keypair in production when the shipped public key is missing (L1); a warning comment at

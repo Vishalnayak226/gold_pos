@@ -10,11 +10,14 @@
  * that one stays as-is for a normal one-tenant-per-server deployment.
  */
 
+const path = require('path');
+const REPO_ROOT = path.join(__dirname, '..');
+
 function backendApp(envName, nodeEnv) {
     return {
         name: `gold-pos-${envName}`,
         script: './backend/server.js',
-        cwd: __dirname + '/..',
+        cwd: REPO_ROOT,
         instances: 1, // single instance only — one SQLite file per tenant, one writer
         exec_mode: 'fork',
         autorestart: true,
@@ -25,7 +28,13 @@ function backendApp(envName, nodeEnv) {
            default would kill the process mid-sale and make the drain decorative.
            This must stay comfortably above that grace period. */
         kill_timeout: 15000,
-        env: { NODE_ENV: nodeEnv, ENV_NAME: envName },
+        /* server.js's very first import is `dotenv/config`, which defaults to
+           reading `.env` from process.cwd() — but cwd here is the checkout
+           root, not `backend/`, where provision-pipeline.sh actually writes
+           the file. Without this, PORT/LICENSING_SERVER_URL/PUBLIC_URL and any
+           later-added GOLD_POS_SECRET_KEY silently never load: dotenv finds no
+           file at the wrong path and no-ops rather than erroring. */
+        env: { NODE_ENV: nodeEnv, ENV_NAME: envName, DOTENV_CONFIG_PATH: path.join(REPO_ROOT, 'backend', '.env') },
         out_file: './backend/logs/pm2-out.log',
         error_file: './backend/logs/pm2-error.log',
         time: true
@@ -36,13 +45,15 @@ function licensingApp(envName, nodeEnv) {
     return {
         name: `licensing-${envName}`,
         script: './licensing_server/server.js',
-        cwd: __dirname + '/..',
+        cwd: REPO_ROOT,
         instances: 1,
         exec_mode: 'fork',
         autorestart: true,
         watch: false,
         max_memory_restart: '300M',
-        env: { NODE_ENV: nodeEnv, ENV_NAME: envName },
+        // Same cwd-vs-.env-location mismatch as backendApp above, for the
+        // freshly generated ADMIN_SECRET in licensing_server/.env.
+        env: { NODE_ENV: nodeEnv, ENV_NAME: envName, DOTENV_CONFIG_PATH: path.join(REPO_ROOT, 'licensing_server', '.env') },
         time: true
         // No custom out_file/error_file: licensing_server has no auto-created
         // logs/ dir (unlike backend/db.js), so this lets PM2 fall back to its
