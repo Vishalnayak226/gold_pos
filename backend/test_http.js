@@ -2792,14 +2792,22 @@ try {
         const stock = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
         assert.equal(stock.find(row => row.itemId === item.id).weightGrams, 4);
 
-        for (const name of ['settlement', 'reconciliation', 'profitability', 'ageing']) {
-            const response = await request(`/api/reports/${name}`, { headers: adminHeaders });
-            assert.equal(response.status, 200, name);
-            const body = await response.json();
-            assert.equal(typeof body.definition, 'string', name);
+        // managementReportsEnabled defaults off and the earlier "enabling
+        // management reports" check already restores it to off in its own
+        // finally — this test needs it on for its own duration only.
+        try {
+            assert.equal((await postSettings({ managementReportsEnabled: true })).status, 200);
+            for (const name of ['settlement', 'reconciliation', 'profitability', 'ageing']) {
+                const response = await request(`/api/reports/${name}`, { headers: adminHeaders });
+                assert.equal(response.status, 200, name);
+                const body = await response.json();
+                assert.equal(typeof body.definition, 'string', name);
+            }
+            const profit = await (await request('/api/reports/profitability', { headers: adminHeaders })).json();
+            assert.ok(profit.rows.some(row => row.invoiceNumber && row.costPaise !== null));
+        } finally {
+            await postSettings({ managementReportsEnabled: false });
         }
-        const profit = await (await request('/api/reports/profitability', { headers: adminHeaders })).json();
-        assert.ok(profit.rows.some(row => row.invoiceNumber && row.costPaise !== null));
     });
 
     /* ==================================================================

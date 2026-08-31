@@ -89,6 +89,11 @@ const PURITY_RATE_KEY = { '24K': 'price24K', '22K': 'price22K', '18K': 'price18K
 // req.ip resolves the real client IP from X-Forwarded-For instead of always
 // reading 127.0.0.1 — required for the admin-login rate limiter (adminAuth.js)
 // to key lockouts per real caller instead of globally locking every user.
+// Security audit L3: 'loopback' is correct for same-host Nginx. Do not widen
+// this to a remote load balancer or CDN without first hardening H1 (today's
+// failed-PIN breaker is tenant-wide, not per-source-IP; a wider trust-proxy
+// scope makes X-Forwarded-For attacker-suppliable, so lockouts would start
+// keying on an untrusted header). See docs/SECURITY_AUDIT.md L3.
 app.set('trust proxy', 'loopback');
 
 /* --------------------------------------------------------------------------

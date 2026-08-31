@@ -250,6 +250,11 @@ them by hand is the single easiest thing to get wrong.
 
 ### A7 — Prove it works end to end
 
+- [ ] **Optional pre-flight, before you have a VPS at all:**
+      `./deploy/verify-nginx-proxy.sh` proves `deploy/nginx.conf.template`'s
+      proxy directives correctly forward to a loopback-bound app (Docker
+      required). It cannot prove DNS/TLS/firewall — only the steps below can.
+
 **On `--profile minimal`:**
 
 - [ ] Push any trivial change to `main` → the run should **pause** on

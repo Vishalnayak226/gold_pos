@@ -73,6 +73,16 @@ nginx -t && systemctl reload nginx
 certbot --nginx -d <tenant-subdomain>   # issues + auto-configures TLS
 ```
 
+**Before a VPS/domain exists**, `./deploy/verify-nginx-proxy.sh` proves the
+template's `proxy_pass`/header directives actually forward a request through
+Nginx to a loopback-bound app and back — the one part of "does the reverse
+proxy work" that doesn't need real DNS or a real certificate. It boots
+`licensing_server/` on an ephemeral port, renders this same template into an
+`nginx:alpine` Docker container, and curls through it. Requires Docker
+Desktop; does not touch a real `.env`, a real dev session on :6060, or
+`backend/data/`. DNS resolution and the actual Let's Encrypt cert still need
+the real box — see `docs/GO_LIVE_CHECKLIST.md` A7.
+
 ## 5. The central licensing server (deploy once, not per-tenant)
 
 `licensing_server/` is the platform owner's single control-plane instance —

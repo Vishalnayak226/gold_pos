@@ -47,6 +47,17 @@ function ensureBlackBoxKeysExist() {
     try {
         if (!fs.existsSync(KEYS_DIR)) fs.mkdirSync(KEYS_DIR, { recursive: true });
         if (!fs.existsSync(PUBLIC_KEY_FILE)) {
+            // Security audit L1: never mint a fresh throwaway keypair on a live
+            // tenant machine — the private half would land in
+            // developer_blackbox_keys/ right beside the data it protects. A
+            // production install ships blackbox_public.pem already (see
+            // release_pipeline.js); a missing key there means an incomplete
+            // deploy, and the black-box export is the only thing that degrades.
+            if (process.env.NODE_ENV === 'production') {
+                dbLogError('Black-box public key (backend/keys/blackbox_public.pem) is missing in production. Refusing to auto-generate a new keypair on this machine — black-box export will fail until the shipped key is restored. See docs/SECURITY_AUDIT.md L1.');
+                return;
+            }
+
             console.log('[BlackBox] Generating dedicated black-box RSA-4096 keypair (separate from the Level-2 developer key)...');
 
             const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {

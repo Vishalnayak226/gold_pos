@@ -19,8 +19,19 @@ if (!fs.existsSync(KEYS_DIR)) fs.mkdirSync(KEYS_DIR, { recursive: true });
 function ensureKeysExist() {
     try {
         if (!fs.existsSync(PUBLIC_KEY_FILE)) {
+            // Security audit L1: never mint a fresh throwaway keypair on a live
+            // tenant machine — the private half would land in
+            // developer_doomsday_keys/ right beside the data it decrypts. A
+            // production install ships developer_public.pem already (see
+            // release_pipeline.js); a missing key there means an incomplete
+            // deploy, and Level-2 export is the only thing that degrades.
+            if (process.env.NODE_ENV === 'production') {
+                logError('Developer public key (backend/keys/developer_public.pem) is missing in production. Refusing to auto-generate a new keypair on this machine — Level-2 diagnostic exports will fail until the shipped key is restored. See docs/SECURITY_AUDIT.md L1.');
+                return;
+            }
+
             console.log('[Crypto] Developer public key missing. Generating mock developer RSA-4096 keypair for local verification...');
-            
+
             const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
                 modulusLength: 4096,
                 publicKeyEncoding: { type: 'spki', format: 'pem' },

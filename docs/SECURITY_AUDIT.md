@@ -11,6 +11,15 @@ addressed in this pass — see the status table for what's still open. Details
 in each finding's section below; original findings text is otherwise
 unchanged so this stays a readable diff of what was found vs. what closed it.
 
+**Follow-up pass: 2026-08-30.** L1 and L3 closed (see their sections below).
+L2 remains open — it is deployment-time infrastructure proof, not a code
+change, and there is still no VPS/domain to prove it against (CLAUDE.md §7).
+M1, M3–M5 still not addressed — unchanged from the 2026-08-24 pass.
+
+**Follow-up pass: 2026-08-31.** L2's code/config half made locally provable
+(`deploy/verify-nginx-proxy.sh`, see L2's section below) — finding stays
+OPEN, the DNS/TLS/firewall half is still genuinely infra-blocked.
+
 ---
 
 ## Executive Summary
@@ -42,8 +51,9 @@ That single hole chains into full financial/system takeover; it is the #1 thing 
 | H8 | MEDIUM | Licensing server — permissive CORS, no CSP/helmet, no rate limiter | **FIXED 2026-08-24** — `cors()` removed outright (dependency dropped), basic security headers added, blanket + per-route rate limiting added |
 | M1 | MEDIUM | No approval/alert for extreme invoice discounts | **OPEN** — not addressed this pass |
 | M2+ | MEDIUM/LOW | No rate limiters on many admin/customer endpoints (table below) | **PARTIALLY ADDRESSED** — the endpoints named in C3/H2/H3/H6 above are covered; the remaining rows in the matrix are still open |
-| L1 | INFO | Dev private keys auto-generated into repo workspace | **OPEN** — not addressed this pass |
-| L2 | INFO | Licensing server binds 127.0.0.1 only; nginx exposure unproven | **OPEN** — not addressed this pass |
+| L1 | INFO | Dev private keys auto-generated into repo workspace | **FIXED 2026-08-30** — `cryptoHelper.js`/`blackBoxLogger.js` refuse to mint a new keypair when `NODE_ENV=production` and the shipped public key is missing |
+| L2 | INFO | Licensing server binds 127.0.0.1 only; nginx exposure unproven | **OPEN** — genuinely blocked on infrastructure, not code (no VPS/domain provisioned, CLAUDE.md §7); proof step is `docs/GO_LIVE_CHECKLIST.md` A7 |
+| L3 | INFO | trust-proxy scope | **FIXED 2026-08-30** — warning comment added at the `app.set('trust proxy', ...)` call site so a future widening can't happen without reading the H1 caveat |
 
 ---
 ## CRITICAL findings
@@ -274,13 +284,21 @@ Equal PINs → equal hashes is safe *only because* duplicates are refused outrig
 
 `backend/cryptoHelper.js` writes `developer_doomsday_keys/developer_private.pem` (RSA-4096; decrypts every Level-2 support export) and `backend/blackBoxLogger.js` writes `developer_blackbox_keys/blackbox_private.pem` whenever the matching public key is missing on disk. On a real tenant machine those sit beside the data they protect. They are gitignored — but remove them from production builds and never ship them.
 
+**FIXED 2026-08-30.** `release_pipeline.js` already shipped both `backend/keys/developer_public.pem` and `backend/keys/blackbox_public.pem` in the dist bundle (the general recursive copy of `backend/` — only the *private* key path was ever excluded), so a normal release-built install never hit the auto-generation branch. The residual risk was a misconfigured or hand-copied deploy that shipped `backend/` without those public keys: `ensureKeysExist()`/`ensureBlackBoxKeysExist()` would then silently mint a fresh RSA-4096 keypair on the tenant's own machine and write the private half to disk beside the ledger it protects. Both functions now check `NODE_ENV === 'production'` before generating and refuse (log via `logError`/`dbLogError`, return without writing a key) rather than improvise — Level-2 export and black-box export degrade to an error until the shipped key is restored, instead of quietly creating new cryptographic material on a live till. No test previously covered this path (none broken).
+
 ### L2 — Licensing server binds 127.0.0.1 only
 
 `app.listen(PORT, '127.0.0.1')` in `licensing_server/server.js` — the control-plane is loopback-only; `deploy/nginx.conf.template` is the intended public path but has **not been proven end-to-end** (per CLAUDE.md §7 no VPS/domain provisioned as of 2026-07-17). Verify firewall/proxy config before exposing; otherwise C2's default-secret risk becomes internet-facing.
 
+**2026-08-31: the code/config half is now provable without a VPS, the infra half still isn't.** `deploy/verify-nginx-proxy.sh` boots `licensing_server/` on an ephemeral port, renders the real `deploy/nginx.conf.template` into an `nginx:alpine` container, and curls through it — proving `proxy_pass`/header forwarding to the loopback-bound app actually works, unmodified from what `deploy/provision-pipeline.sh` renders in production. Run and passed locally (`{"status":"ok",...}` through the proxy, `nginx -t` clean). Still open and still genuinely blocked on infrastructure: DNS resolving a real subdomain to the VPS, `certbot` issuing a real cert, and `ufw` + the public internet actually reaching the box — none of that can be simulated without a live VPS/domain (CLAUDE.md §7). Finding stays OPEN; proof step is still `docs/GO_LIVE_CHECKLIST.md` A7.
+
+**Still open 2026-08-30 — genuinely infrastructure-gated, not a code fix.** The bind address itself (`127.0.0.1`, hardcoded, not configurable) already makes the raw port unreachable from outside the host regardless of firewall state, so the only thing actually unproven is that Nginx+TLS terminates and proxies correctly end-to-end. That proof already has a home: `docs/GO_LIVE_CHECKLIST.md` **A7 — "Prove it works end to end"** hits `https://license.<domain>/api/health` through the real reverse proxy once a VPS and domain exist. There is nothing to build here until Track A of that checklist is run; do not fabricate a substitute check against infrastructure that doesn't exist yet.
+
 ### L3 — trust-proxy scope
 
 `app.set('trust proxy', 'loopback')` is correct for same-host nginx. Do not widen it to remote LBs/CDNs without hardening H1 first (real client IPs also mean per-IP lockouts are per-attacker).
+
+**FIXED 2026-08-30.** The setting itself was already correct and needed no change. Added a comment at the `app.set('trust proxy', 'loopback')` call site in `backend/server.js` spelling out exactly why widening it is unsafe before H1's per-operator lockout lands (a wider trust-proxy scope makes `X-Forwarded-For` attacker-suppliable), so the next person touching that line reads the constraint instead of rediscovering it.
 
 ---
 ## Already closed — verified during this review (keep the tests that pin them)
@@ -310,9 +328,9 @@ Equal PINs → equal hashes is safe *only because* duplicates are refused outrig
 | 6 | Add limiters: `/api/qrcode`, `/api/payment/verify`, `/api/license/activate`, unthrottled admin writes | H2,H3,H4,H6 | **Done 2026-08-24** — H4 fixed by unifying the response instead (limiters don't address enumeration); `/api/license/verify` also limited (H6) |
 | 7 | Generic 500 bodies on the leaky routes | H5 | **Done 2026-08-24** — the 5 confirmed sites; `/api/diagnostics/telemetry`'s log tail is now owner-gated (C3) rather than redacted |
 | 8 | Bounded map + rate limiter on licensing `failedAdminAttempts` | H7 | **Done 2026-08-24** |
-| 9 | Strip dev private keys from shipped builds; firewall/reachability proof for licensing public path | L1,L2 | **Not started** |
+| 9 | Strip dev private keys from shipped builds; firewall/reachability proof for licensing public path | L1,L2 | **L1 done 2026-08-30** (refuse-to-generate guard); **L2 blocked on infra** — see L2 note above |
 
-**Not addressed this pass:** M1 (extreme-discount alerting — needs a threshold/product decision), M3–M5 (already accepted trade-offs / low severity, no action needed), L1–L3 (deployment-time hardening, not code changes).
+**Not addressed this pass:** M1 (extreme-discount alerting — needs a threshold/product decision), M3–M5 (already accepted trade-offs / low severity, no action needed), L2 (deployment-time proof — no VPS/domain to prove it against yet). L1 and L3 closed 2026-08-30 — see their sections above.
 
 ---
 

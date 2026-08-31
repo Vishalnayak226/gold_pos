@@ -12,25 +12,27 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
-- **Security audit remediation (C1–C5, H1–H8) completed 2026-08-25, NOT YET COMMITTED.**
-  Full detail in the new `docs/LEDGER.md` row and in `docs/SECURITY_AUDIT.md` itself (each
-  finding's own section now says what closed it, or why it wasn't addressed this pass — M1, L1–L3
-  are still open by design). `npm test` 611/611, `npm run test:e2e` 43/43, both green on the
-  current working tree. This was the concurrent work the Phase 44 entry below flagged as
-  in-progress; it is now finished.
-  **Working-tree state is split across two points in history** because Phase 44 was committed
-  (`e08aaea`) while this work was still in flight in the same files: `backend/server.js`,
-  `backend/test_http.js`, `frontend/index.html`, `frontend/js/components/SettingsManager.js` and
-  `frontend/js/customerAlertOverride.js` already carry this session's edits *inside* `e08aaea` (the
-  other session folded whatever was on disk into its commit rather than reverting it — reasonable,
-  but it means checking out `e08aaea` in isolation is not byte-identical to either phase cleanly).
-  Still uncommitted on top of that: `backend/adminAuth.js`, `frontend/customer.html`,
-  `licensing_server/package.json` + `package-lock.json` (the `cors` dependency was dropped —
-  nothing in that service needs cross-origin access), `licensing_server/server.js`, and new files
-  `frontend/js/adminAlertOverride.js`, `frontend/js/customer-app.js` (the ~870-line inline module
-  `customer.html` used to carry), `docs/SECURITY_AUDIT.md`. **Next session: run `git status` and
-  `git diff` before touching any of the above — do not assume `e08aaea` is a clean baseline for
-  them.** Not committed here because the user did not ask for a commit.
+- **2026-09-01: security-audit follow-up (L1, L3 closed; L2 locally provable) committed and
+  merged to `main`, plus two pre-existing `npm test` failures fixed.** Security work:
+  `backend/cryptoHelper.js`/`backend/blackBoxLogger.js` now refuse to auto-generate a fresh RSA
+  keypair in production when the shipped public key is missing (L1); a warning comment at
+  `app.set('trust proxy', 'loopback')` in `backend/server.js` documents why it must not be widened
+  before H1 is fully hardened (L3); new `deploy/verify-nginx-proxy.sh` proves
+  `deploy/nginx.conf.template`'s proxy_pass/header forwarding without needing a live VPS — L2
+  itself stays OPEN, DNS/TLS/firewall genuinely need real infrastructure (CLAUDE.md §7). Test
+  fixes (found while verifying the tree before merging to `main` — neither is a regression from
+  this session's own changes): `test_http.js`'s management-reports check wasn't re-enabling the
+  setting an earlier test had reset in cleanup; `test_suite.js`'s backup-encryption restore drill
+  was snapshotting a completely empty ledger, now seeds one fixture deposit first;
+  `verifyBackup.js --quiet` no longer swallows its own failure summary. Full detail:
+  `docs/LEDGER.md` 2026-09-01 row, `docs/SECURITY_AUDIT.md` L1/L2/L3 sections.
+  **`cd backend && npm test` — 618 checks, green, exit 0, all nine suites.** Working tree clean;
+  `main` and this branch are even.
+- **Security audit remediation (C1–C5, H1–H8) — committed `aaa4af3`, 2026-08-24.** Full detail in
+  `docs/LEDGER.md` and `docs/SECURITY_AUDIT.md` (each finding's own section says what closed it,
+  or why it wasn't addressed — M1, M3-M5 still open by design). The #1 finding was architectural:
+  `POST /api/settings` was gated only by session auth, so any signed-in cashier could rewrite the
+  whole settings document, including adding themselves as `owner`.
 - **Phase 44 was completed 2026-08-24 and committed from the shared working tree on 2026-08-25.** Migration 016,
   billing-linked sale/return/void lot movements, SKU auto-fill, return exchange, same-day void,
   the verified filesystem off-site backup destination, and four explicitly-defined management

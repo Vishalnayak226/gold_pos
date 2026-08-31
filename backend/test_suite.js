@@ -837,6 +837,22 @@ async function testBackupArchiveEncryption() {
     const vault = await import('./secretVault.js');
     const { key: activeKey } = vault.resolveKey(process.env.GOLD_POS_DATA_DIR);
 
+    // verifyBackup.js's "the books are actually there" check needs at least one
+    // real business record in the snapshot. This suite is otherwise pure
+    // crypto/licensing/account-machinery and never writes an invoice or an
+    // advance entry, so without this fixture the restore drill would
+    // legitimately — and uselessly — fail every run against an empty ledger.
+    const advanceService = await import('./services/advanceService.js');
+    const seededDeposit = advanceService.recordDeposit({
+        customerPhone: '9000000015', customerName: 'Backup Drill Fixture',
+        amount: 500, paymentMethod: 'Cash', referenceId: 'backup-drill-fixture',
+        status: 'approved', source: 'counter'
+    }, {
+        getActiveGoldRates: () => ROU_DATA,
+        isValidPhone: (v) => /^\d{10}$/.test(String(v || ''))
+    });
+    assert.ok(seededDeposit.success, 'seeding the backup-drill fixture deposit: ' + seededDeposit.error);
+
     const { createBackup } = await import('./backupEngine.js');
     const result = createBackup();
     assert.strictEqual(result.success, true, result.error);

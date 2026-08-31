@@ -260,8 +260,12 @@ if (failed.length === 0) {
     say(`  RESTORE VERIFIED — ${results.length} checks passed.`);
     say('  This snapshot can be turned back into a working install.');
 } else {
-    say(`  RESTORE NOT VERIFIED — ${failed.length} of ${results.length} checks failed:`);
-    for (const f of failed) say(`    - ${f.label}${f.detail ? `: ${f.detail}` : ''}`);
+    // Failure detail is printed even under --quiet: quiet mode exists to keep
+    // a clean-pass cron log short, not to hide the one thing a monthly restore
+    // drill exists to surface. A silent, undiagnosable failure here is worse
+    // than a noisy one.
+    console.error(`  RESTORE NOT VERIFIED — ${failed.length} of ${results.length} checks failed:`);
+    for (const f of failed) console.error(`    - ${f.label}${f.detail ? `: ${f.detail}` : ''}`);
 }
 say('');
 
