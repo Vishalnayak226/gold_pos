@@ -12,6 +12,27 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
+- **2026-09-02: `app.luminapos.in` brought fully up and license-activated for real (Track A8/§9
+  bootstrap flow), one code bug and one self-inflicted ops mistake found and fixed along the way.**
+  `GOLD_POS_SECRET_KEY` generated and set (was entirely missing — provision-pipeline.sh doesn't
+  auto-generate this one, by design, since losing an auto-generated master key nobody saw would be
+  catastrophic). Temporary `gold-pos-bootstrap` PM2 process (`NODE_ENV=development`, per
+  `deploy/README.md` §9 step 2) used to reach the admin UI while the real process still refuses to
+  bind on the three expected blockers (demo Razorpay creds, no webhook secret, default PIN).
+  **Found: `backend/licenseChecker.js` resolved its public-key path from `process.cwd()` instead
+  of `__dirname`** — every sibling key-reading file already used the correct pattern; fixed,
+  committed, pushed (`bfb32d2`). **Found: a raw `git reset --hard` during the 2026-09-01 session
+  (instead of `deploy/remote-deploy.sh`) had silently reverted `licensing_server/keys/
+  license_public.pem` back to its git-tracked placeholder**, so the real signing key and the
+  public key being checked against had quietly diverged — rebuilt both from their private keys
+  and re-synced every copy. **Lesson for next time: always use `deploy/remote-deploy.sh` to sync a
+  checkout on this VPS, never a raw `git reset --hard`** — the script restores the signing-key
+  overlay automatically, a bare reset does not. Verified end to end:
+  `POST /api/license/activate {"licenseKey":"DEMO-KEY-12345"}` against `https://app.luminapos.in`
+  now returns `"success":true`. Full detail: `docs/LEDGER.md` 2026-09-02.
+  **Still open:** Razorpay test keys + webhook secret + admin PIN change — user has the values,
+  needs to enter them in Settings; then tear down `gold-pos-bootstrap` and restart the real
+  `gold-pos-live` via `deploy/remote-deploy.sh`.
 - **2026-09-01: first real VPS provisioning run — `docs/GO_LIVE_CHECKLIST.md` Track A5 done
   against `luminapos.in` (DigitalOcean, `--profile minimal`), closing security-audit L2 for real.**
   `https://license.luminapos.in/api/health` answers over real DNS/TLS/Nginx/ufw, verified by curl
