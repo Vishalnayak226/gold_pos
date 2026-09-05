@@ -66,11 +66,30 @@ body {
     width: 100vw;
 }
 
+/* Default (unauthenticated) state: login screen visible, app hidden. The
+   inline pre-paint script in index.html's <head> adds .gp-authenticated to
+   <html> synchronously — before first paint — when sessionStorage already
+   says this tab is logged in, so a refresh lands on the app directly
+   instead of flashing this login screen first. app.js's own login/logout/
+   401 handlers toggle the two elements' inline .style.display afterwards,
+   which (being inline) always takes precedence over these rules. */
+#admin-login-view {
+    display: flex;
+}
+
 #app-viewport {
-    display: grid;
+    display: none;
     grid-template-columns: 240px 1fr;
     height: 100vh;
     width: 100vw;
+}
+
+html.gp-authenticated #admin-login-view {
+    display: none;
+}
+
+html.gp-authenticated #app-viewport {
+    display: grid;
 }
 
 /* ==========================================================================
@@ -84,6 +103,8 @@ body {
     justify-content: space-between;
     border-right: 1px solid rgba(255, 255, 255, 0.1);
     padding: 10px;
+    height: 100vh;
+    overflow: hidden; /* only .sidebar-nav scrolls internally, below */
 }
 
 .sidebar-header h2 {
@@ -115,6 +136,17 @@ body {
     gap: 4px;
     margin-top: 20px;
     flex-grow: 1;
+    min-height: 0; /* let this child shrink so overflow can scroll instead of clipping */
+    overflow-y: auto;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+    width: 6px;
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
 }
 
 .nav-btn {

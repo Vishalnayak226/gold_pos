@@ -8,7 +8,12 @@
     "dotenv": "^17.4.2",
     "express": "^4.19.2"
   },
+  "overrides": {
+    "qs": "6.16.0"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "audit:security": "npm audit --omit=dev --audit-level=moderate",
+    "sbom:dependencies": "npm ls --all --json"
   }
 }

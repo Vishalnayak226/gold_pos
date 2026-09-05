@@ -982,3 +982,249 @@ _____________________________________________________________________
 _____________________________________________________________________
 _____________________________________________________________________
 _____________________________________________________________________
+
+---
+
+## 23. POS 360° remediation and pilot-readiness *(added 2026-09-02)*
+
+This section is the executable checklist for the findings in
+[`POS_360_AUDIT_PLAN_2026-09-02.md`](POS_360_AUDIT_PLAN_2026-09-02.md).
+Code-side checks may be completed by automated tests; legal, merchant, payment,
+deployment and hardware checks must be evidenced by the named real-world owner.
+
+### 23a. Lightweight performance and resilience
+
+- [x] Replace synchronous request telemetry/black-box disk writes with a bounded,
+  observable batch writer; financial SQL commits and durable audit facts must remain
+  synchronous. Verify the queue is bounded, flushes on graceful shutdown, reports
+  drops/failures and cannot make a successful sale appear unsuccessful.
+  Result: Automated log-writer + full backend HTTP suite green (2026-09-03).
+  Notes: Queue/flush/drop/failure metrics appear in owner diagnostics. ______
+
+- [ ] Add log rotation/retention and a disk-budget alert. Verify a full or unwritable
+  log destination produces an actionable warning without corrupting or blocking the ledger.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Cache the server version at boot and apply explicit static-asset caching:
+  revalidated HTML and release-versioned JS/CSS/assets. Verify a new release does not
+  serve stale code and a repeat visit avoids redundant asset downloads.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Customer and SKU lookup requests are latest-result-wins: type one valid phone/SKU,
+  change it before the first response returns, and confirm stale data can never populate
+  the new customer/item. Verify a failed/aborted lookup leaves the current cart intact.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Run the dependency-free benchmark against a seeded tenant on the target VPS:
+  1,000 invoices, 50,000 advances and expected concurrent tills. Record p50/p95/p99 for
+  input feedback, lookup, save, tab load, memory and disk. Compare with the targets in
+  the 360° audit before accepting a pilot.
+  Result: _____  Notes: ______________________________________________
+
+### 23b. Legal, payments and operating evidence — external launch gates
+
+- [ ] CA approves the final tax-invoice and credit-note template for this merchant,
+  including GST/HSN/place-of-supply/recipient facts where applicable. A printed sample
+  is attached to the merchant launch record.
+  Owner: CA  Result: _____  Notes: ___________________________________
+
+- [ ] BIS/jeweller review approves hallmarked-article invoice content and the consumer
+  verification statement. Test the actual printed invoice for description, net weight,
+  carat/fineness and hallmarking-charge presentation.
+  Owner: Merchant/BIS adviser  Result: _____  Notes: __________________
+
+- [ ] Old-gold exchange and gold-savings schemes remain disabled until a CA/lawyer signs
+  their purchase/exchange/scheme terms, GST/RCM treatment, reversal/refund policy and
+  customer-facing documents. Do not substitute a settings toggle for this evidence.
+  Owner: Merchant + counsel  Result: _____  Notes: ____________________
+
+- [ ] Prove Razorpay in a sandbox against the merchant account: immediate success,
+  abandoned checkout, signature failure, duplicate webhook, late/out-of-order webhook,
+  amount mismatch and settlement reconciliation. Capture dashboard evidence.
+  Owner: Merchant/onboarding engineer  Result: _____  Notes: __________
+
+- [ ] DPDP/privacy review maps every customer field, consent purpose, retention/deletion,
+  export, grievance contact, processor access and breach response. Publish the approved
+  customer notice before enabling public sign-up or the mobile app.
+  Owner: Privacy counsel  Result: _____  Notes: _______________________
+
+### 23c. Counter and recovery acceptance
+
+- [ ] Certify the exact browser, workstation, scanner, weighing scale, thermal printer,
+  label printer and cash drawer used at the pilot. Test scanner Enter behavior, printer
+  paper-out/retry, 125% zoom, touchscreen, slow device and power/network loss.
+  Owner: Store manager  Result: _____  Notes: _________________________
+
+- [ ] Run a full shop-day reconciliation: physical cash, card/UPI settlement, sales
+  register, returns/credit notes, advances, stock movement and bank settlement all agree.
+  Owner: Owner/manager  Result: _____  Notes: _________________________
+
+- [ ] Restore the latest encrypted backup onto a different host, verify the audit chain
+  and ledger totals, then rehearse a documented rollback. Record restore time and the
+  people who hold the recovery key.
+  Owner: Onboarding engineer + owner  Result: _____  Notes: ___________
+
+- [ ] Train cashier and manager using the role cards: sale, split tender, advance,
+  return, manager approval, rate-stale/outage behavior, printer failure and day close.
+  Each person completes an observed practice transaction before live access.
+  Owner: Store manager  Result: _____  Notes: _________________________
+
+### 23d. Security hardening — continuous release gates *(added 2026-09-03)*
+
+- [x] Maintain a versioned threat model covering cashier, manager, owner, customer,
+  attacker on the internet, malicious insider, stolen device, compromised VPS,
+  compromised dependency, payment-webhook spoofing, ransomware and accidental operator error.
+  Every new route or financial workflow names its assets, trust boundary, abuse case,
+  mitigation, test and owner.
+  Result: `docs/THREAT_MODEL.md` baseline added 2026-09-03.
+  Notes: Update it as part of every workflow/route change. _______________
+
+- [ ] Enforce a production security baseline: HTTPS/TLS, secure cookies, CSP, CSRF,
+  exact CORS allowlist, security headers, input/body limits, request IDs, error redaction,
+  login/payment rate limits, named roles, session revocation and MFA for money-release roles.
+  Verify the deployed response headers and failed-path bodies from outside the VPS.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Add a security-focused automated suite for regression-prone boundaries:
+  authorization matrix, IDOR/tenant isolation, CSRF, XSS rendering sinks, path traversal,
+  oversized/malformed requests, hostile request IDs, replay/duplicate money events,
+  session fixation/revocation and secret redaction. Run it in CI on every pull request.
+  Result: _____  Notes: ______________________________________________
+
+- [x] Pin and continuously audit runtime dependencies, Node version, GitHub Actions,
+  release signatures and deployment scripts. Produce an SBOM and review every new runtime
+  dependency as an exception to the zero-dependency-growth rule.
+  Result: Both service locks override transitive qs to 6.16.0; `audit:security`
+  reports 0 vulnerabilities (2026-09-03). `sbom:dependencies` scripts added.
+  Notes: CI/release workflow review remains an operational gate. __________
+
+- [ ] Secure the host and secrets: non-root service account, least-privilege filesystem,
+  firewall, unattended OS security updates, encrypted/off-host backups, separated vault-key
+  custody, SSH MFA/rotation, incident contacts and tested credential revocation.
+  Owner: Platform operator  Result: _____  Notes: _____________________
+
+- [ ] Commission an independent penetration test and code review before accepting a paid
+  merchant. Triage every high/critical finding to closure; record risk acceptance only with
+  a named business owner and expiry date.
+  Owner: Independent security assessor  Result: _____  Notes: _________
+
+---
+
+## 24. Twenty-year durability standard *(added 2026-09-04)*
+
+This is a design and operating standard, not a claim that a browser, provider,
+law, hardware platform or cryptographic algorithm will remain unchanged for two
+decades. It requires the system to be understandable, recoverable and safely
+replaceable as those things change.
+
+- [x] Every backup is self-describing: immutable format version, application/Node
+  version, creation time, ledger filename and migration inventory; the restore tool
+  reads it when present but continues to accept legacy snapshots. Verify it is encrypted
+  with the archive and that metadata matches the restored ledger.
+  Result: Encrypted manifest + restore validation verified by integration Test 15
+  on 2026-09-04. Notes: Clean-host recovery remains an external annual drill.
+
+- [ ] Maintain additive data evolution only. Run migration checksum, orphan and
+  destructive-DDL checks in CI; record a supported rollback/forward-only policy for every
+  release. Never use a code rollback to interpret a database with newer semantics without
+  a compatibility test.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Annually prove recovery independence: restore a backup onto a clean supported OS/Node
+  version with only documented environment variables and the separately-held recovery key.
+  Measure RTO/RPO, verify invoices/audit chain/stock, and retain the evidence outside the POS.
+  Owner: Platform operator + owner  Result: _____  Notes: ____________
+
+- [ ] Maintain a machine-readable data export specification and a tested export containing
+  invoices, returns, advances, stock, operators and audit evidence. A merchant must be able
+  to leave the product without a proprietary database client or an active vendor account.
+  Owner: Product + finance owner  Result: _____  Notes: _______________
+
+- [ ] Create a supported-version policy: Node LTS review, browser support window, dependency
+  audit cadence, TLS/certificate/crypto review and a documented deprecation path. Time-box any
+  exception with an owner, mitigation and removal date.
+  Owner: Engineering owner  Result: _____  Notes: ____________________
+
+- [ ] Keep operations boring: a one-page install/upgrade/rollback/runbook, external secrets
+  inventory, named recovery-key custodians, off-host encrypted backups, spare-counter hardware
+  plan and an annual disaster rehearsal with a non-engineer store owner observing.
+  Owner: Platform operator + store owner  Result: _____  Notes: _______
+
+### 24b. Whole-app future-proofing — continuous engineering gates
+
+- [ ] Publish and enforce stable contracts for every external surface: versioned API behaviour,
+  machine-readable error codes, pagination/filter bounds, authentication semantics, webhook
+  idempotency and export schemas. Add rather than mutate; announce and measure any deprecation.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Treat financial, stock, tax, identity and audit invariants as executable specifications.
+  For every new workflow, test normal, retry, replay, concurrency, partial failure, upgrade and
+  permission-denied paths against a disposable real database—not only mocked helpers.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Keep modules replaceable: documented domain boundaries, no browser-only financial authority,
+  no hidden cross-module writes, no permanent vendor lock-in, and a supported import/export path.
+  New runtime dependencies require a written lifecycle, licence, vulnerability and exit review.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Enforce a counter performance budget on supported low-end hardware and target VPS: boot,
+  login, product/customer lookup, recalculation, sale commit, print, tab switch, memory growth and
+  slow/offline failure response. Regressions block release; optimise measured bottlenecks only.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Make the UI durable for real operators: keyboard/scanner/touch paths, readable errors,
+  responsive layouts, semantic focus order, contrast/zoom, no data loss on slow requests, and
+  all destructive actions reversible or explicitly confirmed and audited.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Maintain an upgrade discipline: reproducible locked installs, API/data compatibility matrix,
+  release notes, canary rollout, observability dashboard, rollback decision tree and a scheduled
+  removal process for retired flags/code. No unreviewed production hotfixes.
+  Result: _____  Notes: ______________________________________________
+
+### 24c. Trusted-core implementation queue *(started 2026-09-04)*
+
+- [ ] Build a machine-checkable invariant matrix for every money/stock workflow:
+  sale, tender split, advance redemption, return, exchange, void, payment webhook,
+  stock adjustment and day reconciliation. Each row proves units, authorization,
+  atomic writes, retry/replay handling, audit actor and historical projection.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Add targeted adversarial tests for configuration drift during a transaction,
+  concurrent/duplicate document actions, process interruption, permission/session change,
+  malformed legacy record and post-restore replay. A green happy path is insufficient.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Centralize and freeze domain refusal codes at service boundaries. Routes may map a
+  code to HTTP/operator guidance, but no browser or route handler may invent financial,
+  stock or authorization business rules independently.
+  Result: Initial registry in `backend/domainCodes.js` covers refund approvals/MFA,
+  insufficient stock and the complete void lifecycle; service + HTTP regressions passed
+  2026-09-05. Notes: Advance, exchange, payment and remaining return/sale refusals still
+  need migration before this gate can close. _______________________________
+
+- [ ] Verify every permanent record has an owning service/repository, integer boundary
+  units, server-issued identity/timestamp, actor/audit context and an immutable projection
+  that survives settings/rate/operator changes.
+  Result: _____  Notes: ______________________________________________
+
+### 24d. Counter-performance implementation queue *(started 2026-09-05)*
+
+- [x] Provide a dependency-free, repeatable benchmark that boots the real server against an
+  isolated tenant, warms it, measures serial and concurrent health/static paths, emits p50/p95/p99
+  JSON evidence and never touches merchant data. It is a baseline tool—not proof of checkout,
+  low-end hardware, VPS or printer performance.
+  Result: `npm --prefix backend run benchmark` passed on 2026-09-05 (Node 26,
+  Windows loopback): p95 16.79 ms health serial, 17.01 ms HTML serial, 17.49 ms
+  app-module serial, 47.25 ms health at 25-way concurrency. `benchmark:quick`
+  also passed. Notes: The seeded/VPS/browser gates below remain open. _______
+
+- [ ] Extend the benchmark with a representative seeded merchant dataset and authenticated
+  checkout/lookup/paged-ledger workload; record target-hardware and target-VPS budgets before
+  treating a regression as release-blocking.
+  Result: _____  Notes: ______________________________________________
+
+- [ ] Capture a low-end-counter browser trace for keyboard/scanner input, total recalculation,
+  tab transitions, print preparation and an 8-hour soak. Fix only bottlenecks the trace proves;
+  preserve synchronous financial commits and audit guarantees.
+  Owner: Product + engineering  Result: _____  Notes: ________________

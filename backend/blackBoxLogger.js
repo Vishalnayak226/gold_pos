@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { LOGS_DIR, logError as dbLogError } from './db.js';
+import { enqueueLog } from './logWriter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const KEYS_DIR = path.join(__dirname, 'keys');
@@ -95,7 +96,7 @@ export function logBlackBoxEvent(eventType, meta = {}) {
             eventType,
             ...scrub(meta)
         }) + '\n';
-        fs.appendFileSync(BLACKBOX_LOG_FILE, entry, 'utf8');
+        enqueueLog(BLACKBOX_LOG_FILE, entry);
     } catch (err) {
         dbLogError('Failed to write black-box log entry: ' + err.message, err.stack);
     }

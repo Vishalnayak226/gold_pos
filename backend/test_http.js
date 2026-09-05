@@ -326,6 +326,8 @@ try {
         const blocked = await request('/api/health', { headers: { Origin: 'https://evil.example.test' } });
         assert.equal(blocked.status, 200);
         assert.equal(blocked.headers.get('access-control-allow-origin'), null);
+        assert.equal(blocked.headers.get('x-gold-pos-api-version'), '1');
+        assert.equal((await blocked.json()).apiVersion, '1');
         assert.match(blocked.headers.get('content-security-policy') || '', /default-src 'self'/);
         assert.equal(blocked.headers.get('x-content-type-options'), 'nosniff');
 
@@ -2541,6 +2543,7 @@ try {
         assert.equal(refused.status, 403);
         const body = await refused.json();
         assert.equal(body.error, 'APPROVER_REQUIRED');
+        assert.equal(body.code, 'APPROVER_REQUIRED', 'domain refusals expose a stable machine code');
         assert.match(body.message, /500/, 'the message should name the store limit');
         // Nothing was filed.
         assert.equal(
@@ -2788,6 +2791,13 @@ try {
         });
         assert.equal(voidRes.status, 200);
         assert.equal((await voidRes.json()).sale.state, 'cancelled');
+
+        const repeatedVoid = await request(`/api/sales/${encodeURIComponent(invoiceId)}/void`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ reason: 'HTTP test cashier correction' })
+        });
+        assert.equal(repeatedVoid.status, 409);
+        assert.equal((await repeatedVoid.json()).code, 'VOID_NOT_ALLOWED');
 
         const stock = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
         assert.equal(stock.find(row => row.itemId === item.id).weightGrams, 4);

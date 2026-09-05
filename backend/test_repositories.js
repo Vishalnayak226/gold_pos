@@ -1981,6 +1981,11 @@ console.log('\n22. Billing-linked inventory and management reports');
         assert.equal(result.sale.state, 'cancelled');
         assert.equal(repo.inventory.lotBalanceMg(lotId), 7000);
         assert.equal(repo.invoices.findByNumber(context.tenantId, sale.invoiceId).state, 'cancelled');
+        const repeated = saleService.voidSale(sale.invoiceId, 'Cashier selected wrong customer', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(repeated.ok, false);
+        assert.equal(repeated.code, 'VOID_NOT_ALLOWED', 'a repeated void has a stable domain outcome');
     });
 
     check('reconciliation compares counter tenders to the already advance-net invoice payable', () => {

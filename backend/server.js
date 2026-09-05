@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { drainLogWriter, getLogWriterStats } from './logWriter.js';
 import { readJSON, logError, logTelemetry, newId, DATA_DIR } from './db.js';
 import { readSettings, writeSettings } from './settingsStore.js';
 import { redactSettings, OPERATOR_ROLES, validateSettingsPatch } from './defaultSettings.js';
@@ -61,6 +62,15 @@ import { importLegacyJson, collectSource, formatReport } from './importLegacyJso
 // updateEngine.js ship and replace backend/ and frontend/ as a pair.
 import { normalizeTaxMode, round2, round3, toPaise, fromPaise, ADVANCE_STATUS } from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
+import { DOMAIN_CODE } from './domainCodes.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Health probes run frequently. Parse package metadata once at boot rather
+// than synchronously reopening it on every liveness request.
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
+// Increment only for a deliberately breaking public API change. Additive
+// fields/endpoints remain compatible within this contract generation.
+const API_CONTRACT_VERSION = '1';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -384,6 +394,7 @@ app.use((req, res, next) => {
     const startTime = Date.now();
     req.id = resolveRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, req.id);
+    res.setHeader('X-Gold-POS-API-Version', API_CONTRACT_VERSION);
     res.on('finish', () => {
         const duration = Date.now() - startTime;
         recordRequestOutcome(res.statusCode, duration);
@@ -439,10 +450,10 @@ app.use(express.json({ limit: '5mb' }));
  * loop. Exempt from checkLicenseGate.
  */
 app.get('/api/health', (req, res) => {
-    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'));
     res.json({
         status: 'ok',
-        version: pkg.version,
+        version: PACKAGE_VERSION,
+        apiVersion: API_CONTRACT_VERSION,
         env: process.env.ENV_NAME || process.env.NODE_ENV || 'unknown'
     });
 });
@@ -480,8 +491,6 @@ app.get('/api/ready', (req, res) => {
 
 // Protect all POS cashier routes with licensing gate
 app.use(checkLicenseGate);
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Serve static frontend assets
 app.use(express.static(path.join(__dirname, '../frontend')));
@@ -2034,7 +2043,11 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         });
 
         if (!result.ok) {
-            return res.status(result.status || 400).json({ error: result.error });
+            return res.status(result.status || 400).json({
+                error: result.error,
+                ...(result.code ? { code: result.code } : {}),
+                ...(result.message ? { message: result.message } : {})
+            });
         }
 
         logTelemetry('SAVE_SALE', 0, `Invoice: ${result.invoiceId}, Total: ${result.sale.totalAmount}`);
@@ -2069,7 +2082,12 @@ app.post('/api/sales/:invoiceNumber/void', requireAdminSession, requireApprover,
             actorLabel: (req.actor && req.actor.name) || 'counter',
             ipAddress: req.ip
         });
-        if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+        if (!result.ok) {
+            return res.status(result.status || 400).json({
+                error: result.error,
+                ...(result.code ? { code: result.code } : {})
+            });
+        }
         res.json({ success: true, invoiceId: result.invoiceId, sale: result.sale });
     } catch (err) {
         logError('Error cancelling invoice: ' + err.message, err.stack);
@@ -2194,7 +2212,7 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
                     return {
                         ok: false,
                         status: 403,
-                        error: 'APPROVER_REQUIRED',
+                        error: DOMAIN_CODE.APPROVER_REQUIRED,
                         message: `A refund of ₹${refundAmount} needs a manager or the owner to authorise it `
                             + `(this store's limit is ₹${threshold}). ${req.actor.name} is signed in as ${req.actor.role}.`
                     };
@@ -2206,7 +2224,7 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
                     return {
                         ok: false,
                         status: 403,
-                        error: 'MFA_REQUIRED',
+                        error: DOMAIN_CODE.MFA_REQUIRED,
                         message: `A refund of ₹${refundAmount} is at or above this store's ₹${threshold} limit, `
                             + 'and this store requires two-factor authentication to authorise one. '
                             + 'Sign in with your authenticator code.'
@@ -2219,8 +2237,14 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
 
         if (!result.ok) {
             return res.status(result.status || 400).json({
-                error: result.error,
-                ...(result.message ? { message: result.message } : {})
+                // Earlier clients receive the same stable `error` code they
+                // already branch on. New clients can use the explicit `code`
+                // field and always treat `message` as operator-facing prose.
+                error: result.code || result.error,
+                ...(result.code ? { code: result.code } : {}),
+                ...(result.code
+                    ? { message: result.message || result.error }
+                    : (result.message ? { message: result.message } : {}))
             });
         }
 
@@ -4446,7 +4470,8 @@ app.get('/api/diagnostics/telemetry', requireAdminSession, requireRole('owner'),
             metrics: {
                 memory: process.memoryUsage(),
                 uptime: process.uptime(),
-                cpuUsage: process.cpuUsage()
+                cpuUsage: process.cpuUsage(),
+                logWriter: getLogWriterStats()
             },
             telemetry: telemetryLogs,
             errors: errorLogs
@@ -4651,8 +4676,12 @@ export function shutdown(server, reason = 'manual') {
         }, SHUTDOWN_GRACE_MS);
         forceTimer.unref?.();
 
-        server.close(() => {
+        server.close(async () => {
             clearTimeout(forceTimer);
+            const logDrain = await drainLogWriter();
+            if (!logDrain.ok) {
+                console.error(`[Server] ${logDrain.queuedEntries} diagnostic event(s) remain queued after shutdown drain.`);
+            }
             try {
                 repo.closeDb();
             } catch (err) {

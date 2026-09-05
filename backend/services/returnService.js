@@ -29,6 +29,7 @@ import {
 import { newId, logError, logTelemetry } from '../db.js';
 import { computeReturnRefund, round2, round3, toPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
+import { isDomainCode } from '../domainCodes.js';
 
 export const REFUND_MODES = ['cash', 'gold', 'exchange'];
 
@@ -165,9 +166,15 @@ export function createReturn(input, deps) {
             if (deps.authorizeRefund) {
                 const permitted = deps.authorizeRefund(refund.refundAmount);
                 if (!permitted.ok) {
+                    // Older callers returned the stable code in `error` and
+                    // operator prose in `message`. Preserve that wire shape
+                    // while carrying the code explicitly through the domain
+                    // boundary, so routes/integrations never parse prose.
+                    const stableCode = isDomainCode(permitted.code)
+                        ? permitted.code
+                        : (isDomainCode(permitted.error) ? permitted.error : undefined);
                     throw new DomainRefusal(
-                        permitted.status || 403, permitted.error, permitted.code || undefined,
-                        permitted.message
+                        permitted.status || 403, permitted.message || permitted.error, stableCode
                     );
                 }
             }
@@ -352,8 +359,7 @@ export function createReturn(input, deps) {
         if (err instanceof DomainRefusal) {
             return {
                 ok: false, status: err.status, error: err.message,
-                // Present only on a coded refusal (the approval threshold), where
-                // the desk shows the prose and branches on the code.
+                ...(err.code ? { code: err.code } : {}),
                 ...(err.detail ? { message: err.detail } : {})
             };
         }

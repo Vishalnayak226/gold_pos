@@ -27,6 +27,17 @@ test('catalogue lot flows through sale, exchange, void and reports without losin
 
     await loginAsAdmin(page, posServer);
 
+    // Reports are intentionally off for a new tenant until the owner accepts
+    // their operational definition. This journey is an owner workflow, so it
+    // enables the module through the actual Settings UI before exercising it.
+    await openTab(page, 'settings-tab');
+    await page.click('button.settings-subnav-btn[data-section="billing"]');
+    await expect(page.locator('#set-reports-enabled')).toBeVisible();
+    await page.selectOption('#set-reports-enabled', 'true');
+    await page.click('#save-billing-btn');
+    expect(await readAlert(page)).toContain('Billing settings saved');
+    await expect(page.locator('#reports-nav-btn')).toBeVisible();
+
     // Create the catalogue item and its costed opening lot through the real UI.
     await openTab(page, 'inventory-tab');
     await page.click('#inventory-new-item-btn');

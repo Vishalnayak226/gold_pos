@@ -29,6 +29,7 @@ import {
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
 import { raiseAlert } from '../alerting.js';
+import { DOMAIN_CODE } from '../domainCodes.js';
 import {
     computeInvoiceTotals, computeMetalValue, computeWastageAmount, normalizeTaxMode,
     fromPaise, round2, round3, toPaise
@@ -372,7 +373,7 @@ export function createSale(input, deps) {
                 if (lot.balance_mg < reservedMg) {
                     throw new DomainRefusal(409,
                         `Lines using lot ${lot.id} need ${round3(reservedMg / 1000)}g in total, but it has only ${round3(lot.balance_mg / 1000)}g on hand.`,
-                        'INSUFFICIENT_STOCK');
+                        DOMAIN_CODE.INSUFFICIENT_STOCK);
                 }
                 reservedByLot.set(lot.id, reservedMg);
             }
@@ -742,27 +743,30 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
     const actorUserId = deps.actorUserId || context.ownerUserId;
     const cleanNumber = String(invoiceNumber || '').trim();
     const cleanReason = String(reason || '').trim();
-    if (!cleanNumber) return { ok: false, status: 400, error: 'Invoice number is required.' };
+    if (!cleanNumber) {
+        return { ok: false, status: 400, error: 'Invoice number is required.', code: DOMAIN_CODE.INVOICE_NUMBER_REQUIRED };
+    }
     if (cleanReason.length < 5 || cleanReason.length > 300) {
-        return { ok: false, status: 400, error: 'Cancellation reason must be 5–300 characters.' };
+        return { ok: false, status: 400, error: 'Cancellation reason must be 5–300 characters.', code: DOMAIN_CODE.VOID_REASON_INVALID };
     }
 
     try {
         return inTransaction(() => {
             const header = invoices.findByNumber(context.tenantId, cleanNumber);
-            if (!header) throw new DomainRefusal(404, `No filed invoice ${cleanNumber} exists.`);
+            if (!header) throw new DomainRefusal(404, `No filed invoice ${cleanNumber} exists.`, DOMAIN_CODE.INVOICE_NOT_FOUND);
             if (header.state !== 'issued') {
-                throw new DomainRefusal(409, 'Only an issued invoice with no returns can be cancelled.');
+                throw new DomainRefusal(409, 'Only an issued invoice with no returns can be cancelled.', DOMAIN_CODE.VOID_NOT_ALLOWED);
             }
             const now = Date.now();
             if (header.business_date !== businessDate(now)) {
                 throw new DomainRefusal(409,
-                    'Only a sale from the current business date can be voided. Use a return/credit note for an earlier sale.');
+                    'Only a sale from the current business date can be voided. Use a return/credit note for an earlier sale.',
+                    DOMAIN_CODE.VOID_DATE_RESTRICTED);
             }
 
             const priorReturns = creditNotes.summarizeForInvoice(header.id);
             if (priorReturns.count > 0 || priorReturns.returnedWeightGrams > 0) {
-                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.');
+                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.', DOMAIN_CODE.VOID_AFTER_RETURN);
             }
 
             for (const movement of inventory.documentSaleMovementsForInvoice(context.tenantId, header.id)) {
@@ -784,7 +788,8 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
             if (advanceTender) {
                 const redemption = advances.findEntryById(advanceTender.advance_entry_id);
                 if (!redemption || redemption.status !== 'posted') {
-                    throw new DomainRefusal(409, 'The invoice advance redemption is not in a reversible state.');
+                    throw new DomainRefusal(409, 'The invoice advance redemption is not in a reversible state.',
+                        DOMAIN_CODE.ADVANCE_REVERSAL_UNAVAILABLE);
                 }
                 advances.insertEntry({
                     id: newId('REV'),
@@ -838,7 +843,7 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
     } catch (err) {
         if (err instanceof DomainRefusal) return { ok: false, status: err.status, error: err.message, code: err.code };
         if (isUniqueViolation(err)) {
-            return { ok: false, status: 409, error: 'This invoice has already been cancelled.' };
+            return { ok: false, status: 409, error: 'This invoice has already been cancelled.', code: DOMAIN_CODE.VOID_ALREADY_PROCESSED };
         }
         logError('Sale void failed and was rolled back: ' + err.message, err.stack);
         return { ok: false, status: 500, error: 'Failed to cancel invoice: ' + err.message };

@@ -45,6 +45,9 @@ process.env.GOLD_POS_LOGS_DIR = path.join(TEST_ROOT, 'logs');
 process.env.GOLD_POS_PITR_DIR = path.join(TEST_ROOT, 'pitr');
 process.env.GOLD_POS_BACKUPS_DIR = path.join(TEST_ROOT, 'backups');
 process.env.GOLD_POS_OFFSITE_BACKUP_DIR = path.join(TEST_ROOT, 'offsite');
+// Test 15 invokes verifyBackup.js itself and awaits it. Avoid a second,
+// intentionally asynchronous production verifier outliving this temp tree.
+process.env.GOLD_POS_DISABLE_POST_BACKUP_VERIFY = '1';
 fs.mkdirSync(process.env.GOLD_POS_DATA_DIR, { recursive: true });
 fs.mkdirSync(process.env.GOLD_POS_LOGS_DIR, { recursive: true });
 
@@ -861,6 +864,8 @@ async function testBackupArchiveEncryption() {
     assert.ok(files.length > 0, 'the backup snapshot must contain files');
     assert.ok(files.every(f => f.endsWith(backupCrypto.ENCRYPTED_EXTENSION)),
         `every backup file must be encrypted, got: ${files.join(', ')}`);
+    assert.ok(files.includes(`backup_manifest.json${backupCrypto.ENCRYPTED_EXTENSION}`),
+        'the encrypted archive must include its self-description manifest');
 
     // The restore drill runs as a separate process with its own fresh temp
     // restore directory, so — same as production — it needs the vault key
@@ -874,7 +879,7 @@ async function testBackupArchiveEncryption() {
         `verifyBackup.js must restore and pass its checks against an encrypted snapshot `
         + `(stdout: ${verify.stdout}, stderr: ${verify.stderr})`);
 
-    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, and the restore drill still passes against them.');
+    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, carry a self-description manifest, and the restore drill still passes against them.');
 }
 
 // Execute all test cases

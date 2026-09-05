@@ -112,6 +112,50 @@ test.describe('Cashier billing journey', () => {
         expect(redemption.id).toMatch(/^RED-[0-9A-F]{12}$/);
     });
 
+    test('keeps a late customer lookup from overwriting the number currently being typed', async ({ page, posServer }) => {
+        await loginAsAdmin(page, posServer);
+        await openBillingDesk(page);
+
+        const slowPhone = posServer.seeded.customers[0].phone;
+        const currentPhone = '9898989898';
+        let markSlowRequestSeen;
+        let releaseSlowResponse;
+        const slowRequestSeen = new Promise(resolve => { markSlowRequestSeen = resolve; });
+        const slowResponseRelease = new Promise(resolve => { releaseSlowResponse = resolve; });
+
+        // Hold the first response until the second number has already resolved.
+        // This is the exact race a cashier creates by correcting a phone number
+        // on a slow counter network.
+        await page.route(`**/api/advances/lookup?phone=${slowPhone}`, async route => {
+            markSlowRequestSeen();
+            await slowResponseRelease;
+            try {
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({ balance: 99999 })
+                });
+            } catch {
+                // The browser correctly aborts this route; there is nothing
+                // left to fulfil once it has done so.
+            }
+        });
+        await page.route(`**/api/advances/lookup?phone=${currentPhone}`, route => route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ balance: 321 })
+        }));
+
+        await page.fill('#customer-phone', slowPhone);
+        await slowRequestSeen;
+        await page.fill('#customer-phone', currentPhone);
+        await expect(page.locator('#advance-balance-display')).toHaveText('₹321');
+
+        releaseSlowResponse();
+        await page.waitForTimeout(100);
+        await expect(page.locator('#advance-balance-display')).toHaveText('₹321');
+    });
+
     test('tells the cashier when the server repriced the invoice', async ({ page, posServer }) => {
         await loginAsAdmin(page, posServer);
         await openBillingDesk(page);
