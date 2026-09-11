@@ -26,6 +26,7 @@ import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import { computeMetalValue, computeInvoiceTotals } from '../frontend/js/lib/billingMath.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUICK = process.argv.includes('--quick');
@@ -35,6 +36,20 @@ const outputFile = OUTPUT_INDEX === -1 ? null : process.argv[OUTPUT_INDEX + 1];
 if (OUTPUT_INDEX !== -1 && (!outputFile || outputFile.startsWith('--'))) {
     throw new Error('--output requires a destination filename.');
 }
+
+/* The one source of truth for this tenant's PIN, tax and rate configuration —
+   seedBenchmarkTenant() writes it to disk and buildSalePayload() prices
+   against it, so the two can never drift the way two copies of the same
+   numbers eventually do. */
+const BENCHMARK_SETTINGS = {
+    companyName: 'Benchmark Tenant',
+    adminPin: '2468',
+    goldTaxSlab: 3,
+    taxMode: 'Exclusive',
+    invoicePrefix: 'PERF',
+    invoiceSeqStart: 1
+};
+const BENCHMARK_RATES = { price24K: 7500, price22K: 6875, price18K: 5600 };
 
 function wait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -55,17 +70,10 @@ function getFreePort() {
 /** A valid, deliberately uninteresting tenant that opens the license gate. */
 function seedBenchmarkTenant(dataDir) {
     fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({
-        companyName: 'Benchmark Tenant',
-        adminPin: '2468',
-        goldTaxSlab: 3,
-        taxMode: 'Exclusive',
-        invoicePrefix: 'PERF',
-        invoiceSeqStart: 1
-    }, null, 2));
+    fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify(BENCHMARK_SETTINGS, null, 2));
     fs.writeFileSync(path.join(dataDir, 'rates.json'), JSON.stringify({
         lastUpdated: new Date().toISOString(),
-        status: 'fixture', price24K: 7500, price22K: 6875, price18K: 5600
+        status: 'fixture', ...BENCHMARK_RATES
     }, null, 2));
     fs.writeFileSync(path.join(dataDir, 'license.json'), JSON.stringify({
         licenseKey: 'PERFORMANCE-BENCHMARK',
@@ -89,6 +97,12 @@ function rounded(value) {
  * Measure complete HTTP round trips. Each worker claims a next index instead
  * of building an enormous promise array, which keeps the benchmark itself
  * light and prevents it from becoming the bottleneck at large sample counts.
+ *
+ * `scenario.method`/`headers` extend a request past a bare GET — an
+ * authenticated checkout is a POST carrying a session cookie and CSRF header,
+ * same as a real cashier's browser sends. `scenario.body` may be a fixed
+ * string or a `(index) => string` so every sample can be a genuinely new,
+ * valid invoice rather than one replayed body.
  */
 async function measure(baseUrl, scenario) {
     const latencies = [];
@@ -97,6 +111,7 @@ async function measure(baseUrl, scenario) {
     let next = 0;
     let firstError = null;
     const startedAt = performance.now();
+    const method = scenario.method || 'GET';
 
     async function worker() {
         while (true) {
@@ -105,7 +120,15 @@ async function measure(baseUrl, scenario) {
             const started = performance.now();
             try {
                 const response = await fetch(baseUrl + scenario.path, {
-                    headers: { 'Cache-Control': 'no-cache' }
+                    method,
+                    headers: {
+                        'Cache-Control': 'no-cache',
+                        ...(method !== 'GET' ? { 'Content-Type': 'application/json' } : {}),
+                        ...(scenario.headers || {})
+                    },
+                    body: method === 'GET'
+                        ? undefined
+                        : (typeof scenario.body === 'function' ? scenario.body(index) : scenario.body)
                 });
                 const bytes = (await response.arrayBuffer()).byteLength;
                 const elapsed = performance.now() - started;
@@ -150,6 +173,101 @@ async function measure(baseUrl, scenario) {
     };
 }
 
+/** A deterministic, always-10-digit phone for seeded customer `index`. */
+function benchmarkPhone(index) {
+    return String(9700000000 + index);
+}
+
+/**
+ * The same body a real Billing Desk would submit: a priced single-line cash
+ * sale, `totalAmount` computed against this tenant's own tax/rate config so
+ * the checkout benchmark measures a well-formed request rather than
+ * repeatedly exercising the server's stale-client-total correction path.
+ */
+function buildSalePayload(weightGrams, customerIndex) {
+    const metalValue = computeMetalValue(weightGrams, BENCHMARK_RATES.price22K);
+    const totals = computeInvoiceTotals({
+        metalValue, makingChargeAmount: 0, discountPercent: 0,
+        taxSlab: BENCHMARK_SETTINGS.goldTaxSlab, taxMode: BENCHMARK_SETTINGS.taxMode
+    });
+    return JSON.stringify({
+        purity: '22K', weightGrams, makingChargeAmount: 0, discountPercent: 0,
+        totalAmount: totals.totalAmount,
+        customerName: `Benchmark Customer ${customerIndex}`,
+        customerPhone: benchmarkPhone(customerIndex)
+    });
+}
+
+/** Cookie/CSRF pair a mutating admin request needs — same shape test_http.js's session helpers use. */
+function sessionHeadersFrom(response) {
+    const jar = {};
+    (response.headers.getSetCookie ? response.headers.getSetCookie() : []).forEach(line => {
+        const pair = line.split(';')[0];
+        const idx = pair.indexOf('=');
+        if (idx === -1) return;
+        jar[pair.slice(0, idx).trim()] = decodeURIComponent(pair.slice(idx + 1).trim());
+    });
+    const csrfToken = jar.gp_admin_csrf || '';
+    return { Cookie: `gp_admin_sess=${jar.gp_admin_sess || ''}; gp_admin_csrf=${csrfToken}`, 'X-CSRF-Token': csrfToken };
+}
+
+/** Signs in as the seeded tenant's owner and returns headers for every later authenticated request. */
+async function authenticate(baseUrl) {
+    const response = await fetch(`${baseUrl}/api/admin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: BENCHMARK_SETTINGS.adminPin })
+    });
+    if (!response.ok) {
+        throw new Error(`Benchmark admin login failed: HTTP ${response.status} — ${await response.text()}`);
+    }
+    await response.arrayBuffer();
+    return sessionHeadersFrom(response);
+}
+
+/**
+ * Populates the tenant with a small merchant-shaped ledger — several
+ * customers, each with a few invoices — through the exact same authenticated
+ * HTTP path a cashier uses. Unmeasured setup, not a scenario: it exists so
+ * the checkout/lookup/paged-ledger scenarios that follow run against real row
+ * counts instead of an empty tenant.
+ */
+async function seedMerchantDataset(baseUrl, authHeaders, { customerCount, invoicesPerCustomer }) {
+    const startedAt = performance.now();
+    const jobs = [];
+    for (let customerIndex = 0; customerIndex < customerCount; customerIndex++) {
+        for (let n = 0; n < invoicesPerCustomer; n++) {
+            jobs.push({ customerIndex, weightGrams: 1 + ((customerIndex + n) % 5) });
+        }
+    }
+
+    let next = 0;
+    async function worker() {
+        while (true) {
+            const index = next++;
+            if (index >= jobs.length) return;
+            const job = jobs[index];
+            const response = await fetch(`${baseUrl}/api/sales`, {
+                method: 'POST',
+                headers: { ...authHeaders, 'Content-Type': 'application/json' },
+                body: buildSalePayload(job.weightGrams, job.customerIndex)
+            });
+            if (!response.ok) {
+                throw new Error(`Seeding invoice ${index + 1}/${jobs.length} failed: HTTP ${response.status} — ${await response.text()}`);
+            }
+            await response.arrayBuffer();
+        }
+    }
+
+    // A few tills at once, same as the concurrent checkout scenario below —
+    // BEGIN IMMEDIATE serialises the writes regardless, so this shortens wall
+    // time without changing what gets written.
+    const concurrency = Math.max(1, Math.min(10, jobs.length));
+    await Promise.all(Array.from({ length: concurrency }, worker));
+
+    return { customerCount, invoiceCount: jobs.length, elapsedMs: rounded(performance.now() - startedAt) };
+}
+
 async function startServer(tempRoot) {
     const port = await getFreePort();
     const dataDir = path.join(tempRoot, 'data');
@@ -165,7 +283,13 @@ async function startServer(tempRoot) {
             NODE_ENV: 'test',
             GOLDPOS_DATA_DIR: dataDir,
             GOLDPOS_LOGS_DIR: logsDir,
-            PORT: String(port)
+            PORT: String(port),
+            // The blanket per-minute API_RATE_MAX (600 by default) exists to stop
+            // runaway automation against a real store, not to cap how fast this
+            // harness may measure the server's own throughput. Raised only for
+            // this ephemeral benchmark process; the tuning is a router concern
+            // and already covered by its own rate-limit tests.
+            API_RATE_MAX: String(process.env.API_RATE_MAX || 50_000)
         },
         stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -206,23 +330,70 @@ async function main() {
     try {
         const started = await startServer(tempRoot);
         child = started.child;
-        const count = QUICK ? { health: 50, static: 30, concurrent: 100 } : { health: 250, static: 100, concurrent: 500 };
-        const scenarios = [
+        const count = QUICK
+            ? {
+                health: 50, static: 30, concurrent: 100,
+                seedCustomers: 10, seedInvoicesPerCustomer: 2,
+                checkout: 20, checkoutConcurrent: 20, lookup: 20, pagedLedger: 20
+            }
+            : {
+                health: 250, static: 100, concurrent: 500,
+                seedCustomers: 40, seedInvoicesPerCustomer: 5,
+                checkout: 100, checkoutConcurrent: 100, lookup: 100, pagedLedger: 100
+            };
+
+        // Warm server, JIT, module cache and local TCP path outside the measured samples.
+        await measure(started.baseUrl, { name: 'warmup', path: '/api/health', samples: 10, concurrency: 1 });
+
+        // UNAUTHENTICATED, EMPTY-TENANT BASELINE. Measured before any seeding
+        // touches this tenant, so these four numbers stay exactly what they
+        // always were: the cost of the server and static assets alone.
+        const unauthenticatedScenarios = [
             { name: 'GET /api/health serial', path: '/api/health', samples: count.health, concurrency: 1 },
             { name: 'GET / static HTML serial', path: '/', samples: count.static, concurrency: 1 },
             { name: 'GET /js/app.js serial', path: '/js/app.js', samples: count.static, concurrency: 1 },
             { name: 'GET /api/health concurrent', path: '/api/health', samples: count.concurrent, concurrency: 25 }
         ];
-
-        // Warm server, JIT, module cache and local TCP path outside the measured samples.
-        await measure(started.baseUrl, { name: 'warmup', path: '/api/health', samples: 10, concurrency: 1 });
         const results = [];
-        for (const scenario of scenarios) {
+        for (const scenario of unauthenticatedScenarios) {
+            results.push(await measure(started.baseUrl, scenario));
+        }
+
+        // AUTHENTICATED WORKLOAD AGAINST A SEEDED MERCHANT DATASET. Everything
+        // above this line ran against an empty tenant; everything below runs
+        // as the store owner against a tenant that now has a real ledger.
+        const authHeaders = await authenticate(started.baseUrl);
+        const seed = await seedMerchantDataset(started.baseUrl, authHeaders, {
+            customerCount: count.seedCustomers, invoicesPerCustomer: count.seedInvoicesPerCustomer
+        });
+
+        const authenticatedScenarios = [
+            {
+                name: 'POST /api/sales authenticated checkout serial', method: 'POST', path: '/api/sales',
+                headers: authHeaders, body: () => buildSalePayload(2, 0), samples: count.checkout, concurrency: 1
+            },
+            {
+                name: 'POST /api/sales authenticated checkout concurrent (5 tills)', method: 'POST', path: '/api/sales',
+                headers: authHeaders, body: () => buildSalePayload(2, 0), samples: count.checkoutConcurrent, concurrency: 5
+            },
+            {
+                // 'Benchmark' matches every seeded customer's name, so this
+                // returns a real, non-trivial page rather than the near-empty
+                // result an exact single-phone match would.
+                name: 'GET /api/sales/lookup authenticated (seeded dataset)', path: '/api/sales/lookup?q=Benchmark&limit=50',
+                headers: authHeaders, samples: count.lookup, concurrency: 1
+            },
+            {
+                name: 'GET /api/sales authenticated paged ledger (seeded dataset)', path: '/api/sales?limit=50',
+                headers: authHeaders, samples: count.pagedLedger, concurrency: 1
+            }
+        ];
+        for (const scenario of authenticatedScenarios) {
             results.push(await measure(started.baseUrl, scenario));
         }
 
         const report = {
-            formatVersion: 1,
+            formatVersion: 2,
             generatedAt: new Date().toISOString(),
             mode: QUICK ? 'quick' : 'baseline',
             runtime: {
@@ -233,7 +404,12 @@ async function main() {
                 logicalCpuCount: os.cpus().length,
                 totalMemoryMB: Math.round(os.totalmem() / 1024 / 1024)
             },
-            scope: 'Warm loopback only; isolated empty tenant; no authenticated checkout, browser rendering, printer, low-end hardware or VPS claim.',
+            seed,
+            scope: 'Warm loopback only. The four "empty tenant" results run before seeding; the '
+                + 'checkout/lookup/paged-ledger results run authenticated, against the seeded merchant '
+                + `dataset described in "seed" (${seed.customerCount} customers, ${seed.invoiceCount} invoices). `
+                + 'Still no claim about browser rendering, scanner/scale/printer hardware, a low-end '
+                + 'counter, real network latency, VPS capacity or return/void/mixed-concurrency workloads.',
             results
         };
 

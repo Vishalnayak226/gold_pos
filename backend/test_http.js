@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
@@ -75,6 +76,11 @@ fs.writeFileSync(path.join(dataDir, 'license.json'), JSON.stringify({
     lastHandshakeTime: Date.now()
 }, null, 2));
 let server;
+let razorpayDouble;
+// Set by the §"Gateway await gap" check below: the route's ONE genuine
+// await, made controllable — see razorpayDouble's setup inside the try block.
+let gatewayRequestReceived = null;
+let releaseGatewayPayment = null;
 let passed = 0;
 
 function check(label, fn) {
@@ -313,7 +319,48 @@ let mfaSecret = '';
 let mfaRecoveryCodes = [];
 let mfaManagerHeaders = null;
 
+// The store's live Razorpay secret, kept in step with §"non-null secret
+// updates rotate credentials without echoing them" below, which rotates it
+// to 'rotated-razorpay-secret' partway through this suite and never rotates
+// it back. Anything computing a gateway HMAC after that point must sign with
+// THIS, not the module-level initialSettings.razorpayKeySecret — signing
+// with the stale value produces a signature the running server correctly
+// rejects, which starves the §"Gateway await gap" check of the gateway call
+// it is waiting on and hangs it forever (found 2026-09-11: two independent
+// `npm test` runs sat blocked on this for hours before anyone noticed).
+let currentRazorpayKeySecret = initialSettings.razorpayKeySecret;
+
 try {
+    /* A local double for Razorpay's API — server.js's RAZORPAY_API_HOST/PORT
+       seam (added alongside this check) exists so a test can redirect the
+       ONE outbound gateway call this deliberately synchronous codebase ever
+       awaits (fetchRazorpayPayment, inside /api/payment/verify) to a server
+       this suite fully controls. That makes the await gap pausable: hold the
+       response open, change state underneath the suspended request, then
+       release it. Must be listening, and the env vars set, BEFORE server.js
+       is imported below — it reads them into module-level consts once.
+       Only GET /v1/payments/:id is stubbed; nothing here exercises order
+       creation over the real gateway path (orders are seeded directly
+       through paymentService.recordOrder, like every other fixture above). */
+    razorpayDouble = http.createServer((req, res) => {
+        if (req.method === 'GET' && req.url.startsWith('/v1/payments/')) {
+            if (gatewayRequestReceived) gatewayRequestReceived();
+            releaseGatewayPayment = (statusCode, body) => {
+                res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(body));
+            };
+            return;
+        }
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { description: 'not stubbed by razorpayDouble' } }));
+    });
+    await new Promise((resolve, reject) => {
+        razorpayDouble.once('error', reject);
+        razorpayDouble.listen(0, '127.0.0.1', resolve);
+    });
+    process.env.RAZORPAY_API_HOST = '127.0.0.1';
+    process.env.RAZORPAY_API_PORT = String(razorpayDouble.address().port);
+
     const { startServer } = await import('./server.js');
     server = startServer(0);
     if (!server.listening) await once(server, 'listening');
@@ -418,6 +465,7 @@ try {
         assert.equal(stored.adminPin, undefined);
         assert.equal(stored.razorpayKeySecret, 'rotated-razorpay-secret');
         assert.equal(stored.smtp.pass, 'rotated-smtp-secret');
+        currentRazorpayKeySecret = 'rotated-razorpay-secret';
     });
 
     await check('over-redemption is rejected without consuming an invoice or changing a ledger', async () => {
@@ -774,6 +822,7 @@ try {
             body: JSON.stringify({ invoiceId: 'NO-SUCH-INVOICE', weightGrams: 1, refundMode: 'cash' })
         });
         assert.equal(response.status, 404);
+        assert.equal((await response.json()).code, 'INVOICE_NOT_FOUND', 'domain refusals expose a stable machine code');
     });
 
     await check('a refund mode other than cash or gold is refused', async () => {
@@ -784,6 +833,7 @@ try {
                 body: JSON.stringify({ invoiceId: returnableInvoiceId, weightGrams: 1, refundMode })
             });
             assert.equal(response.status, 400, `refundMode ${JSON.stringify(refundMode)} must be refused`);
+            assert.equal((await response.json()).code, 'RETURN_MODE_INVALID');
         }
     });
 
@@ -1565,7 +1615,9 @@ try {
             body: JSON.stringify({ invoiceId: sale.id, weightGrams: 1, refundMode: 'cash' })
         });
         assert.equal(response.status, 400);
-        assert.match((await response.json()).error, /several items/i);
+        const body = await response.json();
+        assert.match(body.error, /several items/i);
+        assert.equal(body.code, 'RETURN_LINE_REQUIRED');
     });
 
     /* ==================================================================
@@ -1603,7 +1655,9 @@ try {
             })
         });
         assert.equal(response.status, 400);
-        assert.match((await response.json()).error, /do not add up/i);
+        const body = await response.json();
+        assert.match(body.error, /do not add up/i);
+        assert.equal(body.code, 'SALE_TENDER_TOTAL_MISMATCH');
         // Refused BEFORE the invoice number is consumed.
         assert.equal(readData('settings.json').invoiceSeqStart, before);
     });
@@ -1618,7 +1672,9 @@ try {
             })
         });
         assert.equal(response.status, 400);
-        assert.match((await response.json()).error, /unknown method/i);
+        const body = await response.json();
+        assert.match(body.error, /unknown method/i);
+        assert.equal(body.code, 'SALE_TENDER_INVALID');
     });
 
     await check('a tender must cover the total AFTER an advance is redeemed', async () => {
@@ -2028,6 +2084,7 @@ try {
             })
         });
         assert.equal(response.status, 404);
+        assert.equal((await response.json()).code, 'OLD_GOLD_EXCHANGE_DISABLED');
     });
 
     await check('enabling old-gold exchange requires an owner/manager, then credits a redeemable balance', async () => {
@@ -2057,6 +2114,7 @@ try {
                 })
             });
             assert.equal(refused.status, 403);
+            assert.equal((await refused.json()).code, 'APPROVER_REQUIRED');
 
             const allowed = await request('/api/old-gold-exchanges', {
                 method: 'POST',
@@ -2773,6 +2831,34 @@ try {
         billingInventory = { item, lot, exchangeCreditNoteId: returned.returnId };
     });
 
+    await check('a replacement sale naming a bogus exchange credit is refused', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerPhone: phone,
+                purity: '22K', weightGrams: 1, appliedAdvance: 1,
+                exchangeCreditNoteId: 'CN-NO-SUCH-CREDIT',
+                totalAmount: 0
+            })
+        });
+        assert.equal(response.status, 409);
+        assert.equal((await response.json()).code, 'EXCHANGE_CREDIT_INVALID');
+    });
+
+    await check('a replacement sale for a different customer than the exchange return is refused', async () => {
+        const response = await request('/api/sales', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                customerPhone: '9888877766',
+                purity: '22K', weightGrams: 1,
+                exchangeCreditNoteId: billingInventory.exchangeCreditNoteId,
+                totalAmount: 0
+            })
+        });
+        assert.equal(response.status, 400);
+        assert.equal((await response.json()).code, 'EXCHANGE_CUSTOMER_MISMATCH');
+    });
+
     await check('same-day void restores linked stock and all four management reports answer over HTTP', async () => {
         const { item, lot } = billingInventory;
         const saleRes = await request('/api/sales', {
@@ -2954,6 +3040,42 @@ try {
         assert.equal((await request('/api/audit/export')).status, 401);
     });
 
+    /* ==================================================================
+       CASH SHIFTS (day reconciliation). No owning service exists for this
+       workflow (route -> repository directly, see docs/INVARIANT_MATRIX.md),
+       but open/close are still financial facts and belong in the same
+       tamper-evident trail a sale/return/void already lands in.
+       ================================================================== */
+
+    await check('opening and closing a cash shift both leave an audit trail entry', async () => {
+        const opened = await request('/api/cash-shifts/open', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ openingFloat: 2000, openingNote: 'Morning float' })
+        });
+        const openedBody = await opened.json();
+        assert.equal(opened.status, 200, JSON.stringify(openedBody));
+        assert.ok(openedBody.id);
+
+        const openTrail = await request(`/api/audit?action=CASH_SHIFT_OPENED&limit=10`, { headers: adminHeaders });
+        const openEvents = (await openTrail.json()).results;
+        assert.ok(openEvents.some(e => e.entityId === openedBody.id && e.entityType === 'cash_shift'),
+            'opening a shift must leave a CASH_SHIFT_OPENED row naming that shift');
+
+        const closed = await request(`/api/cash-shifts/${openedBody.id}/close`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ countedCash: 2000, closingNote: 'Balanced' })
+        });
+        const closedBody = await closed.json();
+        assert.equal(closed.status, 200, JSON.stringify(closedBody));
+        assert.equal(closedBody.variance, 0, 'a float counted back exactly should show zero variance');
+
+        const closeTrail = await request(`/api/audit?action=CASH_SHIFT_CLOSED&limit=10`, { headers: adminHeaders });
+        const closeEvents = (await closeTrail.json()).results;
+        const closeEvent = closeEvents.find(e => e.entityId === openedBody.id);
+        assert.ok(closeEvent, 'closing a shift must leave a CASH_SHIFT_CLOSED row naming that shift');
+        assert.equal(closeEvent.detail.variance, 0);
+    });
+
     /* ------------------------------------------------------------------
        §"Body schemas" — shape checked before the handler, so a handler can
        trust `typeof`. Meaning is still checked where it always was.
@@ -3067,6 +3189,118 @@ try {
     });
 
     /* ------------------------------------------------------------------
+       §"Gateway await gap" — INVARIANT_MATRIX.md names fetchRazorpayPayment()
+       (inside /api/payment/verify) as the one place in this deliberately
+       synchronous codebase where a request is genuinely suspended waiting on
+       another party. razorpayDouble above makes that suspension controllable,
+       so this asserts what happens to a permission that changes WHILE the
+       request is open — Phase 2.4 of docs/ENGINEERING_EXCELLENCE_PROGRAM.md.
+       ------------------------------------------------------------------ */
+
+    await check('a session revoked while payment verification awaits the gateway does not stop the correct credit, and does not credit it twice', async () => {
+        const { destroyAllCustomerSessions } = await import('./customerAuth.js');
+
+        const issued = await request('/api/customer-accounts/issue-login', {
+            method: 'POST',
+            headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone, name: 'HTTP Customer', confirmDestructive: true })
+        });
+        assert.equal(issued.status, 200);
+        const tempPassword = (await issued.json()).tempPassword;
+        const firstSignIn = await loginCustomerHttp(request, { phone, password: tempPassword });
+        assert.equal(firstSignIn.response.status, 200);
+        const changed = await request('/api/customer/password/change', {
+            method: 'POST',
+            headers: { ...firstSignIn.headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ currentPassword: tempPassword, newPassword: 'GatewayGap!2026' })
+        });
+        assert.equal(changed.status, 200);
+        const session = await loginCustomerHttp(request, { phone, password: 'GatewayGap!2026' });
+        assert.equal(session.response.status, 200);
+        const customerHeaders = session.headers;
+
+        const balanceBefore = advanceService.customerLedger(phone).balance;
+        const orderId = 'order_gateway_gap_test';
+        const paymentId = 'pay_gateway_gap_test';
+        const amountPaise = 150000;
+        assert.equal(paymentServiceModule.recordOrder({
+            providerOrderId: orderId, customerPhone: phone, amountPaise, currency: 'INR'
+        }), true);
+
+        // Signed with the store's CURRENT secret, not initialSettings' — the
+        // rotation check above already moved the live secret to
+        // 'rotated-razorpay-secret' and never moves it back. Signing with the
+        // stale value makes the server correctly reject the signature before
+        // ever touching the gateway, which starves the gatewayReached wait
+        // below of the event it is waiting on.
+        const signature = crypto.createHmac('sha256', currentRazorpayKeySecret)
+            .update(`${orderId}|${paymentId}`).digest('hex');
+
+        const gatewayReached = new Promise(resolve => { gatewayRequestReceived = resolve; });
+        const verifyPromise = request('/api/payment/verify', {
+            method: 'POST',
+            headers: { ...customerHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: signature
+            })
+        });
+
+        // Not a fixed delay: wait for the route to actually be suspended
+        // inside fetchRazorpayPayment before changing anything underneath it.
+        // Bounded rather than a bare await — if the route ever takes an
+        // early-return path instead of reaching the gateway (a wrong secret,
+        // a rejected signature, a future regression), gatewayRequestReceived
+        // never fires and an unbounded await hangs this process forever
+        // rather than failing the check. Found for real on 2026-09-11: two
+        // independent `npm test` runs sat blocked here for hours before
+        // anyone noticed, because nothing about a hung suite says "failed".
+        const gatewayTimedOut = Symbol('gatewayTimedOut');
+        const gatewayTimeout = new Promise(resolve => setTimeout(() => resolve(gatewayTimedOut), 5000));
+        const gatewayOutcome = await Promise.race([gatewayReached, gatewayTimeout]);
+        assert.notEqual(gatewayOutcome, gatewayTimedOut,
+            'the route never reached the gateway call — it must have returned early ' +
+            '(check the signature/order/secret setup above rather than assuming this hung by chance)');
+
+        // THE permission change, mid-flight — the same call a password reset
+        // or an admin lockout makes, while the request above is still open.
+        destroyAllCustomerSessions(phone);
+
+        // A fresh request on the now-revoked session must already be refused
+        // — proving the revocation is visible immediately, not only after
+        // the suspended request happens to finish.
+        const duringGap = await request('/api/customer/advances', { headers: customerHeaders });
+        assert.equal(duringGap.status, 401,
+            'the revocation must take effect while the first request is still suspended on the gateway');
+
+        // The gateway answers: the payment really was captured.
+        releaseGatewayPayment(200, { status: 'captured', amount: amountPaise, order_id: orderId });
+
+        const verifyResponse = await verifyPromise;
+        assert.equal(verifyResponse.status, 200,
+            'a payment genuinely captured by the gateway must still be credited, even though the session that opened the request is gone');
+        const verifyBody = await verifyResponse.json();
+        assert.equal(verifyBody.success, true);
+        assert.equal(verifyBody.duplicate, false);
+
+        const balanceAfter = advanceService.customerLedger(phone).balance;
+        assert.equal(balanceAfter - balanceBefore, amountPaise / 100,
+            'the captured amount must land exactly once, on the account the stored order actually belongs to');
+
+        // The webhook is the independent second path to the same credit — a
+        // retry racing the same session revocation must still be caught by
+        // the duplicate guard, not create a second deposit.
+        const webhookResponse = await postWebhook(
+            capturedEvent(paymentId, orderId, amountPaise),
+            { eventId: 'evt_gateway_gap_retry' }
+        );
+        assert.equal(webhookResponse.status, 200);
+        assert.equal((await webhookResponse.json()).duplicate, true,
+            'a webhook retry for the same payment must be recognised as a duplicate even after a concurrent session revocation');
+        assert.equal(advanceService.customerLedger(phone).balance, balanceAfter,
+            'the duplicate-delivery guard must hold after the gap');
+    });
+
+    /* ------------------------------------------------------------------
        §"The operational boundary" — request identity, readiness vs
        liveness, safe errors, and draining. Everything here is what an
        operator sees, so it is asserted the way an operator would see it.
@@ -3173,6 +3407,7 @@ try {
     console.log('======================================================================');
 } finally {
     if (server) await new Promise(resolve => server.close(resolve));
+    if (razorpayDouble) await new Promise(resolve => razorpayDouble.close(resolve));
 
     /* CLOSE THE DATABASE BEFORE REMOVING ITS DIRECTORY. Windows refuses to
        unlink a file that still has an open handle, so an unclosed connection

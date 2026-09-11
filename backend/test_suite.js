@@ -12,7 +12,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 // Mock DB helpers to avoid polluting live databases
 const ROU_DATA = {
@@ -856,6 +856,21 @@ async function testBackupArchiveEncryption() {
     });
     assert.ok(seededDeposit.success, 'seeding the backup-drill fixture deposit: ' + seededDeposit.error);
 
+    // A second fixture, carrying an idempotency key, so the post-restore
+    // replay drill below can prove that key still dedupes after a restore —
+    // not just that the row is readable.
+    const saleService = await import('./services/saleService.js');
+    const BACKUP_DRILL_IDEMPOTENCY_KEY = 'backup-drill-idempotency-key';
+    const seededSale = saleService.createSale({
+        purity: '22K', weightGrams: 1, customerName: 'Backup Drill Sale',
+        idempotencyKey: BACKUP_DRILL_IDEMPOTENCY_KEY
+    }, {
+        getActiveGoldRates: () => ({ ...ROU_DATA, sources: { price24K: 'auto', price22K: 'auto', price18K: 'auto' } }),
+        getSettings: () => ({ goldTaxSlab: 3, taxMode: 'Exclusive', invoicePrefix: 'GOLD', invoiceSeqStart: 1 }),
+        isValidPhone: (v) => /^\d{10}$/.test(String(v || ''))
+    });
+    assert.ok(seededSale.ok, 'seeding the backup-drill fixture sale: ' + seededSale.error);
+
     const { createBackup } = await import('./backupEngine.js');
     const result = createBackup();
     assert.strictEqual(result.success, true, result.error);
@@ -879,7 +894,94 @@ async function testBackupArchiveEncryption() {
         `verifyBackup.js must restore and pass its checks against an encrypted snapshot `
         + `(stdout: ${verify.stdout}, stderr: ${verify.stderr})`);
 
-    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, carry a self-description manifest, and the restore drill still passes against them.');
+    /* POST-RESTORE REPLAY. verifyBackup.js above proves a restored snapshot is
+       self-consistent AT REST — integrity_check, migrations applied, the
+       audit chain verifies. It never attempts a WRITE against the restored
+       copy, so it cannot prove the thing a real recovery actually needs:
+       that the restored install is SERVABLE, and that a cashier's next
+       actions on it are still safe — a duplicate submission of an
+       already-filed idempotency key must not create a second invoice, and a
+       fresh sale must not collide with the restored sequence history.
+       --keep (and no --quiet) makes verifyBackup.js leave its restored copy
+       on disk instead of deleting it, so this can point real service calls
+       at it afterward — in a fresh child process, since db.js resolves
+       DATA_DIR once per process and this process already opened the live
+       suite's own database (CLAUDE.md §8). */
+    const replayVerify = spawnSync(process.execPath, ['verifyBackup.js', '--backup', folder, '--keep'], {
+        cwd: __dirname,
+        env: { ...process.env, GOLD_POS_SECRET_KEY: activeKey.toString('hex') }
+    });
+    assert.strictEqual(replayVerify.status, 0,
+        `verifyBackup.js --keep must also pass (stdout: ${replayVerify.stdout}, stderr: ${replayVerify.stderr})`);
+    const restoredMatch = /Restored to:\s*(.+)/.exec(replayVerify.stdout.toString());
+    assert.ok(restoredMatch, 'expected verifyBackup.js to print where it restored to:\n' + replayVerify.stdout);
+    const restoredDataDir = restoredMatch[1].trim();
+    const restoredRoot = path.dirname(restoredDataDir);
+
+    try {
+        const replayWorker = path.join(restoredRoot, 'replay-worker.mjs');
+        fs.writeFileSync(replayWorker, `
+import { pathToFileURL } from 'url';
+const BACKEND = ${JSON.stringify(__dirname.replace(/\\/g, '/'))};
+const load = p => import(pathToFileURL(BACKEND + '/' + p).href);
+
+const repo = await load('repositories/index.js');
+const saleService = await load('services/saleService.js');
+const { readSettings } = await load('settingsStore.js');
+
+const settings = readSettings(process.env.GOLD_POS_DATA_DIR);
+const DEPS = {
+    getSettings: () => settings,
+    getActiveGoldRates: () => ({
+        price24K: 7500, price22K: 6875, price18K: 5625,
+        sources: { price24K: 'auto', price22K: 'auto', price18K: 'auto' }
+    }),
+    isValidPhone: v => /^\\d{10}\$/.test(String(v || ''))
+};
+
+const replay = saleService.createSale({
+    purity: '22K', weightGrams: 1, customerName: 'Backup Drill Sale',
+    idempotencyKey: ${JSON.stringify(BACKUP_DRILL_IDEMPOTENCY_KEY)}
+}, DEPS);
+const fresh = saleService.createSale({
+    purity: '22K', weightGrams: 1, customerName: 'Post-Restore Fresh Sale'
+}, DEPS);
+
+process.stdout.write(JSON.stringify({ replay, fresh }));
+repo.closeDb();
+`, 'utf8');
+
+        const replayRun = spawnSync(process.execPath, [replayWorker], {
+            env: {
+                ...process.env,
+                GOLD_POS_DATA_DIR: restoredDataDir,
+                GOLD_POS_LOGS_DIR: path.join(restoredRoot, 'logs'),
+                // Same reason verifyBackup.js above needs it explicitly: the
+                // restored settings.json holds ciphertext sealed under the
+                // live suite's key, and the dev-keyfile fallback lives INSIDE
+                // the directory it protects, so it never travels with a copy.
+                GOLD_POS_SECRET_KEY: activeKey.toString('hex')
+            }
+        });
+        assert.strictEqual(replayRun.status, 0,
+            `replaying requests against the restored data failed:\n${replayRun.stdout}\n${replayRun.stderr}`);
+        const { replay, fresh } = JSON.parse(replayRun.stdout.toString());
+
+        assert.strictEqual(replay.ok, true, 'replaying the seeded idempotency key: ' + replay.error);
+        assert.strictEqual(replay.invoiceId, seededSale.invoiceId,
+            'resubmitting an idempotency key already in the restored ledger must return the SAME invoice, not a new one');
+
+        assert.strictEqual(fresh.ok, true, 'a fresh sale against the restored ledger: ' + fresh.error);
+        assert.notStrictEqual(fresh.invoiceId, seededSale.invoiceId);
+        const seededSeq = Number(/-(\d+)-/.exec(seededSale.invoiceId)[1]);
+        const freshSeq = Number(/-(\d+)-/.exec(fresh.invoiceId)[1]);
+        assert.ok(freshSeq > seededSeq,
+            `a fresh sale after restore got sequence ${freshSeq}, which does not continue past the restored history's ${seededSeq}`);
+    } finally {
+        fs.rmSync(restoredRoot, { recursive: true, force: true });
+    }
+
+    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, carry a self-description manifest, the restore drill passes against them, and a restored install correctly dedupes a replayed idempotency key while continuing its sequence for a fresh sale.');
 }
 
 // Execute all test cases

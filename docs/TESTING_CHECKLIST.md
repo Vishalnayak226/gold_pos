@@ -991,6 +991,9 @@ This section is the executable checklist for the findings in
 [`POS_360_AUDIT_PLAN_2026-09-02.md`](POS_360_AUDIT_PLAN_2026-09-02.md).
 Code-side checks may be completed by automated tests; legal, merchant, payment,
 deployment and hardware checks must be evidenced by the named real-world owner.
+For the owner-readable order of work and the current launch decision, start with
+[`GO_LIVE_RUNBOOK.md`](GO_LIVE_RUNBOOK.md); this section remains the detailed
+evidence record and does not become complete merely because a meeting occurred.
 
 ### 23a. Lightweight performance and resilience
 
@@ -1195,13 +1198,25 @@ replaceable as those things change.
   malformed legacy record and post-restore replay. A green happy path is insufficient.
   Result: _____  Notes: ______________________________________________
 
-- [ ] Centralize and freeze domain refusal codes at service boundaries. Routes may map a
+- [x] Centralize and freeze domain refusal codes at service boundaries. Routes may map a
   code to HTTP/operator guidance, but no browser or route handler may invent financial,
   stock or authorization business rules independently.
-  Result: Initial registry in `backend/domainCodes.js` covers refund approvals/MFA,
-  insufficient stock and the complete void lifecycle; service + HTTP regressions passed
-  2026-09-05. Notes: Advance, exchange, payment and remaining return/sale refusals still
-  need migration before this gate can close. _______________________________
+  Result: `backend/domainCodes.js` now also covers sale (stock/lot/purity, advance-balance,
+  exchange-credit, tender), return/credit-note, advance deposit/review, gateway-payment and
+  old-gold-exchange refusals, on top of the refund/MFA, stock and void codes already there.
+  Every `DomainRefusal` throw site and plain refusal return across `saleService.js`,
+  `returnService.js`, `advanceService.js`, `paymentService.js` and `oldGoldService.js` now
+  carries a code; routes forward it additively (`code` is a new field, `error` keeps its
+  existing prose) except the pre-existing `APPROVER_REQUIRED`/`MFA_REQUIRED` shape on
+  `/api/returns`, where `error` has always legitimately held the bare code and still does.
+  Verified 2026-09-07: full `npm test` green (all nine suites), plus new HTTP regressions
+  asserting `code` on `INVOICE_NOT_FOUND`, `RETURN_MODE_INVALID`, `RETURN_LINE_REQUIRED`,
+  `SALE_TENDER_TOTAL_MISMATCH`, `SALE_TENDER_INVALID`, `EXCHANGE_CREDIT_INVALID`,
+  `EXCHANGE_CUSTOMER_MISMATCH`, `OLD_GOLD_EXCHANGE_DISABLED` and the reused `APPROVER_REQUIRED`
+  on the old-gold-exchange route. Notes: `DUPLICATE_REFERENCE` and the gateway
+  `PAYMENT_AMOUNT_MISMATCH`/`PAYMENT_CREDIT_PERSIST_FAILED` codes are wired but not yet
+  covered by a dedicated HTTP-level assertion — no existing fixture reaches them without new
+  scaffolding (a signed `/api/payment/verify` checkout, a duplicate-reference deposit).
 
 - [ ] Verify every permanent record has an owning service/repository, integer boundary
   units, server-issued identity/timestamp, actor/audit context and an immutable projection
@@ -1222,7 +1237,18 @@ replaceable as those things change.
 - [ ] Extend the benchmark with a representative seeded merchant dataset and authenticated
   checkout/lookup/paged-ledger workload; record target-hardware and target-VPS budgets before
   treating a regression as release-blocking.
-  Result: _____  Notes: ______________________________________________
+  Result: The seeded/authenticated half is done and verified 2026-09-07 — `backend/benchmark.js`
+  now signs in as the tenant owner over the real `/api/admin/login` + session-cookie + CSRF path,
+  files 40 customers × 5 invoices through `POST /api/sales` (10×2 in `--quick`), then measures a
+  serial checkout, a 5-till concurrent checkout, `GET /api/sales/lookup` and
+  `GET /api/sales?limit=` against that populated tenant — the pre-seed empty-tenant scenarios are
+  unchanged and still measured first. Full and `--quick` runs both passed on this dev laptop (Node
+  26, Windows loopback): checkout serial p95 35.69 ms, 5-till concurrent p95 99.91 ms, lookup p95
+  34.97 ms, paged-ledger p95 33.74 ms (`API_RATE_MAX` raised for the child process so the harness's
+  own request volume does not trip the abuse-prevention throttle it is not testing). Notes: target-
+  hardware and target-VPS budgets are still not recorded — no such device/VPS was available this
+  session — and return/void/mixed-concurrency scenarios are still open (see `docs/PERFORMANCE_BENCHMARK.md`).
+  Leaving unchecked until those numbers exist.
 
 - [ ] Capture a low-end-counter browser trace for keyboard/scanner input, total recalculation,
   tab transitions, print preparation and an 8-hour soak. Fix only bottlenecks the trace proves;
