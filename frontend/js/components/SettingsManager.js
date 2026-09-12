@@ -499,7 +499,12 @@ export class SettingsManager {
                 payload.confirmDestructive = true;
             }
 
-            await this.saveSettings(payload, 'Billing settings saved!');
+            await this.saveSettings(payload, 'Billing settings saved!', async () => {
+                // Feature-gated modules must become reachable immediately
+                // after their owner enables them; requiring a browser reload
+                // would make a successful Settings save look ineffective.
+                if (window.reportsDesk) await window.reportsDesk.refresh();
+            });
         });
     }
 
@@ -902,6 +907,7 @@ export class SettingsManager {
        existing person means "leave theirs alone" rather than "clear it". */
 
     renderStaffSection() {
+        const s = this.settings;
         // The draft survives a re-render (adding a row repaints the table), but
         // is rebuilt from the server's copy whenever the section is opened fresh.
         if (!this.staffDraft) this.staffDraft = this.cloneRoster();

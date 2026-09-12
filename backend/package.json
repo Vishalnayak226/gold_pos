@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_billing_math.js && node test_schema.js && node test_repositories.js && node test_concurrency.js && node test_suite.js && node test_routes.js && node test_http.js && node test_production_guard.js && node test_alerting.js",
+    "test": "node test_billing_math.js && node test_schema.js && node test_repositories.js && node test_concurrency.js && node test_suite.js && node test_routes.js && node test_http.js && node test_production_guard.js && node test_alerting.js && node test_log_writer.js && node test_log_rotation.js",
     "test:billing": "node test_billing_math.js",
     "test:schema": "node test_schema.js",
     "test:repositories": "node test_repositories.js",
@@ -21,12 +21,18 @@
     "test:http": "node test_http.js",
     "test:guard": "node test_production_guard.js",
     "test:alerting": "node test_alerting.js",
+    "test:log-writer": "node test_log_writer.js",
+    "test:log-rotation": "node test_log_rotation.js",
+    "benchmark": "node benchmark.js",
+    "benchmark:quick": "node benchmark.js --quick",
     "test:e2e": "playwright test",
     "seed": "node seed.js",
     "key:generate": "node rotateSecretKey.js --generate",
     "key:rotate": "node rotateSecretKey.js --generate-new",
     "key:rotate:dry-run": "node rotateSecretKey.js --generate-new --dry-run",
     "audit:verify": "node verifyAuditChain.js",
+    "audit:security": "npm audit --omit=dev --audit-level=moderate",
+    "sbom:dependencies": "npm ls --all --json",
     "backup:verify": "node verifyBackup.js",
     "restore:drill": "node verifyBackup.js --keep"
   },
@@ -38,6 +44,9 @@
     "node-cron": "^4.6.0",
     "nodemailer": "^9.0.5",
     "qrcode": "^1.5.4"
+  },
+  "overrides": {
+    "qs": "6.16.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.50.0"

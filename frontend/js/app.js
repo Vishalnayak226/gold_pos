@@ -285,6 +285,12 @@ function initAdminAuth() {
                 if (window.advancesManager) window.advancesManager.refresh();
                 if (window.customerAccountsManager) window.customerAccountsManager.refresh();
                 if (window.settingsManager) window.settingsManager.refresh();
+                // This module deliberately hides its navigation until its
+                // server-side feature flag has been checked. Refresh it after
+                // login as well as on an already-authenticated page load;
+                // otherwise a fresh counter session can never open an enabled
+                // Management Reports module.
+                if (window.reportsDesk) window.reportsDesk.refresh();
                 if (window.billingDesk) window.billingDesk.fetchSettings();
             } else {
                 const err = await res.json().catch(() => ({}));

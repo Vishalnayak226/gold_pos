@@ -26,6 +26,7 @@ import {
 import { newId, logError, logTelemetry } from '../db.js';
 import { ADVANCE_STATUS, toPaise, round2 } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
+import { DOMAIN_CODE } from '../domainCodes.js';
 
 /** Sanity ceiling for one deposit — a guard against fat-fingered extremes. */
 const MAX_SANE_AMOUNT = 100000000;
@@ -55,14 +56,14 @@ export function recordDeposit(input, deps) {
     const actorUserId = deps.actorUserId || context.ownerUserId;
 
     if (!deps.isValidPhone(input.customerPhone)) {
-        return { success: false, status: 400, error: 'Valid 10-digit customer phone number required' };
+        return { success: false, status: 400, error: 'Valid 10-digit customer phone number required', code: DOMAIN_CODE.ADVANCE_PHONE_INVALID };
     }
     const amount = parseFloat(input.amount);
     if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_SANE_AMOUNT) {
-        return { success: false, status: 400, error: 'Valid deposit amount required' };
+        return { success: false, status: 400, error: 'Valid deposit amount required', code: DOMAIN_CODE.ADVANCE_AMOUNT_INVALID };
     }
     if (input.customerName && String(input.customerName).length > 200) {
-        return { success: false, status: 400, error: 'Customer name is too long (max 200 characters).' };
+        return { success: false, status: 400, error: 'Customer name is too long (max 200 characters).', code: DOMAIN_CODE.ADVANCE_NAME_TOO_LONG };
     }
 
     const requestedStatus = String(input.status || ADVANCE_STATUS.APPROVED).toLowerCase();
@@ -75,7 +76,8 @@ export function recordDeposit(input, deps) {
     if (storedStatus === 'posted' && !users.isApprover(context.tenantId, actorUserId)) {
         return {
             success: false, status: 403,
-            error: 'Only an owner or a manager can post a deposit directly. Submit it for approval instead.'
+            error: 'Only an owner or a manager can post a deposit directly. Submit it for approval instead.',
+            code: DOMAIN_CODE.APPROVER_REQUIRED
         };
     }
 
@@ -99,7 +101,7 @@ export function recordDeposit(input, deps) {
                     throw new DomainRefusal(409,
                         `Reference "${cleanReference}" has already been submitted against deposit ${clash.id}. ` +
                         'Each transaction reference can only be used once.',
-                        'DUPLICATE_REFERENCE');
+                        DOMAIN_CODE.DUPLICATE_REFERENCE);
                 }
             }
 
@@ -178,7 +180,7 @@ export function recordDeposit(input, deps) {
                 : advances.findEntryByIdempotencyKey(context.tenantId, input.idempotencyKey);
             if (clash) {
                 return {
-                    success: false, status: 409, code: 'DUPLICATE_REFERENCE',
+                    success: false, status: 409, code: DOMAIN_CODE.DUPLICATE_REFERENCE,
                     error: `Reference "${cleanReference}" has already been submitted against deposit ${clash.id}. ` +
                         'Each transaction reference can only be used once.'
                 };
@@ -208,21 +210,22 @@ export function reviewDeposit(entryId, decision, note, deps = {}) {
     const toStatus = advances.toStoredStatus(decision);
 
     if (toStatus !== 'posted' && toStatus !== 'rejected') {
-        return { success: false, status: 400, error: 'A review decision must be either approve or reject.' };
+        return { success: false, status: 400, error: 'A review decision must be either approve or reject.', code: DOMAIN_CODE.ADVANCE_REVIEW_DECISION_INVALID };
     }
     if (toStatus === 'posted' && !users.isApprover(context.tenantId, actorUserId)) {
-        return { success: false, status: 403, error: 'Only an owner or a manager can approve a deposit.' };
+        return { success: false, status: 403, error: 'Only an owner or a manager can approve a deposit.', code: DOMAIN_CODE.APPROVER_REQUIRED };
     }
 
     try {
         return inTransaction(() => {
             const existing = advances.findEntryById(entryId);
             if (!existing || existing.entry_type !== 'deposit') {
-                throw new DomainRefusal(404, 'No such deposit in the advances ledger.');
+                throw new DomainRefusal(404, 'No such deposit in the advances ledger.', DOMAIN_CODE.ADVANCE_ENTRY_NOT_FOUND);
             }
             if (existing.status !== 'pending') {
                 throw new DomainRefusal(409,
-                    `Deposit ${entryId} is already ${advances.toWireStatus(existing.status)} and cannot be reviewed again.`);
+                    `Deposit ${entryId} is already ${advances.toWireStatus(existing.status)} and cannot be reviewed again.`,
+                    DOMAIN_CODE.ADVANCE_ALREADY_REVIEWED);
             }
 
             const now = Date.now();
@@ -237,7 +240,8 @@ export function reviewDeposit(entryId, decision, note, deps = {}) {
 
             if (!changed) {
                 throw new DomainRefusal(409,
-                    `Deposit ${entryId} is already ${advances.toWireStatus(entry ? entry.status : 'posted')} and cannot be reviewed again.`);
+                    `Deposit ${entryId} is already ${advances.toWireStatus(entry ? entry.status : 'posted')} and cannot be reviewed again.`,
+                    DOMAIN_CODE.ADVANCE_ALREADY_REVIEWED);
             }
 
             audit.record({
@@ -261,7 +265,7 @@ export function reviewDeposit(entryId, decision, note, deps = {}) {
         });
     } catch (err) {
         if (err instanceof DomainRefusal) {
-            return { success: false, status: err.status, error: err.message };
+            return { success: false, status: err.status, error: err.message, code: err.code };
         }
         logError('Advance review failed and was rolled back: ' + err.message, err.stack);
         return { success: false, status: 500, error: 'Failed to save the review. Please retry.' };

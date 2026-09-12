@@ -6,10 +6,13 @@
     <title>Gold Business POS</title>
     <link rel="stylesheet" href="css/app.css">
     <script src="js/adminAlertOverride.js"></script>
+    <!-- See CSS's default #admin-login-view/#app-viewport display rules for
+         the other half of this. -->
+    <script src="js/preAuthCheck.js"></script>
 </head>
 <body>
     <!-- Admin Login Screen -->
-    <div id="admin-login-view" style="width:100vw; height:100vh; background:#0f172a; display:flex; align-items:center; justify-content:center; font-family:'Outfit',sans-serif;">
+    <div id="admin-login-view" style="width:100vw; height:100vh; background:#0f172a; align-items:center; justify-content:center; font-family:'Outfit',sans-serif;">
         <div style="background:#1e293b; padding:40px; border-radius:12px; width:100%; max-width:350px; text-align:center; box-shadow:0 10px 30px rgba(0,0,0,0.5); border:1px solid #334155;">
             <h1 style="color:#f8fafc; font-size:24px; margin-bottom:5px;">Admin Terminal</h1>
             <p style="color:#94a3b8; font-size:14px; margin-bottom:25px;">Enter your PIN to unlock</p>
@@ -34,7 +37,7 @@
     </div>
 
     <!-- Main PDF-Style Fixed App Viewport -->
-    <div id="app-viewport" style="display:none;">
+    <div id="app-viewport">
         <!-- Sidebar Navigation (Gentle, Low-Saturation) -->
         <aside id="sidebar">
             <div class="sidebar-header">

@@ -29,6 +29,7 @@ import {
 import { newId, logError, logTelemetry } from '../db.js';
 import { computeReturnRefund, round2, round3, toPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
+import { DOMAIN_CODE, isDomainCode } from '../domainCodes.js';
 
 export const REFUND_MODES = ['cash', 'gold', 'exchange'];
 
@@ -64,14 +65,14 @@ export function createReturn(input, deps) {
 
     const invoiceNumber = String(input.invoiceId || '').trim();
     if (!invoiceNumber) {
-        return { ok: false, status: 400, error: 'An invoice number is required to file a return.' };
+        return { ok: false, status: 400, error: 'An invoice number is required to file a return.', code: DOMAIN_CODE.INVOICE_NUMBER_REQUIRED };
     }
     if (!REFUND_MODES.includes(input.refundMode)) {
-        return { ok: false, status: 400, error: 'Refund mode must be cash, gold credit, or exchange credit.' };
+        return { ok: false, status: 400, error: 'Refund mode must be cash, gold credit, or exchange credit.', code: DOMAIN_CODE.RETURN_MODE_INVALID };
     }
     const weightGrams = Number(input.weightGrams);
     if (!Number.isFinite(weightGrams) || weightGrams <= 0) {
-        return { ok: false, status: 400, error: 'A valid positive return weight is required.' };
+        return { ok: false, status: 400, error: 'A valid positive return weight is required.', code: DOMAIN_CODE.RETURN_WEIGHT_INVALID };
     }
 
     if (input.idempotencyKey) {
@@ -83,7 +84,8 @@ export function createReturn(input, deps) {
     if (!header) {
         return {
             ok: false, status: 404,
-            error: `No filed invoice ${invoiceNumber} exists. Only saved invoices can be returned against.`
+            error: `No filed invoice ${invoiceNumber} exists. Only saved invoices can be returned against.`,
+            code: DOMAIN_CODE.INVOICE_NOT_FOUND
         };
     }
 
@@ -93,7 +95,8 @@ export function createReturn(input, deps) {
     if (input.refundMode !== 'cash' && !deps.isValidPhone(header.customer_phone)) {
         return {
             ok: false, status: 400,
-            error: 'This invoice has no customer phone number on it, so there is no account to credit. Refund it as cash, or re-file the sale against a customer.'
+            error: 'This invoice has no customer phone number on it, so there is no account to credit. Refund it as cash, or re-file the sale against a customer.',
+            code: DOMAIN_CODE.RETURN_CUSTOMER_PHONE_REQUIRED
         };
     }
 
@@ -119,18 +122,21 @@ export function createReturn(input, deps) {
             if (requestedLine === null) {
                 if (lines.length > 1) {
                     throw new DomainRefusal(400,
-                        'This invoice has several items on it. Choose which line is being returned.');
+                        'This invoice has several items on it. Choose which line is being returned.',
+                        DOMAIN_CODE.RETURN_LINE_REQUIRED);
                 }
                 originalLine = lines[0];
             } else {
                 originalLine = lines.find(row => row.line_number === requestedLine);
                 if (!originalLine) {
-                    throw new DomainRefusal(400, `This invoice has no line ${input.lineNumber}.`);
+                    throw new DomainRefusal(400, `This invoice has no line ${input.lineNumber}.`,
+                        DOMAIN_CODE.RETURN_LINE_NOT_FOUND);
                 }
             }
             if (!originalLine) {
                 throw new DomainRefusal(422,
-                    `Invoice ${invoiceNumber} has no lines to return against; it cannot be refunded automatically.`);
+                    `Invoice ${invoiceNumber} has no lines to return against; it cannot be refunded automatically.`,
+                    DOMAIN_CODE.RETURN_NO_LINES);
             }
 
             /* Measured against THIS LINE's history, not the invoice's. The
@@ -148,10 +154,11 @@ export function createReturn(input, deps) {
                 ),
                 alreadyRefundedAmount: prior.refundedAmount
             });
-            if (!refund.ok) throw new DomainRefusal(400, refund.error);
+            if (!refund.ok) throw new DomainRefusal(400, refund.error, DOMAIN_CODE.RETURN_PRICING_REFUSED);
             if (!(refund.refundAmount > 0)) {
                 throw new DomainRefusal(400,
-                    'This return prices to a zero refund, so there is nothing to pay back. Check the weight entered.');
+                    'This return prices to a zero refund, so there is nothing to pay back. Check the weight entered.',
+                    DOMAIN_CODE.RETURN_ZERO_REFUND);
             }
 
             /* APPROVAL THRESHOLD. A refund is the one counter action that takes
@@ -165,9 +172,15 @@ export function createReturn(input, deps) {
             if (deps.authorizeRefund) {
                 const permitted = deps.authorizeRefund(refund.refundAmount);
                 if (!permitted.ok) {
+                    // Older callers returned the stable code in `error` and
+                    // operator prose in `message`. Preserve that wire shape
+                    // while carrying the code explicitly through the domain
+                    // boundary, so routes/integrations never parse prose.
+                    const stableCode = isDomainCode(permitted.code)
+                        ? permitted.code
+                        : (isDomainCode(permitted.error) ? permitted.error : undefined);
                     throw new DomainRefusal(
-                        permitted.status || 403, permitted.error, permitted.code || undefined,
-                        permitted.message
+                        permitted.status || 403, permitted.message || permitted.error, stableCode
                     );
                 }
             }
@@ -352,8 +365,7 @@ export function createReturn(input, deps) {
         if (err instanceof DomainRefusal) {
             return {
                 ok: false, status: err.status, error: err.message,
-                // Present only on a coded refusal (the approval threshold), where
-                // the desk shows the prose and branches on the code.
+                ...(err.code ? { code: err.code } : {}),
                 ...(err.detail ? { message: err.detail } : {})
             };
         }

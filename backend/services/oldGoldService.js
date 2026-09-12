@@ -29,6 +29,7 @@ import {
 import { newId, logError } from '../db.js';
 import { computeOldGoldCredit, round2, round3, toPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal } from './saleService.js';
+import { DOMAIN_CODE } from '../domainCodes.js';
 
 const VALID_PURITIES = ['24K', '22K', '18K'];
 const PURITY_RATE_KEY = { '24K': 'price24K', '22K': 'price22K', '18K': 'price18K' };
@@ -61,30 +62,30 @@ export function recordExchange(input, deps) {
 
     const settings = getSettings();
     if (settings.oldGoldExchangeEnabled !== true) {
-        return { success: false, status: 404, error: 'Old-gold exchange is not enabled for this store.' };
+        return { success: false, status: 404, error: 'Old-gold exchange is not enabled for this store.', code: DOMAIN_CODE.OLD_GOLD_EXCHANGE_DISABLED };
     }
 
     // Crediting a customer's balance is cash-equivalent — the same bar a
     // posted counter advance deposit already needs.
     if (!users.isApprover(context.tenantId, actorUserId)) {
-        return { success: false, status: 403, error: 'Only an owner or a manager may record an old-gold exchange.' };
+        return { success: false, status: 403, error: 'Only an owner or a manager may record an old-gold exchange.', code: DOMAIN_CODE.APPROVER_REQUIRED };
     }
 
     if (!isValidPhone(input.customerPhone)) {
-        return { success: false, status: 400, error: 'Valid 10-digit customer phone number required.' };
+        return { success: false, status: 400, error: 'Valid 10-digit customer phone number required.', code: DOMAIN_CODE.OLD_GOLD_PHONE_INVALID };
     }
     if (!VALID_PURITIES.includes(input.declaredPurity)) {
-        return { success: false, status: 400, error: 'Declared purity must be 24K, 22K, or 18K.' };
+        return { success: false, status: 400, error: 'Declared purity must be 24K, 22K, or 18K.', code: DOMAIN_CODE.OLD_GOLD_PURITY_INVALID };
     }
     if (!VALID_PURITIES.includes(input.testedPurity)) {
-        return { success: false, status: 400, error: 'Tested purity must be 24K, 22K, or 18K.' };
+        return { success: false, status: 400, error: 'Tested purity must be 24K, 22K, or 18K.', code: DOMAIN_CODE.OLD_GOLD_PURITY_INVALID };
     }
     const grossWeightGrams = Number(input.grossWeightGrams);
     if (!Number.isFinite(grossWeightGrams) || grossWeightGrams <= 0) {
-        return { success: false, status: 400, error: 'A positive gross weight is required.' };
+        return { success: false, status: 400, error: 'A positive gross weight is required.', code: DOMAIN_CODE.OLD_GOLD_WEIGHT_INVALID };
     }
     if (grossWeightGrams > MAX_SANE_WEIGHT_GRAMS) {
-        return { success: false, status: 400, error: `Weight exceeds the ${MAX_SANE_WEIGHT_GRAMS}g limit.` };
+        return { success: false, status: 400, error: `Weight exceeds the ${MAX_SANE_WEIGHT_GRAMS}g limit.`, code: DOMAIN_CODE.OLD_GOLD_WEIGHT_INVALID };
     }
 
     // The deduction percentage is a store policy, not a client-supplied
@@ -97,14 +98,22 @@ export function recordExchange(input, deps) {
     const ratePerGram = Number(activeRates[rateKey]);
     if (!Number.isFinite(ratePerGram) || ratePerGram <= 0) {
         logError(`Refusing an old-gold exchange at ${input.testedPurity}: the active gold rate is unusable (${activeRates[rateKey]}).`);
-        return { success: false, status: 503, error: 'The current gold rate is unavailable, so this exchange cannot be valued. Check the gold rate in Settings and retry.' };
+        return {
+            success: false, status: 503,
+            error: 'The current gold rate is unavailable, so this exchange cannot be valued. Check the gold rate in Settings and retry.',
+            code: DOMAIN_CODE.OLD_GOLD_RATE_UNAVAILABLE
+        };
     }
 
     const { netWeightGrams, creditAmount } = computeOldGoldCredit({
         grossWeightGrams, ratePerGram, deductionPercent
     });
     if (creditAmount <= 0) {
-        return { success: false, status: 400, error: 'This exchange values at zero after the deduction — nothing to credit.' };
+        return {
+            success: false, status: 400,
+            error: 'This exchange values at zero after the deduction — nothing to credit.',
+            code: DOMAIN_CODE.OLD_GOLD_ZERO_CREDIT
+        };
     }
 
     try {

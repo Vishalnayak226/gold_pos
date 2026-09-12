@@ -95,6 +95,7 @@ if (!fs.existsSync(source)) {
 const restoreRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-restore-'));
 const restoreData = path.join(restoreRoot, 'data');
 fs.mkdirSync(restoreData, { recursive: true });
+const BACKUP_MANIFEST_FILE = 'backup_manifest.json';
 
 say('\n  Restore verification');
 say('  ' + '-'.repeat(64));
@@ -140,10 +141,38 @@ try {
     }
 
     const restoredEntries = fs.readdirSync(restoreData);
+    const manifestFile = path.join(restoreData, BACKUP_MANIFEST_FILE);
+    let backupManifest = null;
+    if (fs.existsSync(manifestFile)) {
+        try {
+            const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+            const valid = manifest.formatVersion === 1
+                && typeof manifest.createdAt === 'string'
+                && typeof manifest.application?.version === 'string'
+                && manifest.ledger?.engine === 'sqlite'
+                && Array.isArray(manifest.migrations);
+            record(valid, 'the backup self-description is valid', valid
+                ? `format ${manifest.formatVersion}, app ${manifest.application.version}, ${manifest.migrations.length} migrations`
+                : 'backup_manifest.json has an unsupported or incomplete shape');
+            if (valid) backupManifest = manifest;
+        } catch (error) {
+            record(false, 'the backup self-description is readable', error.message);
+        }
+    } else {
+        // Snapshots created before the manifest feature remain restorable.
+        say('  ℹ backup self-description absent (legacy snapshot accepted)');
+    }
     const dbName = restoredEntries.find(n => n.endsWith('.db'));
     record(Boolean(dbName), 'the snapshot contains the SQLite ledger',
         dbName || 'NO .db FILE — this snapshot cannot restore a ledger');
     if (!dbName) throw new Error('no ledger in snapshot');
+    if (backupManifest) {
+        record(backupManifest.ledger.filename === dbName,
+            'the backup self-description names the restored ledger',
+            backupManifest.ledger.filename === dbName
+                ? dbName
+                : `manifest: ${backupManifest.ledger.filename}, restored: ${dbName}`);
+    }
 
     /* Point the data layer at the restored copy BEFORE importing it: db.js
        resolves DATA_DIR once at import and ESM caches the module, so a static

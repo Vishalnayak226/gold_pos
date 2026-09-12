@@ -29,6 +29,7 @@ import {
 } from '../repositories/index.js';
 import { newId, logError, logTelemetry } from '../db.js';
 import { raiseAlert } from '../alerting.js';
+import { DOMAIN_CODE } from '../domainCodes.js';
 import {
     computeInvoiceTotals, computeMetalValue, computeWastageAmount, normalizeTaxMode,
     fromPaise, round2, round3, toPaise
@@ -320,7 +321,10 @@ export function createSale(input, deps) {
             if (deps.authorizeDiscount) {
                 const permitted = deps.authorizeDiscount(maxDiscountPercent);
                 if (!permitted.ok) {
-                    return { ok: false, status: permitted.status || 403, error: permitted.error };
+                    return {
+                        ok: false, status: permitted.status || 403, error: permitted.error,
+                        ...(permitted.code ? { code: permitted.code } : {})
+                    };
                 }
             }
         }
@@ -359,20 +363,23 @@ export function createSale(input, deps) {
                 const item = inventory.getItem(context.tenantId, line.inventoryItemId);
                 const lot = inventory.getLot(context.tenantId, line.inventoryLotId);
                 if (!item || item.is_active !== 1) {
-                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s catalogue item is no longer active.`);
+                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s catalogue item is no longer active.`,
+                        DOMAIN_CODE.STOCK_ITEM_INACTIVE);
                 }
                 if (!lot || lot.item_id !== item.id || lot.branch_id !== context.branchId) {
-                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s stock lot is unavailable at this branch.`);
+                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s stock lot is unavailable at this branch.`,
+                        DOMAIN_CODE.STOCK_LOT_UNAVAILABLE);
                 }
                 if (item.purity !== line.purity) {
-                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s purity no longer matches its catalogue item.`);
+                    throw new DomainRefusal(409, `Line ${line.lineNumber}'s purity no longer matches its catalogue item.`,
+                        DOMAIN_CODE.STOCK_PURITY_MISMATCH);
                 }
                 const requestedMg = weightMilligrams(line.weightGrams);
                 const reservedMg = (reservedByLot.get(lot.id) || 0) + requestedMg;
                 if (lot.balance_mg < reservedMg) {
                     throw new DomainRefusal(409,
                         `Lines using lot ${lot.id} need ${round3(reservedMg / 1000)}g in total, but it has only ${round3(lot.balance_mg / 1000)}g on hand.`,
-                        'INSUFFICIENT_STOCK');
+                        DOMAIN_CODE.INSUFFICIENT_STOCK);
                 }
                 reservedByLot.set(lot.id, reservedMg);
             }
@@ -393,7 +400,8 @@ export function createSale(input, deps) {
                     // Thrown rather than returned so the transaction unwinds; caught
                     // and converted back to a 400 below.
                     throw new DomainRefusal(400,
-                        `Applied advance exceeds the customer's available balance of ${round2(balance)}.`);
+                        `Applied advance exceeds the customer's available balance of ${round2(balance)}.`,
+                        DOMAIN_CODE.ADVANCE_BALANCE_EXCEEDED);
                 }
             }
 
@@ -467,13 +475,16 @@ export function createSale(input, deps) {
             if (input.exchangeCreditNoteId) {
                 exchangeNote = creditNotes.findByNumber(context.tenantId, String(input.exchangeCreditNoteId).trim());
                 if (!exchangeNote || exchangeNote.is_exchange !== 1 || exchangeNote.exchange_invoice_id) {
-                    throw new DomainRefusal(409, 'That exchange credit is invalid or has already been used.');
+                    throw new DomainRefusal(409, 'That exchange credit is invalid or has already been used.',
+                        DOMAIN_CODE.EXCHANGE_CREDIT_INVALID);
                 }
                 if (!customerPhone || exchangeNote.customer_phone !== customerPhone) {
-                    throw new DomainRefusal(400, 'The replacement sale must use the same customer phone as the exchange return.');
+                    throw new DomainRefusal(400, 'The replacement sale must use the same customer phone as the exchange return.',
+                        DOMAIN_CODE.EXCHANGE_CUSTOMER_MISMATCH);
                 }
                 if (!(appliedAdvanceRequested > 0)) {
-                    throw new DomainRefusal(400, 'Apply some of the exchange credit before filing the replacement invoice.');
+                    throw new DomainRefusal(400, 'Apply some of the exchange credit before filing the replacement invoice.',
+                        DOMAIN_CODE.EXCHANGE_CREDIT_NOT_APPLIED);
                 }
             }
 
@@ -742,27 +753,30 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
     const actorUserId = deps.actorUserId || context.ownerUserId;
     const cleanNumber = String(invoiceNumber || '').trim();
     const cleanReason = String(reason || '').trim();
-    if (!cleanNumber) return { ok: false, status: 400, error: 'Invoice number is required.' };
+    if (!cleanNumber) {
+        return { ok: false, status: 400, error: 'Invoice number is required.', code: DOMAIN_CODE.INVOICE_NUMBER_REQUIRED };
+    }
     if (cleanReason.length < 5 || cleanReason.length > 300) {
-        return { ok: false, status: 400, error: 'Cancellation reason must be 5–300 characters.' };
+        return { ok: false, status: 400, error: 'Cancellation reason must be 5–300 characters.', code: DOMAIN_CODE.VOID_REASON_INVALID };
     }
 
     try {
         return inTransaction(() => {
             const header = invoices.findByNumber(context.tenantId, cleanNumber);
-            if (!header) throw new DomainRefusal(404, `No filed invoice ${cleanNumber} exists.`);
+            if (!header) throw new DomainRefusal(404, `No filed invoice ${cleanNumber} exists.`, DOMAIN_CODE.INVOICE_NOT_FOUND);
             if (header.state !== 'issued') {
-                throw new DomainRefusal(409, 'Only an issued invoice with no returns can be cancelled.');
+                throw new DomainRefusal(409, 'Only an issued invoice with no returns can be cancelled.', DOMAIN_CODE.VOID_NOT_ALLOWED);
             }
             const now = Date.now();
             if (header.business_date !== businessDate(now)) {
                 throw new DomainRefusal(409,
-                    'Only a sale from the current business date can be voided. Use a return/credit note for an earlier sale.');
+                    'Only a sale from the current business date can be voided. Use a return/credit note for an earlier sale.',
+                    DOMAIN_CODE.VOID_DATE_RESTRICTED);
             }
 
             const priorReturns = creditNotes.summarizeForInvoice(header.id);
             if (priorReturns.count > 0 || priorReturns.returnedWeightGrams > 0) {
-                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.');
+                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.', DOMAIN_CODE.VOID_AFTER_RETURN);
             }
 
             for (const movement of inventory.documentSaleMovementsForInvoice(context.tenantId, header.id)) {
@@ -784,7 +798,8 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
             if (advanceTender) {
                 const redemption = advances.findEntryById(advanceTender.advance_entry_id);
                 if (!redemption || redemption.status !== 'posted') {
-                    throw new DomainRefusal(409, 'The invoice advance redemption is not in a reversible state.');
+                    throw new DomainRefusal(409, 'The invoice advance redemption is not in a reversible state.',
+                        DOMAIN_CODE.ADVANCE_REVERSAL_UNAVAILABLE);
                 }
                 advances.insertEntry({
                     id: newId('REV'),
@@ -838,7 +853,7 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
     } catch (err) {
         if (err instanceof DomainRefusal) return { ok: false, status: err.status, error: err.message, code: err.code };
         if (isUniqueViolation(err)) {
-            return { ok: false, status: 409, error: 'This invoice has already been cancelled.' };
+            return { ok: false, status: 409, error: 'This invoice has already been cancelled.', code: DOMAIN_CODE.VOID_ALREADY_PROCESSED };
         }
         logError('Sale void failed and was rolled back: ' + err.message, err.stack);
         return { ok: false, status: 500, error: 'Failed to cancel invoice: ' + err.message };
@@ -855,11 +870,11 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
  */
 function recordSuppliedTenders(raw, { invoiceId, actorUserId, now, payablePaise }) {
     if (raw === undefined || raw === null) return;
-    if (!Array.isArray(raw)) throw new DomainRefusal(400, 'Tenders must be a list.');
+    if (!Array.isArray(raw)) throw new DomainRefusal(400, 'Tenders must be a list.', DOMAIN_CODE.SALE_TENDER_INVALID);
     if (raw.length === 0) return;
     if (raw.length > MAX_TENDERS) {
         throw new DomainRefusal(400,
-            `An invoice may be split across at most ${MAX_TENDERS} tenders.`);
+            `An invoice may be split across at most ${MAX_TENDERS} tenders.`, DOMAIN_CODE.SALE_TENDER_INVALID);
     }
     /* Nothing left to pay — an invoice fully settled by a redeemed advance has
        no counter tender, and recording a ₹0 one would be a row that means
@@ -869,12 +884,13 @@ function recordSuppliedTenders(raw, { invoiceId, actorUserId, now, payablePaise 
     let sum = 0;
     for (const [i, entry] of raw.entries()) {
         if (!entry || typeof entry !== 'object') {
-            throw new DomainRefusal(400, `Tender ${i + 1} is not a valid payment.`);
+            throw new DomainRefusal(400, `Tender ${i + 1} is not a valid payment.`, DOMAIN_CODE.SALE_TENDER_INVALID);
         }
         const method = String(entry.method || '').trim().toLowerCase();
         if (!TENDER_METHODS.includes(method)) {
             throw new DomainRefusal(400,
-                `Tender ${i + 1} has an unknown method. Use one of: ${TENDER_METHODS.join(', ')}.`);
+                `Tender ${i + 1} has an unknown method. Use one of: ${TENDER_METHODS.join(', ')}.`,
+                DOMAIN_CODE.SALE_TENDER_INVALID);
         }
 
         /* A LONE TENDER WITH NO AMOUNT means "the whole bill, by this method".
@@ -892,10 +908,10 @@ function recordSuppliedTenders(raw, { invoiceId, actorUserId, now, payablePaise 
             && (entry.amount === undefined || entry.amount === null || entry.amount === '');
         const amount = amountOmitted ? fromPaise(payablePaise) : Number(entry.amount);
         if (!Number.isFinite(amount) || amount <= 0) {
-            throw new DomainRefusal(400, `Tender ${i + 1} needs a positive amount.`);
+            throw new DomainRefusal(400, `Tender ${i + 1} needs a positive amount.`, DOMAIN_CODE.SALE_TENDER_INVALID);
         }
         if (amount > MAX_SANE_AMOUNT) {
-            throw new DomainRefusal(400, `Tender ${i + 1} exceeds the per-payment limit.`);
+            throw new DomainRefusal(400, `Tender ${i + 1} exceeds the per-payment limit.`, DOMAIN_CODE.SALE_TENDER_INVALID);
         }
 
         const amountPaise = toPaise(round2(amount));
@@ -924,7 +940,7 @@ function recordSuppliedTenders(raw, { invoiceId, actorUserId, now, payablePaise 
     if (sum !== payablePaise) {
         throw new DomainRefusal(400,
             `The payments recorded (₹${fromPaise(sum)}) do not add up to the amount due (₹${fromPaise(payablePaise)}). `
-            + 'Adjust the split so the two match.');
+            + 'Adjust the split so the two match.', DOMAIN_CODE.SALE_TENDER_TOTAL_MISMATCH);
     }
 }
 

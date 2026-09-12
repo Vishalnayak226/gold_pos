@@ -5,12 +5,14 @@ import helmet from 'helmet';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { drainLogWriter, getLogWriterStats } from './logWriter.js';
 import { readJSON, logError, logTelemetry, newId, DATA_DIR } from './db.js';
 import { readSettings, writeSettings } from './settingsStore.js';
 import { redactSettings, OPERATOR_ROLES, validateSettingsPatch } from './defaultSettings.js';
 import { getActiveGoldRates, syncGoldPrice, initPriceScheduler } from './priceEngine.js';
 import { encryptLevel2Payload } from './cryptoHelper.js';
 import https from 'https';
+import http from 'http';
 import crypto from 'crypto';
 import { checkLicenseGate, syncLicenseStatus, isLicenseValid } from './licenseChecker.js';
 import { initBackupScheduler, createBackup } from './backupEngine.js';
@@ -61,6 +63,21 @@ import { importLegacyJson, collectSource, formatReport } from './importLegacyJso
 // updateEngine.js ship and replace backend/ and frontend/ as a pair.
 import { normalizeTaxMode, round2, round3, toPaise, fromPaise, ADVANCE_STATUS } from '../frontend/js/lib/billingMath.js';
 import QRCode from 'qrcode';
+import { DOMAIN_CODE } from './domainCodes.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Health probes run frequently. Parse package metadata once at boot rather
+// than synchronously reopening it on every liveness request.
+const PACKAGE_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
+// Increment only for a deliberately breaking public API change. Additive
+// fields/endpoints remain compatible within this contract generation.
+const API_CONTRACT_VERSION = '1';
+// Cache-busting tag for static assets. This project has no build step and no
+// content-hashed filenames (CLAUDE.md §0), so the only reliable "did the
+// release change" signal is "did the process restart" — which every deploy
+// does. Not a content hash; a same-content redeploy still bumps it, which is
+// the safe direction to be wrong in.
+const ASSET_VERSION = `${PACKAGE_VERSION}-${Date.now().toString(36)}`;
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -68,6 +85,16 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const MOCK_RAZORPAY_KEY_ID = 'rzp_test_xxxxxx';
 const MOCK_RAZORPAY_SECRET = 'rzp_test_xxxxxx_secret';
 const MOCK_PAYMENTS_ENABLED = !IS_PRODUCTION;
+
+/* Test-only seam so a local double can stand in for Razorpay's API — same
+   `!IS_PRODUCTION` gate as MOCK_PAYMENTS_ENABLED above, so a stray env var
+   can never redirect a live production gateway call. Plain HTTP is used
+   whenever the host is overridden, since a throwaway test double has no
+   certificate for the real hostname to verify against; production always
+   resolves to the real host and therefore always stays on HTTPS. */
+const RAZORPAY_API_HOST = (!IS_PRODUCTION && process.env.RAZORPAY_API_HOST) || 'api.razorpay.com';
+const RAZORPAY_API_PORT = (!IS_PRODUCTION && Number(process.env.RAZORPAY_API_PORT)) || 443;
+const RAZORPAY_TRANSPORT = RAZORPAY_API_HOST === 'api.razorpay.com' ? https : http;
 
 // Sanity ceiling for a single advance deposit/redemption amount (10 crore
 // INR) — not a business rule, just a guard against fat-finger/malicious
@@ -384,6 +411,7 @@ app.use((req, res, next) => {
     const startTime = Date.now();
     req.id = resolveRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, req.id);
+    res.setHeader('X-Gold-POS-API-Version', API_CONTRACT_VERSION);
     res.on('finish', () => {
         const duration = Date.now() - startTime;
         recordRequestOutcome(res.statusCode, duration);
@@ -439,10 +467,10 @@ app.use(express.json({ limit: '5mb' }));
  * loop. Exempt from checkLicenseGate.
  */
 app.get('/api/health', (req, res) => {
-    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'));
     res.json({
         status: 'ok',
-        version: pkg.version,
+        version: PACKAGE_VERSION,
+        apiVersion: API_CONTRACT_VERSION,
         env: process.env.ENV_NAME || process.env.NODE_ENV || 'unknown'
     });
 });
@@ -481,10 +509,44 @@ app.get('/api/ready', (req, res) => {
 // Protect all POS cashier routes with licensing gate
 app.use(checkLicenseGate);
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// Serve the two HTML shells with their same-origin <script src>/<link href>
+// tags stamped ?v=ASSET_VERSION, read once at boot — no build step exists to
+// do this ahead of time (CLAUDE.md §0). HTML itself is always revalidated
+// (below) so a browser never runs a page whose asset URLs point at a release
+// that no longer exists.
+function versionedHtml(relPath) {
+    const raw = fs.readFileSync(path.join(__dirname, '../frontend', relPath), 'utf8');
+    return raw.replace(
+        /(<(?:script|link)\b[^>]*?(?:\bsrc|\bhref)=")(js\/[^"]+\.js|css\/[^"]+\.css)(")/g,
+        (match, pre, assetPath, post) => `${pre}${assetPath}?v=${ASSET_VERSION}${post}`
+    );
+}
+const INDEX_HTML = versionedHtml('index.html');
+const CUSTOMER_HTML = versionedHtml('customer.html');
 
-// Serve static frontend assets
-app.use(express.static(path.join(__dirname, '../frontend')));
+app.get(['/', '/index.html'], (req, res) => {
+    res.set('Cache-Control', 'no-cache').type('html').send(INDEX_HTML);
+});
+app.get('/customer.html', (req, res) => {
+    res.set('Cache-Control', 'no-cache').type('html').send(CUSTOMER_HTML);
+});
+
+// Serve static frontend assets. A request carrying this release's exact
+// ?v= tag is immutable content — cache it for a year; anything else (a
+// stale ?v= from a previous release, or no tag at all) is revalidated on
+// every load instead of risking stale code, exactly like the HTML above.
+app.use(express.static(path.join(__dirname, '../frontend'), {
+    setHeaders: (res, filePath) => {
+        if (path.extname(filePath) === '.html') {
+            res.setHeader('Cache-Control', 'no-cache');
+            return;
+        }
+        const isCurrentRelease = res.req.query && res.req.query.v === ASSET_VERSION;
+        res.setHeader('Cache-Control', isCurrentRelease
+            ? 'public, max-age=31536000, immutable'
+            : 'no-cache');
+    }
+}));
 
 /* ==========================================================================
    API Routes: Admin Session Authentication
@@ -1098,7 +1160,7 @@ app.post('/api/customer/advances', requireEstablishedCustomer, depositClaimLimit
         });
         if (!result.success) {
             const status = result.status
-                || (result.code === 'DUPLICATE_REFERENCE' ? 409 : 400);
+                || (result.code === DOMAIN_CODE.DUPLICATE_REFERENCE ? 409 : 400);
             return res.status(status).json({ error: result.error, code: result.code });
         }
         res.json({
@@ -2025,6 +2087,7 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
                     return {
                         ok: false,
                         status: 403,
+                        code: DOMAIN_CODE.APPROVER_REQUIRED,
                         error: `A ${discountPercent}% discount needs a manager or the owner to authorise it `
                             + `(this store's limit is ${discountThreshold}%). ${req.actor.name} is signed in as ${req.actor.role}.`
                     };
@@ -2034,7 +2097,11 @@ app.post('/api/sales', requireAdminSession, (req, res) => {
         });
 
         if (!result.ok) {
-            return res.status(result.status || 400).json({ error: result.error });
+            return res.status(result.status || 400).json({
+                error: result.error,
+                ...(result.code ? { code: result.code } : {}),
+                ...(result.message ? { message: result.message } : {})
+            });
         }
 
         logTelemetry('SAVE_SALE', 0, `Invoice: ${result.invoiceId}, Total: ${result.sale.totalAmount}`);
@@ -2069,7 +2136,12 @@ app.post('/api/sales/:invoiceNumber/void', requireAdminSession, requireApprover,
             actorLabel: (req.actor && req.actor.name) || 'counter',
             ipAddress: req.ip
         });
-        if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+        if (!result.ok) {
+            return res.status(result.status || 400).json({
+                error: result.error,
+                ...(result.code ? { code: result.code } : {})
+            });
+        }
         res.json({ success: true, invoiceId: result.invoiceId, sale: result.sale });
     } catch (err) {
         logError('Error cancelling invoice: ' + err.message, err.stack);
@@ -2194,7 +2266,7 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
                     return {
                         ok: false,
                         status: 403,
-                        error: 'APPROVER_REQUIRED',
+                        error: DOMAIN_CODE.APPROVER_REQUIRED,
                         message: `A refund of ₹${refundAmount} needs a manager or the owner to authorise it `
                             + `(this store's limit is ₹${threshold}). ${req.actor.name} is signed in as ${req.actor.role}.`
                     };
@@ -2206,7 +2278,7 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
                     return {
                         ok: false,
                         status: 403,
-                        error: 'MFA_REQUIRED',
+                        error: DOMAIN_CODE.MFA_REQUIRED,
                         message: `A refund of ₹${refundAmount} is at or above this store's ₹${threshold} limit, `
                             + 'and this store requires two-factor authentication to authorise one. '
                             + 'Sign in with your authenticator code.'
@@ -2218,9 +2290,18 @@ app.post('/api/returns', requireAdminSession, (req, res) => {
         });
 
         if (!result.ok) {
+            // Only the approval/MFA refusal ever had the bare code sitting in
+            // `error` — that is the shape earlier clients already branch on.
+            // Every other domain code is additive: `error` stays the prose it
+            // always was, and `code` is new.
+            const isLegacyCodeInError = result.code === DOMAIN_CODE.APPROVER_REQUIRED
+                || result.code === DOMAIN_CODE.MFA_REQUIRED;
             return res.status(result.status || 400).json({
-                error: result.error,
-                ...(result.message ? { message: result.message } : {})
+                error: isLegacyCodeInError ? result.code : result.error,
+                ...(result.code ? { code: result.code } : {}),
+                ...(isLegacyCodeInError
+                    ? { message: result.message || result.error }
+                    : (result.message ? { message: result.message } : {}))
             });
         }
 
@@ -2539,7 +2620,7 @@ app.post('/api/advances', requireAdminSession, (req, res) => {
         });
         if (!result.success) {
             const status = result.status
-                || (result.code === 'DUPLICATE_REFERENCE' ? 409 : 400);
+                || (result.code === DOMAIN_CODE.DUPLICATE_REFERENCE ? 409 : 400);
             return res.status(status).json({ error: result.error, code: result.code });
         }
         res.json({ success: true, id: result.deposit.id, deposit: result.deposit });
@@ -2735,7 +2816,7 @@ app.post('/api/advances/:id/approve', requireAdminSession, requireApprover, (req
                 ipAddress: req.ip
             }
         );
-        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error, code: result.code });
         // Fired on APPROVAL rather than at submission: this is the moment the
         // credit becomes real for the customer. Raised at the route because
         // extensions are a delivery concern, not something the service layer
@@ -2769,7 +2850,7 @@ app.post('/api/advances/:id/reject', requireAdminSession, requireApprover, (req,
             actorLabel: (req.actor && req.actor.name) || 'counter',
             ipAddress: req.ip
         });
-        if (!result.success) return res.status(result.status || 400).json({ error: result.error });
+        if (!result.success) return res.status(result.status || 400).json({ error: result.error, code: result.code });
         res.json({ success: true, deposit: result.deposit });
     } catch (err) {
         logError('Error rejecting advance deposit: ' + err.message, err.stack);
@@ -3439,13 +3520,32 @@ app.get('/api/cash-shifts/current', requireAdminSession, (req, res) => {
 app.post('/api/cash-shifts/open', requireAdminSession, validateBody(CASH_SHIFT_OPEN_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
-        const shiftId = repo.inTransaction(() => repo.cashShifts.openShift({
-            tenantId: context.tenantId,
-            branchId: context.branchId,
-            openingFloatPaise: toPaise(req.body.openingFloat),
-            openingNote: req.body.openingNote || null,
-            actorUserId: resolveActorUserId(req.actor)
-        }));
+        const actorUserId = resolveActorUserId(req.actor);
+        const shiftId = repo.inTransaction(() => {
+            const id = repo.cashShifts.openShift({
+                tenantId: context.tenantId,
+                branchId: context.branchId,
+                openingFloatPaise: toPaise(req.body.openingFloat),
+                openingNote: req.body.openingNote || null,
+                actorUserId
+            });
+            // A cash shift is a financial fact like any other counter action —
+            // it belongs in the same tamper-evident trail a sale/return/void
+            // already lands in, not just the shift row's own actor column.
+            repo.audit.record({
+                tenantId: context.tenantId,
+                branchId: context.branchId,
+                actorUserId,
+                actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
+                action: 'CASH_SHIFT_OPENED',
+                entityType: 'cash_shift',
+                entityId: id,
+                summary: `Shift opened with float ${round2(req.body.openingFloat)}`,
+                detail: { openingFloat: req.body.openingFloat, openingNote: req.body.openingNote || null },
+                ipAddress: req.ip
+            });
+            return id;
+        });
         res.json({ success: true, id: shiftId, shift: cashShiftToWire(repo.cashShifts.getShift(context.tenantId, shiftId)) });
     } catch (err) {
         logError('Error opening cash shift: ' + err.message, err.stack);
@@ -3463,13 +3563,36 @@ app.post('/api/cash-shifts/open', requireAdminSession, validateBody(CASH_SHIFT_O
 app.post('/api/cash-shifts/:id/close', requireAdminSession, validateBody(CASH_SHIFT_CLOSE_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
-        const result = repo.inTransaction(() => repo.cashShifts.closeShift({
-            tenantId: context.tenantId,
-            shiftId: req.params.id,
-            countedCashPaise: toPaise(req.body.countedCash),
-            closingNote: req.body.closingNote || null,
-            actorUserId: resolveActorUserId(req.actor)
-        }));
+        const actorUserId = resolveActorUserId(req.actor);
+        const result = repo.inTransaction(() => {
+            const closed = repo.cashShifts.closeShift({
+                tenantId: context.tenantId,
+                shiftId: req.params.id,
+                countedCashPaise: toPaise(req.body.countedCash),
+                closingNote: req.body.closingNote || null,
+                actorUserId
+            });
+            // Closing is the one action that can surface a cash variance —
+            // worth its own tamper-evident audit entry even more than opening.
+            repo.audit.record({
+                tenantId: context.tenantId,
+                branchId: context.branchId,
+                actorUserId,
+                actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
+                action: 'CASH_SHIFT_CLOSED',
+                entityType: 'cash_shift',
+                entityId: req.params.id,
+                summary: `Shift closed: expected ${round2(fromPaise(closed.expectedPaise))}, variance ${round2(fromPaise(closed.variancePaise))}`,
+                detail: {
+                    countedCash: req.body.countedCash,
+                    expectedCash: round2(fromPaise(closed.expectedPaise)),
+                    variance: round2(fromPaise(closed.variancePaise)),
+                    closingNote: req.body.closingNote || null
+                },
+                ipAddress: req.ip
+            });
+            return closed;
+        });
         res.json({
             success: true,
             expectedCash: fromPaise(result.expectedPaise),
@@ -3695,9 +3818,9 @@ function razorpayRequest({ method, path: apiPath, body, keyId, keySecret, timeou
         const postData = body === undefined ? null : JSON.stringify(body);
         const auth = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
 
-        const request = https.request({
-            hostname: 'api.razorpay.com',
-            port: 443,
+        const request = RAZORPAY_TRANSPORT.request({
+            hostname: RAZORPAY_API_HOST,
+            port: RAZORPAY_API_PORT,
             path: apiPath,
             method,
             headers: {
@@ -4055,7 +4178,7 @@ app.post('/api/payment/verify', requireEstablishedCustomer, paymentVerifyLimiter
             findAccount
         });
         if (!credit.ok) {
-            return res.status(credit.status || 500).json({ error: credit.error });
+            return res.status(credit.status || 500).json({ error: credit.error, ...(credit.code ? { code: credit.code } : {}) });
         }
 
         logTelemetry('PAYMENT_VERIFIED_SUCCESS', 0, `Deposit: ${credit.deposit ? credit.deposit.id : 'n/a'}, PayId: ${razorpay_payment_id}`);
@@ -4446,7 +4569,8 @@ app.get('/api/diagnostics/telemetry', requireAdminSession, requireRole('owner'),
             metrics: {
                 memory: process.memoryUsage(),
                 uptime: process.uptime(),
-                cpuUsage: process.cpuUsage()
+                cpuUsage: process.cpuUsage(),
+                logWriter: getLogWriterStats()
             },
             telemetry: telemetryLogs,
             errors: errorLogs
@@ -4651,8 +4775,12 @@ export function shutdown(server, reason = 'manual') {
         }, SHUTDOWN_GRACE_MS);
         forceTimer.unref?.();
 
-        server.close(() => {
+        server.close(async () => {
             clearTimeout(forceTimer);
+            const logDrain = await drainLogWriter();
+            if (!logDrain.ok) {
+                console.error(`[Server] ${logDrain.queuedEntries} diagnostic event(s) remain queued after shutdown drain.`);
+            }
             try {
                 repo.closeDb();
             } catch (err) {

@@ -67,7 +67,7 @@ export function decryptFile(srcPath, destPath, key, aad) {
     const tag = raw.subarray(offset, offset + TAG_BYTES); offset += TAG_BYTES;
     const ciphertext = raw.subarray(offset);
     try {
-        const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+        const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_BYTES });
         decipher.setAAD(Buffer.from(aad, 'utf8'));
         decipher.setAuthTag(tag);
         const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);

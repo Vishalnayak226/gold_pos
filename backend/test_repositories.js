@@ -1864,6 +1864,50 @@ console.log('\n20. Customer master');
 }
 
 /* ==========================================================================
+   20b. Historical records survive later changes (adversarial: a resident
+   record diverging from what a service or the customer master now says).
+   docs/INVARIANT_MATRIX.md's cross-cutting item 3 asks that every permanent
+   record carry "an immutable projection that survives settings/rate/operator
+   changes" — these two prove it against real, resident, damaged/stale data
+   rather than a happy-path record.
+   ========================================================================== */
+
+console.log('\n20b. Historical records survive later changes');
+
+check('a sale keeps its own customer name after the customer record is anonymised', () => {
+    const custId = repo.customers.ensureCustomerId(context.tenantId, '9991119999', 'Original Name Customer');
+    const sale = saleService.createSale({
+        purity: '22K', weightGrams: 1, customerName: 'Original Name Customer', customerPhone: '9991119999'
+    }, DEPS);
+    assert.equal(sale.ok, true, sale.error);
+
+    repo.customers.anonymiseCustomer(context.tenantId, custId);
+
+    const reread = saleService.findSale(sale.invoiceId);
+    assert.equal(reread.customerName, 'Original Name Customer',
+        'an invoice is a snapshot taken at the moment of sale, not a live join — anonymising the customer master must not rewrite history');
+});
+
+check('an invoice whose header no longer sums to its lines still reads back instead of crashing', () => {
+    const sale = saleService.createSale({ purity: '22K', weightGrams: 1, customerName: 'Torn Row Test' }, DEPS);
+    assert.equal(sale.ok, true, sale.error);
+
+    /* Simulates a historical/manual-surgery row that has drifted from its own
+       lines — exactly what test_alerting.js's LEDGER_LINE_DRIFT check flags on
+       the monitoring side. The read path a cashier actually uses (reprint,
+       lookup) must degrade honestly, not throw, even on data this damaged. */
+    const header = repo.invoices.findByNumber(context.tenantId, sale.invoiceId);
+    repo.unsafeDatabaseHandle()
+        .prepare('UPDATE invoices SET total_amount_paise = total_amount_paise + 100000 WHERE id = ?')
+        .run(header.id);
+
+    const reread = saleService.findSale(sale.invoiceId);
+    assert.ok(reread, 'a torn row must still be readable, not throw');
+    assert.equal(reread.totalAmount, sale.sale.totalAmount + 1000,
+        'the read path must report what the header actually says, not silently recompute it from the lines');
+});
+
+/* ==========================================================================
    21. Accounting export — invoice rows uncapped by the UI page size
    (roadmap Phase 5.5)
    ========================================================================== */
@@ -1981,6 +2025,11 @@ console.log('\n22. Billing-linked inventory and management reports');
         assert.equal(result.sale.state, 'cancelled');
         assert.equal(repo.inventory.lotBalanceMg(lotId), 7000);
         assert.equal(repo.invoices.findByNumber(context.tenantId, sale.invoiceId).state, 'cancelled');
+        const repeated = saleService.voidSale(sale.invoiceId, 'Cashier selected wrong customer', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(repeated.ok, false);
+        assert.equal(repeated.code, 'VOID_NOT_ALLOWED', 'a repeated void has a stable domain outcome');
     });
 
     check('reconciliation compares counter tenders to the already advance-net invoice payable', () => {

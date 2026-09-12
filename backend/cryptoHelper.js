@@ -121,7 +121,7 @@ export function decryptLevel2Payload(envelope, privateKeyPem) {
         }, Buffer.from(encryptedAesKey, 'base64'));
 
         // 2. Decrypt the ciphertext using AES-GCM
-        const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, Buffer.from(iv, 'hex'));
+        const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, Buffer.from(iv, 'hex'), { authTagLength: 16 });
         decipher.setAuthTag(Buffer.from(authTag, 'hex'));
         
         let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
