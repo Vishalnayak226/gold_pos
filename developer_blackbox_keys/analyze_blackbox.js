@@ -36,7 +36,7 @@ function decryptEnvelope(envelopePath) {
         oaepHash: 'sha256'
     }, Buffer.from(encryptedAesKey, 'base64'));
 
-    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, Buffer.from(iv, 'hex'));
+    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, Buffer.from(iv, 'hex'), { authTagLength: 16 });
     decipher.setAuthTag(Buffer.from(authTag, 'hex'));
 
     let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
