@@ -1254,3 +1254,64 @@ replaceable as those things change.
   tab transitions, print preparation and an 8-hour soak. Fix only bottlenecks the trace proves;
   preserve synchronous financial commits and audit guarantees.
   Owner: Product + engineering  Result: _____  Notes: ________________
+
+---
+
+## 26. Customer Portal PWA (installable, offline fallback) *(added 2026-09-27)*
+
+Build record in `docs/LEDGER.md` (2026-09-27 entry). Adds installable-PWA
+support to `frontend/customer.html` only — manifest, service worker, iOS
+meta tags — as a lighter-weight, store-independent alternative to the
+Capacitor/Play Store track for that one page. Does not replace that track,
+and does not resolve the "outage mode" open design decision above: the
+offline fallback page is a UX nicety for a dropped connection, not queued
+offline writes.
+
+- [x] Manifest links correctly and fetches as valid JSON with the expected
+  installability fields (`name`, `scope` pinned to `/customer.html`,
+  `display: standalone`, three icons including a `maskable` one).
+  Owner: Engineering  Result: **PASS**  Notes: `customer-pwa.spec.js`
+  "links a valid manifest..." — green on both `desktop-chromium` and
+  `mobile-chromium`.
+
+- [x] Service worker activates scoped to `/customer.html` only, and is
+  proven — not assumed — to never control the admin desk (`/index.html`)
+  even when visited in the same browser context right after.
+  Owner: Engineering  Result: **PASS**  Notes: `customer-pwa.spec.js`
+  "activates a service worker scoped to customer.html only" and "does not
+  let the customer-portal worker control the admin desk".
+
+- [x] Offline fallback page renders on a genuine network drop mid-session,
+  with a working retry; a real 4xx/5xx server response is never masked by
+  it (the service worker only catches an actual failed fetch).
+  Owner: Engineering  Result: **PASS**  Notes: `customer-pwa.spec.js`
+  "shows the cached offline page when the network drops mid-session"
+  (`context.setOffline(true)` + reload).
+
+- [x] iOS Safari "Add to Home Screen" bookmark/icon add works.
+  Owner: Product  Result: **PASS**  Notes: user-verified 2026-09-26,
+  against the plain page (before the manifest/SW/meta tags existed) —
+  confirms the baseline bookmark behavior, not standalone-mode launch.
+
+- [ ] iOS standalone-mode re-verification on a real device: with
+  `apple-mobile-web-app-capable=yes` now added, launching from the
+  home-screen icon should open full-screen with no Safari chrome, and the
+  status bar (`apple-mobile-web-app-status-bar-style: default`, chosen
+  specifically to avoid needing `env(safe-area-inset-top)` CSS) should not
+  overlap the header banner. Genuinely new behavior beyond the earlier
+  plain-page pass above — not yet re-checked.
+  Owner: Product  Result: _____  Notes: _________________
+
+- [ ] Real Android/Chrome manual install click-through (Add to Home
+  Screen / install prompt). The automated checks above prove the
+  installability criteria are met programmatically (manifest + active
+  worker with a fetch handler); they don't prove a human actually sees a
+  working install prompt on a real device.
+  Owner: Product  Result: _____  Notes: _________________
+
+- [x] Zero regression on the existing customer-portal journeys and visual
+  baselines after adding the new head tags/script.
+  Owner: Engineering  Result: **PASS**  Notes: `customer-portal.spec.js` +
+  `customer-master.spec.js` 34/34 unaffected specs still green on both
+  viewport projects; `visual-regression.spec.js`'s three customer-portal
+  screenshots (signin desktop/390, dashboard 390) unchanged.

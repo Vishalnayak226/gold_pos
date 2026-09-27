@@ -53,7 +53,7 @@ export default defineConfig({
             // customer portal journey is asserted at 390px too.
             name: 'mobile-chromium',
             use: { ...devices['Pixel 7'] },
-            testMatch: /customer-portal\.spec\.js/
+            testMatch: /customer-portal\.spec\.js|customer-pwa\.spec\.js/
         }
     ]
 });

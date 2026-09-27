@@ -27,6 +27,7 @@
     "benchmark:quick": "node benchmark.js --quick",
     "test:e2e": "playwright test",
     "seed": "node seed.js",
+    "icons:generate": "node generate-icons.js",
     "key:generate": "node rotateSecretKey.js --generate",
     "key:rotate": "node rotateSecretKey.js --generate-new",
     "key:rotate:dry-run": "node rotateSecretKey.js --generate-new --dry-run",

@@ -12,6 +12,44 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
+- **2026-09-27: installable PWA added for the customer portal (`customer.html`
+  only)** — manifest, service worker with an offline fallback, iOS home-screen
+  meta tags, and a hand-rolled stdlib-only PNG icon generator
+  (`backend/generate-icons.js`) — as a lighter-weight, store-independent
+  alternative to the Capacitor/Play Store track in `mobile/` for that one
+  page. `mobile/` and the Android/Play Store docs (`PROJECT_PLAN.md` §5.11,
+  `GO_LIVE_CHECKLIST.md` Track E) are deliberately untouched — this adds a
+  second option, it does not replace that track. Full design rationale
+  (service-worker scope pinned to `/customer.html`, `navigate`-only fetch
+  interception so it can't fight `server.js`'s `?v=ASSET_VERSION` caching or
+  mask a real API/money response, no `skipWaiting()`/`clients.claim()` so a
+  deploy can't hot-swap the worker mid-payment) is in `docs/LEDGER.md`'s
+  2026-09-27 entry. **Zero `backend/server.js` changes** — its existing
+  static-file serving already headers every new file safely.
+  **New `backend/tests/e2e/customer-pwa.spec.js`** (4 checks), wired into
+  both Playwright projects. **Verified:** `cd backend && npm test` (9
+  suites) green; `npx playwright test customer-pwa.spec.js
+  customer-portal.spec.js customer-master.spec.js` 38/38 green on both
+  viewport projects; the three customer-portal `visual-regression.spec.js`
+  screenshots re-run clean (no visual diff from the head-only tag changes).
+  **Found, not fixed — flag for the next session**: the real
+  `backend/data/` ledger currently **fails to boot** (`node
+  backend/server.js` / `Restart_Server.bat`) — `initialiseLedger()`'s
+  migration-safety check reports all 17 on-disk migration files no longer
+  match their recorded checksums. Not caused by this unit of work (no
+  migration file touched here) and not investigated further — it touches
+  protected real tenant data and looks like fallout from other concurrent
+  work already in progress on this branch (see the large pre-existing
+  modified-file list this branch already carries). Confirm before assuming
+  the dev server just works. **Uncommitted, on top of everything else
+  already listed below:** `backend/generate-icons.js` (new),
+  `backend/tests/e2e/customer-pwa.spec.js` (new), `frontend/manifest.json`
+  (new), `frontend/offline.html` (new), `frontend/service-worker.js` (new),
+  `frontend/js/pwaRegister.js` (new), `frontend/icons/*.png` (new),
+  `backend/package.json` (modified), `backend/playwright.config.js`
+  (modified), `frontend/customer.html` (modified),
+  `docs/{LEDGER,TESTING_CHECKLIST,ai_handover}.md` (modified).
+
 - **2026-09-11: fixed an indefinite hang in `test_http.js`'s "Gateway await gap" check before committing/deploying phase-21.** Root cause: the check signed its expected Razorpay HMAC with the stale module-level `initialSettings.razorpayKeySecret`; an earlier check in the same file rotates the store's live secret and never rotates it back, so the server correctly rejected the signature and returned before ever reaching the gateway call the check was waiting to observe — and `await gatewayReached` had no timeout, so it hung forever instead of failing. Confirmed for real, not theoretically: two independent `npm test` runs (one from an unrelated concurrent session, started ~19h earlier) were both found stuck at the exact same line. Fixed by tracking the live secret in a `currentRazorpayKeySecret` variable kept in sync by the rotation check, and by bounding `gatewayReached` with a 5s timeout that fails loudly instead of hanging. Full detail: `docs/LEDGER.md` 2026-09-11. **Verified:** `node test_http.js` alone and full `npm test` (all eleven suites) both green, exit code 0. No production code changed — `backend/server.js` only had temporary diagnostic logging added and removed during the investigation; `git diff` on it is unchanged from before this entry. This was found while preparing to commit and deploy the branch below to `main` — do not skip a real `npm test` run before that merge on the strength of this fix alone; it was one specific hang, not a general clean bill of health beyond what the suite covers.
 
 - **2026-09-07: benchmark now measures a seeded, authenticated workload.** `backend/benchmark.js` keeps its original empty-tenant health/static scenarios (unchanged, still run first), then signs in as the tenant owner, files a seeded merchant dataset via real `POST /api/sales` calls, and measures authenticated checkout (serial + 5-till concurrent)/lookup/paged-ledger against that populated tenant. `API_RATE_MAX` is raised for the spawned child so the harness's own volume doesn't trip the abuse throttle it isn't testing. `docs/TESTING_CHECKLIST.md` §24d's seeded-benchmark item is updated but left unchecked — target-hardware/VPS budgets and a return/void/mixed-concurrency workload are still open, see `docs/PERFORMANCE_BENCHMARK.md`. Full `npm test` green throughout. **Uncommitted on `phase-21-payment-verification-and-production-guard`**: everything listed in the domain-refusal entry immediately below, plus `backend/benchmark.js` and `docs/PERFORMANCE_BENCHMARK.md`.
