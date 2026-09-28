@@ -1,0 +1,4 @@
+# Migration checksums are sha256 of file content (backend/repositories/migrate.js).
+# Force LF here so a Windows checkout (core.autocrlf=true) can't rewrite these
+# bytes and look like an edited already-applied migration (2026-09-28).
+backend/repositories/migrations/*.sql text eol=lf

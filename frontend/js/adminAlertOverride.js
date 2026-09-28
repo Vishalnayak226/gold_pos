@@ -18,6 +18,15 @@ window.alert = function (message) {
     const iconBg = isSuccess ? '#dcfce7' : '#f1f5f9';
     const iconColor = isSuccess ? '#166534' : '#334155';
 
+    // §24b keyboard-path audit (2026-09-17): this box is the one hand-rolled
+    // dialog every admin-desk message funnels through, including the outcome
+    // of destructive actions (void, return, stock adjustment, ...). It used to
+    // leave focus wherever it was and ignore Escape, so a keyboard user could
+    // tab into controls hidden behind the overlay instead of reaching OK.
+    // Remember what had focus, move focus onto OK, keep Tab from leaving the
+    // dialog's one control, and restore focus to the trigger on close.
+    const previouslyFocused = document.activeElement;
+
     const overlay = document.createElement('div');
     overlay.id = 'custom-alert-box';
     overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(15,23,42,0.8);display:flex;align-items:center;justify-content:center;z-index:999999;backdrop-filter:blur(2px);';
@@ -34,11 +43,33 @@ window.alert = function (message) {
     text.textContent = message;
 
     const okBtn = document.createElement('button');
+    okBtn.type = 'button';
     okBtn.style.cssText = "background:#0f172a; color:#fff; border:none; padding:10px 25px; border-radius:6px; cursor:pointer; font-weight:600; width:100%; font-family:'Outfit',sans-serif;";
     okBtn.textContent = 'OK';
-    okBtn.addEventListener('click', () => overlay.remove());
+
+    const close = () => {
+        overlay.remove();
+        document.removeEventListener('keydown', onKeydown, true);
+        if (previouslyFocused && typeof previouslyFocused.focus === 'function' && document.contains(previouslyFocused)) {
+            previouslyFocused.focus();
+        }
+    };
+    const onKeydown = (event) => {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            close();
+        } else if (event.key === 'Tab') {
+            // Only one focusable control in this dialog — keep it there so
+            // Tab can never land on something hidden behind the overlay.
+            event.preventDefault();
+            okBtn.focus();
+        }
+    };
+    okBtn.addEventListener('click', close);
+    document.addEventListener('keydown', onKeydown, true);
 
     card.append(badge, text, okBtn);
     overlay.appendChild(card);
     document.body.appendChild(overlay);
+    okBtn.focus();
 };

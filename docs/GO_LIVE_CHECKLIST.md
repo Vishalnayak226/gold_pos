@@ -1,9 +1,15 @@
-# Go-Live Checklist — Everything Blocked On You
+# Go-Live Checklist — External Accounts and Evidence
 
-Every code-side item is done and verified (`docs/PROJECT_PLAN.md` §6). What
-remains needs *you personally* — signups need your identity and payment
-details, and an AI agent cannot complete KYC, hold a credit card, or own a
-Google/Razorpay account on your behalf.
+> **Start with [GO_LIVE_RUNBOOK.md](GO_LIVE_RUNBOOK.md).** It is the simple,
+> owner-readable sequence and its current go/no-go decision is authoritative.
+> This document is the detailed account, deployment, and evidence checklist
+> behind that sequence.
+
+Some automated code evidence is complete, but several implementation and
+real-world release gates remain open in `docs/TESTING_CHECKLIST.md` §§23–24.
+What follows also needs *you personally* — signups need your identity and
+payment details, and an AI agent cannot complete KYC, hold a credit card, or
+own a Google/Razorpay account on your behalf.
 
 **How to use this doc:** work top to bottom. Each task says **what** it is,
 **where** to do it, **how** (exact commands/clicks), what it costs, and what
@@ -52,21 +58,22 @@ server (Track F below). Architecture: `deploy/README.md` §8.
 >    server would run Phase 19 code: no production guard, no SQLite seam, no
 >    verified payments.
 >
-> - [ ] Merge the Phase 20–27 work into `main` (and fast-forward `develop`
->       and `staging` to match, so the pipeline branches aren't inverted).
-> - [ ] Confirm with: `git cat-file -e origin/main:deploy/provision-pipeline.sh`
+> - [x] Merge the Phase 20–27 work into `main` — **done 2026-09-01.** `main` is
+>       current through commit `b7b50b0` (`develop`/`staging` not re-synced —
+>       not needed for `--profile minimal`, which only touches `main`).
+> - [x] Confirm with: `git cat-file -e origin/main:deploy/provision-pipeline.sh` — confirmed.
 >
 > **A1–A4 and A6 do not depend on this** — buy the droplet, set DNS and
 > generate the SSH key in parallel while it's sorted out. Only A5 is blocked.
 
 ### A1 — Buy a domain
 
-- [ ] **Where:** any registrar — Namecheap, Cloudflare Registrar (cheapest,
+- [x] **Where:** any registrar — Namecheap, Cloudflare Registrar (cheapest,
       at-cost), GoDaddy, BigRock.
-- [ ] **What:** one domain, e.g. `luminapos.in`. It can be the same domain
+- [x] **What:** one domain, e.g. `luminapos.in`. It can be the same domain
       you later use for tenant subdomains, or a separate internal one.
 - **Cost:** ~₹800–1,200/yr for a `.com`.
-- **Hand back:** the domain name.
+- **Hand back:** the domain name. **Done — `luminapos.in`, registered at Hostinger, active, auto-renew on.**
 
 ### A2 — Buy the VPS
 
@@ -92,9 +99,12 @@ server (Track F below). Architecture: `deploy/README.md` §8.
   laptop at `localhost:5000`, and Sandbox exists to protect a *paying tenant*
   from a bad deploy — worth its RAM the day you have one, not before. Moving up
   later is one idempotent re-run with `--profile full` plus a resize.
-- [ ] Add your SSH key during creation (every provider offers this) so you
-      can log in without a password.
-- **Hand back:** the server's public IP.
+- [x] Add your SSH key during creation (every provider offers this) so you
+      can log in without a password. **The key wasn't actually attached at
+      creation time (unclear why) — worked around 2026-09-01 by adding the
+      public key through DigitalOcean's browser Console instead. Functionally
+      equivalent, just a manual extra step; no need to repeat it.**
+- **Hand back:** the server's public IP. **Done — see below.**
 
 **Done 2026-08-14.** DigitalOcean droplet, BLR1, Ubuntu, in its own `Gold POS`
 project (the `Custom ERP` droplet is deliberately left alone).
@@ -149,14 +159,16 @@ killer takes the install and provisioning dies halfway through.
 | A | `sandbox` | `<VPS IP>` | Sandbox/UAT POS | `full` only |
 | A | `license-dev` | `<VPS IP>` | Non-prod licensing server | `full` only |
 
-- [ ] Verify before moving on — each must return the VPS IP:
+- [x] Verify before moving on — each must return the VPS IP:
       ```bash
       # minimal:
       for h in app license; do echo -n "$h: "; dig +short $h.luminapos.in; done
       # full: for h in dev sandbox app license-dev license; do ... done
       ```
       DNS can take 5–30 minutes. Certbot in A5 fails on any record that
-      hasn't propagated, so don't rush this step.
+      hasn't propagated, so don't rush this step. **Confirmed 2026-09-01 —
+      both `app.luminapos.in` and `license.luminapos.in` resolved to
+      `139.59.37.153` before A5 was run.**
 
 ### A4 — Generate the CI deploy SSH key (on your own machine)
 
@@ -165,8 +177,8 @@ yourself so the private key lives with you permanently — an earlier session
 generated one in a temp directory and it has since been wiped, which is
 exactly why it now belongs on your machine, not mine.
 
-- [ ] **Where:** your Windows machine, PowerShell.
-- [ ] **How:**
+- [x] **Where:** your Windows machine, PowerShell.
+- [x] **How:**
       ```powershell
       ssh-keygen -t ed25519 -C "gold-pos-ci-deploy" -f "$env:USERPROFILE\.ssh\gold_pos_ci" -N '""'
       Get-Content "$env:USERPROFILE\.ssh\gold_pos_ci.pub"     # public  → goes on the VPS (A5)
@@ -174,6 +186,17 @@ exactly why it now belongs on your machine, not mine.
       ```
 - The `.pub` line is safe to share anywhere. The other one is **not** —
   never paste it into a file in this repo, only into the GitHub secret box.
+- **⚠️ PowerShell quoting bug, found and fixed 2026-09-01: `-N '""'` does NOT
+  produce an empty passphrase in PowerShell.** Single quotes preserve the two
+  literal `"` characters, so the key ends up encrypted with the 2-character
+  passphrase `""` instead of no passphrase — which then makes the key
+  silently unusable for unattended/CI use (`Permission denied (publickey)`
+  with no hint why, since the public half is still byte-for-byte correct).
+  Both `luminapos_admin` and `gold_pos_ci` had this. Fixed in place with
+  `ssh-keygen -p -P '""' -N "" -f <keyfile>` (no need to regenerate). If
+  generating a fresh CI key from PowerShell, verify immediately with
+  `ssh-keygen -y -P '""' -f <keyfile>` — if that prints the public key
+  instead of erroring, the passphrase bug is present and needs the same fix.
 
 ### A5 — Provision the server (one command)
 
@@ -189,40 +212,67 @@ them by hand is the single easiest thing to get wrong.
 > branch** from GitHub. The script — and the whole Phase 20–27 codebase — must
 > actually be on that branch first. See the note at the top of Track A.
 
-- [ ] **Where:** SSH'd into the VPS as root.
-- [ ] **How:**
+- [x] **Where:** SSH'd into the VPS as root. **Done 2026-09-01** — via
+      `luminapos_admin` key (see A4's passphrase-bug note; had to be fixed
+      before this worked) and DigitalOcean's browser Console for the initial
+      `authorized_keys` bootstrap (see A2's note).
+- [x] **How:** the script was `scp`'d directly to `/root/` and run from
+      there instead of bootstrapping via `git clone` (equivalent — the
+      script clones the real per-environment checkouts itself regardless of
+      how it got onto the box):
       ```bash
-      ssh root@<VPS-IP>
-      apt-get update && apt-get install -y git
-      git clone https://github.com/Vishalnayak226/gold_pos.git /tmp/gold-pos-bootstrap
-      cd /tmp/gold-pos-bootstrap
-      chmod +x deploy/provision-pipeline.sh
-      ./deploy/provision-pipeline.sh \
-          --profile minimal \
-          --domain luminapos.in \
-          --email your-real-email@example.com \
+      scp deploy/provision-pipeline.sh root@139.59.37.153:/root/
+      ssh root@139.59.37.153
+      chmod +x /root/provision-pipeline.sh
+      /root/provision-pipeline.sh --profile minimal --domain luminapos.in \
+          --email vishalnayak0893@gmail.com \
           --ssh-pubkey "ssh-ed25519 AAAA...   gold-pos-ci-deploy"
       ```
+      **Windows/Git Bash gotcha:** a heredoc or `scp`'d shell script can pick
+      up CRLF line endings, which breaks the `#!/usr/bin/env bash` shebang
+      (`env: 'bash\r': No such file or directory`). Fix: `sed -i 's/\r$//'`
+      the script on the remote box before running it.
       (`--profile minimal` is the default; pass `--profile full` for all 5
       processes. Re-running with `full` later adds the missing three without
       disturbing the running two.)
-      (`--email` is for Let's Encrypt expiry notices. Add `--skip-tls` if
-      DNS isn't ready yet and run certbot later.)
-- [ ] **If the repo is private**, the clone fails and the script tells you
+      (`--email` is for Let's Encrypt expiry notices.)
+- [x] **If the repo is private**, the clone fails and the script tells you
       exactly what to do: generate a read-only key on the VPS, add it under
       GitHub → repo → Settings → **Deploy keys**, then re-run with
-      `--repo git@github.com:Vishalnayak226/gold_pos.git`.
+      `--repo git@github.com:Vishalnayak226/gold_pos.git`. **Not needed — the
+      repo cloned anonymously without issue.**
 - **What "done" looks like:** the script prints a health-check table with
-  five green `ok` lines, then a summary block.
-- [ ] **Copy the two `ADMIN_SECRET` values** it prints into your password
-      manager. They are the admin tokens for the non-prod and production
-      licensing dashboards, generated fresh per server, and stored nowhere
-      else. Losing the live one means editing `.env` on the server to reset it.
+  five green `ok` lines, then a summary block. **On `--profile minimal` you
+  only get 2 rows, and both showed FAIL on the first run — see below, this
+  turned out to be correct/expected for one and a real bug for the other.**
+- [x] **Copy the ADMIN_SECRET value(s)** it prints into your password
+      manager. `--profile minimal` only provisions one licensing server
+      (`live-licensing`), so there's one value, not two:
+      `687a4f953f85cb4155205dc832176c33d6e23ce379f333e6` — **record this
+      somewhere durable, it is not stored anywhere else.**
 - Re-running the script later is safe — it never overwrites an existing
   `.env` or an existing certificate.
+- **Both health checks FAILED on the first run — one expected, one a real bug, both resolved:**
+  - `live-backend` (**expected, by design**): `productionGuard.js` refuses to
+    bind without real Razorpay credentials, a webhook secret, a changed admin
+    PIN, and a real rate provider. That's A8 below, not this step.
+  - `live-licensing` (**a real, previously unexercised bug — fixed
+    2026-09-01**): PM2's `cwd` (the checkout root, `deploy/ecosystem.base.cjs`)
+    didn't match where this script writes `.env` (the module subdirectory),
+    so `dotenv/config`'s default `process.cwd()` lookup silently found
+    nothing on either app. `licensing-live` kept running the placeholder
+    `ADMIN_SECRET` as a result — and correctly refused to start, since that's
+    exactly what security-audit finding C2 exists to catch. Fixed at the one
+    shared choke point, `deploy/ecosystem.base.cjs`, via `DOTENV_CONFIG_PATH`;
+    full detail in `docs/SECURITY_AUDIT.md` L2 and `docs/LEDGER.md`. If you
+    provisioned before this fix landed, `git pull` the checkout and
+    `pm2 startOrRestart <ecosystem-file> --update-env` for each app.
 
 ### A6 — Wire up GitHub
 
+- [x] **Done 2026-09-01, via `gh` CLI** (repo is public, `gh` was already
+      authenticated as the repo owner) rather than the manual UI steps below —
+      left here as reference/for future re-verification.
 - [ ] **Where:** github.com/Vishalnayak226/gold_pos → **Settings** →
       *Secrets and variables* → **Actions**.
 
@@ -233,9 +283,11 @@ them by hand is the single easiest thing to get wrong.
 | Secret | `VPS_SSH_KEY` | **entire** contents of the private key file from A4, including the `-----BEGIN/END OPENSSH PRIVATE KEY-----` lines |
 | Variable *(Variables tab, not Secrets)* | `PIPELINE_DOMAIN` | `luminapos.in` — bare domain, no `https://`, no subdomain |
 
-- [ ] **Where:** same Settings page → **Environments** → New environment.
+- [x] **Where:** same Settings page → **Environments** → New environment.
       Exact lowercase names — the workflows reference them by name and fail if
-      missing. **On `minimal` you only need `production`:**
+      missing. **On `minimal` you only need `production`:** **done 2026-09-01
+      — `production` environment exists with `Vishalnayak226` as the sole
+      required reviewer, confirmed via the API response.**
 
 | Environment | Profile | Protection |
 |---|---|---|
@@ -250,6 +302,11 @@ them by hand is the single easiest thing to get wrong.
 
 ### A7 — Prove it works end to end
 
+- [ ] **Optional pre-flight, before you have a VPS at all:**
+      `./deploy/verify-nginx-proxy.sh` proves `deploy/nginx.conf.template`'s
+      proxy directives correctly forward to a loopback-bound app (Docker
+      required). It cannot prove DNS/TLS/firewall — only the steps below can.
+
 **On `--profile minimal`:**
 
 - [ ] Push any trivial change to `main` → the run should **pause** on
@@ -259,6 +316,16 @@ them by hand is the single easiest thing to get wrong.
 - [ ] After approving, `https://license.luminapos.in/api/health` returns
       `{"status":"ok",...}`. The POS at `https://app.luminapos.in` is the one
       that will still refuse to boot — that's A8 below, and it's expected.
+      **The infra-reachability half of this is already proven (2026-09-01,
+      manually, ahead of A6/CI being wired up)**: `curl https://license.luminapos.in/api/health`
+      from outside the VPS returned `{"status":"ok","version":"1.0.0","env":"live"}`
+      for real — real DNS, real Let's Encrypt cert, real Nginx, real `ufw`.
+      `curl https://app.luminapos.in/api/health` correctly returned a clean
+      `502` (Nginx's own page — no stack trace), matching the expected
+      not-yet-configured state. This closes `docs/SECURITY_AUDIT.md` L2.
+      **Still to do for this checkbox specifically**: the CI-driven version —
+      push to `main`, watch `cd-live.yml` pause for approval — which needs A6
+      wired up first.
 
 **Additionally, on `--profile full`:**
 
@@ -373,29 +440,134 @@ that's a genuine one-line change I'll make on the spot.
 
 # Track E — Play Store (Android app)
 
-**What for:** publishing the Capacitor wrapper around `customer.html`
-(`mobile/`). This is the one track that needs a different machine as well as
-your accounts.
+**Status on 2026-09-06: NOT published.** `mobile/` is only a Capacitor
+scaffold around `customer.html`; there is no generated Android project, signed
+Android App Bundle (AAB), Play Console listing, test track or approved release.
 
-1. [ ] **Account:** play.google.com/console — **$25 one-time** registration,
-       needs a Google account + ID verification.
-2. [ ] **Branding assets** to prepare or commission:
-   - App icon, 512×512 PNG
-   - Feature graphic, 1024×500 PNG
-   - At least 2 phone screenshots
-   - **A privacy policy at a URL you control** — mandatory; the listing is
-     rejected without one. This app handles phone-number login and payments.
-     Easiest host: a `privacy.html` page on the domain from A1.
-3. [ ] **Build machine:** Android Studio + JDK 17 (not available in this
-       sandbox). Then follow `mobile/README.md`: `npm install`, set the real
-       domain in `capacitor.config.json`, `npx cap add android`,
-       `npx cap sync android`, `npx cap open android`, then
-       Build → Generate Signed Bundle/AAB.
-4. [ ] Create the listing in Play Console, upload the AAB, fill in the
-       assets, submit. First review is typically 1–3 days.
+**What this is—and is not:** this is a **customer portal** app, not the
+cashier POS. The cashier POS works in a browser and does not need a Play Store
+launch. Build this track only if customers should install an Android app.
 
-**Hand back:** nothing I can act on remotely. I can write the privacy-policy
-page for you, and I'll fix any `customer.html` issue the review flags.
+**Stop rule:** do not publish to Production until the real-money, privacy,
+security and customer-support gates in `TESTING_CHECKLIST.md` §23 are complete.
+An app-store listing cannot make an unready payment or legal workflow safe.
+
+### E1. Decide the release scope
+
+- [ ] Confirm that the first app is the single-shop **Lumina POS Customer
+      Portal**, not a cashier app and not a multi-shop marketplace.
+  Why: the current wrapper points to one portal URL. One public app serving
+  many independent shops requires a separate tenant-selection design.
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+- [ ] Keep the permanent package ID `in.luminapos.customer` only if no
+      previous public listing exists and this is the intended permanent brand.
+  Why: Google package names cannot be reused after publication. Do not change
+  it casually after the first upload.
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+### E2. Create and protect the Play Console account
+
+- [ ] Register at [Google Play Console](https://play.google.com/console) and
+      complete identity verification. Use an **Organization** account for this
+      commercial product; gather the legal business name, address, website,
+      contact person and D-U-N-S number if Google asks for one. Turn on two-step
+      verification and give each developer their own access—never share the
+      owner password.
+  Why: Google verifies developer identity and the account owner is responsible
+  for customer data. See [Google's account-type guidance](https://support.google.com/googleplay/android-developer/answer/13634885?hl=en).
+  Result: _____  Owner: Business owner  Notes: _________________________
+
+### E3. Complete privacy and customer-rights work before building the listing
+
+- [ ] Publish a permanent public **Privacy Policy** webpage on the real HTTPS
+      domain—not a PDF or a draft document. It must name the business/developer,
+      explain collected data (phone, account, payment and device data), why it
+      is used, who receives it, retention, security, deletion and a contact
+      method. Link to it inside the customer portal as well as in Play Console.
+  Result: _____  Owner: Privacy counsel + product owner  Notes: ________
+
+- [ ] Give customers a clear account-deletion request path and test that it
+      deletes/anonymises the associated personal data according to the approved
+      retention policy. Do not merely hide or lock an account.
+  Result: _____  Owner: Developer + privacy counsel  Notes: ___________
+
+- [ ] Complete the Play Console **Data safety** form truthfully after reviewing
+      the portal, backend and every SDK. Declare how data is collected, used,
+      shared and protected; ensure it exactly matches the Privacy Policy.
+  Why: Google requires a privacy policy and Data safety declaration for apps,
+  including customer-account apps. [Google Play user-data policy](https://support.google.com/googleplay/android-developer/answer/10144311)
+  Result: _____  Owner: Product owner + privacy counsel  Notes: _______
+
+### E4. Prepare honest store-listing material
+
+- [ ] Create the app icon (512×512 PNG), feature graphic (1024×500 PNG), at
+      least two real-device phone screenshots, short description, full
+      description, support email and support/privacy URLs. Do not use mock
+      balances, unsupported claims or another shop's branding.
+  Result: _____  Owner: Product/brand owner  Notes: ____________________
+
+- [ ] Prepare a Google reviewer test account/phone number, safe test payment
+      method and exact review instructions. The reviewer must be able to reach
+      the live HTTPS portal without needing to contact the shop first.
+  Result: _____  Owner: Developer + product owner  Notes: _____________
+
+### E5. Build a signed Android App Bundle on a suitable machine
+
+- [ ] On a separate trusted computer, install Android Studio, Android SDK and
+      JDK 17. This workspace cannot build the app because those tools are not
+      installed here.
+  Result: _____  Owner: Android release engineer  Notes: ______________
+
+- [ ] In `mobile/`, run the following. Confirm `server.url` is the intended
+      public HTTPS customer-portal URL before generating Android files:
+
+  ```powershell
+  cd mobile
+  npm install
+  npx cap add android
+  npx cap sync android
+  npx cap open android
+  ```
+
+  In Android Studio, create and securely back up the release signing key, then
+  use **Build → Generate Signed Bundle / APK → Android App Bundle** to create
+  the `.aab` file. Do not upload an unsigned APK.
+  Result: _____  Owner: Android release engineer  Notes: ______________
+
+### E6. Test before asking Google to review it
+
+- [ ] Install the signed build on at least two real Android phones. Test login,
+      logout, password reset, payment success/failure, weak/slow/no network,
+      privacy-policy link, account deletion, rotation and different screen
+      sizes. Record each phone model and Android version.
+  Result: _____  Owner: QA + product owner  Notes: ____________________
+
+- [ ] Upload the AAB first to Play Console's **closed testing** track. Invite
+      real testers, collect defects, and fix/retest any blocking issue before
+      production. New personal developer accounts can have extra testing
+      requirements; check the current Console dashboard rather than guessing.
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+### E7. Create the listing and release to Production
+
+- [ ] In Play Console: Create app → set it as an app (not game), select
+      free/paid, add contact email, accept the declarations and Play App
+      Signing, upload the AAB, complete App content/Data safety/privacy/support
+      details, provide reviewer access, then submit the Production release.
+  Why: Google Play distributes signed Android App Bundles and reviews the
+  listing, app content and supplied access. [Official setup guide](https://support.google.com/googleplay/android-developer/answer/9859152?hl=en)
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+- [ ] After approval, install the Play Store version from a clean phone and
+      repeat login, payment, privacy and account-deletion checks. Save the
+      listing URL, release version, approval date and screenshots in the launch
+      evidence folder.
+  Result: _____  Owner: QA + product owner  Notes: ____________________
+
+**Hand back:** Play Console account status, closed-test feedback, the signed
+AAB's version number, and any Google review rejection text. Never send a
+password, signing key or payment secret in chat.
 
 ---
 
@@ -426,4 +598,4 @@ pasting output back and forth, when you get there.
 | A5 | Confirmation the 5 health checks went green | Proceeding to A6 |
 | A7 | Any red CI job's log | Me fixing it |
 | D | Price + billing cycle *(only if you want it as a dashboard default)* | One-line change |
-| — | Nothing at all for B, C, E | Those are self-serve UIs |
+| E | Play Console status, AAB version, tester feedback or review rejection | Play Store release support |

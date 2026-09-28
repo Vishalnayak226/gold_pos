@@ -14,7 +14,7 @@ import { raiseAlert } from './alerting.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LICENSE_FILE = path.join(DATA_DIR, 'license.json');
-const PUBLIC_KEY_FILE = path.join(process.cwd(), 'keys', 'license_public.pem');
+const PUBLIC_KEY_FILE = path.join(__dirname, 'keys', 'license_public.pem');
 
 // central licensing server URL (configured locally or via env). Port 6000 is
 // deliberately avoided as the default — it's on the WHATWG Fetch spec's

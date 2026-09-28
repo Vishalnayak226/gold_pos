@@ -111,11 +111,21 @@ export function getActiveGoldRates() {
     const rates = readJSON(RATES_FILE, defaultRates);
     const override = settings.overrideGoldPrice || {};
 
-    const active24K = (parseFloat(override.price24K) > 0) ? parseFloat(override.price24K) : rates.price24K;
-    const active22K = (parseFloat(override.price22K) > 0) ? parseFloat(override.price22K) : rates.price22K;
-    const active18K = (parseFloat(override.price18K) > 0) ? parseFloat(override.price18K) : rates.price18K;
+    // `active` gates the whole override, not just a stored price being > 0 —
+    // it did not until 2026-09-19 (TESTING_CHECKLIST.md Module 6), which meant
+    // unchecking "Enable manual overrides" and saving never actually turned it
+    // off: the checkbox was cosmetic, and every price/service that reads
+    // gold rates through this function (sales, returns, advances, old-gold
+    // exchange, payment credit, gold schemes) kept silently pricing off the
+    // stale manual figures forever, with no way back to auto short of also
+    // zeroing all three override price fields by hand.
+    const overrideOn = Boolean(override.active);
 
-    const hasOverride = (override.price24K > 0 || override.price22K > 0 || override.price18K > 0);
+    const active24K = (overrideOn && parseFloat(override.price24K) > 0) ? parseFloat(override.price24K) : rates.price24K;
+    const active22K = (overrideOn && parseFloat(override.price22K) > 0) ? parseFloat(override.price22K) : rates.price22K;
+    const active18K = (overrideOn && parseFloat(override.price18K) > 0) ? parseFloat(override.price18K) : rates.price18K;
+
+    const hasOverride = overrideOn && (override.price24K > 0 || override.price22K > 0 || override.price18K > 0);
 
     return {
         source: hasOverride ? 'manual' : 'auto',
@@ -129,9 +139,9 @@ export function getActiveGoldRates() {
             price18K: rates.price18K
         },
         sources: {
-            price24K: (override.price24K > 0) ? 'manual' : 'auto',
-            price22K: (override.price22K > 0) ? 'manual' : 'auto',
-            price18K: (override.price18K > 0) ? 'manual' : 'auto'
+            price24K: (overrideOn && override.price24K > 0) ? 'manual' : 'auto',
+            price22K: (overrideOn && override.price22K > 0) ? 'manual' : 'auto',
+            price18K: (overrideOn && override.price18K > 0) ? 'manual' : 'auto'
         }
     };
 }

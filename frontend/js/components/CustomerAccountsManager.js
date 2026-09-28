@@ -38,6 +38,7 @@ export class CustomerAccountsManager {
         this.lastIssued = null;
         this.editingCustomerId = null;
         this.duplicateGroups = null;
+        this.loadError = null;
         this.render();
     }
 
@@ -289,13 +290,30 @@ export class CustomerAccountsManager {
     }
 
     async refresh() {
+        this.loadError = null;
         try {
             const res = await adminFetch('/api/customer-accounts');
-            this.accounts = res.ok ? await res.json() : [];
+            if (!res.ok) {
+                // GET /api/customer-accounts is owner/manager-only, but this
+                // tab's nav button carries no role-gating — a cashier reaches
+                // this screen fine and, before this fix, saw an apparently
+                // real "No customer on record yet" empty state (any non-ok
+                // response silently became []), indistinguishable from a
+                // genuinely new install. Name the actual reason instead.
+                this.accounts = [];
+                this.loadError = res.status === 403
+                    ? 'You do not have permission to view the customer master. Ask an owner or manager.'
+                    : 'Customer records could not be loaded. Check the server is reachable and try Refresh.';
+                this.renderTable();
+                return;
+            }
+            this.accounts = await res.json();
             this.renderTable();
             logTelemetry(`Customer logins refreshed (${this.accounts.length}).`);
         } catch (err) {
             console.error('Failed to load customer logins:', err);
+            this.accounts = [];
+            this.loadError = 'Customer records could not be loaded. Check the server is reachable and try Refresh.';
             this.renderTable();
         }
     }
@@ -331,10 +349,13 @@ export class CustomerAccountsManager {
         }
 
         if (rows.length === 0) {
-            const message = this.accounts.length === 0
-                ? 'No customer on record yet. Use “Issue Login” or file a sale to create the first one.'
-                : 'No customer matches that search.';
-            tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:30px; color:var(--color-text-light); font-style:italic;">${message}</td></tr>`;
+            const message = this.loadError
+                ? this.loadError
+                : (this.accounts.length === 0
+                    ? 'No customer on record yet. Use “Issue Login” or file a sale to create the first one.'
+                    : 'No customer matches that search.');
+            const color = this.loadError ? 'var(--color-danger)' : 'var(--color-text-light)';
+            tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:30px; color:${color}; font-style:italic;">${message}</td></tr>`;
             return;
         }
 

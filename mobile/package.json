@@ -6,13 +6,15 @@
   "scripts": {
     "sync": "cap sync android",
     "open:android": "cap open android",
-    "add:android": "cap add android"
+    "add:android": "cap add android",
+    "audit:security": "npm audit --audit-level=moderate",
+    "sbom:dependencies": "npm ls --all --json"
   },
   "dependencies": {
-    "@capacitor/core": "^6.0.0"
+    "@capacitor/core": "^7.0.0"
   },
   "devDependencies": {
-    "@capacitor/android": "^6.0.0",
-    "@capacitor/cli": "^6.0.0"
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/cli": "^7.0.0"
   }
 }

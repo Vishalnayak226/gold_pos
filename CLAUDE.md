@@ -71,7 +71,7 @@ not every turn. This file is auto-loaded on every request, so it stays tight.
     when no single value exists. Do not "fix" them to line 1's value.
 - Frontend posture: **vanilla JS/CSS/HTML in `frontend/`, served statically off disk by `backend/server.js`. No framework.**
 - Build step: **none.** `frontend/package.json` exists only to mark `js/lib/` as ESM so Node tests can import it — it is never installed and never bundled.
-- Dependency budget: **the 7 runtime deps in `backend/package.json` (cors, dotenv, express, helmet, node-cron, nodemailer, qrcode) + the 3 in `licensing_server/`. That is the whole budget.** Adding another is a deliberate, announced decision.
+- Dependency budget: **the 7 runtime deps in `backend/package.json` (cors, dotenv, express, helmet, node-cron, nodemailer, qrcode) + the 2 in `licensing_server/` (dotenv, express). That is the whole budget.** Adding another is a deliberate, announced decision — see `docs/DEPENDENCY_REVIEW.md` for the required lifecycle/licence/vulnerability/exit review and the current entry for every dependency already in the budget.
   - **One devDependency**, `@playwright/test`, is exempt from that budget because it ships nowhere: it is not imported by any runtime file, not in the release bundle, and not needed by `npm test`. That exemption covers exactly this one package — a *runtime* dependency is still a permanent liability and still needs the argument.
 
 Three separately-run Node processes, not one app: `backend/` (POS, :5000), `licensing_server/`

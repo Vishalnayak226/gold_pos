@@ -35,7 +35,13 @@ export class SettingsManager {
     constructor() {
         this.settings = {};
         this.activeSection = 'profile';
-        this.currentLogoBase64 = null;
+        // undefined = untouched this session (defer to the saved settings);
+        // '' = explicitly cleared; a data URL = a freshly chosen file. `null`
+        // could not hold this distinction on its own — it was the untouched
+        // sentinel AND what Clear Logo used to set, so a clear-then-save could
+        // never tell "nothing changed" from "remove it" apart and silently
+        // kept the old logo (found via TESTING_CHECKLIST.md Module 5, 2026-09-18).
+        this.currentLogoBase64 = undefined;
         this.render();
     }
 
@@ -95,6 +101,10 @@ export class SettingsManager {
     // ---------------------------------------------------------------- Profile
     renderProfileSection() {
         const s = this.settings;
+        // See the constructor's note on currentLogoBase64: undefined defers
+        // to the saved logo, '' means explicitly cleared, anything else is a
+        // freshly chosen file — `||` alone could not tell '' apart from unset.
+        const effectiveLogo = this.currentLogoBase64 !== undefined ? this.currentLogoBase64 : (s.companyLogo || '');
         return `
             <h3 class="settings-section-title">Store Profile</h3>
             <div class="form-group-row">
@@ -137,8 +147,8 @@ export class SettingsManager {
                     <button type="button" id="clear-logo-btn" class="btn btn-danger">Clear Logo</button>
                 </div>
                 <div style="border:1px dashed var(--color-border-dark); padding:10px; border-radius:4px; background:var(--color-bg-base); min-width:150px; min-height:80px; display:flex; align-items:center; justify-content:center;">
-                    <img id="logo-preview" src="${this.currentLogoBase64 || s.companyLogo || ''}" alt="No Logo Selected" style="max-width:150px; max-height:80px; display:${(this.currentLogoBase64 || s.companyLogo) ? 'block' : 'none'};">
-                    <span id="logo-preview-placeholder" style="font-size:12px; color:var(--color-text-light); display:${(this.currentLogoBase64 || s.companyLogo) ? 'none' : 'block'};">No Logo</span>
+                    <img id="logo-preview" src="${effectiveLogo}" alt="No Logo Selected" style="max-width:150px; max-height:80px; display:${effectiveLogo ? 'block' : 'none'};">
+                    <span id="logo-preview-placeholder" style="font-size:12px; color:var(--color-text-light); display:${effectiveLogo ? 'none' : 'block'};">No Logo</span>
                 </div>
             </div>
 
@@ -169,7 +179,7 @@ export class SettingsManager {
         }
         if (clearLogoBtn) {
             clearLogoBtn.addEventListener('click', () => {
-                this.currentLogoBase64 = null;
+                this.currentLogoBase64 = '';
                 if (logoUpload) logoUpload.value = '';
                 logoPreview.src = '';
                 logoPreview.style.display = 'none';
@@ -184,7 +194,7 @@ export class SettingsManager {
                 address: document.getElementById('set-address').value,
                 gstNumber: document.getElementById('set-gst').value,
                 currency: document.getElementById('set-currency').value,
-                companyLogo: this.currentLogoBase64 !== null ? this.currentLogoBase64 : (this.settings.companyLogo || null)
+                companyLogo: this.currentLogoBase64 !== undefined ? this.currentLogoBase64 : (this.settings.companyLogo || null)
             };
             await this.saveSettings(payload, 'Store profile saved!');
         });
@@ -427,6 +437,21 @@ export class SettingsManager {
                            value="${Number(s.goldSchemeEarlyClosurePenaltyPercent) || 0}" step="0.5" min="0" max="100">
                 </div>
             </div>
+            <h3 class="settings-section-title" style="margin-top:30px;">Management Reports</h3>
+            <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
+                Off by default. Settlement, Reconciliation, Gross Profitability and Inventory Ageing
+                are operational views built on this ledger, not statutory books — turn them on once
+                you and your accountant have accepted their definitions (shown on every report).
+            </p>
+            <div class="form-group-row">
+                <div class="form-group">
+                    <label for="set-reports-enabled">Enable Management Reports</label>
+                    <select id="set-reports-enabled" class="form-control">
+                        <option value="false"${s.managementReportsEnabled ? '' : ' selected'}>No</option>
+                        <option value="true"${s.managementReportsEnabled ? ' selected' : ''}>Yes</option>
+                    </select>
+                </div>
+            </div>
             <button type="button" id="save-billing-btn" class="btn btn-primary">Save Billing Settings</button>
         `;
     }
@@ -469,7 +494,8 @@ export class SettingsManager {
                 goldSchemeInstallmentCount: parseInt(document.getElementById('set-scheme-installments').value, 10) || 11,
                 goldSchemeBonusInstallments: parseInt(document.getElementById('set-scheme-bonus').value, 10) || 0,
                 goldSchemeDefaultGraceDays: parseInt(document.getElementById('set-scheme-grace').value, 10) || 30,
-                goldSchemeEarlyClosurePenaltyPercent: parseFloat(document.getElementById('set-scheme-penalty').value) || 0
+                goldSchemeEarlyClosurePenaltyPercent: parseFloat(document.getElementById('set-scheme-penalty').value) || 0,
+                managementReportsEnabled: document.getElementById('set-reports-enabled').value === 'true'
             };
 
             if (requestedSeq < currentSeq) {
@@ -483,7 +509,20 @@ export class SettingsManager {
                 payload.confirmDestructive = true;
             }
 
-            await this.saveSettings(payload, 'Billing settings saved!');
+            await this.saveSettings(payload, 'Billing settings saved!', async () => {
+                // Feature-gated modules must become reachable immediately
+                // after their owner enables them; requiring a browser reload
+                // would make a successful Settings save look ineffective. This
+                // same payload also carries goldSchemeEnabled (line above),
+                // which needs the identical refresh — missing here until now.
+                if (window.reportsDesk) await window.reportsDesk.refresh();
+                if (window.schemeDesk) await window.schemeDesk.refresh();
+                // This payload is also where tax slab, tax mode, the default
+                // discount and wastage/old-gold settings live — Billing Desk
+                // caches all of them at login (app.js) and otherwise would not
+                // see a change until a reload.
+                if (window.billingDesk) await window.billingDesk.fetchSettings();
+            });
         });
     }
 
@@ -748,12 +787,12 @@ export class SettingsManager {
                 if (block) {
                     block.innerHTML = `
                         <table style="font-size:13px; border-collapse:collapse;">
-                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">License Key</td><td><strong>${license.licenseKey || '—'}</strong></td></tr>
-                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Status</td><td><strong>${data.isValid ? 'Valid ✓' : 'Invalid / Expired ✗'}</strong> (${license.status || 'unknown'})</td></tr>
+                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">License Key</td><td><strong>${escapeHtmlAttr(license.licenseKey || '—')}</strong></td></tr>
+                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Status</td><td><strong>${data.isValid ? 'Valid ✓' : 'Invalid / Expired ✗'}</strong> (${escapeHtmlAttr(license.status || 'unknown')})</td></tr>
                             <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Expiry Date</td><td>${license.expiryDate ? new Date(license.expiryDate).toLocaleDateString() : '—'}</td></tr>
                             <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Last Handshake</td><td>${license.lastHandshakeTime ? new Date(license.lastHandshakeTime).toLocaleString() : 'Never'}</td></tr>
-                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Software Version</td><td>${license.currentVersion || '—'}${license.updateAvailable ? ` <span style="color:var(--color-warning); font-weight:600;">(v${license.latestVersion} available)</span>` : ''}</td></tr>
-                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Billing Cycle</td><td>${license.billingCycle || '—'}</td></tr>
+                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Software Version</td><td>${escapeHtmlAttr(license.currentVersion || '—')}${license.updateAvailable ? ` <span style="color:var(--color-warning); font-weight:600;">(v${escapeHtmlAttr(license.latestVersion)} available)</span>` : ''}</td></tr>
+                            <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Billing Cycle</td><td>${escapeHtmlAttr(license.billingCycle || '—')}</td></tr>
                             <tr><td style="padding:4px 12px 4px 0; color:var(--color-text-muted);">Next Due Date</td><td>${license.nextDueDate ? new Date(license.nextDueDate).toLocaleDateString() : '—'}</td></tr>
                         </table>
                     `;
@@ -886,6 +925,7 @@ export class SettingsManager {
        existing person means "leave theirs alone" rather than "clear it". */
 
     renderStaffSection() {
+        const s = this.settings;
         // The draft survives a re-render (adding a row repaints the table), but
         // is rebuilt from the server's copy whenever the section is opened fresh.
         if (!this.staffDraft) this.staffDraft = this.cloneRoster();
@@ -960,8 +1000,8 @@ export class SettingsManager {
 
             <h3 class="settings-section-title" style="margin-top:30px;">Controls on releasing money</h3>
             <p style="font-size:13px; color:var(--color-text-muted); max-width:80ch; margin-bottom:16px;">
-                Two limits on the actions that move money out of the store. Both are off by default,
-                so nothing changes until you set them.
+                Limits on the actions that move money out of the store, or give it away. All are off
+                by default, so nothing changes until you set them.
             </p>
             <div class="form-group-row">
                 <div class="form-group">
@@ -972,6 +1012,16 @@ export class SettingsManager {
                         A refund at or above this amount is refused for a Cashier. <strong>0 means no
                         limit</strong> — any signed-in person can refund any amount, which is how the
                         till has always worked.
+                    </span>
+                </div>
+                <div class="form-group">
+                    <label for="set-discount-threshold">Discount needing an Owner/Manager (%)</label>
+                    <input type="number" id="set-discount-threshold" class="form-control" min="0" max="100" step="5"
+                           value="${Number(s.discountApprovalThreshold) || 0}">
+                    <span class="text-muted-small">
+                        A sale with a line or invoice discount at or above this percent is refused for a
+                        Cashier, and always logged as an alert. <strong>0 means no limit</strong> — any
+                        signed-in person can apply any discount, which is how the till has always worked.
                     </span>
                 </div>
                 <div class="form-group">
@@ -1081,6 +1131,11 @@ export class SettingsManager {
                 alert('The refund limit must be zero or a positive amount.');
                 return;
             }
+            const discountThreshold = Number(document.getElementById('set-discount-threshold').value);
+            if (!Number.isFinite(discountThreshold) || discountThreshold < 0 || discountThreshold > 100) {
+                alert('The discount limit must be between 0 and 100.');
+                return;
+            }
             const requireMfa = document.getElementById('set-require-mfa').value === 'true';
             // A store that turns this on with nobody enrolled locks itself out of
             // its own approvals, so it is caught here rather than at the counter.
@@ -1096,7 +1151,11 @@ export class SettingsManager {
                 return;
             }
             this.saveSettings(
-                { refundApprovalThreshold: threshold, requireMfaForApprovers: requireMfa },
+                {
+                    refundApprovalThreshold: threshold,
+                    discountApprovalThreshold: discountThreshold,
+                    requireMfaForApprovers: requireMfa
+                },
                 'Money controls saved.'
             );
         });

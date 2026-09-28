@@ -38,6 +38,12 @@ may read it).
 12. [Offboarding a tenant](#12-offboarding-a-tenant)
 13. [Incident response — DRAFT, pending Indian counsel review](#13-incident-response--draft-pending-indian-counsel-review)
 
+**Mobile**
+14. [Android build and device test](#14-android-build-and-device-test)
+
+**Operations**
+15. [Alert drill](#15-alert-drill)
+
 ---
 
 ## 1. Rotating the secret-vault key
@@ -491,6 +497,113 @@ Once contained:
    so the historical record distinguishes a rehearsal from the real thing.
 5. Feed anything this runbook did not anticipate back into it. A runbook that is never updated
    after the incident it was written for is decoration.
+
+---
+
+## 14. Android build and device test
+
+`mobile/` is a thin Capacitor wrapper around the live `customer.html` portal (see
+`mobile/README.md`) — it has no logic of its own, and no `android/` project is checked in (it is
+generated, not committed). Nothing in this section can run in this repository's own CI runners:
+GitHub-hosted `ubuntu-latest` has no Android SDK/emulator, and this project deliberately has not
+added a self-hosted Android runner (dependency/infra budget, CLAUDE.md §0). What CI *can* and does
+check on every push — `npm ci`, `npm audit`, SBOM generation for `mobile/`'s own dependency tree —
+is wired into `.github/workflows/daily-checks.yml`'s `dependency-audit`/`sbom` jobs (added
+2026-09-19, alongside `mobile/package-lock.json`). Everything below needs a real machine with
+Android Studio, the Android SDK, and a JDK 17.
+
+**Before starting:** confirm which domain this build should point at (`capacitor.config.json`'s
+`server.url` — see `mobile/README.md`'s frozen-`appId` warning before touching that file) and
+that the platform-owner branding assets referenced in `mobile/README.md`'s "Play Store submission"
+section are in hand if this build is headed anywhere near a store listing.
+
+1. **Reproducible install.** `cd mobile && npm ci` — not `npm install`; `npm ci` fails loudly if
+   `package-lock.json` and `package.json` have drifted, which is the whole point of committing a
+   lockfile.
+2. **Generate the native project** (not checked in — a build artifact, regenerated per machine):
+   `npx cap add android`.
+3. **Sync web assets and config into it:** `npx cap sync android`. Re-run this any time
+   `capacitor.config.json` changes.
+4. **Open and build:** `npx cap open android` launches Android Studio on the generated project.
+   From there: Run ▶ on an emulator or a USB-connected device for a debug build, or
+   Build → Generate Signed Bundle/APK for a release artifact (needs a signing keystore — not
+   currently provisioned anywhere in this repo; treat creating and custodying one as its own
+   decision, not an incidental step here).
+5. **Smoke-test on the device/emulator**, against a real deployed tenant domain (not `localhost` —
+   Capacitor disallows cleartext by default, so this only works against the HTTPS domain configured
+   in step "before starting" above):
+   - App launches and loads the customer portal WebView without a certificate or mixed-content
+     error.
+   - Phone-number login and OTP/password flow completes.
+   - The customer's own ledger (advances, balance) loads.
+   - A test Razorpay checkout opens correctly inside the WebView (use Razorpay's documented test
+     mode/cards — never a live payment method for this check).
+   - The `upi://pay` QR fallback path (Phase 9) still resolves to an installed UPI app on the test
+     device.
+   - Backgrounding and resuming the app does not lose the session or blank the WebView.
+   - Rotating the device does not break layout (the underlying page is the same responsive
+     `customer.html` already covered by the 390px-viewport Playwright journeys — this step is
+     about the *native shell*, not re-litigating that coverage).
+6. **Record the result** in the table below — an unrecorded build/device test did not happen, same
+   principle as the backup drill log.
+7. **Uninstall the test build** from the device/emulator afterward if it used any non-test payment
+   credentials or a shared/borrowed device.
+
+### Android build/device test log
+
+| Date | Capacitor version | Target domain | Device/emulator | Result | Run by |
+|---|---|---|---|---|---|
+| _(none recorded yet — mobile/ has never been built in this tree; see mobile/README.md)_ | | | | | |
+
+---
+
+## 15. Alert drill
+
+`backend/alerting.js`'s `raiseAlert()` is the one choke point every operational signal goes
+through (payment/webhook failure, ledger drift, stale gold rates, elevated HTTP error rate/
+latency, low disk, an expiring TLS cert, a failing or overflowing diagnostic log writer, the
+licensing control plane being unreachable). Every alert is **always** written to `error.log` and
+`telemetry.log`, with no configuration needed — that half needed no drill, it is asserted
+directly by `backend/test_alerting.js`. Email is the best-effort layer on top, gated on
+`settings.alertEmail`/`reportEmail` being set, and until 2026-09-19 **nothing had ever proven an
+alert email actually leaves the process** — every existing test either left the recipient unset
+(so `raiseAlert()` returns before ever calling `sendMailIfConfigured()`) or asserted only the
+in-memory cooldown flag.
+
+**Automated, real-SMTP-send coverage now exists** — `backend/test_alerting.js` §8 boots a minimal
+in-process fake SMTP server (same "throwaway local SMTP server" pattern already used for the
+Phase 20.1 password-reset email; no new dependency, no real network egress), points a temp-tenant
+`settings.json` at it via `alertEmail`/`smtp`, and proves: a real send happens and the captured
+message's Subject/recipient/body are all correct; the per-code cooldown blocks a **second real
+network connection**, not just the return flag; and an unreachable SMTP host fails soft
+(`raiseAlert()` reports `sent:false`, never throws). This runs on every `npm test` — no manual
+step needed to re-prove the mechanism itself.
+
+**What that automated coverage does NOT prove, and this manual drill does:** that a *real* tenant's
+configured SMTP credentials actually work, and that whoever is on call actually receives and can
+act on the email. Run this against a real (or realistic staging) tenant, not a synthetic fixture:
+
+1. Confirm `alertEmail` (or `reportEmail` as a fallback) and a working `smtp` block are set in
+   Settings for the tenant under test.
+2. Trigger one real, low-consequence alert condition. The cheapest to trigger safely: temporarily
+   rename `backend/backups/` (or point `GOLD_POS_BACKUPS_DIR` at an empty directory) so the next
+   scheduled `checkBackupFreshness()` tick raises `BACKUP_MISSING` — this touches no financial
+   data and the alert itself does not modify anything. Restore the real directory name immediately
+   after confirming the alert fired; do not leave a tenant's real backups directory renamed.
+3. Confirm the email arrives at the configured address within the check's next scheduled tick
+   (see the cron schedule in `backend/alerting.js`), with the expected subject
+   (`[SEVERITY] CODE — Gold POS Alert`) and a readable detail block.
+4. Confirm a second identical condition within the 30-minute cooldown window does **not** send a
+   second email (check `telemetry.log` for the `ALERT_RAISED` event still being logged even when
+   suppressed — the log line is unconditional, only the email is cooled down).
+5. Record the result below — an unrecorded drill did not happen, same principle as the backup
+   restore drill.
+
+### Alert drill log
+
+| Date | Alert code used | Recipient confirmed | Result | Run by |
+|---|---|---|---|---|
+| _(none recorded yet — the automated SMTP-send suite above was added and proven 2026-09-19; a real-tenant manual drill has not yet been run)_ | | | | |
 
 ---
 

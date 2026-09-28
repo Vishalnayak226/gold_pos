@@ -18,6 +18,7 @@ function gramsMg(value) {
 
 export class ReportsDesk {
     constructor() {
+        this.enabled = false;
         this.render();
         this.wire();
     }
@@ -26,22 +27,40 @@ export class ReportsDesk {
         const host = document.querySelector('#reports-tab .panel-body');
         if (!host) return;
         const now = new Date();
-        const first = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-        const today = now.toISOString().slice(0, 10);
+        // Local calendar date, not UTC: `toISOString()` here used to slice off
+        // the UTC date, which drifts a day behind local time for roughly the
+        // second half of every day in India (UTC+5:30) — a report defaulting
+        // its "To" field to UTC-yesterday silently excluded every sale rung
+        // today, wherever `businessDate()` (repositories/calendar.js) already
+        // groups sales by server-LOCAL date on purpose. Found via
+        // TESTING_CHECKLIST.md's Module 22 e2e journey failing right at the
+        // IST/UTC midnight boundary, 2026-09-19.
+        const pad = (n) => String(n).padStart(2, '0');
+        const localDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        const first = localDate(new Date(now.getFullYear(), now.getMonth(), 1));
+        const today = localDate(now);
         host.innerHTML = `
-            <div class="advances-toolbar">
-                <select id="management-report-kind" class="form-control">
-                    <option value="settlement">Settlement</option>
-                    <option value="reconciliation">Reconciliation exceptions</option>
-                    <option value="profitability">Gross profitability</option>
-                    <option value="ageing">Inventory ageing</option>
-                </select>
-                <input type="date" id="management-report-from" class="form-control" value="${first}">
-                <input type="date" id="management-report-to" class="form-control" value="${today}">
-                <button type="button" id="management-report-run" class="btn btn-primary">Run report</button>
+            <div id="reports-disabled-notice" style="display:none;" class="text-muted-small">
+                Management Reports are not enabled for this store. These four reports (Settlement,
+                Reconciliation, Gross Profitability, Inventory Ageing) are operational views, not
+                statutory books, and wait on merchant/accountant sign-off — turn them on under
+                Settings → Management Reports once that's done.
             </div>
-            <div id="management-report-output" style="margin-top:18px;">
-                <p class="text-muted-small">Choose a report and run it. Each result states the definition used.</p>
+            <div id="reports-desk-body" style="display:none;">
+                <div class="advances-toolbar">
+                    <select id="management-report-kind" class="form-control">
+                        <option value="settlement">Settlement</option>
+                        <option value="reconciliation">Reconciliation exceptions</option>
+                        <option value="profitability">Gross profitability</option>
+                        <option value="ageing">Inventory ageing</option>
+                    </select>
+                    <input type="date" id="management-report-from" class="form-control" value="${first}">
+                    <input type="date" id="management-report-to" class="form-control" value="${today}">
+                    <button type="button" id="management-report-run" class="btn btn-primary">Run report</button>
+                </div>
+                <div id="management-report-output" style="margin-top:18px;">
+                    <p class="text-muted-small">Choose a report and run it. Each result states the definition used.</p>
+                </div>
             </div>`;
     }
 
@@ -54,7 +73,25 @@ export class ReportsDesk {
         });
     }
 
+    /** Confirms the module is on before showing anything, and toggles the nav button to match. */
+    async checkEnabled() {
+        try {
+            const res = await adminFetch('/api/reports/ageing');
+            this.enabled = res.status !== 404;
+        } catch {
+            this.enabled = false;
+        }
+        const navBtn = document.getElementById('reports-nav-btn');
+        if (navBtn) navBtn.style.display = this.enabled ? 'block' : 'none';
+        const notice = document.getElementById('reports-disabled-notice');
+        const body = document.getElementById('reports-desk-body');
+        if (notice) notice.style.display = this.enabled ? 'none' : 'block';
+        if (body) body.style.display = this.enabled ? 'block' : 'none';
+        return this.enabled;
+    }
+
     async refresh() {
+        if (!(await this.checkEnabled())) return;
         const kind = document.getElementById('management-report-kind')?.value || 'settlement';
         const from = document.getElementById('management-report-from')?.value || '';
         const to = document.getElementById('management-report-to')?.value || '';

@@ -13,10 +13,18 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 import { logError, logTelemetry, DATA_DIR } from './db.js';
 import { DB_FILE, checkpointAndCopy } from './repositories/connection.js';
+import { discoverMigrations } from './repositories/migrate.js';
 import { raiseAlert } from './alerting.js';
 import { readSettings } from './settingsStore.js';
+import { resolveKey } from './secretVault.js';
+import { encryptFile, ENCRYPTED_EXTENSION } from './backupCrypto.js';
 
 const BACKEND_DIR = path.dirname(fileURLToPath(import.meta.url));
+const BACKUP_MANIFEST_FILE = 'backup_manifest.json';
+const BACKUP_FORMAT_VERSION = 1;
+const APPLICATION_VERSION = JSON.parse(
+    fs.readFileSync(path.join(BACKEND_DIR, 'package.json'), 'utf8')
+).version;
 
 // Same override convention as db.js's DATA_DIR/LOGS_DIR — test/recovery
 // tooling can point this at an isolated directory. Production leaves it unset.
@@ -60,6 +68,41 @@ export function createBackup() {
             checkpointAndCopy(path.join(targetBackupDir, path.basename(DB_FILE)));
         }
 
+        // A backup must remain intelligible after the current workstation,
+        // release tooling and people have changed. This compact manifest is
+        // encrypted with the archive below; it contains no customer or secret
+        // data, only the facts needed to identify and recover the snapshot.
+        fs.writeFileSync(path.join(targetBackupDir, BACKUP_MANIFEST_FILE), JSON.stringify({
+            formatVersion: BACKUP_FORMAT_VERSION,
+            createdAt: new Date().toISOString(),
+            application: {
+                name: 'gold-pos-backend',
+                version: APPLICATION_VERSION,
+                node: process.version
+            },
+            ledger: {
+                filename: path.basename(DB_FILE),
+                engine: 'sqlite'
+            },
+            migrations: discoverMigrations().map(({ version, name, filename, checksum }) => ({
+                version, name, filename, checksum
+            }))
+        }, null, 2), 'utf8');
+
+        // WHOLE-ARCHIVE ENCRYPTION. Everything copied above is plaintext on disk
+        // right now — the SQLite ledger and every JSON document, not just the
+        // credentials sealed inside settings.json (secretVault.js). Encrypt the
+        // whole snapshot with that same vault key before it, or its off-site
+        // copy shipped below, ever sits unprotected. A failure here throws into
+        // this function's own catch, same as any other backup failure.
+        const { key: archiveKey } = resolveKey(DATA_DIR);
+        for (const name of fs.readdirSync(targetBackupDir)) {
+            const plainPath = path.join(targetBackupDir, name);
+            if (!fs.statSync(plainPath).isFile() || name.endsWith(ENCRYPTED_EXTENSION)) continue;
+            encryptFile(plainPath, plainPath + ENCRYPTED_EXTENSION, archiveKey, name);
+            fs.rmSync(plainPath);
+        }
+
         logTelemetry('BACKUP_CREATE_SUCCESS', Date.now() - startTime, `Dir: backup_${todayStr}`);
         console.log(`[Backup] Daily database snapshot created: backup_${todayStr}`);
 
@@ -71,7 +114,12 @@ export function createBackup() {
         // with a key nobody has any more — see verifyBackup.js's header).
         // Reuses the same tool `npm run backup:verify` and the monthly drill
         // use, rather than re-implementing the checks here.
-        verifyLatestBackupAsync();
+        // Test/recovery tooling can perform its own awaited restore drill. Do
+        // not leave a duplicate fire-and-forget child writing after that tool
+        // has deliberately removed its temporary workspace.
+        if (process.env.GOLD_POS_DISABLE_POST_BACKUP_VERIFY !== '1') {
+            verifyLatestBackupAsync();
+        }
 
         const offsite = shipOffsite(targetBackupDir);
 

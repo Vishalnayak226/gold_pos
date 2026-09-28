@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { enqueueLog } from './logWriter.js';
 import {
     getDefaultSettings,
     RETIRED_SETTINGS_KEYS,
@@ -115,7 +116,7 @@ export function logTelemetry(action, durationMs, details = '', fields = {}) {
             ...fields
         }) + '\n';
         
-        fs.appendFileSync(telemetryFile, logEntry, 'utf8');
+        enqueueLog(telemetryFile, logEntry);
     } catch (err) {
         logError('Failed to write telemetry log', err.stack);
     }

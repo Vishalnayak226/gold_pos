@@ -128,6 +128,13 @@ export const DEFAULT_SETTINGS = {
        behaviour, and therefore the default, so no existing store is surprised by
        a refusal it did not ask for. */
     refundApprovalThreshold: 0,
+    /* Discount percent at or above which an owner/manager must authorise the sale.
+       A cashier could otherwise apply a 100% discount with nothing flagging it —
+       the refund threshold above guards money leaving the till, but nothing
+       guarded a give-away SALE. 0 disables the control (the previous behaviour),
+       same convention as refundApprovalThreshold, so no existing store is
+       surprised by a refusal it never configured. See saleService.js#createSale. */
+    discountApprovalThreshold: 0,
     // Origin this install is reachable at from the public internet, e.g.
     // "https://pos.example.com". Razorpay needs it to deliver webhooks, so a
     // production process without it can take money it will never hear back
@@ -187,7 +194,15 @@ export const DEFAULT_SETTINGS = {
     goldSchemeInstallmentCount: 11,
     goldSchemeBonusInstallments: 1,
     goldSchemeDefaultGraceDays: 30,
-    goldSchemeEarlyClosurePenaltyPercent: 0
+    goldSchemeEarlyClosurePenaltyPercent: 0,
+    /* The four Phase 44 management reports (Settlement, Reconciliation, Gross
+       Profitability, Inventory Ageing — backend/repositories/reportRepository.js).
+       Off by default — the routes 404 as though the module never existed, same
+       contract as wastage/old-gold/gold-schemes above. These are operational
+       views, not statutory labels (see docs/PRODUCTION_READINESS_ROADMAP.md);
+       they need merchant/accountant acceptance before a tenant relies on them,
+       not any further engineering. */
+    managementReportsEnabled: false
 };
 
 /**
@@ -287,7 +302,9 @@ export const SETTINGS_FIELD_RULES = {
     goldSchemeInstallmentCount: { type: 'integer', min: 1, max: 60 },
     goldSchemeBonusInstallments: { type: 'integer', min: 0, max: 12 },
     goldSchemeDefaultGraceDays: { type: 'integer', min: 1, max: 365 },
-    goldSchemeEarlyClosurePenaltyPercent: { type: 'number', min: 0, max: 100 }
+    goldSchemeEarlyClosurePenaltyPercent: { type: 'number', min: 0, max: 100 },
+    discountApprovalThreshold: { type: 'number', min: 0, max: 100 },
+    managementReportsEnabled: { type: 'boolean' }
 };
 
 /**

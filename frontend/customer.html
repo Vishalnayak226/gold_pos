@@ -5,9 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Customer Advance Portal</title>
     <link rel="stylesheet" href="css/app.css">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#0f172a">
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Gold Savings">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <!-- Razorpay Checkout SDK -->
     <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
     <script src="js/customerAlertOverride.js"></script>
+    <script src="js/pwaRegister.js"></script>
     <style>
         /* Specific Customer mobile-first adjustments */
         body {
@@ -177,10 +184,10 @@
                 </div>
                 <div class="form-group" style="margin-top: 12px;">
                     <label for="login-password">Password</label>
-                    <input type="password" id="login-password" class="form-control" placeholder="Your password" autocomplete="current-password">
-                    <span class="input-error-msg" id="login-error"></span>
+                    <input type="password" id="login-password" class="form-control" placeholder="Your password" autocomplete="current-password" aria-describedby="login-error">
+                    <span class="input-error-msg" id="login-error" aria-live="polite"></span>
                 </div>
-                <button id="login-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SIGN IN</button>
+                <button type="button" id="login-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SIGN IN</button>
                 <p style="text-align: center; margin-top: 12px;">
                     <button type="button" class="link-btn" id="show-forgot-btn">Forgot password?</button>
                 </p>
@@ -220,10 +227,10 @@
                 </div>
                 <div class="form-group" style="margin-top: 12px;">
                     <label for="reg-password2">Confirm Password</label>
-                    <input type="password" id="reg-password2" class="form-control" placeholder="Re-enter password" autocomplete="new-password">
-                    <span class="input-error-msg" id="register-error"></span>
+                    <input type="password" id="reg-password2" class="form-control" placeholder="Re-enter password" autocomplete="new-password" aria-describedby="register-error">
+                    <span class="input-error-msg" id="register-error" aria-live="polite"></span>
                 </div>
-                <button id="register-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">CREATE ACCOUNT</button>
+                <button type="button" id="register-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">CREATE ACCOUNT</button>
             </div>
 
             <!-- Forgot password -->
@@ -246,10 +253,10 @@
                     </div>
                     <div class="form-group">
                         <label for="forgot-phone">Mobile Number</label>
-                        <input type="tel" id="forgot-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10">
-                        <span class="input-error-msg" id="forgot-error"></span>
+                        <input type="tel" id="forgot-phone" class="form-control" placeholder="10-Digit Mobile" maxlength="10" aria-describedby="forgot-error">
+                        <span class="input-error-msg" id="forgot-error" aria-live="polite"></span>
                     </div>
-                    <button id="forgot-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SEND RESET CODE</button>
+                    <button type="button" id="forgot-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SEND RESET CODE</button>
                 </div>
                 <div id="forgot-step-2" style="display: none;">
                     <div class="notice-box" style="margin-bottom: 15px;" id="forgot-sent-note"></div>
@@ -290,10 +297,10 @@
                     </div>
                     <div class="form-group" style="margin-top: 12px;">
                         <label for="reset-password2">Confirm New Password</label>
-                        <input type="password" id="reset-password2" class="form-control" autocomplete="new-password">
-                        <span class="input-error-msg" id="reset-error"></span>
+                        <input type="password" id="reset-password2" class="form-control" autocomplete="new-password" aria-describedby="reset-error">
+                        <span class="input-error-msg" id="reset-error" aria-live="polite"></span>
                     </div>
-                    <button id="reset-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SET NEW PASSWORD</button>
+                    <button type="button" id="reset-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SET NEW PASSWORD</button>
                 </div>
                 <p style="text-align: center; margin-top: 12px;">
                     <button type="button" class="link-btn" id="back-to-login-btn">Back to sign in</button>
@@ -317,10 +324,10 @@
             </div>
             <div class="form-group" style="margin-top: 12px;">
                 <label for="fc-password2">Confirm New Password</label>
-                <input type="password" id="fc-password2" class="form-control" autocomplete="new-password">
-                <span class="input-error-msg" id="fc-error"></span>
+                <input type="password" id="fc-password2" class="form-control" autocomplete="new-password" aria-describedby="fc-error">
+                <span class="input-error-msg" id="fc-error" aria-live="polite"></span>
             </div>
-            <button id="fc-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SET PASSWORD & CONTINUE</button>
+            <button type="button" id="fc-submit-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SET PASSWORD & CONTINUE</button>
         </div>
 
         <!-- Logged-in Customer Dashboard Screen -->
@@ -393,7 +400,7 @@
                             <input type="checkbox" id="acct-notify-email" style="width: auto; margin: 0;">
                             <label for="acct-notify-email" style="margin: 0;">Email me about my deposits and dues</label>
                         </div>
-                        <button id="acct-save-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SAVE DETAILS</button>
+                        <button type="button" id="acct-save-btn" class="btn btn-primary btn-block" style="margin-top: 15px;">SAVE DETAILS</button>
                     </div>
 
                     <div class="form-section" style="margin-top: 20px;">
@@ -408,11 +415,11 @@
                         </div>
                         <div class="form-group" style="margin-top: 12px;">
                             <label for="cp-new2">Confirm New Password</label>
-                            <input type="password" id="cp-new2" class="form-control" autocomplete="new-password">
-                            <span class="input-error-msg" id="cp-error"></span>
+                            <input type="password" id="cp-new2" class="form-control" autocomplete="new-password" aria-describedby="cp-error">
+                            <span class="input-error-msg" id="cp-error" aria-live="polite"></span>
                         </div>
                         <p class="text-muted-small" style="margin-top: 10px;">Changing your password signs you out of every device.</p>
-                        <button id="cp-submit-btn" class="btn btn-secondary btn-block" style="margin-top: 12px;">CHANGE PASSWORD</button>
+                        <button type="button" id="cp-submit-btn" class="btn btn-secondary btn-block" style="margin-top: 12px;">CHANGE PASSWORD</button>
                     </div>
                 </div>
 
@@ -474,26 +481,26 @@
                             </p>
                         </div>
 
-                        <button id="pay-submit-btn" class="btn btn-primary btn-block">PAY & SUBMIT DEPOSIT</button>
+                        <button type="button" id="pay-submit-btn" class="btn btn-primary btn-block">PAY & SUBMIT DEPOSIT</button>
                     </div>
                 </div>
             </div>
 
             <!-- Bottom Tab Navigation -->
             <div style="background: #0f172a; display: flex; justify-content: space-around; padding: 15px 0; border-top-left-radius: 12px; border-top-right-radius: 12px; z-index: 10; margin-top: auto; flex-shrink: 0; margin-left: -20px; margin-right: -20px;">
-                <button id="nav-profile" style="background: none; border: none; color: #fff; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                <button type="button" id="nav-profile" style="background: none; border: none; color: #fff; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">👤</span> Profile
                 </button>
-                <button id="nav-deposit" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                <button type="button" id="nav-deposit" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">💰</span> Deposit
                 </button>
-                <button id="nav-history" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                <button type="button" id="nav-history" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">📜</span> History
                 </button>
-                <button id="nav-account" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                <button type="button" id="nav-account" style="background: none; border: none; color: #64748b; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">⚙️</span> Account
                 </button>
-                <button id="logout-btn" style="background: none; border: none; color: #ef4444; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
+                <button type="button" id="logout-btn" style="background: none; border: none; color: #ef4444; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 5px; font-family: 'Outfit'; font-size: 11px;">
                     <span style="font-size: 20px;">🚪</span> Logout
                 </button>
             </div>

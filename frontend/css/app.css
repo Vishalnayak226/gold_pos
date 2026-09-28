@@ -66,11 +66,30 @@ body {
     width: 100vw;
 }
 
+/* Default (unauthenticated) state: login screen visible, app hidden. The
+   inline pre-paint script in index.html's <head> adds .gp-authenticated to
+   <html> synchronously — before first paint — when sessionStorage already
+   says this tab is logged in, so a refresh lands on the app directly
+   instead of flashing this login screen first. app.js's own login/logout/
+   401 handlers toggle the two elements' inline .style.display afterwards,
+   which (being inline) always takes precedence over these rules. */
+#admin-login-view {
+    display: flex;
+}
+
 #app-viewport {
-    display: grid;
+    display: none;
     grid-template-columns: 240px 1fr;
     height: 100vh;
     width: 100vw;
+}
+
+html.gp-authenticated #admin-login-view {
+    display: none;
+}
+
+html.gp-authenticated #app-viewport {
+    display: grid;
 }
 
 /* ==========================================================================
@@ -84,6 +103,8 @@ body {
     justify-content: space-between;
     border-right: 1px solid rgba(255, 255, 255, 0.1);
     padding: 10px;
+    height: 100vh;
+    overflow: hidden; /* only .sidebar-nav scrolls internally, below */
 }
 
 .sidebar-header h2 {
@@ -115,6 +136,17 @@ body {
     gap: 4px;
     margin-top: 20px;
     flex-grow: 1;
+    min-height: 0; /* let this child shrink so overflow can scroll instead of clipping */
+    overflow-y: auto;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+    width: 6px;
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
 }
 
 .nav-btn {
@@ -406,9 +438,9 @@ body {
 
 .form-control:focus {
     outline: none;
-    border-color: var(--color-text-muted);
+    border-color: var(--color-accent);
     background-color: #ffffff;
-    box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.1);
+    box-shadow: 0 0 0 3px rgba(51, 65, 85, 0.35);
 }
 
 .input-error-msg {
@@ -619,7 +651,11 @@ body {
 }
 
 .btn-danger:hover {
-    background-color: #fca5a5;
+    /* Red 100, not Red 300: Red 300 dropped text/background contrast to
+       ~3.4:1 on hover (below the 4.5:1 AA floor for this non-large text) —
+       §24b contrast audit, 2026-09-17. This keeps the hover feedback while
+       staying >5:1. */
+    background-color: #fee2e2;
 }
 
 .btn-block {

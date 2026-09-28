@@ -216,12 +216,12 @@ export function recordDocumentMovement({
 }
 
 /** Sale movements for an invoice, used to create exact void reversals. */
-export function documentSaleMovementsForInvoice(invoiceId) {
+export function documentSaleMovementsForInvoice(tenantId, invoiceId) {
     return getDb().prepare(`
         SELECT * FROM inventory_document_movements
-        WHERE invoice_id = ? AND movement_type = 'sale'
+        WHERE tenant_id = ? AND invoice_id = ? AND movement_type = 'sale'
         ORDER BY created_at, rowid
-    `).all(invoiceId);
+    `).all(tenantId, invoiceId);
 }
 
 /**

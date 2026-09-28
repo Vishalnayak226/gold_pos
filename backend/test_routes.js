@@ -506,8 +506,51 @@ try {
         assert.strictEqual(afterLogout.json.error, 'ADMIN_SESSION_REQUIRED');
     });
 
-    /* ---------- Group 8: brute-force lockout (LAST — it locks this IP out) ---------- */
-    console.log('\nGroup 8: Login brute-force lockout');
+    /* ---------- Group 8: authentication semantics contract ----------
+       TESTING_CHECKLIST.md §24b: "authentication semantics" was the one named
+       gap left in the external-surface-contracts item. CSRF rejection itself
+       is already covered for both session types in test_security.js — what
+       was never asserted anywhere is the cookie ATTRIBUTE contract
+       (HttpOnly/SameSite/Secure) and that safe methods need no CSRF header at
+       all, so this group covers exactly those two, not a re-check of CSRF
+       rejection. */
+    console.log('\nGroup 8: Authentication semantics contract');
+
+    // A fresh session — Group 7 above logged the previous one out.
+    const contractAdmin = await loginAdmin(REAL.adminPin);
+    const sessionCookieLine = (contractAdmin.response.setCookies || []).find(line => line.startsWith('gp_admin_sess='));
+    const csrfCookieLine = (contractAdmin.response.setCookies || []).find(line => line.startsWith('gp_admin_csrf='));
+
+    check('The admin session cookie is HttpOnly and SameSite=Lax', () => {
+        assert.ok(sessionCookieLine, 'expected a gp_admin_sess Set-Cookie line');
+        assert.match(sessionCookieLine, /;\s*HttpOnly/i, 'the session cookie must be HttpOnly — JS must never read it');
+        assert.match(sessionCookieLine, /;\s*SameSite=Lax/i, 'the session cookie must be SameSite=Lax');
+    });
+
+    check('The CSRF cookie is JS-readable (not HttpOnly) but still SameSite=Lax', () => {
+        assert.ok(csrfCookieLine, 'expected a gp_admin_csrf Set-Cookie line');
+        assert.ok(!/;\s*HttpOnly/i.test(csrfCookieLine), 'the CSRF cookie must stay JS-readable — the double-submit pattern depends on it');
+        assert.match(csrfCookieLine, /;\s*SameSite=Lax/i, 'the CSRF cookie must be SameSite=Lax');
+    });
+
+    check('Neither cookie carries Secure over a plain-HTTP local request', () => {
+        // Mirrors cookieOpts()'s own documented reasoning in server.js: a
+        // Secure cookie is silently DROPPED by the browser over plain HTTP,
+        // which would break every local dev session outright. Asserting its
+        // absence here is asserting that reasoning is still wired up.
+        assert.ok(!/;\s*Secure/i.test(sessionCookieLine), 'Secure must not be sent to a non-TLS request');
+        assert.ok(!/;\s*Secure/i.test(csrfCookieLine), 'Secure must not be sent to a non-TLS request');
+    });
+
+    const safeMethodNoCsrf = await call('GET', '/api/settings', {
+        session: { headers: { Cookie: `gp_admin_sess=${contractAdmin.token}; gp_admin_csrf=${contractAdmin.csrfToken}` } }
+    });
+    check('A safe-method (GET) request needs no X-CSRF-Token header at all', () => {
+        assert.strictEqual(safeMethodNoCsrf.status, 200, 'GET must be exempt from the CSRF check');
+    });
+
+    /* ---------- Group 9: brute-force lockout (LAST — it locks this IP out) ---------- */
+    console.log('\nGroup 9: Login brute-force lockout');
 
     let lockoutStatus = 0;
     let attempts = 0;

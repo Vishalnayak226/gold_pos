@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { LOGS_DIR, logError as dbLogError } from './db.js';
+import { enqueueLog } from './logWriter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const KEYS_DIR = path.join(__dirname, 'keys');
@@ -47,6 +48,17 @@ function ensureBlackBoxKeysExist() {
     try {
         if (!fs.existsSync(KEYS_DIR)) fs.mkdirSync(KEYS_DIR, { recursive: true });
         if (!fs.existsSync(PUBLIC_KEY_FILE)) {
+            // Security audit L1: never mint a fresh throwaway keypair on a live
+            // tenant machine — the private half would land in
+            // developer_blackbox_keys/ right beside the data it protects. A
+            // production install ships blackbox_public.pem already (see
+            // release_pipeline.js); a missing key there means an incomplete
+            // deploy, and the black-box export is the only thing that degrades.
+            if (process.env.NODE_ENV === 'production') {
+                dbLogError('Black-box public key (backend/keys/blackbox_public.pem) is missing in production. Refusing to auto-generate a new keypair on this machine — black-box export will fail until the shipped key is restored. See docs/SECURITY_AUDIT.md L1.');
+                return;
+            }
+
             console.log('[BlackBox] Generating dedicated black-box RSA-4096 keypair (separate from the Level-2 developer key)...');
 
             const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -84,7 +96,7 @@ export function logBlackBoxEvent(eventType, meta = {}) {
             eventType,
             ...scrub(meta)
         }) + '\n';
-        fs.appendFileSync(BLACKBOX_LOG_FILE, entry, 'utf8');
+        enqueueLog(BLACKBOX_LOG_FILE, entry);
     } catch (err) {
         dbLogError('Failed to write black-box log entry: ' + err.message, err.stack);
     }

@@ -38,6 +38,9 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { DATA_DIR } from './db.js';
+import { resolveKey } from './secretVault.js';
+import { decryptFile, ENCRYPTED_EXTENSION } from './backupCrypto.js';
 
 const args = process.argv.slice(2);
 const has = (flag) => args.includes(flag);
@@ -59,7 +62,14 @@ function record(ok, label, detail = '') {
    Pick the snapshot
    --------------------------------------------------------------------------- */
 
-const backupsRoot = path.join(process.cwd(), 'backups');
+// Same override convention as backupEngine.js's BACKUPS_DIR and alerting.js's
+// backupsDirPath() — must match exactly, since this picks among what that
+// module writes. Falling back to a plain process.cwd()-relative default meant
+// an operator who redirects backups elsewhere had the post-backup restore
+// drill silently checking the wrong (or a stale) location.
+const backupsRoot = path.resolve(
+    process.env.GOLD_POS_BACKUPS_DIR || process.env.GOLDPOS_BACKUPS_DIR || path.join(process.cwd(), 'backups')
+);
 let source = valueOf('--backup');
 
 if (!source) {
@@ -86,6 +96,7 @@ if (!fs.existsSync(source)) {
 const restoreRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gold-pos-restore-'));
 const restoreData = path.join(restoreRoot, 'data');
 fs.mkdirSync(restoreData, { recursive: true });
+const BACKUP_MANIFEST_FILE = 'backup_manifest.json';
 
 say('\n  Restore verification');
 say('  ' + '-'.repeat(64));
@@ -100,16 +111,74 @@ say('');
 let repo = null;
 try {
     const entries = fs.readdirSync(source);
+    // Whole-archive encryption (backupCrypto.js) writes every file as
+    // `<name>.enc`; decrypt those back to their original name here. A file
+    // with no `.enc` suffix is copied as-is, which is what keeps a
+    // pre-encryption snapshot still sitting on disk restoring exactly as it
+    // did before (CLAUDE.md §1 — additive, backward-compatible).
+    let vaultKey = null;
+    let decryptError = null;
     for (const name of entries) {
         const from = path.join(source, name);
-        if (fs.statSync(from).isFile()) fs.copyFileSync(from, path.join(restoreData, name));
+        if (!fs.statSync(from).isFile()) continue;
+        if (name.endsWith(ENCRYPTED_EXTENSION)) {
+            const originalName = name.slice(0, -ENCRYPTED_EXTENSION.length);
+            try {
+                // Resolve against the REAL data dir, not the throwaway restore
+                // dir: this backup was sealed with the live install's key
+                // (backupEngine.js calls resolveKey(DATA_DIR) the same way), so
+                // pointing at the empty restore dir generated a fresh, wrong
+                // dev keyfile there and every decrypt failed (2026-09-28).
+                if (!vaultKey) ({ key: vaultKey } = resolveKey(DATA_DIR));
+                decryptFile(from, path.join(restoreData, originalName), vaultKey, originalName);
+            } catch (err) {
+                decryptError = decryptError || err;
+            }
+        } else {
+            fs.copyFileSync(from, path.join(restoreData, name));
+        }
     }
     record(entries.length > 0, 'the snapshot contains files', `${entries.length} copied`);
 
-    const dbName = entries.find(n => n.endsWith('.db'));
+    const wasEncrypted = entries.some(n => n.endsWith(ENCRYPTED_EXTENSION));
+    if (wasEncrypted) {
+        record(!decryptError, 'the encrypted archive decrypts with the current key',
+            decryptError ? decryptError.message : 'every .enc file opened cleanly');
+    }
+
+    const restoredEntries = fs.readdirSync(restoreData);
+    const manifestFile = path.join(restoreData, BACKUP_MANIFEST_FILE);
+    let backupManifest = null;
+    if (fs.existsSync(manifestFile)) {
+        try {
+            const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+            const valid = manifest.formatVersion === 1
+                && typeof manifest.createdAt === 'string'
+                && typeof manifest.application?.version === 'string'
+                && manifest.ledger?.engine === 'sqlite'
+                && Array.isArray(manifest.migrations);
+            record(valid, 'the backup self-description is valid', valid
+                ? `format ${manifest.formatVersion}, app ${manifest.application.version}, ${manifest.migrations.length} migrations`
+                : 'backup_manifest.json has an unsupported or incomplete shape');
+            if (valid) backupManifest = manifest;
+        } catch (error) {
+            record(false, 'the backup self-description is readable', error.message);
+        }
+    } else {
+        // Snapshots created before the manifest feature remain restorable.
+        say('  ℹ backup self-description absent (legacy snapshot accepted)');
+    }
+    const dbName = restoredEntries.find(n => n.endsWith('.db'));
     record(Boolean(dbName), 'the snapshot contains the SQLite ledger',
         dbName || 'NO .db FILE — this snapshot cannot restore a ledger');
     if (!dbName) throw new Error('no ledger in snapshot');
+    if (backupManifest) {
+        record(backupManifest.ledger.filename === dbName,
+            'the backup self-description names the restored ledger',
+            backupManifest.ledger.filename === dbName
+                ? dbName
+                : `manifest: ${backupManifest.ledger.filename}, restored: ${dbName}`);
+    }
 
     /* Point the data layer at the restored copy BEFORE importing it: db.js
        resolves DATA_DIR once at import and ESM caches the module, so a static
@@ -226,8 +295,12 @@ if (failed.length === 0) {
     say(`  RESTORE VERIFIED — ${results.length} checks passed.`);
     say('  This snapshot can be turned back into a working install.');
 } else {
-    say(`  RESTORE NOT VERIFIED — ${failed.length} of ${results.length} checks failed:`);
-    for (const f of failed) say(`    - ${f.label}${f.detail ? `: ${f.detail}` : ''}`);
+    // Failure detail is printed even under --quiet: quiet mode exists to keep
+    // a clean-pass cron log short, not to hide the one thing a monthly restore
+    // drill exists to surface. A silent, undiagnosable failure here is worse
+    // than a noisy one.
+    console.error(`  RESTORE NOT VERIFIED — ${failed.length} of ${results.length} checks failed:`);
+    for (const f of failed) console.error(`    - ${f.label}${f.detail ? `: ${f.detail}` : ''}`);
 }
 say('');
 

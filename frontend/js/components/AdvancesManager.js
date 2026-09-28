@@ -367,7 +367,7 @@ export class AdvancesManager {
                             <div class="recent-list-item"${counts ? '' : ' style="opacity:0.6;"'}>
                                 <div>
                                     <strong>${e.type === 'deposit' ? 'Deposit' : 'Redeemed at Billing'}</strong>${tag}
-                                    <div class="text-muted-small">${escapeHtml(e.paymentMethod || (e.invoiceId ? 'Invoice ' + e.invoiceId : ''))}${e.referenceId ? ' · Ref: ' + escapeHtml(e.referenceId) : ''}${e.reviewNote ? ' · ' + escapeHtml(e.reviewNote) : ''}</div>
+                                    <div class="text-muted-small">${escapeHtml(e.type === 'deposit' ? (e.paymentMethod || '') : (e.invoiceId ? 'Invoice ' + e.invoiceId : (e.paymentMethod || '')))}${e.referenceId ? ' · Ref: ' + escapeHtml(e.referenceId) : ''}${e.reviewNote ? ' · ' + escapeHtml(e.reviewNote) : ''}</div>
                                 </div>
                                 <div class="text-right">
                                     <strong class="${!counts ? '' : e.type === 'deposit' ? 'ledger-amount-positive' : 'ledger-amount-negative'}"${counts ? '' : ' style="text-decoration:line-through; color:var(--color-text-light);"'}>${e.type === 'deposit' ? '+' : '-'}₹${(parseFloat(e.amount) || 0).toLocaleString('en-IN')}</strong>

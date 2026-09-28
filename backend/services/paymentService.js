@@ -26,6 +26,7 @@ import { newId, logError, logTelemetry } from '../db.js';
 import { raiseAlert } from '../alerting.js';
 import { fromPaise } from '../../frontend/js/lib/billingMath.js';
 import { DomainRefusal, isUniqueViolation } from './saleService.js';
+import { DOMAIN_CODE } from '../domainCodes.js';
 
 export const PROVIDER = { RAZORPAY: 'razorpay', MOCK: 'mock' };
 
@@ -129,6 +130,7 @@ export function creditCapturedPayment({ order, paymentId, capturedPaise, source 
         return {
             ok: false,
             status: 409,
+            code: DOMAIN_CODE.PAYMENT_AMOUNT_MISMATCH,
             error: 'The captured amount does not match this payment order. Please contact the store with your payment ID: ' + paymentId
         };
     }
@@ -225,6 +227,7 @@ export function creditCapturedPayment({ order, paymentId, capturedPaise, source 
         return {
             ok: false,
             status: 500,
+            code: DOMAIN_CODE.PAYMENT_CREDIT_PERSIST_FAILED,
             error: 'Your payment was received but could not be credited automatically. Please contact the store with your payment ID: ' + paymentId
         };
     }
