@@ -1181,61 +1181,112 @@ person clicking through can confirm.
 
 ### 22a. SKU to invoice to stock
 
-- [ ] Inventory → create an active item with a unique SKU/barcode, purity and nominal net weight;
+- [x] Inventory → create an active item with a unique SKU/barcode, purity and nominal net weight;
   open a costed lot. In Billing, scan/type the SKU → name, purity and weight fill automatically and
   the exact positive-stock lot is selectable.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — `backend/tests/e2e/inventory-billing-operations.spec.js`
+  `'catalogue lot flows through sale, exchange, void and reports without losing stock history'`
+  creates the item/lot through the real UI and asserts the scanned SKU fills name/purity/weight.
 
-- [ ] File the sale → the invoice line retains the item/lot link and the lot drops by exactly the
+- [x] File the sale → the invoice line retains the item/lot link and the lot drops by exactly the
   billed weight. Try to file more than the remaining lot → 409/refused, with no invoice number or
   stock movement consumed.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — same e2e spec asserts the filed line's `inventoryItemId`/
+  `inventoryLotId`; the over-sell refusal is `backend/test_repositories.js` §22 `'selling more than
+  a lot has is refused without changing stock'` (single line and split-across-two-lines, both
+  `INSUFFICIENT_STOCK`/409, lot balance unchanged).
 
 ### 22b. Return exchange and void/cancel
 
-- [ ] Return part of that linked line using **Exchange credit** → the credit note says EXCHANGE
+- [x] Return part of that linked line using **Exchange credit** → the credit note says EXCHANGE
   CREDIT, the exact source lot increases by the returned weight, and Billing opens for the same
   customer with the exchange-credit banner. Apply Advance and file the replacement → the exchange
   note links once to that invoice; attempting to reuse it is refused.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — e2e spec above drives the exchange/banner/apply-advance/replacement
+  flow; the reuse refusal is `test_repositories.js` §22 `'the exchange credit binds once to its
+  replacement invoice'` (409 on a second attempt with the same credit note id).
 
-- [ ] File a fresh linked sale and use Reprint → Void with an Owner/Manager and a meaningful reason
+- [x] File a fresh linked sale and use Reprint → Void with an Owner/Manager and a meaningful reason
   on the same business date → invoice remains visible as cancelled, stock is restored by a new void
   movement and any redeemed advance is restored by a reversal. A prior-day or partly returned sale
   must refuse void and direct staff to the return flow.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — same-day void with reason/cancelled-visible/stock-restored is the
+  e2e spec's Reprint → Void step. The two refusal rules and the advance reversal were **not
+  actually reachable before this session**: `VOID_AFTER_RETURN` was documented in
+  `docs/API_COMPATIBILITY.md` but the generic `state !== 'issued'` guard in
+  `backend/services/saleService.js#voidSale` always fired first (a return itself flips state to
+  `partially_returned`/`returned`), so no caller could ever receive the specific code the docs
+  promised. Fixed by checking prior returns before the generic state guard (`saleService.js`,
+  2026-09-28). Regression coverage added in `test_repositories.js` §22: `'a sale from a prior
+  business date refuses void with VOID_DATE_RESTRICTED'`, `'a sale that already has a return
+  refuses void with VOID_AFTER_RETURN'`, and `'voiding a sale that redeemed an advance restores the
+  balance with a reversal entry'` (asserts the `reversal` entry, the restored customer balance, and
+  that a refused void leaves state/stock untouched). Full evidence: `docs/LEDGER.md` 2026-09-28.
 
 ### 22c. Off-site destination
 
-- [ ] Settings → Backup & Email → enable off-site copy and choose a mounted/synchronised directory
+- [x] Settings → Backup & Email → enable off-site copy and choose a mounted/synchronised directory
   outside both the live data and local backup trees. Create Backup Now → local backup succeeds, the
   off-site status says verified, and the destination contains the dated folder plus `manifest.json`
   with a SHA-256 entry for every copied file.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — `backend/tests/e2e/backup-settings.spec.js` `'enabling off-site copy
+  and running a backup verifies every file by SHA-256 and writes a manifest'` drives the real
+  Settings UI (toggle, path, Save, Create Backup Now) against a destination directory the spec
+  owns, then reads the manifest and every copied file's bytes directly off disk.
 
-- [ ] Temporarily make the destination unavailable → local backup still reports its own success,
+- [x] Temporarily make the destination unavailable → local backup still reports its own success,
   off-site status explicitly fails, and `BACKUP_OFFSITE_FAILED` reaches the configured alert path.
   Restore the destination and run again. Confirm retention removes only matching old `backup_*`
   folders in that destination.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — same file, `'an unavailable off-site destination fails the off-site
+  copy while the local backup still succeeds, and recovers once restored'`: replaces the
+  destination with a plain file (a real, portable filesystem failure), asserts the status line
+  still shows local success plus "OFF-SITE COPY FAILED", then restores the directory and confirms
+  the very next run succeeds. Retention-removes-only-the-stale-folder is asserted in the first
+  test above (a `backup_2020-01-01` fixture is gone after a successful run; today's folder is not).
+  `BACKUP_OFFSITE_FAILED` reaching the alert path is not re-proven per caller here: `raiseAlert`'s
+  delivery is the one choke point already proven generically in `test_alerting.js` (CLAUDE.md §1),
+  and `backend/backupEngine.js#shipOffsite` is read to call it with exactly that code on this path.
 
 ### 22d. Management report definitions
 
-- [ ] Management Reports → Settlement for a known period → active counter tenders, tenders retained
+- [x] Management Reports → Settlement for a known period → active counter tenders, tenders retained
   on voids, refunds/credits and net settlement agree with filed documents; advance tender is not
   counted as new counter cash.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — UI happy path (real cash sale, exact total) already covered by
+  `management-reports.spec.js`. The specifics named here were unasserted anywhere until this
+  session's `test_repositories.js` §22 `'settlement shows a voided invoice tender separately from
+  active ones, and excludes advance from counter cash'`: a voided invoice's cash tender appears
+  under `voided_paise` rather than being dropped, and a sale fully settled by advance produces an
+  `advance` tender row that `counterTenderPaise` correctly excludes.
 
-- [ ] Reconciliation → a correctly tendered invoice (including one partly paid by advance) is clean;
+- [x] Reconciliation → a correctly tendered invoice (including one partly paid by advance) is clean;
   a tender mismatch, tender on a void or paid gateway order without an equal posted advance credit
   appears as an exception.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — the clean/no-false-positive case was already covered (`'reconciliation
+  compares counter tenders to the already advance-net invoice payable'`). All three actual exception
+  kinds had zero coverage until this session's `test_repositories.js` §22 `'reconciliation flags a
+  real tender mismatch, a voided invoice retained tender, and a paid gateway order missing its
+  advance credit'`: a post-filing tender-amount drift (`invoice_tender_mismatch`), a voided invoice
+  whose tender was never reversed (`voided_tender`), and a paid gateway order with no linked advance
+  entry (`gateway_advance_mismatch`) each appear with the right `kind` and figures. (A mismatch
+  cannot exist at filing time — `saleService.js` refuses a sale whose tenders do not sum to the
+  total — so the fixture simulates the only way one can exist afterwards: a direct row edit, same
+  technique as the `VOID_DATE_RESTRICTED` fixture above.)
 
-- [ ] Profitability → a costed linked lot shows remaining net-of-GST revenue after returns less lot
+- [x] Profitability → a costed linked lot shows remaining net-of-GST revenue after returns less lot
   cost; a manual/uncosted line is labeled uncosted and lowers cost coverage instead of inventing a
   margin. Ageing → only positive on-hand lots appear in the correct opening-date bucket, with cost
   value only for costed lots.
-  Result: _____  Notes: ______________________________________________
+  Result: PASS (2026-09-28) — the costed-lot figures were already covered (`'profitability and
+  ageing reports use the lot cost and current movement-derived stock'`). The uncosted/manual-line
+  and positive-balance-only claims had zero coverage until this session's two new
+  `test_repositories.js` §22 checks: `'profitability labels a manual/uncosted line separately and
+  lowers cost coverage instead of inventing a margin'` (an uncosted line's `costPaise`/
+  `grossProfitPaise` stay `null`, adds to `revenuePaise` but never to `coveredRevenuePaise`, and
+  measurably lowers `costCoveragePercent`) and `'ageing only lists lots with positive on-hand
+  weight, and shows cost value only where a cost exists'` (a fully depleted lot is absent entirely;
+  an uncosted positive-balance lot appears with `costValuePaise: null`, not an invented figure).
 
 ---
 

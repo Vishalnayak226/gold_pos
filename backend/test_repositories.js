@@ -2032,6 +2032,95 @@ console.log('\n22. Billing-linked inventory and management reports');
         assert.equal(repeated.code, 'VOID_NOT_ALLOWED', 'a repeated void has a stable domain outcome');
     });
 
+    // Own dedicated item/lot from here on: §22's shared `itemId`/`lotId` still
+    // needs to read exactly 7000mg for the profitability/ageing checks below,
+    // and these void-refusal tests each leave their sale un-reversed on
+    // purpose (that's the point — a refused void must not touch stock), so
+    // reusing the shared lot would permanently drift its balance out from
+    // under those later assertions (found 2026-09-28).
+    const voidItemId = repo.inventory.createItem({
+        tenantId: context.tenantId, name: 'Void Test Chain', category: 'Chains',
+        purity: '22K', skuCode: 'VOID-TEST-SKU-1', netWeightMg: 10000, grossWeightMg: 10000
+    });
+    const { lotId: voidLotId } = repo.inTransaction(() => repo.inventory.openLot({
+        tenantId: context.tenantId, branchId: context.branchId, itemId: voidItemId,
+        weightMg: 10000, actorUserId: context.ownerUserId, unitCostPaisePerG: 500000
+    }));
+
+    check('a sale from a prior business date refuses void with VOID_DATE_RESTRICTED', () => {
+        const sale = saleService.createSale({
+            lines: [{ purity: '22K', weightGrams: 1, inventoryItemId: voidItemId, inventoryLotId: voidLotId }]
+        }, DEPS);
+        const header = repo.invoices.findByNumber(context.tenantId, sale.invoiceId);
+        repo.unsafeDatabaseHandle()
+            .prepare('UPDATE invoices SET business_date = ? WHERE id = ?')
+            .run('2000-01-01', header.id);
+
+        const balanceBeforeAttempt = repo.inventory.lotBalanceMg(voidLotId);
+        const result = saleService.voidSale(sale.invoiceId, 'Backdated void attempt', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(result.ok, false);
+        assert.equal(result.code, 'VOID_DATE_RESTRICTED');
+        assert.equal(repo.invoices.findByNumber(context.tenantId, sale.invoiceId).state, 'issued',
+            'a refused void must not touch the invoice state');
+        assert.equal(repo.inventory.lotBalanceMg(voidLotId), balanceBeforeAttempt,
+            'a refused void must not touch stock');
+    });
+
+    check('a sale that already has a return refuses void with VOID_AFTER_RETURN', () => {
+        const sale = saleService.createSale({
+            lines: [{ purity: '22K', weightGrams: 1, inventoryItemId: voidItemId, inventoryLotId: voidLotId }]
+        }, DEPS);
+        const partialReturn = returnService.createReturn({
+            invoiceId: sale.invoiceId, weightGrams: 0.3, refundMode: 'cash'
+        }, DEPS);
+        assert.equal(partialReturn.ok, true, partialReturn.error);
+
+        const result = saleService.voidSale(sale.invoiceId, 'Attempt to void after a return', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(result.ok, false);
+        assert.equal(result.code, 'VOID_AFTER_RETURN');
+        assert.equal(repo.invoices.findByNumber(context.tenantId, sale.invoiceId).state, 'partially_returned',
+            'the refused void must not disturb the state the return itself already set');
+    });
+
+    check('voiding a sale that redeemed an advance restores the balance with a reversal entry', () => {
+        const deposit = advanceService.recordDeposit({
+            customerPhone: '9888800099', customerName: 'Void Reversal Customer',
+            amount: 2000, paymentMethod: 'Cash', referenceId: 'UTR-VOID-REVERSAL'
+        }, DEPS);
+        assert.equal(deposit.success, true, deposit.error);
+        assert.equal(advanceService.customerLedger('9888800099').balance, 2000);
+
+        const sale = saleService.createSale({
+            customerName: 'Void Reversal Customer', customerPhone: '9888800099',
+            lines: [{ purity: '22K', weightGrams: 1, inventoryItemId: voidItemId, inventoryLotId: voidLotId }],
+            appliedAdvance: 2000
+        }, DEPS);
+        assert.equal(sale.ok, true, sale.error);
+        assert.equal(advanceService.customerLedger('9888800099').balance, 0);
+
+        const header = repo.invoices.findByNumber(context.tenantId, sale.invoiceId);
+        const redemption = repo.advances.search({ tenantId: context.tenantId, entryType: 'redeem', limit: 50 })
+            .rows.find(row => row.invoice_id === header.id);
+        assert.ok(redemption, 'the redemption must be findable before it can be reversed');
+
+        const result = saleService.voidSale(sale.invoiceId, 'Void a sale that redeemed an advance', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(result.ok, true, result.error);
+        assert.equal(advanceService.customerLedger('9888800099').balance, 2000,
+            'voiding must restore the redeemed advance, not leave the customer short-credited');
+
+        const reversal = repo.advances.search({ tenantId: context.tenantId, entryType: 'reversal', limit: 50 })
+            .rows.find(row => row.reverses_entry_id === redemption.id);
+        assert.ok(reversal, 'the reversal must reference the exact redemption it undoes');
+        assert.equal(reversal.amount_paise, Math.abs(redemption.amount_paise));
+        assert.equal(reversal.invoice_id, header.id);
+    });
+
     check('reconciliation compares counter tenders to the already advance-net invoice payable', () => {
         const deposit = advanceService.recordDeposit({
             customerName: 'Reconciliation Customer', customerPhone: '9888800002',
@@ -2061,6 +2150,130 @@ console.log('\n22. Billing-linked inventory and management reports');
         const agedLot = ageing.rows.find(row => row.lotId === lotId);
         assert.equal(agedLot.balanceMg, 7000);
         assert.equal(agedLot.costValuePaise, 3500000);
+    });
+
+    check('settlement shows a voided invoice tender separately from active ones, and excludes advance from counter cash', () => {
+        const voided = saleService.createSale({ purity: '22K', weightGrams: 1, tenders: [{ method: 'cash' }] }, DEPS);
+        assert.equal(voided.ok, true, voided.error);
+        const voidResult = saleService.voidSale(voided.invoiceId, 'Settlement report test void', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(voidResult.ok, true, voidResult.error);
+
+        const deposit = advanceService.recordDeposit({
+            customerName: 'Settlement Advance Customer', customerPhone: '9888800100',
+            amount: 100000, paymentMethod: 'Cash', referenceId: 'SETTLEMENT-ADVANCE-1'
+        }, DEPS);
+        assert.equal(deposit.success, true, deposit.error);
+        // Deliberately larger than the sale total: computeInvoiceTotals caps the
+        // resolved advance at the invoice total, so this fully settles the sale
+        // by advance with no remaining counter tender to record.
+        const advanceSale = saleService.createSale({
+            customerName: 'Settlement Advance Customer', customerPhone: '9888800100',
+            purity: '22K', weightGrams: 1, appliedAdvance: 100000
+        }, DEPS);
+        assert.equal(advanceSale.ok, true, advanceSale.error);
+
+        const report = repo.reports.settlement({ tenantId: context.tenantId });
+        const cashRow = report.tenders.find(row => row.method === 'cash');
+        assert.ok(cashRow.voided_paise > 0, 'a voided invoice cash tender must be shown, not silently dropped');
+        const advanceRow = report.tenders.find(row => row.method === 'advance');
+        assert.ok(advanceRow && advanceRow.active_paise > 0, 'a fully advance-paid sale must produce an advance tender row');
+        assert.equal(report.counterTenderPaise, report.activeTenderPaise - advanceRow.active_paise,
+            'advance is a liability drawdown already collected earlier, not new counter cash, and must not inflate the counter total');
+    });
+
+    check('reconciliation flags a real tender mismatch, a voided invoice retained tender, and a paid gateway order missing its advance credit', () => {
+        const mismatchSale = saleService.createSale({ purity: '22K', weightGrams: 2, tenders: [{ method: 'cash' }] }, DEPS);
+        assert.equal(mismatchSale.ok, true, mismatchSale.error);
+        const mismatchHeader = repo.invoices.findByNumber(context.tenantId, mismatchSale.invoiceId);
+        // A sale cannot be FILED with tenders that fail to add up (saleService
+        // throws SALE_TENDER_TOTAL_MISMATCH before it commits) — this simulates
+        // the only way a mismatch can exist afterwards: a later drift against
+        // the already-filed row (manual data correction, partial migration),
+        // exactly like the VOID_DATE_RESTRICTED test above backdates a filed row.
+        repo.unsafeDatabaseHandle()
+            .prepare('UPDATE tenders SET amount_paise = amount_paise - 100000 WHERE invoice_id = ?')
+            .run(mismatchHeader.id);
+
+        const voided = saleService.createSale({ purity: '22K', weightGrams: 1, tenders: [{ method: 'cash' }] }, DEPS);
+        assert.equal(voided.ok, true, voided.error);
+        const voidResult = saleService.voidSale(voided.invoiceId, 'Reconciliation report test void', {
+            actorUserId: context.ownerUserId, actorLabel: 'owner'
+        });
+        assert.equal(voidResult.ok, true, voidResult.error);
+
+        repo.payments.createOrder({
+            tenantId: context.tenantId, providerOrderId: 'RECON-ORDER-1',
+            customerPhone: '9888800101', amountPaise: 500000
+        });
+        repo.payments.settleOrder('razorpay', 'RECON-ORDER-1', 'paid', { providerPaymentId: 'RECON-PAY-1' });
+
+        const report = repo.reports.reconciliation({ tenantId: context.tenantId });
+        const mismatch = report.issues.find(row =>
+            row.kind === 'invoice_tender_mismatch' && row.invoice_number === mismatchSale.invoiceId);
+        assert.ok(mismatch, 'an invoice whose tenders no longer add up to its total must be flagged');
+        assert.equal(mismatch.difference_paise, -100000);
+
+        const voidedIssue = report.issues.find(row =>
+            row.kind === 'voided_tender' && row.invoice_number === voided.invoiceId);
+        assert.ok(voidedIssue, 'a cancelled invoice that still carries a tender must be flagged for follow-up');
+
+        const gatewayIssue = report.issues.find(row =>
+            row.kind === 'gateway_advance_mismatch' && row.provider_order_id === 'RECON-ORDER-1');
+        assert.ok(gatewayIssue, 'a paid gateway order with no linked advance credit must be flagged');
+    });
+
+    check('profitability labels a manual/uncosted line separately and lowers cost coverage instead of inventing a margin', () => {
+        const before = repo.reports.profitability({ tenantId: context.tenantId });
+
+        const manualSale = saleService.createSale({ purity: '22K', weightGrams: 1 }, DEPS);
+        assert.equal(manualSale.ok, true, manualSale.error);
+
+        const after = repo.reports.profitability({ tenantId: context.tenantId });
+        const row = after.rows.find(r => r.invoiceNumber === manualSale.invoiceId);
+        assert.ok(row, 'the uncosted line must still appear in the report');
+        assert.equal(row.costPaise, null, 'a manual line with no linked lot must not get an invented cost');
+        assert.equal(row.grossProfitPaise, null, 'no cost means no derivable margin, not a margin equal to the full revenue');
+        assert.equal(after.totals.coveredRevenuePaise, before.totals.coveredRevenuePaise,
+            'an uncosted line must not add to covered revenue');
+        assert.ok(after.totals.revenuePaise > before.totals.revenuePaise,
+            'an uncosted line must still count toward total revenue');
+        assert.ok(after.totals.costCoveragePercent < before.totals.costCoveragePercent,
+            'adding uncosted revenue must lower blended cost coverage, not leave it unchanged');
+    });
+
+    check('ageing only lists lots with positive on-hand weight, and shows cost value only where a cost exists', () => {
+        const depletedItemId = repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Ageing Depleted Item', category: 'Chains',
+            purity: '22K', skuCode: 'AGE-DEPLETED-1', netWeightMg: 5000, grossWeightMg: 5000
+        });
+        const { lotId: depletedLotId } = repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId: depletedItemId,
+            weightMg: 5000, actorUserId: context.ownerUserId, unitCostPaisePerG: 500000
+        }));
+        const depletingSale = saleService.createSale({
+            lines: [{ purity: '22K', weightGrams: 5, inventoryItemId: depletedItemId, inventoryLotId: depletedLotId }]
+        }, DEPS);
+        assert.equal(depletingSale.ok, true, depletingSale.error);
+        assert.equal(repo.inventory.lotBalanceMg(depletedLotId), 0);
+
+        const uncostedItemId = repo.inventory.createItem({
+            tenantId: context.tenantId, name: 'Ageing Uncosted Item', category: 'Chains',
+            purity: '22K', skuCode: 'AGE-UNCOSTED-1', netWeightMg: 4000, grossWeightMg: 4000
+        });
+        const { lotId: uncostedLotId } = repo.inTransaction(() => repo.inventory.openLot({
+            tenantId: context.tenantId, branchId: context.branchId, itemId: uncostedItemId,
+            weightMg: 4000, actorUserId: context.ownerUserId
+        }));
+
+        const ageing = repo.reports.ageing({ tenantId: context.tenantId, branchId: context.branchId });
+        assert.equal(ageing.rows.some(row => row.lotId === depletedLotId), false,
+            'a fully depleted lot must not appear in the ageing report');
+        const uncostedRow = ageing.rows.find(row => row.lotId === uncostedLotId);
+        assert.ok(uncostedRow, 'a positive-balance lot with no recorded cost must still appear');
+        assert.equal(uncostedRow.costValuePaise, null, 'a lot with no cost per gram must not get an invented cost value');
+        assert.equal(uncostedRow.balanceMg, 4000);
     });
 }
 

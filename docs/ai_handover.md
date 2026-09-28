@@ -12,6 +12,84 @@ This document contains key architectural details, non-negotiable design guidelin
 
 *Keep this section current whenever a unit of work finishes. Absolute dates only.*
 
+- **2026-09-28 (later): closed the two items the entry directly below left open —
+  `TESTING_CHECKLIST.md` §22c (off-site backup destination) and §22d (management
+  report definitions).** Full detail: `docs/LEDGER.md` (new 2026-09-28 entry above
+  the one referenced below). Summary: both modules were already correctly built;
+  the gap was purely that their specific claims had never been asserted anywhere.
+  **§22c**: new `backend/tests/e2e/backup-settings.spec.js` (2 tests) drives the
+  real Settings → Backup & Email UI — enable off-site copy, Create Backup Now,
+  verify the manifest/SHA-256 on disk and that a stale dated folder gets pruned;
+  then simulates an unavailable destination (replaced with a plain file — a real,
+  portable filesystem failure, no OS permission trick needed), confirming the
+  local backup still succeeds while the status line shows "OFF-SITE COPY FAILED",
+  and that the very next run recovers once restored. **§22d**: four new
+  `backend/test_repositories.js` §22 checks — Settlement's voided-tender/
+  advance-exclusion handling, all three Reconciliation exception kinds
+  (`invoice_tender_mismatch`, `voided_tender`, `gateway_advance_mismatch`, none
+  previously exercised), Profitability's uncosted-line handling (`null` cost, not
+  an invented margin, measurably lower blended coverage), and Ageing's
+  positive-balance-only listing with `costValuePaise: null` for an uncosted lot.
+  No defect found in either module — recorded as confirmation, not "nothing to
+  do." **Verified:** `cd backend && npm test` all suites green, exit 0
+  (`test_repositories.js` now 159 checks, up from 155); `npx playwright test
+  backup-settings.spec.js` 2/2; full `npx playwright test --project=desktop-
+  chromium` 133/133 (was 131), no regression. **Uncommitted, on top of the prior
+  entry's own list:** `backend/test_repositories.js` (further modified),
+  `backend/tests/e2e/backup-settings.spec.js` (new),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **§22a–d are now all closed.**
+  Module 23 (POS 360° remediation) and the rest of Modules 20–26 still carry open
+  items needing real infrastructure or a product call (§7's "no VPS provisioned"
+  chief among them), so no Phase is archivable yet — same bar the entry below
+  already established.
+
+- **2026-09-28: fixed the two production-blocking bugs the 2026-09-27 entry below
+  flagged but did not investigate, then closed `TESTING_CHECKLIST.md` §22a/22b
+  (which surfaced a third real bug along the way).** Full detail and evidence:
+  `docs/LEDGER.md` 2026-09-28 entry. Summary for a fast read:
+  **(1) The real `backend/data/` ledger now boots.** The migration-checksum
+  drift the last entry found-but-didn't-fix was git's `core.autocrlf=true`
+  rewriting all 17 migration files' line endings on this Windows checkout —
+  confirmed by hashing the on-disk files with CRLF normalized to LF and
+  matching every one against the real `schema_migrations` table (read-only
+  check, no data touched). Fixed in `backend/repositories/migrate.js`
+  (normalize before hashing) plus a new root `.gitattributes` pinning
+  `backend/repositories/migrations/*.sql` to `eol=lf` so this can't recur.
+  **(2) The nightly `BACKUP_VERIFY_FAILED` alert was structurally incapable of
+  ever passing** in keyfile mode (the only mode this project currently runs
+  in — no VPS/env-var deployment exists yet, §7): `backend/verifyBackup.js`
+  resolved its decryption key from the empty throwaway restore directory
+  instead of the real data directory the backup was actually sealed under.
+  Fixed to match `backupEngine.js`'s own `resolveKey(DATA_DIR)` convention.
+  **(3) `docs/API_COMPATIBILITY.md` promised a `VOID_AFTER_RETURN` code that
+  could never actually fire** — a generic state guard in
+  `saleService.js#voidSale` always pre-empted it. Fixed by checking prior
+  returns first. **§22a/22b now `[x]`**: the UI-observable half was already
+  covered by the existing `inventory-billing-operations.spec.js`; the
+  domain-code half (the three bugs' regression coverage) is three new checks
+  in `test_repositories.js` §22, using their own dedicated lot fixture rather
+  than the section's shared one (a first draft reused the shared lot and
+  silently drifted a later, unrelated ageing-report assertion — caught by the
+  full suite, not assumed safe). §22c/§22d remain open (real off-site
+  directory needed; Settlement-report specifics not yet asserted anywhere).
+  **Verified:** `cd backend && npm test` 12/12 suites green (`test_repositories.js`
+  now 155 checks); `npx playwright test inventory-billing-operations.spec.js
+  reprint-desk.spec.js return-desk.spec.js` 21/21 (re-run, not assumed, since
+  the void-ordering change touches money-path control flow — CLAUDE.md §8);
+  `node verifyBackup.js` against today's real backup — 12/12 PASS (was 1/4);
+  real server boot smoke-tested against `backend/data/`, `GET /api/health`
+  200, shut down cleanly with nothing left listening on :5000.
+  **Uncommitted, on top of everything else already listed below:**
+  `backend/repositories/migrate.js` (modified), `backend/verifyBackup.js`
+  (modified), `backend/services/saleService.js` (modified),
+  `backend/test_repositories.js` (modified), `.gitattributes` (new),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **No Phase is currently
+  archivable**: Phase 19 still needs a real VPS run (§7 — none provisioned),
+  and the live Modules 20/21/22c/22d/23–26 in `TESTING_CHECKLIST.md` still
+  carry open, unchecked items, so `docs/archive/`'s "every item verified,
+  nothing outstanding" bar isn't met yet — checked `docs/archive/README.md`'s
+  own current-state note before concluding this, not assumed.
+
 - **2026-09-27: installable PWA added for the customer portal (`customer.html`
   only)** — manifest, service worker with an offline fallback, iOS home-screen
   meta tags, and a hand-rolled stdlib-only PNG icon generator

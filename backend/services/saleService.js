@@ -764,6 +764,17 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
         return inTransaction(() => {
             const header = invoices.findByNumber(context.tenantId, cleanNumber);
             if (!header) throw new DomainRefusal(404, `No filed invoice ${cleanNumber} exists.`, DOMAIN_CODE.INVOICE_NOT_FOUND);
+
+            // Checked BEFORE the generic state guard below: a return moves
+            // state itself to partially_returned/returned (returnService.js),
+            // so that guard would otherwise always fire first and this more
+            // specific, API_COMPATIBILITY.md-documented code could never be
+            // observed (found 2026-09-28 — docs/API_COMPATIBILITY.md promised
+            // VOID_AFTER_RETURN but callers only ever received VOID_NOT_ALLOWED).
+            const priorReturns = creditNotes.summarizeForInvoice(header.id);
+            if (priorReturns.count > 0 || priorReturns.returnedWeightGrams > 0) {
+                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.', DOMAIN_CODE.VOID_AFTER_RETURN);
+            }
             if (header.state !== 'issued') {
                 throw new DomainRefusal(409, 'Only an issued invoice with no returns can be cancelled.', DOMAIN_CODE.VOID_NOT_ALLOWED);
             }
@@ -772,11 +783,6 @@ export function voidSale(invoiceNumber, reason, deps = {}) {
                 throw new DomainRefusal(409,
                     'Only a sale from the current business date can be voided. Use a return/credit note for an earlier sale.',
                     DOMAIN_CODE.VOID_DATE_RESTRICTED);
-            }
-
-            const priorReturns = creditNotes.summarizeForInvoice(header.id);
-            if (priorReturns.count > 0 || priorReturns.returnedWeightGrams > 0) {
-                throw new DomainRefusal(409, 'This invoice already has a return and must not be cancelled.', DOMAIN_CODE.VOID_AFTER_RETURN);
             }
 
             for (const movement of inventory.documentSaleMovementsForInvoice(context.tenantId, header.id)) {
