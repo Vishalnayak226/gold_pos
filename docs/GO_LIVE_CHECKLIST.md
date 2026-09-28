@@ -1,9 +1,15 @@
-# Go-Live Checklist — Everything Blocked On You
+# Go-Live Checklist — External Accounts and Evidence
 
-Every code-side item is done and verified (`docs/PROJECT_PLAN.md` §6). What
-remains needs *you personally* — signups need your identity and payment
-details, and an AI agent cannot complete KYC, hold a credit card, or own a
-Google/Razorpay account on your behalf.
+> **Start with [GO_LIVE_RUNBOOK.md](GO_LIVE_RUNBOOK.md).** It is the simple,
+> owner-readable sequence and its current go/no-go decision is authoritative.
+> This document is the detailed account, deployment, and evidence checklist
+> behind that sequence.
+
+Some automated code evidence is complete, but several implementation and
+real-world release gates remain open in `docs/TESTING_CHECKLIST.md` §§23–24.
+What follows also needs *you personally* — signups need your identity and
+payment details, and an AI agent cannot complete KYC, hold a credit card, or
+own a Google/Razorpay account on your behalf.
 
 **How to use this doc:** work top to bottom. Each task says **what** it is,
 **where** to do it, **how** (exact commands/clicks), what it costs, and what
@@ -434,29 +440,134 @@ that's a genuine one-line change I'll make on the spot.
 
 # Track E — Play Store (Android app)
 
-**What for:** publishing the Capacitor wrapper around `customer.html`
-(`mobile/`). This is the one track that needs a different machine as well as
-your accounts.
+**Status on 2026-09-06: NOT published.** `mobile/` is only a Capacitor
+scaffold around `customer.html`; there is no generated Android project, signed
+Android App Bundle (AAB), Play Console listing, test track or approved release.
 
-1. [ ] **Account:** play.google.com/console — **$25 one-time** registration,
-       needs a Google account + ID verification.
-2. [ ] **Branding assets** to prepare or commission:
-   - App icon, 512×512 PNG
-   - Feature graphic, 1024×500 PNG
-   - At least 2 phone screenshots
-   - **A privacy policy at a URL you control** — mandatory; the listing is
-     rejected without one. This app handles phone-number login and payments.
-     Easiest host: a `privacy.html` page on the domain from A1.
-3. [ ] **Build machine:** Android Studio + JDK 17 (not available in this
-       sandbox). Then follow `mobile/README.md`: `npm install`, set the real
-       domain in `capacitor.config.json`, `npx cap add android`,
-       `npx cap sync android`, `npx cap open android`, then
-       Build → Generate Signed Bundle/AAB.
-4. [ ] Create the listing in Play Console, upload the AAB, fill in the
-       assets, submit. First review is typically 1–3 days.
+**What this is—and is not:** this is a **customer portal** app, not the
+cashier POS. The cashier POS works in a browser and does not need a Play Store
+launch. Build this track only if customers should install an Android app.
 
-**Hand back:** nothing I can act on remotely. I can write the privacy-policy
-page for you, and I'll fix any `customer.html` issue the review flags.
+**Stop rule:** do not publish to Production until the real-money, privacy,
+security and customer-support gates in `TESTING_CHECKLIST.md` §23 are complete.
+An app-store listing cannot make an unready payment or legal workflow safe.
+
+### E1. Decide the release scope
+
+- [ ] Confirm that the first app is the single-shop **Lumina POS Customer
+      Portal**, not a cashier app and not a multi-shop marketplace.
+  Why: the current wrapper points to one portal URL. One public app serving
+  many independent shops requires a separate tenant-selection design.
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+- [ ] Keep the permanent package ID `in.luminapos.customer` only if no
+      previous public listing exists and this is the intended permanent brand.
+  Why: Google package names cannot be reused after publication. Do not change
+  it casually after the first upload.
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+### E2. Create and protect the Play Console account
+
+- [ ] Register at [Google Play Console](https://play.google.com/console) and
+      complete identity verification. Use an **Organization** account for this
+      commercial product; gather the legal business name, address, website,
+      contact person and D-U-N-S number if Google asks for one. Turn on two-step
+      verification and give each developer their own access—never share the
+      owner password.
+  Why: Google verifies developer identity and the account owner is responsible
+  for customer data. See [Google's account-type guidance](https://support.google.com/googleplay/android-developer/answer/13634885?hl=en).
+  Result: _____  Owner: Business owner  Notes: _________________________
+
+### E3. Complete privacy and customer-rights work before building the listing
+
+- [ ] Publish a permanent public **Privacy Policy** webpage on the real HTTPS
+      domain—not a PDF or a draft document. It must name the business/developer,
+      explain collected data (phone, account, payment and device data), why it
+      is used, who receives it, retention, security, deletion and a contact
+      method. Link to it inside the customer portal as well as in Play Console.
+  Result: _____  Owner: Privacy counsel + product owner  Notes: ________
+
+- [ ] Give customers a clear account-deletion request path and test that it
+      deletes/anonymises the associated personal data according to the approved
+      retention policy. Do not merely hide or lock an account.
+  Result: _____  Owner: Developer + privacy counsel  Notes: ___________
+
+- [ ] Complete the Play Console **Data safety** form truthfully after reviewing
+      the portal, backend and every SDK. Declare how data is collected, used,
+      shared and protected; ensure it exactly matches the Privacy Policy.
+  Why: Google requires a privacy policy and Data safety declaration for apps,
+  including customer-account apps. [Google Play user-data policy](https://support.google.com/googleplay/android-developer/answer/10144311)
+  Result: _____  Owner: Product owner + privacy counsel  Notes: _______
+
+### E4. Prepare honest store-listing material
+
+- [ ] Create the app icon (512×512 PNG), feature graphic (1024×500 PNG), at
+      least two real-device phone screenshots, short description, full
+      description, support email and support/privacy URLs. Do not use mock
+      balances, unsupported claims or another shop's branding.
+  Result: _____  Owner: Product/brand owner  Notes: ____________________
+
+- [ ] Prepare a Google reviewer test account/phone number, safe test payment
+      method and exact review instructions. The reviewer must be able to reach
+      the live HTTPS portal without needing to contact the shop first.
+  Result: _____  Owner: Developer + product owner  Notes: _____________
+
+### E5. Build a signed Android App Bundle on a suitable machine
+
+- [ ] On a separate trusted computer, install Android Studio, Android SDK and
+      JDK 17. This workspace cannot build the app because those tools are not
+      installed here.
+  Result: _____  Owner: Android release engineer  Notes: ______________
+
+- [ ] In `mobile/`, run the following. Confirm `server.url` is the intended
+      public HTTPS customer-portal URL before generating Android files:
+
+  ```powershell
+  cd mobile
+  npm install
+  npx cap add android
+  npx cap sync android
+  npx cap open android
+  ```
+
+  In Android Studio, create and securely back up the release signing key, then
+  use **Build → Generate Signed Bundle / APK → Android App Bundle** to create
+  the `.aab` file. Do not upload an unsigned APK.
+  Result: _____  Owner: Android release engineer  Notes: ______________
+
+### E6. Test before asking Google to review it
+
+- [ ] Install the signed build on at least two real Android phones. Test login,
+      logout, password reset, payment success/failure, weak/slow/no network,
+      privacy-policy link, account deletion, rotation and different screen
+      sizes. Record each phone model and Android version.
+  Result: _____  Owner: QA + product owner  Notes: ____________________
+
+- [ ] Upload the AAB first to Play Console's **closed testing** track. Invite
+      real testers, collect defects, and fix/retest any blocking issue before
+      production. New personal developer accounts can have extra testing
+      requirements; check the current Console dashboard rather than guessing.
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+### E7. Create the listing and release to Production
+
+- [ ] In Play Console: Create app → set it as an app (not game), select
+      free/paid, add contact email, accept the declarations and Play App
+      Signing, upload the AAB, complete App content/Data safety/privacy/support
+      details, provide reviewer access, then submit the Production release.
+  Why: Google Play distributes signed Android App Bundles and reviews the
+  listing, app content and supplied access. [Official setup guide](https://support.google.com/googleplay/android-developer/answer/9859152?hl=en)
+  Result: _____  Owner: Product owner  Notes: _________________________
+
+- [ ] After approval, install the Play Store version from a clean phone and
+      repeat login, payment, privacy and account-deletion checks. Save the
+      listing URL, release version, approval date and screenshots in the launch
+      evidence folder.
+  Result: _____  Owner: QA + product owner  Notes: ____________________
+
+**Hand back:** Play Console account status, closed-test feedback, the signed
+AAB's version number, and any Google review rejection text. Never send a
+password, signing key or payment secret in chat.
 
 ---
 
@@ -487,4 +598,4 @@ pasting output back and forth, when you get there.
 | A5 | Confirmation the 5 health checks went green | Proceeding to A6 |
 | A7 | Any red CI job's log | Me fixing it |
 | D | Price + billing cycle *(only if you want it as a dashboard default)* | One-line change |
-| — | Nothing at all for B, C, E | Those are self-serve UIs |
+| E | Play Console status, AAB version, tester feedback or review rejection | Play Store release support |

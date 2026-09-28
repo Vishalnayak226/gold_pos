@@ -42,13 +42,19 @@ jobs:
       - name: Run all backend test suites
         working-directory: backend
         run: npm test
+      - name: Install licensing_server dependencies
+        working-directory: licensing_server
+        run: npm ci --no-audit --no-fund
+      - name: Run licensing_server behavioural test suite
+        working-directory: licensing_server
+        run: npm test
 
   dependency-audit:
     name: Dependency vulnerability audit
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        module: [backend, licensing_server]
+        module: [backend, licensing_server, mobile]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -124,7 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        module: [backend, licensing_server]
+        module: [backend, licensing_server, mobile]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

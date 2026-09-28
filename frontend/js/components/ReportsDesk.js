@@ -27,8 +27,18 @@ export class ReportsDesk {
         const host = document.querySelector('#reports-tab .panel-body');
         if (!host) return;
         const now = new Date();
-        const first = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
-        const today = now.toISOString().slice(0, 10);
+        // Local calendar date, not UTC: `toISOString()` here used to slice off
+        // the UTC date, which drifts a day behind local time for roughly the
+        // second half of every day in India (UTC+5:30) — a report defaulting
+        // its "To" field to UTC-yesterday silently excluded every sale rung
+        // today, wherever `businessDate()` (repositories/calendar.js) already
+        // groups sales by server-LOCAL date on purpose. Found via
+        // TESTING_CHECKLIST.md's Module 22 e2e journey failing right at the
+        // IST/UTC midnight boundary, 2026-09-19.
+        const pad = (n) => String(n).padStart(2, '0');
+        const localDate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        const first = localDate(new Date(now.getFullYear(), now.getMonth(), 1));
+        const today = localDate(now);
         host.innerHTML = `
             <div id="reports-disabled-notice" style="display:none;" class="text-muted-small">
                 Management Reports are not enabled for this store. These four reports (Settlement,

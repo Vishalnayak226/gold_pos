@@ -552,7 +552,8 @@ function buildInvoiceFilter({ tenantId, q = '', fromAt = null, toAt = null, stat
 
 const MAX_PAGE = 200;
 
-function clampLimit(limit) {
+/** Exported so the service layer can echo the bound actually applied, not the raw request (§24b). */
+export function clampLimit(limit) {
     const n = Math.trunc(Number(limit) || 50);
     if (n < 1) return 1;
     return Math.min(MAX_PAGE, n);

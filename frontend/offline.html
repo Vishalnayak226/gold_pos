@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>You're offline — Gold Savings Portal</title>
+    <style>
+        /* Deliberately self-contained: no external CSS/font/image. This page's
+           only job is to load correctly while genuinely offline, and the
+           service worker only ever precaches this one file. */
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: #f1f5f9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #0f172a;
+        }
+        .card {
+            max-width: 320px;
+            text-align: center;
+            padding: 32px 24px;
+        }
+        .glyph {
+            font-size: 48px;
+            margin-bottom: 12px;
+        }
+        h1 {
+            font-size: 18px;
+            margin: 0 0 8px;
+        }
+        p {
+            font-size: 14px;
+            color: #334155;
+            margin: 0 0 20px;
+        }
+        button {
+            font: inherit;
+            font-weight: 600;
+            padding: 10px 20px;
+            border-radius: 6px;
+            border: 1px solid #0f172a;
+            background-color: #0f172a;
+            color: #ffffff;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="glyph">📡</div>
+        <h1>You're offline</h1>
+        <p>Check your connection, then try again.</p>
+        <button onclick="location.reload()">Retry</button>
+    </div>
+</body>
+</html>

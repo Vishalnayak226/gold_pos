@@ -1,5 +1,5 @@
 import { logTelemetry, adminFetch } from '../app.js';
-import { ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus } from '../lib/billingMath.js';
+import { ADVANCE_STATUS, advanceEntryDelta, normalizeAdvanceStatus, describeSaleGoods } from '../lib/billingMath.js';
 
 /** Rows each "recent" list shows — and therefore rows each list asks for. */
 const RECENT_ROWS = 5;

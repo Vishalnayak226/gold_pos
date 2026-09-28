@@ -434,6 +434,19 @@ export class InventoryManager {
         const weightDeltaGrams = parseFloat(deltaInput.value);
         if (!weightDeltaGrams) { statusEl.textContent = 'Enter a non-zero amount (grams, negative to reduce).'; return; }
 
+        // A stock adjustment is a permanent physical-count correction (see the
+        // module comment above) with no undo in this UI — reversing a mistake
+        // means filing an equal and opposite adjustment, not editing this one.
+        // §24b: a destructive action must be explicitly confirmed and audited;
+        // the audit trail entry already exists (stockService.adjustLot), this
+        // was the missing confirmation half.
+        const item = this.items.find(i => i.id === this.expandedItemId);
+        const itemName = item ? item.name : 'this item';
+        const sign = weightDeltaGrams > 0 ? '+' : '';
+        if (!confirm(`Adjust ${itemName}'s stock by ${sign}${weightDeltaGrams}g? This is a permanent physical-count correction — there is no undo here, only a later equal-and-opposite adjustment.`)) {
+            return;
+        }
+
         try {
             const res = await adminFetch(`/api/inventory/lots/${encodeURIComponent(lotId)}/adjust`, {
                 method: 'POST',

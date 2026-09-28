@@ -33,9 +33,13 @@ process.env.GOLD_POS_LOGS_DIR = path.join(TEMP_ROOT, 'logs');
 process.env.GOLD_POS_BACKUPS_DIR = path.join(TEMP_ROOT, 'backups');
 
 const assert = (await import('assert')).default;
+const net = await import('net');
 const { DATA_DIR, writeJSON } = await import('./db.js');
 const repo = await import('./repositories/index.js');
 const alerting = await import('./alerting.js');
+const logWriter = await import('./logWriter.js');
+const { writeSettings } = await import('./settingsStore.js');
+const { getDefaultSettings } = await import('./defaultSettings.js');
 
 let passed = 0;
 function check(label, fn) {
@@ -205,6 +209,148 @@ await check('checkTlsExpiry no-ops when no publicUrl is configured', () => {
     alerting.checkTlsExpiry();
 });
 
+/* --------------------------------------------------------------------------
+   7. Log writer health — a full/unwritable log destination must reach the
+   one alert choke point, not just a console nobody is watching. Counters are
+   cumulative for the process, so the check must alert on the delta since the
+   last tick and never re-alert on a failure already counted.
+   -------------------------------------------------------------------------- */
+
+await check('checkLogWriterHealth is clean with no write/rotation/drop activity', () => {
+    assert.deepStrictEqual(alerting.checkLogWriterHealth(), []);
+});
+
+await check('checkLogWriterHealth flags a new write failure exactly once', async () => {
+    const unwritableDir = path.join(TEMP_ROOT, 'no-such-dir');
+    const unwritable = path.join(unwritableDir, 'telemetry.log');
+    logWriter.enqueueLog(unwritable, 'line\n');
+    await logWriter.drainLogWriter();
+    assert.ok(logWriter.getLogWriterStats().writeFailures > 0, 'appendFile into a missing directory must count as a write failure');
+    assert.deepStrictEqual(alerting.checkLogWriterHealth(), ['LOG_WRITE_FAILING']);
+    assert.deepStrictEqual(alerting.checkLogWriterHealth(), [], 'the same already-counted failure must not re-alert on the next tick');
+
+    // The failed line stays queued for a background retry (see logWriter.js's
+    // scheduleFlush(retryDelayMs)). Let it succeed and drain fully now, so a
+    // later automatic retry can't asynchronously bump writeFailures again
+    // during an unrelated check further down this suite.
+    fs.mkdirSync(unwritableDir, { recursive: true });
+    await logWriter.drainLogWriter();
+    assert.equal(logWriter.getLogWriterStats().queuedEntries, 0);
+});
+
+await check('checkLogWriterHealth flags dropped entries when the bounded queue overflows', async () => {
+    const target = path.join(TEMP_ROOT, 'overflow.log');
+    // Default MAX_QUEUE_ENTRIES is 2048; enqueue past it synchronously (no
+    // await yields to the 50ms flush timer) so some entries deterministically
+    // drop rather than get written.
+    for (let i = 0; i < 2100; i++) logWriter.enqueueLog(target, `${i}\n`);
+    assert.ok(logWriter.getLogWriterStats().droppedEntries > 0);
+    assert.deepStrictEqual(alerting.checkLogWriterHealth(), ['LOG_QUEUE_OVERFLOW']);
+    await logWriter.drainLogWriter();
+});
+
+/* --------------------------------------------------------------------------
+   8. Alert delivery — a real SMTP send, not just the cooldown/flag logic.
+   Every check above proves raiseAlert() decides correctly; none of them
+   proves an email actually leaves the process, because no prior suite ever
+   configures alertEmail/smtp far enough for sendMailIfConfigured() to be
+   reached (docs/RUNBOOKS.md §15 "Alert drill" — this is its automated half).
+   A minimal in-process SMTP server captures what nodemailer actually sends,
+   the same "throwaway local SMTP server" pattern used for the Phase 20.1
+   password-reset email — no new dependency, no real network egress.
+   -------------------------------------------------------------------------- */
+
+function startFakeSmtpServer() {
+    const messages = [];
+    const server = net.createServer(socket => {
+        let buffer = '';
+        let dataMode = false;
+        let dataBuffer = '';
+        socket.write('220 localhost ESMTP drill\r\n');
+        socket.on('data', chunk => {
+            if (dataMode) {
+                dataBuffer += chunk.toString('utf8');
+                const terminator = dataBuffer.indexOf('\r\n.\r\n');
+                if (terminator !== -1) {
+                    messages.push(dataBuffer.slice(0, terminator));
+                    dataMode = false;
+                    dataBuffer = '';
+                    socket.write('250 OK: queued\r\n');
+                }
+                return;
+            }
+            buffer += chunk.toString('utf8');
+            let idx;
+            while ((idx = buffer.indexOf('\r\n')) !== -1) {
+                const line = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                const cmd = line.split(' ')[0].toUpperCase();
+                if (cmd === 'EHLO' || cmd === 'HELO') socket.write('250 localhost\r\n');
+                else if (cmd === 'MAIL') socket.write('250 OK\r\n');
+                else if (cmd === 'RCPT') socket.write('250 OK\r\n');
+                else if (cmd === 'DATA') { dataMode = true; socket.write('354 End data with <CR><LF>.<CR><LF>\r\n'); }
+                else if (cmd === 'QUIT') { socket.write('221 Bye\r\n'); socket.end(); }
+                else socket.write('250 OK\r\n');
+            }
+        });
+    });
+    return new Promise(resolve => {
+        server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, messages }));
+    });
+}
+
+const { server: smtpServer, port: smtpPort, messages: capturedMessages } = await startFakeSmtpServer();
+
+writeSettings({
+    ...getDefaultSettings(),
+    alertEmail: 'oncall@drill.test',
+    smtp: { host: '127.0.0.1', port: smtpPort, secure: false, user: 'drill', pass: 'drill-pass', fromName: 'Alert Drill' }
+});
+
+await check('raiseAlert actually delivers a real email through the configured SMTP transport', async () => {
+    const result = await alerting.raiseAlert({
+        code: 'DRILL_SMTP_LIVE', severity: 'critical', message: 'Alert drill: this is a real send, not a stub.',
+        details: { drill: true }
+    });
+    assert.strictEqual(result.sent, true, result.reason);
+    assert.strictEqual(capturedMessages.length, 1);
+    // Body is quoted-printable (Content-Transfer-Encoding), which soft-wraps
+    // long lines with a literal "=\r\n" — strip that before substring checks
+    // so a wrap point landing mid-phrase doesn't produce a false negative.
+    const raw = capturedMessages[0].replace(/=\r\n/g, '');
+    assert.match(raw, /Subject: =\?UTF-8\?Q\?=5BCRITICAL=5D_DRILL=5FSMTP=5FLIVE/, 'the subject line must reach the wire');
+    assert.match(raw, /oncall@drill\.test/i, 'the configured recipient must be the actual envelope/header recipient');
+    assert.match(raw, /Alert drill: this is a real send/, 'the message body must contain the real alert text');
+});
+
+await check('the per-code cooldown blocks a second real send, not just the return flag', async () => {
+    const before = capturedMessages.length;
+    const result = await alerting.raiseAlert({ code: 'DRILL_SMTP_LIVE', message: 'second, immediately after' });
+    assert.strictEqual(result.sent, false);
+    assert.strictEqual(result.reason, 'cooldown');
+    assert.strictEqual(capturedMessages.length, before, 'a cooled-down alert must never open a second SMTP connection');
+});
+
+await check('an unreachable SMTP host fails soft — raiseAlert reports it, never throws', async () => {
+    writeSettings({
+        ...getDefaultSettings(),
+        alertEmail: 'oncall@drill.test',
+        smtp: { host: '127.0.0.1', port: 1, secure: false, user: 'drill', pass: 'drill-pass', fromName: 'Alert Drill' }
+    });
+    const result = await alerting.raiseAlert({ code: 'DRILL_SMTP_UNREACHABLE', message: 'must not throw' });
+    assert.strictEqual(result.sent, false);
+    assert.ok(result.reason, 'a failed send must still explain why');
+});
+
+await new Promise(resolve => smtpServer.close(resolve));
+
+/* Same QA-001 bug class as backend/test_security.js's teardown (fixed this
+ * same session): this suite's own checks above queue diagnostic writes
+ * through logWriter.js's async batching, so closing the db and removing the
+ * temp directory before that queue drains raced a scheduled flush against a
+ * directory that no longer existed. Drain first, in the same order
+ * server.js's real shutdown() uses. */
+await logWriter.drainLogWriter();
 repo.closeDb();
 fs.rmSync(TEMP_ROOT, { recursive: true, force: true });
 

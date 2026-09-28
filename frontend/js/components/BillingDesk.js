@@ -76,6 +76,14 @@ export class BillingDesk {
         this.appliedAdvance = 0;
         this.customerAdvanceBalance = 0;
         this.customerPhone = '';
+        // A slow lookup for the previous customer must never repaint the
+        // advance panel after the cashier has typed a different number.
+        this.advanceLookupController = null;
+        this.advanceLookupToken = 0;
+        // Same shape: a slow SKU lookup must never overwrite a faster,
+        // later scan (a busy counter fires these back-to-back).
+        this.skuLookupController = null;
+        this.skuLookupToken = 0;
         this.customerName = '';
         this.inventorySelection = null;
         this.exchangeCreditNoteId = null;
@@ -245,6 +253,10 @@ export class BillingDesk {
                                     <input type="number" id="gold-weight" class="form-control" placeholder="0.00" step="0.001" min="0" required>
                                 </div>
                             </div>
+                            <p class="text-muted-small" style="margin:-4px 0 10px;">
+                                Current rate: <strong id="current-gold-rate-22k">₹0.00/g</strong>
+                                <span class="widget-type-badge" id="rate-type-badge">Auto</span>
+                            </p>
                             <div class="form-group">
                                 <label for="item-description">Item (optional)</label>
                                 <input type="text" id="item-description" class="form-control" placeholder="e.g. Bangles, chain" maxlength="120">
@@ -299,8 +311,8 @@ export class BillingDesk {
                                 </div>
                                 <div class="form-group">
                                     <label for="customer-phone">Customer Phone (10-Digit)</label>
-                                    <input type="tel" id="customer-phone" class="form-control" placeholder="Optional" maxlength="10">
-                                    <span class="input-error-msg" id="phone-validation-error"></span>
+                                    <input type="tel" id="customer-phone" class="form-control" placeholder="Optional" maxlength="10" aria-describedby="phone-validation-error">
+                                    <span class="input-error-msg" id="phone-validation-error" aria-live="polite"></span>
                                 </div>
                             </div>
                             <div class="form-group">
@@ -575,12 +587,14 @@ export class BillingDesk {
 
             const errorEl = document.getElementById('phone-validation-error');
             if (phone.length > 0 && phone.length < 10) {
+                this.cancelAdvanceLookup();
                 errorEl.textContent = 'Phone number must be exactly 10 digits';
             } else {
                 errorEl.textContent = '';
                 if (phone.length === 10) {
                     await this.lookupCustomerAdvance(phone);
                 } else {
+                    this.cancelAdvanceLookup();
                     this.clearAdvance();
                 }
             }
@@ -760,13 +774,25 @@ export class BillingDesk {
         this.recalculate();
     }
 
+    cancelAdvanceLookup() {
+        this.advanceLookupToken += 1;
+        this.advanceLookupController?.abort();
+        this.advanceLookupController = null;
+    }
+
     async lookupCustomerAdvance(phone) {
+        this.cancelAdvanceLookup();
+        const lookupToken = this.advanceLookupToken;
+        const controller = new AbortController();
+        this.advanceLookupController = controller;
         try {
             // Admin-gated since Phase 20.1 — reading an arbitrary customer's
             // ledger by phone number is a cashier action, not a public one.
-            const res = await adminFetch(`/api/advances/lookup?phone=${phone}`);
+            const res = await adminFetch(`/api/advances/lookup?phone=${phone}`, { signal: controller.signal });
             if (res.ok) {
                 const data = await res.json();
+                const currentPhone = String(document.getElementById('customer-phone')?.value || '').replace(/\D/g, '');
+                if (lookupToken !== this.advanceLookupToken || controller.signal.aborted || currentPhone !== phone) return;
                 this.customerAdvanceBalance = parseFloat(data.balance) || 0;
                 
                 const container = document.getElementById('advance-redeem-container');
@@ -781,8 +807,11 @@ export class BillingDesk {
                 }
             }
         } catch (err) {
+            if (err.name === 'AbortError' || lookupToken !== this.advanceLookupToken) return;
             console.error('Failed to lookup customer advance:', err);
             this.clearAdvance();
+        } finally {
+            if (lookupToken === this.advanceLookupToken) this.advanceLookupController = null;
         }
     }
 
@@ -996,23 +1025,25 @@ export class BillingDesk {
             <div class="form-group-row" style="align-items:flex-end;">
                 <div class="form-group">
                     ${i === 0 ? '<label>Method</label>' : ''}
-                    <select class="form-control tender-method" data-index="${i}">
+                    <select class="form-control tender-method" data-index="${i}" aria-label="Payment method, split ${i + 1}">
                         ${TENDER_METHODS.map(m => `<option value="${m.value}"${m.value === t.method ? ' selected' : ''}>${m.label}</option>`).join('')}
                     </select>
                 </div>
                 <div class="form-group">
                     ${i === 0 ? '<label>Amount (₹)</label>' : ''}
                     <input type="number" class="form-control tender-amount" data-index="${i}"
+                           aria-label="Amount (₹), split ${i + 1}"
                            min="0" step="0.01" value="${t.amount || ''}">
                 </div>
                 <div class="form-group">
                     ${i === 0 ? '<label>Reference (optional)</label>' : ''}
                     <input type="text" class="form-control tender-reference" data-index="${i}"
+                           aria-label="Reference (optional), split ${i + 1}"
                            maxlength="100" placeholder="Card slip / UTR" value="${escapeHtml(t.reference)}">
                 </div>
                 ${this.tenders.length > 1 ? `
                 <div class="form-group" style="flex:0 0 auto;">
-                    <button type="button" class="btn btn-secondary btn-sm tender-remove-btn" data-index="${i}">✕</button>
+                    <button type="button" class="btn btn-secondary btn-sm tender-remove-btn" data-index="${i}" aria-label="Remove payment split ${i + 1}">✕</button>
                 </div>` : ''}
             </div>
         `).join('');
@@ -1410,6 +1441,12 @@ export class BillingDesk {
         this.recalculate();
     }
 
+    cancelSkuLookup() {
+        this.skuLookupToken += 1;
+        this.skuLookupController?.abort();
+        this.skuLookupController = null;
+    }
+
     /** Resolves a scanner value to catalogue metadata and an exact on-hand lot. */
     async lookupSku() {
         const input = document.getElementById('billing-sku');
@@ -1419,10 +1456,15 @@ export class BillingDesk {
             this.clearInventorySelection('Scan or type a SKU first.');
             return;
         }
+        this.cancelSkuLookup();
+        const lookupToken = this.skuLookupToken;
+        const controller = new AbortController();
+        this.skuLookupController = controller;
         if (status) status.textContent = 'Looking up catalogue item…';
         try {
-            const res = await adminFetch(`/api/inventory/items/by-sku/${encodeURIComponent(sku)}`);
+            const res = await adminFetch(`/api/inventory/items/by-sku/${encodeURIComponent(sku)}`, { signal: controller.signal });
             const body = await res.json().catch(() => ({}));
+            if (lookupToken !== this.skuLookupToken || controller.signal.aborted) return;
             if (!res.ok) throw new Error(body.error || 'SKU not found.');
             if (!body.item?.isActive) throw new Error('This catalogue item is inactive.');
             const lots = Array.isArray(body.lots) ? body.lots.filter(lot => Number(lot.weightGrams) > 0) : [];
@@ -1449,11 +1491,15 @@ export class BillingDesk {
             this.updateGoldRateDisplay();
             this.recalculate();
         } catch (err) {
+            if (err.name === 'AbortError' || lookupToken !== this.skuLookupToken) return;
             this.clearInventorySelection(err.message || 'Could not look up that SKU.');
+        } finally {
+            if (lookupToken === this.skuLookupToken) this.skuLookupController = null;
         }
     }
 
     clearInventorySelection(message = '') {
+        this.cancelSkuLookup();
         this.inventorySelection = null;
         const lotGroup = document.getElementById('billing-lot-group');
         const lotSelect = document.getElementById('billing-lot');

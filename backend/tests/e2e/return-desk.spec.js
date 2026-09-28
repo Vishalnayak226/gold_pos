@@ -322,4 +322,13 @@ test.describe('Return desk', () => {
         await recent.first().getByRole('button', { name: 'Note' }).click();
         await expect(page.locator('#return-note-container .invoice-sheet')).toContainText('CREDIT NOTE');
     });
+
+    test('refuses to search on nothing rather than returning the whole ledger', async ({ page, posServer }) => {
+        await loginAsAdmin(page, posServer);
+        await openReturnDesk(page);
+
+        await page.click('#return-search-btn');
+        await expect(page.locator('#return-results')).toContainText('Enter an invoice number');
+        await expect(page.locator('#return-results tbody tr')).toHaveCount(0);
+    });
 });

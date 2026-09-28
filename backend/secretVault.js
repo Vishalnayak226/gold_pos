@@ -164,7 +164,7 @@ export function open(value, aad, key) {
         throw new Error(`Malformed vault value at "${aad}".`);
     }
     try {
-        const decipher = crypto.createDecipheriv(ALGORITHM, key, Buffer.from(ivB64, 'base64'));
+        const decipher = crypto.createDecipheriv(ALGORITHM, key, Buffer.from(ivB64, 'base64'), { authTagLength: 16 });
         decipher.setAAD(Buffer.from(aad, 'utf8'));
         decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
         return Buffer.concat([

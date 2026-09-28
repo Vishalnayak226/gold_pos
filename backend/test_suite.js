@@ -12,7 +12,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 // Mock DB helpers to avoid polluting live databases
 const ROU_DATA = {
@@ -45,6 +45,9 @@ process.env.GOLD_POS_LOGS_DIR = path.join(TEST_ROOT, 'logs');
 process.env.GOLD_POS_PITR_DIR = path.join(TEST_ROOT, 'pitr');
 process.env.GOLD_POS_BACKUPS_DIR = path.join(TEST_ROOT, 'backups');
 process.env.GOLD_POS_OFFSITE_BACKUP_DIR = path.join(TEST_ROOT, 'offsite');
+// Test 15 invokes verifyBackup.js itself and awaits it. Avoid a second,
+// intentionally asynchronous production verifier outliving this temp tree.
+process.env.GOLD_POS_DISABLE_POST_BACKUP_VERIFY = '1';
 fs.mkdirSync(process.env.GOLD_POS_DATA_DIR, { recursive: true });
 fs.mkdirSync(process.env.GOLD_POS_LOGS_DIR, { recursive: true });
 
@@ -205,7 +208,8 @@ function testAsymmetricEnvelope() {
     const decipher = crypto.createDecipheriv(
         'aes-256-gcm',
         rsaDecryptedKey,
-        Buffer.from(envelope.iv, 'base64')
+        Buffer.from(envelope.iv, 'base64'),
+        { authTagLength: 16 }
     );
     decipher.setAuthTag(Buffer.from(envelope.authTag, 'base64'));
 
@@ -853,6 +857,21 @@ async function testBackupArchiveEncryption() {
     });
     assert.ok(seededDeposit.success, 'seeding the backup-drill fixture deposit: ' + seededDeposit.error);
 
+    // A second fixture, carrying an idempotency key, so the post-restore
+    // replay drill below can prove that key still dedupes after a restore —
+    // not just that the row is readable.
+    const saleService = await import('./services/saleService.js');
+    const BACKUP_DRILL_IDEMPOTENCY_KEY = 'backup-drill-idempotency-key';
+    const seededSale = saleService.createSale({
+        purity: '22K', weightGrams: 1, customerName: 'Backup Drill Sale',
+        idempotencyKey: BACKUP_DRILL_IDEMPOTENCY_KEY
+    }, {
+        getActiveGoldRates: () => ({ ...ROU_DATA, sources: { price24K: 'auto', price22K: 'auto', price18K: 'auto' } }),
+        getSettings: () => ({ goldTaxSlab: 3, taxMode: 'Exclusive', invoicePrefix: 'GOLD', invoiceSeqStart: 1 }),
+        isValidPhone: (v) => /^\d{10}$/.test(String(v || ''))
+    });
+    assert.ok(seededSale.ok, 'seeding the backup-drill fixture sale: ' + seededSale.error);
+
     const { createBackup } = await import('./backupEngine.js');
     const result = createBackup();
     assert.strictEqual(result.success, true, result.error);
@@ -861,6 +880,8 @@ async function testBackupArchiveEncryption() {
     assert.ok(files.length > 0, 'the backup snapshot must contain files');
     assert.ok(files.every(f => f.endsWith(backupCrypto.ENCRYPTED_EXTENSION)),
         `every backup file must be encrypted, got: ${files.join(', ')}`);
+    assert.ok(files.includes(`backup_manifest.json${backupCrypto.ENCRYPTED_EXTENSION}`),
+        'the encrypted archive must include its self-description manifest');
 
     // The restore drill runs as a separate process with its own fresh temp
     // restore directory, so — same as production — it needs the vault key
@@ -874,7 +895,142 @@ async function testBackupArchiveEncryption() {
         `verifyBackup.js must restore and pass its checks against an encrypted snapshot `
         + `(stdout: ${verify.stdout}, stderr: ${verify.stderr})`);
 
-    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, and the restore drill still passes against them.');
+    /* POST-RESTORE REPLAY. verifyBackup.js above proves a restored snapshot is
+       self-consistent AT REST — integrity_check, migrations applied, the
+       audit chain verifies. It never attempts a WRITE against the restored
+       copy, so it cannot prove the thing a real recovery actually needs:
+       that the restored install is SERVABLE, and that a cashier's next
+       actions on it are still safe — a duplicate submission of an
+       already-filed idempotency key must not create a second invoice, and a
+       fresh sale must not collide with the restored sequence history.
+       --keep (and no --quiet) makes verifyBackup.js leave its restored copy
+       on disk instead of deleting it, so this can point real service calls
+       at it afterward — in a fresh child process, since db.js resolves
+       DATA_DIR once per process and this process already opened the live
+       suite's own database (CLAUDE.md §8). */
+    const replayVerify = spawnSync(process.execPath, ['verifyBackup.js', '--backup', folder, '--keep'], {
+        cwd: __dirname,
+        env: { ...process.env, GOLD_POS_SECRET_KEY: activeKey.toString('hex') }
+    });
+    assert.strictEqual(replayVerify.status, 0,
+        `verifyBackup.js --keep must also pass (stdout: ${replayVerify.stdout}, stderr: ${replayVerify.stderr})`);
+    const restoredMatch = /Restored to:\s*(.+)/.exec(replayVerify.stdout.toString());
+    assert.ok(restoredMatch, 'expected verifyBackup.js to print where it restored to:\n' + replayVerify.stdout);
+    const restoredDataDir = restoredMatch[1].trim();
+    const restoredRoot = path.dirname(restoredDataDir);
+
+    try {
+        const replayWorker = path.join(restoredRoot, 'replay-worker.mjs');
+        fs.writeFileSync(replayWorker, `
+import { pathToFileURL } from 'url';
+const BACKEND = ${JSON.stringify(__dirname.replace(/\\/g, '/'))};
+const load = p => import(pathToFileURL(BACKEND + '/' + p).href);
+
+const repo = await load('repositories/index.js');
+const saleService = await load('services/saleService.js');
+const { readSettings } = await load('settingsStore.js');
+
+const settings = readSettings(process.env.GOLD_POS_DATA_DIR);
+const DEPS = {
+    getSettings: () => settings,
+    getActiveGoldRates: () => ({
+        price24K: 7500, price22K: 6875, price18K: 5625,
+        sources: { price24K: 'auto', price22K: 'auto', price18K: 'auto' }
+    }),
+    isValidPhone: v => /^\\d{10}\$/.test(String(v || ''))
+};
+
+const replay = saleService.createSale({
+    purity: '22K', weightGrams: 1, customerName: 'Backup Drill Sale',
+    idempotencyKey: ${JSON.stringify(BACKUP_DRILL_IDEMPOTENCY_KEY)}
+}, DEPS);
+const fresh = saleService.createSale({
+    purity: '22K', weightGrams: 1, customerName: 'Post-Restore Fresh Sale'
+}, DEPS);
+
+process.stdout.write(JSON.stringify({ replay, fresh }));
+repo.closeDb();
+`, 'utf8');
+
+        const replayRun = spawnSync(process.execPath, [replayWorker], {
+            env: {
+                ...process.env,
+                GOLD_POS_DATA_DIR: restoredDataDir,
+                GOLD_POS_LOGS_DIR: path.join(restoredRoot, 'logs'),
+                // Same reason verifyBackup.js above needs it explicitly: the
+                // restored settings.json holds ciphertext sealed under the
+                // live suite's key, and the dev-keyfile fallback lives INSIDE
+                // the directory it protects, so it never travels with a copy.
+                GOLD_POS_SECRET_KEY: activeKey.toString('hex')
+            }
+        });
+        assert.strictEqual(replayRun.status, 0,
+            `replaying requests against the restored data failed:\n${replayRun.stdout}\n${replayRun.stderr}`);
+        const { replay, fresh } = JSON.parse(replayRun.stdout.toString());
+
+        assert.strictEqual(replay.ok, true, 'replaying the seeded idempotency key: ' + replay.error);
+        assert.strictEqual(replay.invoiceId, seededSale.invoiceId,
+            'resubmitting an idempotency key already in the restored ledger must return the SAME invoice, not a new one');
+
+        assert.strictEqual(fresh.ok, true, 'a fresh sale against the restored ledger: ' + fresh.error);
+        assert.notStrictEqual(fresh.invoiceId, seededSale.invoiceId);
+        const seededSeq = Number(/-(\d+)-/.exec(seededSale.invoiceId)[1]);
+        const freshSeq = Number(/-(\d+)-/.exec(fresh.invoiceId)[1]);
+        assert.ok(freshSeq > seededSeq,
+            `a fresh sale after restore got sequence ${freshSeq}, which does not continue past the restored history's ${seededSeq}`);
+    } finally {
+        fs.rmSync(restoredRoot, { recursive: true, force: true });
+    }
+
+    console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, carry a self-description manifest, the restore drill passes against them, and a restored install correctly dedupes a replayed idempotency key while continuing its sequence for a fresh sale.');
+}
+
+/* ==========================================================================
+   TEST 16: the manual gold-rate override gate — priceEngine.js's
+   getActiveGoldRates() had never been imported by any test in this tree
+   (every other suite mocks it out entirely), so nothing had ever proven it
+   actually reads its own `active` flag rather than just "is a stored price
+   > 0". Found via TESTING_CHECKLIST.md Module 6, 2026-09-19: unchecking
+   "Enable manual overrides" in Settings and saving never actually turned it
+   off, because the gate ignored `active` and looked only at the stored
+   prices — which the form leaves in place when you merely uncheck the box.
+   Every price-dependent service (sales, returns, advances, old-gold
+   exchange, payment credit, gold schemes) reads gold rates through this one
+   function, so this was a real, silent mispricing risk, not a cosmetic bug.
+   ========================================================================== */
+async function testGoldPriceOverrideGate() {
+    console.log('\nRunning Test 16: manual gold-rate override respects its own on/off switch...');
+
+    const { getDefaultSettings } = await import('./defaultSettings.js');
+    const { writeSettings } = await import('./settingsStore.js');
+    const { getActiveGoldRates } = await import('./priceEngine.js');
+    const base = getDefaultSettings();
+
+    // Active, with real prices: the override applies.
+    writeSettings({ ...base, overrideGoldPrice: { active: true, price24K: 9000, price22K: 8250, price18K: 6750 } });
+    let rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'manual', 'an active override with real prices must report source "manual"');
+    assert.strictEqual(rates.price22K, 8250, 'the override price must be used while active');
+
+    // Disabled, but the SAME stored prices are still sitting there — the
+    // exact shape the Settings form leaves behind when a user just unchecks
+    // the box and saves, without also clearing the price fields.
+    writeSettings({ ...base, overrideGoldPrice: { active: false, price24K: 9000, price22K: 8250, price18K: 6750 } });
+    rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'auto', 'a disabled override must report source "auto" even with stale non-zero prices stored');
+    assert.notStrictEqual(rates.price22K, 8250, 'a disabled override must not still be priced off the stale manual figure');
+
+    // Active but with no real prices set: nothing to override with, so auto.
+    writeSettings({ ...base, overrideGoldPrice: { active: true, price24K: 0, price22K: 0, price18K: 0 } });
+    rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'auto', 'an active override with no prices set has nothing to override with');
+
+    // No override object at all: auto, same as a fresh install.
+    writeSettings({ ...base, overrideGoldPrice: undefined });
+    rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'auto', 'no override configured at all must be auto');
+
+    console.log('✅ Test 16 Passed: the manual gold-rate override is gated on its own on/off switch, not on stale stored prices.');
 }
 
 // Execute all test cases
@@ -894,6 +1050,7 @@ try {
     await testPitrScheduler();
     await testOffsiteBackupCopy();
     await testBackupArchiveEncryption();
+    await testGoldPriceOverrideGate();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');
