@@ -253,6 +253,10 @@ export class BillingDesk {
                                     <input type="number" id="gold-weight" class="form-control" placeholder="0.00" step="0.001" min="0" required>
                                 </div>
                             </div>
+                            <p class="text-muted-small" style="margin:-4px 0 10px;">
+                                Current rate: <strong id="current-gold-rate-22k">₹0.00/g</strong>
+                                <span class="widget-type-badge" id="rate-type-badge">Auto</span>
+                            </p>
                             <div class="form-group">
                                 <label for="item-description">Item (optional)</label>
                                 <input type="text" id="item-description" class="form-control" placeholder="e.g. Bangles, chain" maxlength="120">
@@ -307,8 +311,8 @@ export class BillingDesk {
                                 </div>
                                 <div class="form-group">
                                     <label for="customer-phone">Customer Phone (10-Digit)</label>
-                                    <input type="tel" id="customer-phone" class="form-control" placeholder="Optional" maxlength="10">
-                                    <span class="input-error-msg" id="phone-validation-error"></span>
+                                    <input type="tel" id="customer-phone" class="form-control" placeholder="Optional" maxlength="10" aria-describedby="phone-validation-error">
+                                    <span class="input-error-msg" id="phone-validation-error" aria-live="polite"></span>
                                 </div>
                             </div>
                             <div class="form-group">
@@ -1021,23 +1025,25 @@ export class BillingDesk {
             <div class="form-group-row" style="align-items:flex-end;">
                 <div class="form-group">
                     ${i === 0 ? '<label>Method</label>' : ''}
-                    <select class="form-control tender-method" data-index="${i}">
+                    <select class="form-control tender-method" data-index="${i}" aria-label="Payment method, split ${i + 1}">
                         ${TENDER_METHODS.map(m => `<option value="${m.value}"${m.value === t.method ? ' selected' : ''}>${m.label}</option>`).join('')}
                     </select>
                 </div>
                 <div class="form-group">
                     ${i === 0 ? '<label>Amount (₹)</label>' : ''}
                     <input type="number" class="form-control tender-amount" data-index="${i}"
+                           aria-label="Amount (₹), split ${i + 1}"
                            min="0" step="0.01" value="${t.amount || ''}">
                 </div>
                 <div class="form-group">
                     ${i === 0 ? '<label>Reference (optional)</label>' : ''}
                     <input type="text" class="form-control tender-reference" data-index="${i}"
+                           aria-label="Reference (optional), split ${i + 1}"
                            maxlength="100" placeholder="Card slip / UTR" value="${escapeHtml(t.reference)}">
                 </div>
                 ${this.tenders.length > 1 ? `
                 <div class="form-group" style="flex:0 0 auto;">
-                    <button type="button" class="btn btn-secondary btn-sm tender-remove-btn" data-index="${i}">✕</button>
+                    <button type="button" class="btn btn-secondary btn-sm tender-remove-btn" data-index="${i}" aria-label="Remove payment split ${i + 1}">✕</button>
                 </div>` : ''}
             </div>
         `).join('');

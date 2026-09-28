@@ -56,6 +56,8 @@ import * as advanceService from './services/advanceService.js';
 import * as oldGoldService from './services/oldGoldService.js';
 import * as goldSchemeService from './services/goldSchemeService.js';
 import * as paymentService from './services/paymentService.js';
+import * as stockService from './services/stockService.js';
+import * as reconciliationService from './services/reconciliationService.js';
 import { importLegacyJson, collectSource, formatReport } from './importLegacyJson.js';
 // Shared invoice arithmetic — the exact module the Billing Desk renders its
 // preview from, so the persisted ledger and the cashier's screen can never
@@ -514,11 +516,30 @@ app.use(checkLicenseGate);
 // do this ahead of time (CLAUDE.md §0). HTML itself is always revalidated
 // (below) so a browser never runs a page whose asset URLs point at a release
 // that no longer exists.
+//
+// The <script type="module"> ENTRY tag is deliberately excluded from the
+// stamp. Every component imports its shared helpers back from the entry file
+// itself (e.g. `import { adminFetch } from '../app.js'`) using a bare,
+// unversioned specifier — there is no build step to rewrite those in-JS
+// import specifiers to match. ES module identity is exact-URL, so stamping
+// only the HTML tag (`js/app.js?v=...`) while every component keeps
+// importing the bare `js/app.js` would give the entry module TWO distinct
+// cache entries: the browser fetches and executes it twice, registers its
+// DOMContentLoaded bootstrap twice, and ends up with two live instances of
+// every component silently double-wiring listeners onto the same DOM (found
+// via a Playwright SKU-lookup race spec that finally clicked a button whose
+// handler isn't idempotent — see docs/LEDGER.md 2026-09-16).
 function versionedHtml(relPath) {
     const raw = fs.readFileSync(path.join(__dirname, '../frontend', relPath), 'utf8');
     return raw.replace(
-        /(<(?:script|link)\b[^>]*?(?:\bsrc|\bhref)=")(js\/[^"]+\.js|css\/[^"]+\.css)(")/g,
-        (match, pre, assetPath, post) => `${pre}${assetPath}?v=${ASSET_VERSION}${post}`
+        /<(?:script|link)\b[^>]*>/g,
+        (tag) => {
+            if (/type\s*=\s*["']module["']/.test(tag)) return tag;
+            return tag.replace(
+                /(\b(?:src|href)=")(js\/[^"]+\.js|css\/[^"]+\.css)(")/,
+                (m, pre, assetPath, post) => `${pre}${assetPath}?v=${ASSET_VERSION}${post}`
+            );
+        }
     );
 }
 const INDEX_HTML = versionedHtml('index.html');
@@ -1791,7 +1812,13 @@ app.post('/api/settings', requireAdminSession, requireRole('owner'), (req, res) 
    ========================================================================== */
 
 const LEDGER_PAGE_DEFAULT = 100;
-const LEDGER_PAGE_MAX = 500;
+// Must match every ledger repository's own MAX_PAGE (invoiceRepository.js,
+// advanceRepository.js, creditNoteRepository.js all clamp to 200 internally).
+// If this ever exceeds that, the three envelope routes below echo `limit: q.limit`
+// straight from this clamp — a client requesting more than the repository layer's
+// cap would see a `limit` in the response that is larger than `results.length`
+// could ever be, breaking `offset += limit` pagination (§24b, fixed 2026-09-17).
+const LEDGER_PAGE_MAX = 200;
 
 /**
  * Parses the `from` / `to` / `limit` triple every ledger list accepts.
@@ -3087,21 +3114,22 @@ app.get('/api/inventory/lots', requireAdminSession, (req, res) => {
 app.post('/api/inventory/lots', requireAdminSession, validateBody(INVENTORY_LOT_OPEN_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
-        const item = repo.inventory.getItem(context.tenantId, req.body.itemId);
-        if (!item) return res.status(400).json({ error: 'No inventory item with that id' });
-
-        const { lotId } = repo.inTransaction(() => repo.inventory.openLot({
-            tenantId: context.tenantId,
-            branchId: context.branchId,
+        const result = stockService.openLot({
             itemId: req.body.itemId,
             weightMg: gramsToMg(req.body.weightGrams),
             label: req.body.label || null,
             reason: req.body.reason || null,
-            actorUserId: resolveActorUserId(req.actor),
             hallmarkHuid: req.body.hallmarkHuid || null,
             unitCostPaisePerG: req.body.unitCostPerGram == null ? null : toPaise(req.body.unitCostPerGram)
-        }));
-        res.json({ success: true, id: lotId, lot: inventoryLotToWire(repo.inventory.getLot(context.tenantId, lotId)) });
+        }, {
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'admin',
+            ipAddress: req.ip
+        });
+        if (!result.success) {
+            return res.status(result.status || 400).json({ error: result.error, code: result.code });
+        }
+        res.json({ success: true, id: result.lotId, lot: inventoryLotToWire(repo.inventory.getLot(context.tenantId, result.lotId)) });
     } catch (err) {
         logError('Error opening inventory lot: ' + err.message, err.stack);
         res.status(400).json({ error: err.message || 'Failed to open the inventory lot' });
@@ -3116,19 +3144,19 @@ app.post('/api/inventory/lots', requireAdminSession, validateBody(INVENTORY_LOT_
  */
 app.post('/api/inventory/lots/:id/adjust', requireAdminSession, validateBody(INVENTORY_ADJUST_SCHEMA), (req, res) => {
     try {
-        const weightDeltaMg = gramsToMg(req.body.weightDeltaGrams);
-        if (weightDeltaMg === 0) {
-            return res.status(400).json({ error: 'weightDeltaGrams must not round to zero milligrams.' });
-        }
-        const context = repo.dataStoreContext();
-        const movementId = repo.inTransaction(() => repo.inventory.recordAdjustment({
-            tenantId: context.tenantId,
+        const result = stockService.adjustLot({
             lotId: req.params.id,
-            weightDeltaMg,
-            reason: req.body.reason || null,
-            actorUserId: resolveActorUserId(req.actor)
-        }));
-        res.json({ success: true, movementId, balanceGrams: round3(repo.inventory.lotBalanceMg(req.params.id) / 1000) });
+            weightDeltaMg: gramsToMg(req.body.weightDeltaGrams),
+            reason: req.body.reason || null
+        }, {
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'admin',
+            ipAddress: req.ip
+        });
+        if (!result.success) {
+            return res.status(result.status || 400).json({ error: result.error, code: result.code });
+        }
+        res.json({ success: true, movementId: result.movementId, balanceGrams: result.balanceGrams });
     } catch (err) {
         logError('Error adjusting inventory lot: ' + err.message, err.stack);
         res.status(400).json({ error: err.message || 'Failed to adjust the inventory lot' });
@@ -3520,33 +3548,18 @@ app.get('/api/cash-shifts/current', requireAdminSession, (req, res) => {
 app.post('/api/cash-shifts/open', requireAdminSession, validateBody(CASH_SHIFT_OPEN_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
-        const actorUserId = resolveActorUserId(req.actor);
-        const shiftId = repo.inTransaction(() => {
-            const id = repo.cashShifts.openShift({
-                tenantId: context.tenantId,
-                branchId: context.branchId,
-                openingFloatPaise: toPaise(req.body.openingFloat),
-                openingNote: req.body.openingNote || null,
-                actorUserId
-            });
-            // A cash shift is a financial fact like any other counter action —
-            // it belongs in the same tamper-evident trail a sale/return/void
-            // already lands in, not just the shift row's own actor column.
-            repo.audit.record({
-                tenantId: context.tenantId,
-                branchId: context.branchId,
-                actorUserId,
-                actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
-                action: 'CASH_SHIFT_OPENED',
-                entityType: 'cash_shift',
-                entityId: id,
-                summary: `Shift opened with float ${round2(req.body.openingFloat)}`,
-                detail: { openingFloat: req.body.openingFloat, openingNote: req.body.openingNote || null },
-                ipAddress: req.ip
-            });
-            return id;
+        const result = reconciliationService.openShift({
+            openingFloatPaise: toPaise(req.body.openingFloat),
+            openingNote: req.body.openingNote || null
+        }, {
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'admin',
+            ipAddress: req.ip
         });
-        res.json({ success: true, id: shiftId, shift: cashShiftToWire(repo.cashShifts.getShift(context.tenantId, shiftId)) });
+        if (!result.success) {
+            return res.status(result.status || 400).json({ error: result.error, code: result.code });
+        }
+        res.json({ success: true, id: result.id, shift: cashShiftToWire(repo.cashShifts.getShift(context.tenantId, result.id)) });
     } catch (err) {
         logError('Error opening cash shift: ' + err.message, err.stack);
         res.status(400).json({ error: err.message || 'Failed to open the shift' });
@@ -3563,36 +3576,18 @@ app.post('/api/cash-shifts/open', requireAdminSession, validateBody(CASH_SHIFT_O
 app.post('/api/cash-shifts/:id/close', requireAdminSession, validateBody(CASH_SHIFT_CLOSE_SCHEMA), (req, res) => {
     try {
         const context = repo.dataStoreContext();
-        const actorUserId = resolveActorUserId(req.actor);
-        const result = repo.inTransaction(() => {
-            const closed = repo.cashShifts.closeShift({
-                tenantId: context.tenantId,
-                shiftId: req.params.id,
-                countedCashPaise: toPaise(req.body.countedCash),
-                closingNote: req.body.closingNote || null,
-                actorUserId
-            });
-            // Closing is the one action that can surface a cash variance —
-            // worth its own tamper-evident audit entry even more than opening.
-            repo.audit.record({
-                tenantId: context.tenantId,
-                branchId: context.branchId,
-                actorUserId,
-                actorLabel: req.actor && req.actor.name ? req.actor.name : 'admin',
-                action: 'CASH_SHIFT_CLOSED',
-                entityType: 'cash_shift',
-                entityId: req.params.id,
-                summary: `Shift closed: expected ${round2(fromPaise(closed.expectedPaise))}, variance ${round2(fromPaise(closed.variancePaise))}`,
-                detail: {
-                    countedCash: req.body.countedCash,
-                    expectedCash: round2(fromPaise(closed.expectedPaise)),
-                    variance: round2(fromPaise(closed.variancePaise)),
-                    closingNote: req.body.closingNote || null
-                },
-                ipAddress: req.ip
-            });
-            return closed;
+        const result = reconciliationService.closeShift({
+            shiftId: req.params.id,
+            countedCashPaise: toPaise(req.body.countedCash),
+            closingNote: req.body.closingNote || null
+        }, {
+            actorUserId: resolveActorUserId(req.actor),
+            actorLabel: (req.actor && req.actor.name) || 'admin',
+            ipAddress: req.ip
         });
+        if (!result.success) {
+            return res.status(result.status || 400).json({ error: result.error, code: result.code });
+        }
         res.json({
             success: true,
             expectedCash: fromPaise(result.expectedPaise),

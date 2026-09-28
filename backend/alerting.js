@@ -4,8 +4,9 @@
  *
  * One choke point — raiseAlert() — for every "something is operationally
  * wrong" event: payment/webhook failures, ledger drift, backup failure,
- * stale gold rates, elevated HTTP error rate/latency, low disk, an expiring
- * TLS cert, or the control plane (licensing server) being unreachable.
+ * stale gold rates, elevated HTTP error rate/latency, low disk, a failing or
+ * overflowing diagnostic log writer, an expiring TLS cert, or the control
+ * plane (licensing server) being unreachable.
  *
  * Every alert is ALWAYS written to error.log + telemetry.log (logError /
  * logTelemetry — db.js), so nothing is lost even with no SMTP configured.
@@ -31,6 +32,7 @@ import cron from 'node-cron';
 import { logError, logTelemetry, readJSON, DATA_DIR } from './db.js';
 import { readSettings } from './settingsStore.js';
 import { sendMailIfConfigured } from './emailReporter.js';
+import { getLogWriterStats } from './logWriter.js';
 import * as repo from './repositories/index.js';
 
 const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes per alert code
@@ -300,6 +302,67 @@ export function checkBackupFreshness() {
     return [];
 }
 
+/* ---------------------------------------------------------------------------
+   Log writer health — logWriter.js buffers and rotates diagnostic telemetry
+   off the request path on purpose (a cashier's request must never wait on a
+   synchronous log write). That means a full or unwritable log destination
+   previously only ever reached a console nobody watches (logWriter.js
+   deliberately can't call logError itself — see its appendBatch() comment,
+   it would recurse forever on an unwritable log volume). This is the other
+   half: the one alert choke point polls logWriter's own counters instead.
+   Counters are cumulative for the process lifetime, so this tracks the
+   last-seen value and alerts only on the delta since the previous tick —
+   otherwise one already-fixed failure would re-alert on every tick forever.
+   --------------------------------------------------------------------------- */
+
+let lastSeenWriteFailures = 0;
+let lastSeenRotationFailures = 0;
+let lastSeenDroppedEntries = 0;
+
+/** Returns the alert codes raised (empty array when nothing new failed). */
+export function checkLogWriterHealth() {
+    const stats = getLogWriterStats();
+    const raised = [];
+
+    const newWriteFailures = stats.writeFailures - lastSeenWriteFailures;
+    lastSeenWriteFailures = stats.writeFailures;
+    if (newWriteFailures > 0) {
+        raised.push('LOG_WRITE_FAILING');
+        raiseAlert({
+            code: 'LOG_WRITE_FAILING',
+            severity: 'critical',
+            message: `${newWriteFailures} diagnostic log write(s) failed since the last check (${stats.writeFailures} total) — the log destination may be full or unwritable. This is telemetry only; the ledger itself does not depend on it.`,
+            details: { newWriteFailures, totalWriteFailures: stats.writeFailures }
+        });
+    }
+
+    const newRotationFailures = stats.rotationFailures - lastSeenRotationFailures;
+    lastSeenRotationFailures = stats.rotationFailures;
+    if (newRotationFailures > 0) {
+        raised.push('LOG_ROTATION_FAILING');
+        raiseAlert({
+            code: 'LOG_ROTATION_FAILING',
+            severity: 'warning',
+            message: `${newRotationFailures} log rotation attempt(s) failed since the last check (${stats.rotationFailures} total) — a diagnostic log file may grow without bound.`,
+            details: { newRotationFailures, totalRotationFailures: stats.rotationFailures }
+        });
+    }
+
+    const newDroppedEntries = stats.droppedEntries - lastSeenDroppedEntries;
+    lastSeenDroppedEntries = stats.droppedEntries;
+    if (newDroppedEntries > 0) {
+        raised.push('LOG_QUEUE_OVERFLOW');
+        raiseAlert({
+            code: 'LOG_QUEUE_OVERFLOW',
+            severity: 'warning',
+            message: `${newDroppedEntries} diagnostic log event(s) were dropped since the last check (bounded queue full) — the log destination is likely falling behind or blocked.`,
+            details: { newDroppedEntries, totalDroppedEntries: stats.droppedEntries }
+        });
+    }
+
+    return raised;
+}
+
 const TLS_EXPIRY_WARN_DAYS = 14;
 
 /** No-op when settings.publicUrl isn't configured or isn't https — same
@@ -347,13 +410,16 @@ export function checkTlsExpiry() {
 
 /**
  * initAlertScheduler()
- * - every 5 min: HTTP error-rate / latency window
+ * - every 5 min: HTTP error-rate / latency window, log writer health
  * - daily at 6:30 AM (after the 1 AM backup, midnight rate sync, ahead of
  *   the 7 AM report email): stale rates, ledger integrity, disk capacity,
  *   backup freshness, TLS expiry
  */
 export function initAlertScheduler() {
-    cron.schedule('*/5 * * * *', () => checkErrorRateAndLatency());
+    cron.schedule('*/5 * * * *', () => {
+        checkErrorRateAndLatency();
+        checkLogWriterHealth();
+    });
     cron.schedule('30 6 * * *', () => {
         console.log('[Scheduler] Running daily operational health checks...');
         checkStaleRates();

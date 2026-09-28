@@ -43,6 +43,9 @@ const saleService = await import('./services/saleService.js');
 const advanceService = await import('./services/advanceService.js');
 const returnService = await import('./services/returnService.js');
 const oldGoldService = await import('./services/oldGoldService.js');
+const paymentService = await import('./services/paymentService.js');
+const stockService = await import('./services/stockService.js');
+const reconciliationService = await import('./services/reconciliationService.js');
 
 const BACKEND_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WORKER = path.join(TEMP_ROOT, 'worker.mjs');
@@ -77,6 +80,8 @@ const saleService = await load('services/saleService.js');
 const advanceService = await load('services/advanceService.js');
 const returnService = await load('services/returnService.js');
 const paymentService = await load('services/paymentService.js');
+const stockService = await load('services/stockService.js');
+const reconciliationService = await load('services/reconciliationService.js');
 
 const RATES = {
     price24K: 7500, price22K: 6875, price18K: 5600,
@@ -153,6 +158,21 @@ try {
         }, DEPS);
         process.stdout.write(result.success ? 'OK ' + result.deposit.id : 'ERR ' + (result.code || result.error));
 
+    } else if (mode === 'webhook-race') {
+        // arg = the shared Razorpay event id every racer targets. A real retry
+        // storm redelivers the identical event id, order and payment id to every
+        // simultaneous connection, exactly like the parent's one-time setup.
+        const order = paymentService.findOrder('order_webhook_race');
+        const claim = paymentService.claimWebhookEvent(arg, 'payment.captured');
+        if (claim.alreadySeen) {
+            process.stdout.write('DUP');
+        } else {
+            const credit = paymentService.creditCapturedPayment({
+                order, paymentId: 'pay_webhook_race', capturedPaise: order.amountPaise, source: 'webhook'
+            }, { getActiveGoldRates: DEPS.getActiveGoldRates });
+            process.stdout.write(credit.ok ? 'CREDITED' : 'ERR ' + (credit.code || credit.error));
+        }
+
     } else if (mode === 'return-race') {
         // arg = the shared invoice number every racer targets.
         const result = returnService.createReturn({ invoiceId: arg, weightGrams: 1, refundMode: 'cash' }, DEPS);
@@ -171,6 +191,17 @@ try {
             exchangeCreditNoteId: spec.creditNoteNumber, appliedAdvance: spec.appliedAdvance
         }, DEPS);
         process.stdout.write(result.ok ? 'OK ' + result.invoiceId : 'ERR ' + (result.code || result.error));
+
+    } else if (mode === 'stock-adjust-race') {
+        // arg = the shared lot id every racer adjusts by the same negative delta —
+        // individually valid against the opening balance, but not all of them together.
+        const result = stockService.adjustLot({ lotId: arg, weightDeltaMg: -6000, reason: 'Race count' }, {});
+        process.stdout.write(result.success ? 'OK ' + result.movementId : 'ERR ' + (result.code || result.error));
+
+    } else if (mode === 'cash-shift-open-race') {
+        // arg is unused — every racer opens a shift for the same (only) branch.
+        const result = reconciliationService.openShift({ openingFloatPaise: 500000 }, {});
+        process.stdout.write(result.success ? 'OK ' + result.id : 'ERR ' + (result.code || result.error));
 
     } else if (mode.startsWith('crash-') && mode.slice('crash-'.length).startsWith('return-')) {
         /* SETUP runs to completion and commits for real (its own transaction);
@@ -214,6 +245,33 @@ try {
         paymentService.creditCapturedPayment({
             order, paymentId: 'pay_crash_' + arg, capturedPaise: order.amountPaise, source: 'checkout'
         }, { getActiveGoldRates: DEPS.getActiveGoldRates });
+        process.stdout.write('OK survived');
+
+    } else if (mode === 'crash-stock-adjust') {
+        /* Only one write precedes the audit record here — recordAdjustment's
+           single INSERT INTO inventory_movements — so there is only one
+           interesting crash point, same shape as crash-void below. */
+        const itemId = repo.inventory.createItem({ tenantId: repo.dataStoreContext().tenantId, name: 'CrashAdjust Item ' + arg, purity: '22K' });
+        const opened = stockService.openLot({ itemId, weightMg: 10000, label: 'Crash Adjust Lot' }, {});
+        if (!opened.success) throw new Error('setup lot-open failed: ' + opened.error);
+        process.stdout.write('SETUP ' + opened.lotId + '\\n');
+        crashOnSql('INSERT INTO audit_events');
+        stockService.adjustLot({ lotId: opened.lotId, weightDeltaMg: -4000, reason: 'Crash test' }, {});
+        process.stdout.write('OK survived');
+
+    } else if (mode === 'crash-cash-shift-open') {
+        // No setup entity exists to hand back here — the assertion the parent
+        // makes is simply that no shift is left open at all.
+        crashOnSql('INSERT INTO audit_events');
+        reconciliationService.openShift({ openingFloatPaise: 500000 }, {});
+        process.stdout.write('OK survived');
+
+    } else if (mode === 'crash-cash-shift-close') {
+        const opened = reconciliationService.openShift({ openingFloatPaise: 500000 }, {});
+        if (!opened.success) throw new Error('setup shift-open failed: ' + opened.error);
+        process.stdout.write('SETUP ' + opened.id + '\\n');
+        crashOnSql('INSERT INTO audit_events');
+        reconciliationService.closeShift({ shiftId: opened.id, countedCashPaise: 500000 }, {});
         process.stdout.write('OK survived');
 
     } else if (mode.startsWith('crash-')) {
@@ -407,6 +465,34 @@ await check('racing deposits on one payment reference credit the customer once',
         'one ₹500 transfer must credit ₹500, however many times it was submitted');
 });
 
+await check('20 concurrent deliveries of the same webhook event id credit the customer exactly once', async () => {
+    // docs/INVARIANT_MATRIX.md's payment-webhook row names this exact gap: the
+    // sequential replay check in test_repositories.js proves a SECOND delivery
+    // is recognised after the first commits, but nothing proved the unique-index
+    // race claimWebhookEvent() actually depends on under real simultaneous
+    // delivery — a genuine Razorpay retry storm, not a for-loop.
+    const phone = '9877777777';
+    const amountPaise = 200000;
+    assert.equal(paymentService.recordOrder({
+        providerOrderId: 'order_webhook_race', customerPhone: phone, amountPaise
+    }), true);
+    repo.closeDb();
+
+    const results = await runWorkers('webhook-race', 20, () => 'evt-webhook-race-1');
+    const credited = results.filter(r => r.out === 'CREDITED');
+    const duplicates = results.filter(r => r.out === 'DUP');
+    const failures = results.filter(r => r.out !== 'CREDITED' && r.out !== 'DUP');
+
+    assert.equal(failures.length, 0, describeFailures(failures, 20));
+    assert.equal(credited.length, 1,
+        `${credited.length} of 20 concurrent deliveries of the same webhook event credited the ledger; exactly one may`);
+    assert.equal(duplicates.length, 19,
+        'every other simultaneous delivery of the same event id must be recognised as a duplicate, not silently dropped or errored');
+
+    assert.equal(advanceService.customerLedger(phone).balance, amountPaise / 100,
+        'a retry storm of one captured payment must land exactly one credit, however many processes raced to claim it');
+});
+
 console.log('\n3b. Concurrent document actions');
 
 const PARENT_DEPS = {
@@ -476,6 +562,53 @@ await check('two tills racing to redeem the same exchange credit note succeed ex
 
     const note = repo.creditNotes.findByNumber(context.tenantId, filed.returnId);
     assert.ok(note.exchange_invoice_id, 'the winning redemption must mark the credit note spent');
+});
+
+// stockService and reconciliationService (2026-09-16) are the newest workflows in the
+// tree and, until now, the only ones with no race coverage here — every other workflow
+// above has one. §24b: "for every new workflow, test normal, retry, replay, concurrency,
+// partial failure ... against a disposable real database." These close that gap.
+await check('two managers racing to correct the same lot apply exactly one delta when only one fits', async () => {
+    const itemId = repo.inventory.createItem({ tenantId: context.tenantId, name: 'Race Lot Item', purity: '22K' });
+    const opened = stockService.openLot({ itemId, weightMg: 10000, label: 'Stock Race Lot' }, {});
+    assert.equal(opened.success, true, opened.error);
+    repo.closeDb();
+
+    // Ten racers each try to take a 10g lot down by 6g. Only the first can land
+    // without going negative — every later one is re-checked against the balance
+    // it actually left, not the balance the request was issued against.
+    const results = await runWorkers('stock-adjust-race', 10, () => opened.lotId);
+    const succeeded = results.filter(r => r.out.startsWith('OK'));
+    assert.equal(succeeded.length, 1,
+        `${succeeded.length} of 10 concurrent -6g adjustments against a 10g lot succeeded; only one delta fits without going negative`);
+    const refused = results.filter(r => !r.out.startsWith('OK'));
+    assert.ok(refused.every(r => r.out.includes('STOCK_ADJUSTMENT_NEGATIVE')),
+        `every losing adjustment must be refused as STOCK_ADJUSTMENT_NEGATIVE, got: ${refused.map(r => r.out).join(' | ')}`);
+
+    const lot = repo.inventory.getLot(context.tenantId, opened.lotId);
+    assert.equal(lot.balance_mg, 4000, 'the lot must reflect exactly one applied -6g adjustment, not zero and not more than one');
+});
+
+await check('two cashiers racing to open a shift for the same branch succeed exactly once', async () => {
+    assert.equal(repo.cashShifts.getOpenShift(context.tenantId, context.branchId), null,
+        'a prior check left a shift open — this race needs a clean starting state');
+    repo.closeDb();
+
+    const results = await runWorkers('cash-shift-open-race', 10);
+    const succeeded = results.filter(r => r.out.startsWith('OK'));
+    assert.equal(succeeded.length, 1,
+        `${succeeded.length} of 10 concurrent shift-opens for one branch succeeded; exactly one may`);
+    const refused = results.filter(r => !r.out.startsWith('OK'));
+    assert.ok(refused.every(r => r.out.includes('CASH_SHIFT_ALREADY_OPEN')),
+        `every losing open must be refused as CASH_SHIFT_ALREADY_OPEN, got: ${refused.map(r => r.out).join(' | ')}`);
+
+    const open = repo.cashShifts.getOpenShift(context.tenantId, context.branchId);
+    assert.ok(open, 'exactly one shift must be left open after the race');
+    assert.equal(open.id, succeeded[0].out.slice(3), 'the open shift on disk must be the one the winning worker reported');
+
+    // Close it so a later check in this file finds a clean starting state again.
+    const closed = reconciliationService.closeShift({ shiftId: open.id, countedCashPaise: 500000 }, {});
+    assert.equal(closed.success, true, closed.error);
 });
 
 console.log('\n4. Crash injection');
@@ -602,6 +735,51 @@ for (const point of ['after-entry', 'after-settle']) {
 await check('the customer touched only by killed payment credits has no balance', () => {
     assert.equal(advanceService.customerLedger('9844444444').balance, 0,
         'every payment-credit crash above must have rolled back completely — nothing should have posted');
+});
+
+console.log('\n4c. Crash injection — stock adjustment and cash-shift open/close');
+
+// stockService.adjustLot and reconciliationService.openShift/closeShift already
+// have race coverage above (§3b-style); §24b/§24c also name retry/replay/crash
+// coverage against a real database as still open for these two newest
+// workflows specifically — closing that gap here, mirroring 4b's shape.
+
+await check('a stock adjustment killed just before its audit record leaves the lot balance untouched', async () => {
+    await crashSurvivesAndRolledBack('crash-stock-adjust', 'sa1', lotId => {
+        const lot = repo.inventory.getLot(context.tenantId, lotId);
+        assert.ok(lot, 'the setup lot must have survived — opening it commits before the crash');
+        assert.equal(lot.balance_mg, 10000,
+            'a killed adjustment must not leave a partial delta applied to the lot balance');
+    });
+});
+
+await check('a cash-shift open killed just before its audit record leaves no shift open', async () => {
+    assert.equal(repo.cashShifts.getOpenShift(context.tenantId, context.branchId), null,
+        'a prior check left a shift open — this crash test needs a clean starting state');
+    repo.closeDb();
+
+    const result = await runWorker('crash-cash-shift-open', 'cso1');
+    assert.equal(result.code, 9,
+        `worker was expected to die at the injection point:\n${result.out || '(no output)'}\n${result.err || '(no stderr)'}`);
+    assert.equal(repo.cashShifts.getOpenShift(context.tenantId, context.branchId), null,
+        'a killed shift-open must not leave a shift open with no audit trail of it');
+});
+
+await check('a cash-shift close killed just before its audit record leaves the shift open', async () => {
+    await crashSurvivesAndRolledBack('crash-cash-shift-close', 'csc1', shiftId => {
+        const shift = repo.cashShifts.getShift(context.tenantId, shiftId);
+        assert.ok(shift, 'the setup shift-open must have survived — it commits before the crash');
+        assert.equal(shift.status, 'open',
+            'a close killed before its audit record must not leave the shift marked closed with no trail of it');
+    });
+
+    // Leave a clean slate — close the shift the crash test opened, for real,
+    // so a later check in this file (or a future one) finds nothing open.
+    const open = repo.cashShifts.getOpenShift(context.tenantId, context.branchId);
+    if (open) {
+        const closed = reconciliationService.closeShift({ shiftId: open.id, countedCashPaise: 500000 }, {});
+        assert.equal(closed.success, true, closed.error);
+    }
 });
 
 console.log('\n5. Migrations');

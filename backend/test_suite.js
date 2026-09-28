@@ -985,6 +985,54 @@ repo.closeDb();
     console.log('✅ Test 15 Passed: backup snapshots are encrypted AES-256-GCM with per-file AAD binding, carry a self-description manifest, the restore drill passes against them, and a restored install correctly dedupes a replayed idempotency key while continuing its sequence for a fresh sale.');
 }
 
+/* ==========================================================================
+   TEST 16: the manual gold-rate override gate — priceEngine.js's
+   getActiveGoldRates() had never been imported by any test in this tree
+   (every other suite mocks it out entirely), so nothing had ever proven it
+   actually reads its own `active` flag rather than just "is a stored price
+   > 0". Found via TESTING_CHECKLIST.md Module 6, 2026-09-19: unchecking
+   "Enable manual overrides" in Settings and saving never actually turned it
+   off, because the gate ignored `active` and looked only at the stored
+   prices — which the form leaves in place when you merely uncheck the box.
+   Every price-dependent service (sales, returns, advances, old-gold
+   exchange, payment credit, gold schemes) reads gold rates through this one
+   function, so this was a real, silent mispricing risk, not a cosmetic bug.
+   ========================================================================== */
+async function testGoldPriceOverrideGate() {
+    console.log('\nRunning Test 16: manual gold-rate override respects its own on/off switch...');
+
+    const { getDefaultSettings } = await import('./defaultSettings.js');
+    const { writeSettings } = await import('./settingsStore.js');
+    const { getActiveGoldRates } = await import('./priceEngine.js');
+    const base = getDefaultSettings();
+
+    // Active, with real prices: the override applies.
+    writeSettings({ ...base, overrideGoldPrice: { active: true, price24K: 9000, price22K: 8250, price18K: 6750 } });
+    let rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'manual', 'an active override with real prices must report source "manual"');
+    assert.strictEqual(rates.price22K, 8250, 'the override price must be used while active');
+
+    // Disabled, but the SAME stored prices are still sitting there — the
+    // exact shape the Settings form leaves behind when a user just unchecks
+    // the box and saves, without also clearing the price fields.
+    writeSettings({ ...base, overrideGoldPrice: { active: false, price24K: 9000, price22K: 8250, price18K: 6750 } });
+    rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'auto', 'a disabled override must report source "auto" even with stale non-zero prices stored');
+    assert.notStrictEqual(rates.price22K, 8250, 'a disabled override must not still be priced off the stale manual figure');
+
+    // Active but with no real prices set: nothing to override with, so auto.
+    writeSettings({ ...base, overrideGoldPrice: { active: true, price24K: 0, price22K: 0, price18K: 0 } });
+    rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'auto', 'an active override with no prices set has nothing to override with');
+
+    // No override object at all: auto, same as a fresh install.
+    writeSettings({ ...base, overrideGoldPrice: undefined });
+    rates = getActiveGoldRates();
+    assert.strictEqual(rates.source, 'auto', 'no override configured at all must be auto');
+
+    console.log('✅ Test 16 Passed: the manual gold-rate override is gated on its own on/off switch, not on stale stored prices.');
+}
+
 // Execute all test cases
 try {
     testTroyOunceConversion();
@@ -1002,6 +1050,7 @@ try {
     await testPitrScheduler();
     await testOffsiteBackupCopy();
     await testBackupArchiveEncryption();
+    await testGoldPriceOverrideGate();
     console.log('======================================================================');
     console.log('🎉 ALL INTEGRATION TESTS PASSED SUCCESSFULLY! SYSTEM INTEGRITY VERIFIED.');
     console.log('======================================================================');

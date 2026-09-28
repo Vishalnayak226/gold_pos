@@ -13,6 +13,7 @@
   },
   "scripts": {
     "start": "node server.js",
+    "test": "node test_licensing.js",
     "audit:security": "npm audit --omit=dev --audit-level=moderate",
     "sbom:dependencies": "npm ls --all --json"
   }

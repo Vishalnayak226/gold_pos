@@ -292,7 +292,7 @@ export function customerLedger(phone, { limit = 50, offset = 0 } = {}) {
         pendingCount: summary.pendingCount,
         history: advances.toLegacyAdvances(rows),
         total,
-        limit: Math.max(1, Math.trunc(Number(limit) || 50)),
+        limit: advances.clampLimit(limit),
         offset: Math.max(0, Math.trunc(Number(offset) || 0))
     };
 }
@@ -308,7 +308,7 @@ export function listLedger({ limit = 50, offset = 0, status = null } = {}) {
     return {
         results: advances.toLegacyAdvances(rows),
         total,
-        limit: Math.max(1, Math.trunc(Number(limit) || 50)),
+        limit: advances.clampLimit(limit),
         offset: Math.max(0, Math.trunc(Number(offset) || 0))
     };
 }
@@ -320,7 +320,7 @@ export function listPending({ limit = 50, offset = 0 } = {}) {
     return {
         results: advances.toLegacyAdvances(rows),
         total,
-        limit: Math.max(1, Math.trunc(Number(limit) || 50)),
+        limit: advances.clampLimit(limit),
         offset: Math.max(0, Math.trunc(Number(offset) || 0))
     };
 }

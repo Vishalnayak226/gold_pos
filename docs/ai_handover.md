@@ -50,6 +50,709 @@ This document contains key architectural details, non-negotiable design guidelin
   (modified), `frontend/customer.html` (modified),
   `docs/{LEDGER,TESTING_CHECKLIST,ai_handover}.md` (modified).
 
+- **2026-09-26: closed the last two open items in `TESTING_CHECKLIST.md`'s Module 3
+  micro-checklist** (the discount-toggle button, line ~234, and the no-advance-history
+  phone, line ~241) — found while answering "build the next two open items" by walking
+  the checklist in document order rather than the §25 macro backlog, which is fully
+  closed of anything buildable (see 2026-09-24 entries below). **Real bug found and
+  fixed first**: `SettingsManager.js`'s Billing-settings save handler refreshed
+  `window.reportsDesk`/`window.schemeDesk` after a save but never `window.billingDesk`
+  — so a changed default discount, tax slab, tax mode, wastage or old-gold setting never
+  reached the Billing Desk without a page reload, since `billingDesk.fetchSettings()`
+  otherwise only runs once, at login (`app.js`). Fixed by adding the same refresh to
+  that save callback. Guard proven: the new non-zero-default-discount test failed with
+  the toggle hidden (its exact pre-fix state) before the fix, passed after it.
+  **`billing-desk-preview.spec.js`** gained three tests: the seeded 0%-default hidden
+  state, the non-zero-default Remove/Apply round-trip, and a phone outside the seed
+  fixture's range never showing the Apply Advance box (asserted only after the real
+  `GET /api/advances/lookup` response, not before). **Verified:** that spec 6/6; full
+  `npx playwright test` (both projects) 138/139 — the one failure
+  (`visual-regression.spec.js`, untouched by this change) reproduced clean 3/3 in
+  isolation immediately after, matching the same long-run contention signature already
+  on record in `docs/LEDGER.md`'s 2026-09-22 entry. Backend `npm test` unaffected by
+  construction (frontend-only change). **Uncommitted, on top of everything else already
+  listed below:** `frontend/js/components/SettingsManager.js` (modified),
+  `backend/tests/e2e/billing-desk-preview.spec.js` (was already untracked; extended),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+
+- **2026-09-24 (second unit): the two remaining performance-backlog items
+  that needed no VPS/hardware/product decision — `backend/benchmark.js`
+  gained return/void/stock/payment/mixed-till workloads, and a new
+  `backend/perfTrace.js` gives the browser-side counter-responsiveness
+  trace `TESTING_CHECKLIST.md` §24d item 3 asked for.** Everything else
+  left in §24d/§25c genuinely needs real target hardware/VPS or a product
+  call, so this is now the honest ceiling on what's buildable there without
+  either. **Benchmark**: new serial return/void/stock-adjust/advance-deposit
+  scenarios (each against its own disposable invoice/lot) plus a
+  `measureMixedTill()` scenario — several concurrent tills each running
+  sale→sale→return→void→advance-deposit against the same ledger, latency
+  bucketed per operation kind. Full run: return p95 26.16 ms, void p95
+  28.05 ms, stock-adjust p95 23.25 ms, advance-deposit p95 31.62 ms;
+  mixed-till (5×5, 125 ops) sustained 69.4 ops/s, per-kind p95 89.7–144.9 ms.
+  Extracted the shared server-boot logic and `percentile`/`rounded` helpers
+  into new `backend/benchmarkHarness.js` first, so the new browser tool
+  could reuse them instead of duplicating a second boot mechanism (CLAUDE.md
+  §1). **perfTrace.js** (new, `npm run perf-trace`): drives a real headless
+  Chromium tab via `@playwright/test` (the one exempt devDependency — no
+  new dependency) through shift-like cycles: tab transitions, a barcode
+  scan (real server round trip), a hand-corrected weight (pure client-side
+  recalculation + invoice-preview re-render), plus a per-cycle Chromium
+  JS-heap sample as a memory-growth proxy. Found and fixed two real bugs in
+  the tool itself while proving it stable across multiple cycles, not
+  shipped broken on the second cycle: a "wait for text to change" check
+  that hangs forever once a not-found SKU lookup repeats its own generic
+  final message (fixed to wait past the lookup's own synchronous "Looking
+  up…" placeholder instead), and a weight value that cycled mod 7 and so
+  repeated an earlier cycle's exact total text (fixed to a value unique
+  across the whole run). Smoke run (19 cycles, ~18s): recalculation p95
+  8.45 ms, preview re-render p95 16.31 ms, barcode round trip p95 53.38 ms,
+  tab transitions p95 117–196 ms, heap grew ~777 KB over 19 cycles (not
+  diagnostic alone — needs the real multi-hour run). Full evidence in both
+  cases: `docs/PERFORMANCE_BENCHMARK.md`. **Deliberately not run**: the real
+  `--minutes 480` eight-hour soak and anything on real low-end-counter
+  hardware — both need to be started deliberately by whoever has that
+  hardware, not by this session on a dev laptop.
+  **Verified:** `cd backend && npm test` green (680/680, 12 suites, exit 0)
+  before and after (neither new tool is wired into it). Brain map needed a
+  full `node docs/brain/build-brain.mjs` re-extraction this time, not just
+  `--skip-graph` — these are real new source files, not doc/map edits — before:
+  2 unclaimed (`benchmarkHarness.js`, `perfTrace.js`); after: `241 files, 19
+  regions, coverage 100.0%`. **Uncommitted, on top of everything else
+  already listed below:** `backend/benchmark.js` (modified),
+  `backend/benchmarkHarness.js` (new), `backend/perfTrace.js` (new),
+  `backend/package.json` (modified), `docs/PERFORMANCE_BENCHMARK.md`
+  (modified), `docs/brain/brain.map.json` (modified),
+  `docs/brain/{BRAIN.md,brain.html}` (regenerated),
+  `docs/{TESTING_CHECKLIST,ai_handover,LEDGER}.md`. **Remaining performance
+  work — none of it started this session:** target-hardware/VPS budgets, a
+  representative production-scale (thousands-of-invoices) tenant, slow-
+  network/provider-delay and disk-pressure simulation, the real hardware
+  certification (§25c item 3), and the real eight-hour soak.
+
+- **2026-09-24 (first unit): closed the two remaining code-buildable items in
+  `TESTING_CHECKLIST.md` §25a (audit defect and test-system integrity) —
+  QA-001 verified fixed, and `docs/brain/brain.map.json` now claims every
+  file.** Both were genuinely open (`[~]`/`[ ]`) and needed no product
+  decision or external infrastructure, unlike the rest of §25c/§25d.
+  **QA-001:** the fix described in the checklist's own "planned approach"
+  note was already present in the uncommitted `backend/test_security.js` —
+  its `finally` block awaits `shutdown(server, ...)` before removing the
+  temp dir and monkeypatches `console.warn`/`console.error` to fail loudly
+  on a post-cleanup `[LogWriter]` message. This session's contribution was
+  verification, not authorship: ran `node test_security.js` three times in
+  isolation (10/10 checks, exit 0, zero `[LogWriter]`/`ENOENT` lines every
+  run) and the full `cd backend && npm test` (680 checks, all 12 suites,
+  exit 0), then marked the item `[x]` with that evidence recorded inline.
+  **Brain map:** `node docs/brain/build-brain.mjs --check --skip-graph`
+  reported 19 unclaimed files (6 backend modules — `auditRetention.js`,
+  `backupCrypto.js`, `benchmark.js`, `domainCodes.js`, `logWriter.js`,
+  `pitr.js` — plus 9 operating docs and 4 extracted frontend scripts, all
+  built in earlier uncommitted sessions and never mapped). Read each file's
+  own header comment (and grepped which HTML page actually loads the
+  frontend scripts, rather than guessing by name) and added each as an
+  explicit glob to whichever existing region already owns that role — no
+  new region, no explicit file list, per `docs/brain/README.md`'s own rule.
+  Full mapping and reasoning: `docs/TESTING_CHECKLIST.md` §25a. Redraw now
+  reports `239 files, 19 regions, coverage 100.0%`, exit 0.
+  **Verified:** `cd backend && npm test` green (680/680, 12 suites, exit 0);
+  `node docs/brain/build-brain.mjs --check --skip-graph` exit 0, 100%
+  coverage; no source file added/moved/deleted, so the cheaper map-only
+  redraw was correct and a full `graphify update .` re-extraction was not
+  needed. **Uncommitted, on top of everything else already listed below:**
+  `docs/brain/brain.map.json` (modified — the 8 match-array edits),
+  `docs/brain/BRAIN.md` and `docs/brain/brain.html` (regenerated),
+  `docs/{TESTING_CHECKLIST,ai_handover,LEDGER}.md`. **Remaining §25
+  work — none of it started this session:** §25c's hardware/VPS/soak items
+  (need real infrastructure or a store manager) and all of §25d (product
+  decisions for the owner).
+
+- **2026-09-22: whole-app maturity programme — the two remaining Phase 3
+  code-buildable items closed (TESTING_CHECKLIST.md §25b items 2 and 3);
+  item 4 given a runnable protocol but not executed (needs a real human).**
+  **Item 2:** every `<button>` across `frontend/index.html`,
+  `frontend/customer.html` and `frontend/js/app.js` now has an explicit
+  `type="button"` (33 found — `frontend/js/components/*.js` already did
+  this everywhere, so the 2026-09-18 audit's "32" was these three files
+  only). The app's one icon-only control and its unlabelled sibling tender
+  inputs got `aria-label`; all 7 `.input-error-msg` spans got
+  `aria-live="polite"` + `aria-describedby` on their field. The
+  `.form-control:focus` outline replacement was 10%-opacity, effectively
+  invisible — now uses `--color-accent`, a token that existed with the
+  comment "gentle focus" but was never wired to anything. Keyboard order
+  and dialog Escape/focus-return needed no work (verified, not redone).
+  **Item 3:** new `backend/tests/e2e/visual-regression.spec.js`, 18
+  `toHaveScreenshot` baselines for the six named screens, no new dependency.
+  Two real flakiness sources were found and fixed rather than shipped
+  flaky — a live timestamp in the return credit note's footer, and
+  Google-Fonts load-timing antialiasing noise (`document.fonts.ready` wait
+  + `maxDiffPixelRatio: 0.02` in `playwright.config.js`) — stable across 5
+  runs after the fixes, flaky before them. **Item 4:** added
+  `docs/USABILITY_SESSION_PROTOCOL.md`, a runnable script for the six named
+  session types with a defect-logging template; the checklist item stays
+  unchecked, since writing the script doesn't run it. **Verified:** full
+  `npx playwright test` 136/136 (118 pre-existing + 18 new) across two
+  clean full-suite runs; one incidental flake in `customer-master.spec.js`
+  (a file untouched this session) reproduced as a clean pass in isolation —
+  that run's 1.1h wall time against a normal ~10min points at contention
+  from the several other concurrent sessions active on this machine during
+  this work, not a regression. `cd backend && npm test` (12 suites) green
+  throughout. Full detail: `docs/LEDGER.md` 2026-09-22 entry,
+  `docs/TESTING_CHECKLIST.md` §25b items 2–3 (now `[x]`), item 4's note.
+  **Uncommitted, on top of everything else already listed below:**
+  `frontend/index.html`, `frontend/customer.html`, `frontend/js/app.js`,
+  `frontend/js/adminAlertOverride.js`, `frontend/js/customerAlertOverride.js`
+  (all modified), `frontend/js/components/BillingDesk.js` (modified, on top
+  of whatever this file already carried), `frontend/css/app.css` (modified,
+  on top of whatever this file already carried), `backend/playwright.config.js`
+  (modified), `backend/package.json` (modified, on top of whatever this file
+  already carried), `backend/tests/e2e/visual-regression.spec.js` (new, plus
+  its `-snapshots/` baseline PNGs), `docs/USABILITY_SESSION_PROTOCOL.md`
+  (new), `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **Remaining Phase
+  3 work:** item 4's actual sessions (needs a store manager, a screen-reader
+  user, a real scanner/touch device — none of which this session has), plus
+  the already-open §25c performance/infrastructure items, none of which this
+  unit touched.
+
+- **2026-09-19: whole-app maturity programme, Phase 3 unit 7 — Diagnostics gets its first
+  dedicated browser journey (5 tests), a real bug found and fixed first, and this closes the
+  full module list from the 2026-09-18 audit.** All three action buttons showed a bare
+  "failed: 403" for a manager/cashier denied by the owner-only diagnostics gate, with no
+  indication of what that meant. Fixed to name the real reason for the 403 case specifically;
+  proved by temporarily reverting and confirming the test reproduced the bare status code. New
+  `backend/tests/e2e/diagnostics.spec.js` covers the denied case, all three successful pulls
+  (real content asserted, not placeholders), and that repeated pulls append rather than
+  replace the console log. Noted (not fixed, out of scope): a `#toggle-debug-btn` wiring block
+  in `app.js` references an element no longer in `index.html` — harmless dead code, already a
+  no-op via its own guard.
+  **Phase 3's module list is now fully closed**: Cash Shifts, Quotes & Holds, Customer Master,
+  Gold Schemes, Audit Trail, Management Reports and Diagnostics all have dedicated browser
+  journeys — 41 new checks across 7 spec files, six of seven surfacing a real,
+  previously-unknown bug (only Cash Shifts and Quotes & Holds were clean passes). Settings
+  sub-sections were deliberately left to a concurrent session already covering them same-day.
+  **Verified:** targeted spec 5/5 ×3 (incl. regression-guard proof); full `npx playwright test`
+  117/118 (the `advances-manager.spec.js` flake first seen under Gold Schemes recurred again,
+  confirmed intermittent/pre-existing across 4 full-suite runs this batch); full backend
+  `npm test` (12 suites) green. `git diff --check` clean. Full detail: `docs/LEDGER.md`
+  2026-09-19 entry, `docs/TESTING_CHECKLIST.md` §25b (now `[x]`). **Uncommitted, on top of
+  everything else already listed below:** `frontend/js/app.js` (modified),
+  `backend/tests/e2e/diagnostics.spec.js` (new), `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+  **Next Phase 3 work still open**: semantic-HTML/accessibility pass (§25b item 2), visual
+  regression baselines (§25b item 3), and manual usability sessions (§25b item 4) — none of
+  these were started; the module-journey item was the only one worked in this batch.
+
+- **2026-09-19: whole-app maturity programme, Phase 3 unit 6 — Management Reports' coverage gap
+  closed (5 new tests), deliberately not duplicating a concurrent session's same-day work; no
+  defect found this time.** Before writing anything, checked `ReportsDesk.js`'s own header
+  comment (references "Module 22") and found a concurrent session had already covered
+  Profitability, Ageing, and a real local-vs-UTC date-default bug inside
+  `inventory-billing-operations.spec.js`. Scoped this unit to the actual gap instead: new
+  `backend/tests/e2e/management-reports.spec.js` covers the Settlement report (a real cash sale,
+  exact known total), the Reconciliation report (0 exceptions for a clean sale), the
+  invalid-date-range error path, the ageing-report's date-input-disabling behaviour, and the
+  hidden-by-default state. All 5 passed on the first real run — this module's engineering was
+  already solid going in. **Verified:** targeted spec 5/5 ×2; full `npx playwright test`
+  112/113 (the already-documented `advances-manager.spec.js` flake recurred, confirming it is
+  intermittent/timing-dependent and unrelated to any unit in this batch); full backend
+  `npm test` (12 suites) green. `git diff --check` clean. Full detail: `docs/LEDGER.md`
+  2026-09-19 entry, `docs/TESTING_CHECKLIST.md` §25b. **Uncommitted, on top of everything else
+  already listed below:** `backend/tests/e2e/management-reports.spec.js` (new),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **Remaining Phase 3 module: Diagnostics.**
+
+- **2026-09-19: whole-app maturity programme, Phase 3 unit 5 — Audit Trail gets its first
+  dedicated browser journey (5 tests); two real bugs found and fixed first, including two of
+  four entity-type filters that have silently returned zero rows since the screen was built.**
+  Bug 1: the 403 permission-denied path showed `requireApprover`'s server message verbatim
+  ("Approving a deposit needs a manager or the owner...", written for a different call site),
+  telling a cashier viewing the audit trail they were trying to approve a deposit. Fixed to
+  always use the screen's own accurate message. Bug 2: the "Advances"/"Payments" filter options
+  carried values (`advance`/`payment`) that never match any real audit row's actual
+  `entity_type` (`advance_entry`/`payment_order` — confirmed by grepping every
+  `audit.record()` call in `backend/services/`); `auditRepository.search()` does an exact
+  match, so selecting either option always returned zero rows. Fixed both values; proved by
+  temporarily reverting and confirming the test reproduced the exact zero-rows bug. New
+  `backend/tests/e2e/audit-trail.spec.js`: the permission-denied case, a filter-matches-nothing
+  state, a cross-module check (a Cash Shift open/close appears with correct actor/variance),
+  the entity-type fix, and reload persistence. **Verified:** targeted spec 5/5 ×3 (incl.
+  regression-guard proof); full `npx playwright test` 108/108 (the previously-flagged
+  `advances-manager.spec.js` flake did not reproduce this run — timing-dependent, not fixed by
+  this unit, still documented for its owner); full backend `npm test` (12 suites) green.
+  `git diff --check` clean. Full detail: `docs/LEDGER.md` 2026-09-19 entry,
+  `docs/TESTING_CHECKLIST.md` §25b. **Uncommitted, on top of everything else already listed
+  below:** `frontend/js/components/AuditTrail.js` (modified),
+  `backend/tests/e2e/audit-trail.spec.js` (new), `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+  **Remaining Phase 3 modules still open:** Management Reports, Diagnostics.
+
+- **2026-09-19: whole-app maturity programme, Phase 3 unit 4 — Gold Schemes gets its first
+  dedicated browser journey (7 tests); the Management-Reports activation-refresh bug fixed
+  2026-09-03 had never been carried over to this sibling module.** `goldSchemeEnabled` saves
+  through the same Billing-settings handler as `managementReportsEnabled`, but only the latter
+  triggered its desk's refresh after save — enabling Gold Schemes left the nav button hidden
+  until a manual reload. Fixed; proved by temporarily reverting and confirming the test
+  reproduced the exact bug. New `backend/tests/e2e/gold-schemes.spec.js`: default-hidden state,
+  the activation fix, enrollment validation, installment payment validation, close-early
+  (native confirm, payout to advance balance), mark-defaulted (native confirm, status-only),
+  and reload persistence.
+  **Unrelated defect found and deliberately NOT fixed** (out of scope, in a concurrent
+  session's active file): `advances-manager.spec.js`'s "View expands.../Hide collapses" test
+  now fails consistently (3/3 in isolation) — a Playwright strict-mode violation, 5 "View"
+  buttons instead of 1. Root cause: `AdvancesManager.js`'s search is debounced 250ms and the
+  test doesn't wait for it to settle before asserting a single row, racing the post-deposit
+  unfiltered refresh against the debounced filtered one. Confirmed via `git diff` this
+  session's only pending `AdvancesManager.js` change is an unrelated text fix — this is
+  pre-existing, not introduced here. **Whoever owns `backend/tests/e2e/advances-manager.spec.js`
+  next should add an explicit wait for the debounced search to settle** (e.g. assert the row
+  count narrows to 1, or await the search request) before the View/Hide sequence.
+  **Verified:** targeted spec 7/7 ×3 (incl. regression-guard proof); full `npx playwright test`
+  102/103 (the one failure is the unrelated flake above); full backend `npm test` (12 suites)
+  green. `git diff --check` clean. Full detail: `docs/LEDGER.md` 2026-09-19 entry,
+  `docs/TESTING_CHECKLIST.md` §25b. **Uncommitted, on top of everything else already listed
+  below:** `frontend/js/components/SettingsManager.js` (modified),
+  `backend/tests/e2e/gold-schemes.spec.js` (new),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **Remaining Phase 3 modules still open:**
+  Audit Trail, Management Reports, Diagnostics.
+
+- **2026-09-19 (session resumed/finalized 2026-09-22 after an interruption): whole-app
+  maturity programme, Phase 3 unit 3 — Customer Master gets its first dedicated browser
+  journey (6 tests), plus a real permission/UX bug found and fixed first.**
+  `GET /api/customer-accounts` is owner/manager-only server-side, but the nav tab has no
+  role-gating and `refresh()` silently turned a 403 into an empty array — a cashier saw a
+  false "No customer on record yet" instead of a permission message. Fixed
+  `CustomerAccountsManager.js` to distinguish the cases; proved the guard by temporarily
+  reverting it, confirming the test reproduced the exact pre-fix bug, then restoring the
+  real fix (diffed identical). New `backend/tests/e2e/customer-master.spec.js`: the
+  permission-denied case, issue-login validation, issuing a fresh login, the reissue/
+  reset-password native-confirm flow, editing with validation, and owner-only anonymise.
+  **A prior background verification run (full Playwright + full backend suite) was
+  interrupted by a session boundary and could not be trusted, so both were re-run fresh
+  in this session before finalizing.** **Verified:** targeted spec 6/6 ×2 plus the
+  regression-guard proof; full `npx playwright test` 96/96 (90 baseline + 6 new); full
+  `cd backend && npm test` (12 suites) green. `git diff --check` clean. Full detail:
+  `docs/LEDGER.md` 2026-09-19 entry, `docs/TESTING_CHECKLIST.md` §25b. **Uncommitted, on
+  top of everything else already listed below:**
+  `frontend/js/components/CustomerAccountsManager.js` (modified),
+  `backend/tests/e2e/customer-master.spec.js` (new),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **Remaining Phase 3 modules still
+  open:** Gold Schemes, Audit Trail, Management Reports, Diagnostics.
+
+- **2026-09-19: whole-app maturity programme, Phase 3 unit 2 — Quotes & Holds gets its first
+  dedicated browser journey (7 tests), zero prior e2e coverage.** New
+  `backend/tests/e2e/quotes-holds.spec.js`: empty state, client-side refusal on an empty cart,
+  saving a HOLD/QUOTE (form reset, correct list entry, kind filter actually narrows), Resume
+  (cart restored into the banked `#cart-list`, removed from the open list), Discard's native
+  `confirm()` both declined and accepted (first spec in this tree to drive `page.on('dialog')`
+  — checked this is consistent with every other destructive confirm in the app, not unique to
+  this screen), and reload persistence. Same no-permission-denied-state situation as Cash
+  Shifts (`/api/sale-drafts*` has no role restriction). One test-authoring mistake self-caught:
+  the first Resume assertion checked the wrong element (`#gold-weight`, the next-line entry
+  field, not the banked cart) — fixed in the test. **Verified:** targeted spec 7/7 ×2; full
+  `npx playwright test` (both projects) 90/90 (83 baseline + 6 Cash Shifts + 7 this unit) — no
+  regression against concurrent work. Full detail: `docs/LEDGER.md` 2026-09-19 entry,
+  `docs/TESTING_CHECKLIST.md` §25b. **Uncommitted, on top of everything else already listed
+  below:** `backend/tests/e2e/quotes-holds.spec.js` (new),
+  `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`. **Remaining Phase 3 modules still open:**
+  Customer Master, Gold Schemes, Audit Trail, Management Reports, Diagnostics.
+
+- **2026-09-19: whole-app maturity programme, Phase 3 unit 1 — Cash Shifts gets its first
+  dedicated browser journey (6 tests), zero prior e2e coverage.** New
+  `backend/tests/e2e/cash-shifts.spec.js`: empty state, client-side validation on open/close,
+  the full open→breakdown→close→variance→history flow, reload persistence (proves server- not
+  client-state), and a genuine two-terminal race via a second `page` surfacing the real
+  `CASH_SHIFT_ALREADY_OPEN` refusal. Documented (not skipped) that this module has no
+  permission-denied state — every route is role-unrestricted `requireAdminSession`. Picked Cash
+  Shifts first specifically to avoid colliding with concurrent sessions already covering
+  Settings sub-sections/Dashboard/Advances in this same tree today. **Verified:** targeted spec
+  6/6 twice; full `npx playwright test` (both projects) 83/83 — no regression against the
+  concurrent work. Full detail: `docs/LEDGER.md` 2026-09-19 entry, `docs/TESTING_CHECKLIST.md`
+  §25b. **Uncommitted, on top of everything else already listed below:**
+  `backend/tests/e2e/cash-shifts.spec.js` (new), `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+  **Remaining Phase 3 modules still open:** Quotes & Holds, Customer Master, Gold Schemes, Audit
+  Trail, Management Reports, Diagnostics (Settings sub-sections appear to be actively covered by
+  a concurrent session — check `backend/tests/e2e/` for new specs before starting one, to avoid
+  duplicating work).
+
+- **2026-09-19: whole-app maturity programme, Phase 2 unit 4 (partial) — a real automated
+  alert-delivery drill, and a second instance of the QA-001 log-writer-teardown-race bug found
+  and fixed in `test_alerting.js` along the way.** No existing test ever configured
+  `alertEmail`/`smtp` far enough for a real send to be attempted — the email-delivery half of
+  `raiseAlert()` had zero coverage. New `backend/test_alerting.js` §8 (3 checks, 19→22 total)
+  boots a minimal fake SMTP server in-process and proves a real send happens with the correct
+  subject/recipient/body, that the cooldown blocks a second real connection (not just the return
+  flag), and that an unreachable SMTP host fails soft. **Found while building it:**
+  `test_alerting.js`'s own teardown had the exact QA-001 bug (closed the db and removed its temp
+  directory before draining the log writer) — fixed with the same `drainLogWriter()`-first
+  pattern. New `docs/RUNBOOKS.md` §15 documents both the automated coverage and a manual
+  real-tenant drill procedure. **Explicit open decision, not attempted without authorization**:
+  disposable-VPS deployment/rollback drill needs real cloud credentials and spends real money —
+  see the decision question below. A real restore drill against this machine's actual encrypted
+  backups was attempted and correctly failed (no real vault key here, by design — must not seek
+  it); the isolated/synthetic version already passes in `test_suite.js`, unaffected.
+  **Verified:** `npm run test:alerting` × 3, `npm test` × 2, all clean. `git diff --check` clean.
+  Full detail: `docs/LEDGER.md` 2026-09-19 entry, `docs/TESTING_CHECKLIST.md` §25c.
+  **Uncommitted, on top of everything else already listed below:** `backend/test_alerting.js`
+  (modified), `docs/RUNBOOKS.md` (modified), `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+
+  **Decision asked and answered 2026-09-19:** whether to authorize provisioning a real, throwaway
+  cloud VPS to drill deployment/DNS/TLS/rollback end-to-end (per `docs/TESTING_CHECKLIST.md`
+  §25c). User chose **"skip for now"** — left as an explicit open checklist item, no cloud
+  credentials sought or used, nothing provisioned. Re-ask only if the user wants to revisit this
+  before a paid/public launch (§25c itself already gates that).
+
+- **2026-09-19: whole-app maturity programme, Phase 2 units 2–3 — `mobile/` gets a committed
+  lockfile (closing a critical/high `tar` vulnerability chain), CI dependency/SBOM coverage, and
+  a repeatable Android build/device-test runbook.** `mobile/` had no lockfile, so `npm audit` had
+  never run against it. Generating one surfaced a real finding: `@capacitor/{core,android,cli}
+  @^6.0.0` resolved to a `tar` version with several critical/high archive-extraction advisories,
+  unfixable within the 6.x line. Bumped to `^7.0.0` (not the latest `8.x` — smaller, lower-risk
+  migration; no `android/` project has ever existed here to re-migrate either way). `npm audit`
+  now 0 vulnerabilities. `.github/workflows/daily-checks.yml`'s `dependency-audit`/`sbom` job
+  matrices now include `mobile`; also wired the previous unit's `licensing_server` test suite
+  into the `integration-tests` job (it existed but was not yet in CI). New `docs/RUNBOOKS.md`
+  §14: a numbered Android build/device-test procedure with its own drill-log table. **What
+  remains genuinely unproven**: this sandbox has no Android SDK, so `cap add android`, a real
+  Gradle build, and any device test are still unrun — checklist item marked PARTIAL, not done.
+  **Verified:** `npm ci`/`npm install` clean, `npm audit`/`--audit-level=high` — 0 vulnerabilities,
+  `npx cap --version`/`sync` clean, `npm sbom` generates 92 components; `licensing_server`'s
+  `npm ci && npm test` (36/36) re-confirmed matching the new CI job exactly. `git diff --check`
+  clean. Full detail: `docs/LEDGER.md` 2026-09-19 entry, `docs/TESTING_CHECKLIST.md` §25a.
+  **Uncommitted, on top of everything else already listed below:** `mobile/package.json`
+  (modified), `mobile/package-lock.json` (new), `mobile/README.md` (modified),
+  `.github/workflows/daily-checks.yml` (modified), `docs/RUNBOOKS.md` (modified).
+
+- **2026-09-19: whole-app maturity programme, Phase 2 unit 1 — `licensing_server/` gets its
+  first behavioural test suite, and a real stack-trace-leak bug found and fixed along the way.**
+  The service hardcoded its data/keys directories to `licensing_server/{data,keys}` and called
+  `app.listen()` at import time with no override, so it was not testable in isolation before
+  this. Added `GOLD_POS_LICENSING_DATA_DIR`/`GOLD_POS_LICENSING_KEYS_DIR` env overrides (default
+  unchanged) and an exported `startServer(port, host)` gated behind
+  `GOLD_POS_DISABLE_BOOTSTRAP` — same convention `backend/server.js` already uses. **Real bug:**
+  no terminal error-handling middleware existed, so a malformed JSON body (or any thrown error)
+  fell through to Express's default handler and rendered a **full stack trace** — absolute
+  filesystem paths, `node_modules` internals — into the client response outside
+  `NODE_ENV=production`. Reproduced live with curl before fixing; fixed by porting
+  `backend/server.js`'s exact safe-error-handler pattern plus a JSON 404 for unmatched `/api/*`
+  routes. New `licensing_server/test_licensing.js` (36 checks, real HTTP, isolated temp dirs, no
+  mocks) covers entitlement semantics, signature validity (license-verify and release-manifest,
+  including tamper detection), issue/suspend/renew/revoke, release-publish validation, the only
+  rollback lever this API has (documented an explicit gap: no true delete/rollback endpoint
+  exists), malformed/oversized bodies, both rate limiters (with the `/api/health` exemption
+  proved under a tripped general limiter), the admin brute-force lockout, and tenant isolation.
+  **Verified:** `node test_licensing.js` × 4, all exit 0, 36/36 every time; `npm run
+  audit:security` (licensing_server) — 0 vulnerabilities; `node --check` clean; `git diff
+  --check` clean; production boot path smoke-tested unchanged. Full detail: `docs/LEDGER.md`
+  2026-09-19 entry, `docs/TESTING_CHECKLIST.md` §25a. **Uncommitted, on top of everything else
+  already listed below:** `licensing_server/{server,package}.json` (server.js modified in
+  place), `licensing_server/test_licensing.js` (new), `docs/{TESTING_CHECKLIST,LEDGER,
+  ai_handover}.md`. **Concurrent-session activity continues**: a "tenth pass" Module 6 entry
+  (gold pricing override bug) landed in `docs/LEDGER.md` between this pass's first and second
+  doc edits — not investigated or touched by this pass, see its own entry immediately below.
+
+- **2026-09-19: closed Module 6 ("Settings → Gold Pricing & Overrides") — found and fixed a
+  serious mispricing bug with zero prior test coverage.** `priceEngine.js`'s
+  `getActiveGoldRates()` (read by every price-dependent service: sales, returns, advances,
+  old-gold exchange, payment credit, gold schemes) decided an override was active purely from
+  stored prices being `> 0`, never checking `override.active` — so the Settings "Enable manual
+  overrides" checkbox was cosmetic and unchecking it never actually returned pricing to auto.
+  No test in the tree had ever imported `priceEngine.js` before this. Fixed the gate; added a
+  direct unit test (`test_suite.js` Test 16) and a live UI test
+  (`backend/tests/e2e/gold-pricing.spec.js`, 2 tests). "Sync Price Now" left open — needs real
+  internet to Yahoo Finance, which this project's suites deliberately avoid depending on.
+  **Verified:** `node test_suite.js`, `npx playwright test tests/e2e/gold-pricing.spec.js` (2/2),
+  full `npm test` (all twelve suites) and full `npx playwright test` (both projects), all green,
+  exit code 0. Full detail: `docs/LEDGER.md` 2026-09-19 (tenth pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/priceEngine.js`, `backend/test_suite.js`,
+  `backend/tests/e2e/gold-pricing.spec.js` (new).
+
+- **2026-09-19: whole-app maturity programme, Phase 1 unit 1 — QA-001 fixed.**
+  `backend/test_security.js`'s `finally` block now awaits `shutdown(server, reason)` (the
+  real production graceful-shutdown path — drains the async log writer, then closes the
+  ledger) before removing its temp directory, instead of a bare `server.close()`. Added a
+  regression guard that monkeypatches `console.warn`/`console.error` around the cleanup step
+  and throws (fails the suite) on any post-cleanup `[LogWriter]` message, plus an assertion
+  that `getLogWriterStats()` shows zero queued/in-flight entries right after the drain.
+  **Proved the guard catches the old bug**, not just that the happy path is quiet: temporarily
+  reverted to the bare `server.close()`, re-ran, reproduced the exact pre-fix `ENOENT` on
+  `blackbox.log`/`telemetry.log`, and confirmed the new guard threw
+  `QA-001 regression: log writer wrote after cleanup: ...` (exit 1); restored the real fix,
+  diffed byte-identical to the verified version, re-tested. **Verified:** `npm run
+  test:security` × 6 (3 before + 3 after the regression-guard proof), all exit 0, zero
+  `[LogWriter]` lines. `cd backend && npm test` (all 12 suites) × 2, both exit 0 — every suite
+  green including the security suite's 10 checks; the only `[LogWriter]` lines in either full
+  run are `test_alerting.js`'s own deliberate fault-injection checks, unrelated to QA-001.
+  `git diff --check` clean. Full detail: `docs/LEDGER.md` 2026-09-19 entry,
+  `docs/TESTING_CHECKLIST.md` §25a. **Uncommitted, on top of everything else already listed
+  below:** `backend/test_security.js` (modified in place; was already untracked from a prior
+  session), `docs/{TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+  **Concurrent-session risk confirmed live during this unit:** `git status` showed
+  `backend/priceEngine.js` and `backend/test_suite.js` newly modified and a new untracked
+  `_module6_block.txt` appear mid-session, none of which this pass touched or investigated.
+  Multiple other Claude sessions on this machine are named `web-pos-*`/`lumiapos-*` and at
+  least two were `busy` when checked (`ListAgents`) — treat any file this pass did not list as
+  someone else's in-progress work, not stale state.
+
+- **2026-09-18: independent whole-app quality audit completed (audit only; no product source
+  changed).** Read `docs/WHOLE_APP_QUALITY_AUDIT_2026-09-18.md` before describing the app as
+  launch-ready. It contains repeated test evidence, persona/module coverage, UI and accessibility
+  gaps, lightweight-server constraints, legal/operations questions, SaaS decisions and a P0/P1/P2
+  build queue in `docs/TESTING_CHECKLIST.md` §25. Evidence includes two clean full backend runs,
+  security/migration/dependency/benchmark repetitions, and browser snapshots of 67/67 then 71/71;
+  browser inventory changed between those snapshots, so neither is same-revision flake proof.
+  **Confirmed QA-001 remains open:** `backend/test_security.js` deletes its temp directory before
+  its asynchronous log writer is drained, producing post-pass `ENOENT` warnings. Fix the test to
+  await the production graceful-shutdown path and fail on a post-cleanup writer warning. Do not
+  treat a green local suite as proof of payment, hardware, native mobile, production hosting,
+  legal compliance, penetration-test readiness or shared-tenancy SaaS isolation.
+
+- **2026-09-18: closed Module 5 ("Settings → Store Profile") — zero prior e2e coverage, and a
+  real, currently-shipping bug found and fixed.** New `backend/tests/e2e/store-profile.spec.js`
+  (4 tests) plus a tiny fixture PNG cover field editing, logo upload/clear against the Billing
+  Desk invoice, and the Admin PIN's masking/preservation/change guarantees. Real bug:
+  `SettingsManager.js` used `null` for both "untouched" and "explicitly cleared" on the logo field,
+  so Clear-Logo-then-Save has never actually cleared a logo — fixed with the same null-keep/
+  empty-clear convention already used for masked credential fields elsewhere in the file. One
+  stale checklist line corrected (the PIN box shows a placeholder, not literal `••••••••`).
+  **Verified:** `npx playwright test tests/e2e/store-profile.spec.js` (4/4), full `npm test` (all
+  twelve suites) and full `npx playwright test` (both projects), all green, exit code 0.
+  **A concurrent session/process is running its own whole-app quality audit against this same tree
+  today** — noticed via a `docs/TESTING_CHECKLIST.md` §25 section and new
+  `docs/WHOLE_APP_QUALITY_AUDIT_2026-09-18.md` this pass did not create, plus a hand-edit to
+  `docs/brain/brain.map.json`. Not investigated or merged into this pass's work — flagged to the
+  user. Full detail: `docs/LEDGER.md` 2026-09-18 (ninth pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `frontend/js/components/SettingsManager.js`,
+  `backend/tests/e2e/store-profile.spec.js` (new), `backend/tests/e2e/fixtures/tiny-logo.png`
+  (new).
+
+- **2026-09-18: closed Module 4 ("Customer Advances tab") — zero prior e2e coverage, and a real
+  bug found and fixed in the exact item being verified.** New
+  `backend/tests/e2e/advances-manager.spec.js` (5 tests) covers the manual-deposit form and its
+  validation, the live search filter, the per-customer View/Hide drill-down, and a full
+  Billing-Desk-to-Advances-tab round trip. Real bug: the drill-down's entry line
+  (`AdvancesManager.js`) picked `e.paymentMethod || 'Invoice <id>'` — but `saleService.js`
+  hardcodes `paymentMethod: 'other'` on every redemption row (a schema placeholder), so the truthy
+  `'other'` always won and a "Redeemed at Billing" line never showed which invoice consumed the
+  credit, on any redemption, ever. Fixed by making the choice type-aware (deposits show payment
+  method; redemptions show the invoice id first). **Verified:** `npx playwright test
+  tests/e2e/advances-manager.spec.js` (5/5), full `npm test` (all twelve suites) and full `npx
+  playwright test` (both projects), all green, exit code 0. Full detail: `docs/LEDGER.md`
+  2026-09-18 (eighth pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `frontend/js/components/AdvancesManager.js`,
+  `backend/tests/e2e/advances-manager.spec.js` (new).
+
+- **2026-09-18: closed Module 3b ("Returns & Refunds tab").** Thirteen of fourteen items were
+  already fully covered by the existing `return-desk.spec.js`/`test_billing_math.js` — cited, not
+  rebuilt. One real, entirely untested gap closed: the empty-search refusal (Reprint Desk's
+  identical guard already had a test; Returns didn't) — added to `return-desk.spec.js`. One item
+  left open: the pre-Phase-20 legacy-invoice return path has its pricing rule already unit-proven
+  (`test_billing_math.js`'s `SALE_LEGACY` fixture) but no live UI test, same unbuilt-fixture-hook
+  gap as Module 3a's identical item — left open together with it. **Verified:** `npx playwright
+  test tests/e2e/return-desk.spec.js` (8/8, up from 7), full `npm test` (all twelve suites) and
+  full `npx playwright test` (both projects), all green, exit code 0. Full detail: `docs/LEDGER.md`
+  2026-09-18.
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/tests/e2e/return-desk.spec.js`.
+
+- **2026-09-17 (sixth pass, same day): closed Module 3a ("Reprint Invoice tab").** Six of eight
+  items were already fully covered by the existing `reprint-desk.spec.js` (just cited); two real,
+  entirely untested gaps closed with new tests added to that same file — name-fragment customer
+  search, and the date-range filter plus its backwards-range refusal (`server.js`'s `parseLedgerQuery`
+  error had zero test coverage anywhere). One item left honestly open: the pre-Phase-20
+  legacy-invoice print path needs a hand-built legacy-shaped DB row the e2e harness has no hook
+  for yet — noted as a `test_repositories.js`-level task for later, not forced into this pass.
+  **Verified:** `npx playwright test tests/e2e/reprint-desk.spec.js` (8/8, up from 6), full `npm
+  test` (all twelve suites) and full `npx playwright test` (both projects), all green, exit code 0.
+  Full detail: `docs/LEDGER.md` 2026-09-17 (sixth pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/tests/e2e/reprint-desk.spec.js`.
+
+- **2026-09-17 (fifth pass, same day): closed Module 3 ("Billing Desk tab") — a second real
+  production bug found and fixed.** `BillingDesk.js`'s `updateGoldRateDisplay()` was fully wired
+  to the purity-change handler and to init, but its two target DOM elements
+  (`#current-gold-rate-22k`, `#rate-type-badge`) did not exist in the rendered template — a
+  permanent silent no-op, no rate/g display or Auto/Manual badge ever shown, for any purity.
+  Restored both elements. New `backend/tests/e2e/billing-desk-preview.spec.js` (3 tests) covers
+  this plus two other real gaps: the empty-invoice guard's actual current message (the checklist's
+  old "Please enter a valid gold weight." text predates the multi-line cart) and the form/preview
+  reset after a successful save. Most of the module needed no new work — `[math automated]` items
+  are `test_billing_math.js`'s own territory, `[e2e automated]` items were already covered by
+  `cashier-billing.spec.js`/`reprint-desk.spec.js`, and "Dashboard reflects new sale" was closed by
+  the Module 2 pass above. Two items left honestly open rather than checked on adjacent coverage:
+  the Discount toggle's Remove/Apply BUTTON and the "no Apply Advance box with no balance" negative
+  case both have zero dedicated e2e assertions. **Verified:** `npx playwright test
+  tests/e2e/billing-desk-preview.spec.js` (3/3), full `npm test` (all twelve suites) and full
+  `npx playwright test` (both projects), all green, exit code 0. Full detail: `docs/LEDGER.md`
+  2026-09-17 (fifth pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `frontend/js/components/BillingDesk.js`,
+  `backend/tests/e2e/billing-desk-preview.spec.js` (new).
+
+- **2026-09-17 (fourth pass, same day): closed Module 2 ("Dashboard tab") — and found a real
+  production bug while verifying it.** New `backend/tests/e2e/dashboard.spec.js` (3 tests) proved
+  a real gap: `Dashboard.js`'s `renderRecentTransactions()` called `describeSaleGoods()` without
+  ever importing it, throwing on the first render with any sale to show — silently swallowed by a
+  bare `console.error`, so on any store with at least one invoice (i.e. every real store past day
+  one) the Recent Transactions list, the Recent Advance Deposits list, AND the "Updated `<time>`"
+  text all stayed frozen forever, from one missing import. Fixed with a one-line addition to the
+  existing `billingMath.js` import (`ReprintDesk.js`/`ReturnDesk.js` already had it right). Also
+  corrected one stale checklist line: the "Purity Mix — Lifetime Revenue Share" bar it described
+  does not exist in `Dashboard.js` at all — a past performance refactor removed client-side ledger
+  summation and this bar went with it; marked struck-through with the reasoning recorded rather
+  than reimplemented. **Verified:** `npx playwright test tests/e2e/dashboard.spec.js` (3/3),
+  full `npm test` (all twelve suites) and full `npx playwright test` (both projects), all green,
+  exit code 0. Full detail: `docs/LEDGER.md` 2026-09-17 (fourth pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `frontend/js/components/Dashboard.js`,
+  `backend/tests/e2e/dashboard.spec.js` (new).
+
+- **2026-09-17 (third pass, same day): moved into the manual-QA-modules half of
+  `TESTING_CHECKLIST.md` — closed §0's server-start/lock-screen items and all five Module 1
+  ("Admin Login & Session") items with real Playwright coverage.** New
+  `backend/tests/e2e/admin-login.spec.js` (5 tests) drives the real lock-screen PIN pad in a real
+  browser: wrong PIN → inline error, stays locked; correct PIN → Dashboard + sidebar visible, PIN
+  field cleared; 5+ wrong PINs → lockout that also blocks the correct PIN, with the real "Too many
+  failed PIN attempts" message; Logout → lock screen, survives a reload (server session actually
+  invalidated); an authenticated session survives a reload. Backend HTTP-level coverage of this
+  boundary already existed (`test_routes.js`, `test_suite.js` Test 6) but never proved the form
+  itself, per CLAUDE.md §8. One stale checklist line fixed along the way: "Incorrect Admin PIN
+  alert" described a `window.alert()` flow that no longer exists — current behaviour is an inline
+  `#admin-login-error` message, corrected in the doc. **Verified:** `npx playwright test
+  tests/e2e/admin-login.spec.js` (5/5), full `npx playwright test` (53/53, up from 48), full `npm
+  test` (all twelve suites), all green, exit code 0; `docs/brain/build-brain.mjs` re-run (new file
+  auto-claimed by its region's existing glob, no map edit needed). Full detail: `docs/LEDGER.md`
+  2026-09-17 (third pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/tests/e2e/admin-login.spec.js` (new),
+  `docs/brain/{BRAIN.md,brain.html}`.
+
+- **2026-09-17 (second pass, same day): closed the three `TESTING_CHECKLIST.md` §24b slices the
+  first pass below deliberately left open** — authentication-semantics contract test, crash
+  injection for the two newest workflows, and a keyboard/scanner/touch/focus-order/contrast audit.
+  (1) **Authentication-semantics contract**: added cookie-attribute assertions
+  (`HttpOnly`/`SameSite=Lax`/no `Secure` over plain HTTP) and a safe-method-needs-no-CSRF check to
+  `test_routes.js` (admin) and `test_http.js` (customer) — deliberately not re-testing CSRF
+  rejection itself, since `test_security.js` (2026-09-16) already owns that contract. (2)
+  **Crash injection**: added three real-child-process kills in `test_concurrency.js` for
+  `stockService.adjustLot` and `reconciliationService.openShift`/`closeShift`, same
+  kill-before-the-audit-insert shape as the existing return/void/advance-approval tests. (3)
+  **UI durability audit** (delegated to a subagent per CLAUDE.md §5, diff verified before
+  accepting): found and fixed two real gaps — `adminAlertOverride.js`/`customerAlertOverride.js`'s
+  hand-rolled `#custom-alert-box` never focused its OK button, ignored Escape, and didn't trap Tab
+  or return focus to the trigger on close (the one non-native dialog in the app, so every
+  admin/customer message funnels through it); and `.btn-danger:hover` (`app.css`) dropped contrast
+  to ~3.4:1 (below the 4.5:1 AA floor), fixed by swapping Red 300 for Red 100. Scanner/touch/focus
+  paths inside `BillingDesk.js`/`InventoryManager.js`'s own forms were already sound — nothing to
+  fix there. **Deliberately still left open**: the same two §24b bullets as the pass below (counter
+  performance budget on target hardware/VPS; canary rollout/observability/rollback) — still no
+  hardware or deployed infrastructure to test against (§7). **Verified:** `node test_routes.js`
+  (33/33, up from 29), `node test_http.js` (139/139, up from 138), `node test_concurrency.js`
+  (36/36, up from 33), a new Playwright test in `inventory-billing-operations.spec.js` plus
+  re-runs of `customer-portal.spec.js` (24/24, desktop + 390px) and
+  `reprint-desk`/`return-desk`/`cashier-billing` specs (20/20), and full `npm test` (all twelve
+  suites) — all green, exit code 0. Full detail: `docs/LEDGER.md` 2026-09-17 (second pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/test_routes.js`, `backend/test_concurrency.js`,
+  `backend/test_http.js`, `frontend/js/{adminAlertOverride,customerAlertOverride}.js`,
+  `frontend/css/app.css`, `backend/tests/e2e/inventory-billing-operations.spec.js`.
+
+- **2026-09-17: four `TESTING_CHECKLIST.md` §24b ("whole-app future-proofing") items advanced, one
+  concrete slice each — these are continuous standing policies, not one-shot checkboxes, so none
+  was marked `[x]`.** (1) **Pagination/filter-bounds contract bug found and fixed**: `server.js`'s
+  `parseLedgerQuery` clamped a client's `limit` to 500 while every ledger repository
+  (`advanceRepository`/`invoiceRepository`/`creditNoteRepository`) independently clamps the real
+  SQL query to 200 — `GET /api/sales`/`/api/returns`/`/api/advances` echoed the looser 500-based
+  value, so a client requesting `?limit=300` saw `"limit":300` while `results.length` was silently
+  capped at 200, breaking `offset += page.limit` pagination. `LEDGER_PAGE_MAX` lowered to 200 to
+  match; each repository's `clampLimit()` exported and reused in `advanceService`/`saleService`/
+  `returnService`, which had the identical bug in their own echoed `limit`. (2) **Dependency
+  lifecycle review**: new `docs/DEPENDENCY_REVIEW.md` (required-fields template + a filled entry
+  for all 9 current runtime deps and the one exempt devDependency); found CLAUDE.md §0's
+  "the 3 in `licensing_server/`" was stale — it has always had 2 (`dotenv`, `express`) — and fixed
+  it there too. (3) **Concurrency races added for the two newest workflows**:
+  `stockService.adjustLot` and `reconciliationService.openShift` (built 2026-09-16, one entry
+  below) were the only workflows with no race coverage in `test_concurrency.js`; added a
+  10-way negative-balance stock-adjustment race and a 10-way cash-shift double-open race,
+  mirroring the existing return/void/exchange race pattern. (4) **A real missing confirmation,
+  found and fixed**: every destructive action in `frontend/js/components/` has a `confirm()`
+  except `InventoryManager.js`'s stock-adjustment form, which posted directly with no
+  confirmation — the one destructive action with no undo in the UI at all. Added one naming the
+  item and signed delta. **Deliberately left open**: the other two §24b bullets (counter
+  performance budget on target hardware/VPS; canary rollout/observability dashboard/rollback
+  tree) need real hardware/infrastructure that does not exist yet (§7) — not faked against a dev
+  laptop. **Verified:** `node test_http.js` (138/138), `node test_concurrency.js` (33/33), a new
+  Playwright test in `inventory-billing-operations.spec.js`, and full `npm test` (all twelve
+  suites), all green, exit code 0. Full detail: `docs/LEDGER.md` 2026-09-17.
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/server.js`,
+  `backend/repositories/{advanceRepository,invoiceRepository,creditNoteRepository}.js`,
+  `backend/services/{advanceService,saleService,returnService}.js`, `backend/test_http.js`,
+  `backend/test_concurrency.js`, `backend/tests/e2e/inventory-billing-operations.spec.js`,
+  `frontend/js/components/InventoryManager.js`, `docs/DEPENDENCY_REVIEW.md` (new), `CLAUDE.md`.
+
+- **2026-09-16 (third pass): closed the log-writer-alert, asset-caching and SKU/customer-lookup-race
+  `TESTING_CHECKLIST.md` items, added `backend/test_security.js`, and fixed a real double-boot bug
+  the asset-caching test surfaced.** The bug: `server.js`'s `versionedHtml()` stamped the
+  `<script type="module" src="js/app.js">` entry tag with `?v=ASSET_VERSION`, but every component
+  imports shared helpers back from that same file via a bare `'../app.js'` specifier — two URLs for
+  one ES module, so the browser fetched and executed `app.js` TWICE per page load, silently
+  double-registering every component and double-firing every click handler admin-desk-wide. Found
+  via a new Playwright spec that finally clicked Billing Desk's "Add Item" button and got a false
+  "Enter a weight" alert on a successful add — nothing had exercised that non-idempotent click
+  before. Fixed by excluding `<script type="module">` tags from the version stamp; this also fixed
+  an unrelated-looking pre-existing failure in the management-reports e2e journey (same cause).
+  Also added `checkLogWriterHealth()` (`alerting.js`) so a full/unwritable log destination reaches
+  the one alert choke point instead of only a console; added the SKU-lookup race e2e spec (the
+  customer-phone one already existed); and fixed one real XSS gap in `SettingsManager.js`'s license
+  block (unescaped `innerHTML`, found while investigating the new security suite's XSS-sink
+  category). `test_security.js` is wired into `npm test`, which `daily-checks.yml` already runs on
+  every pull request. **Verified:** `node test_alerting.js` (19/19), `node test_http.js` (137/137),
+  `node test_security.js` (10/10), full `npm test` (all twelve suites) and full `npx playwright
+  test` (46/46), all green, exit code 0. Full detail: `docs/LEDGER.md` 2026-09-16 (third pass).
+  **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of this pass, on top
+  of everything already listed below: `backend/alerting.js`, `backend/test_security.js` (new),
+  `backend/package.json`, `backend/tests/e2e/inventory-billing-operations.spec.js`,
+  `frontend/js/components/SettingsManager.js`.
+
+- **2026-09-16 (second pass): closed the last three named-but-untested domain codes
+  (`DUPLICATE_REFERENCE`, `PAYMENT_AMOUNT_MISMATCH`, `PAYMENT_CREDIT_PERSIST_FAILED`) and locked
+  in stock adjustment's documented resubmission behaviour with a test.** No production code
+  changed — `test_http.js` only. `DUPLICATE_REFERENCE` and `PAYMENT_AMOUNT_MISMATCH` are asserted
+  at the real HTTP boundary (a duplicate `/api/advances` reference; a signed `/api/payment/verify`
+  checkout whose local Razorpay double reports a mismatched captured amount, reusing the "Gateway
+  await gap" fixture). `PAYMENT_CREDIT_PERSIST_FAILED` is **not reachable through HTTP at all** —
+  `payment_orders`/`advance_accounts` both make `customer_phone` `NOT NULL`, so no real checkout
+  can ever put `creditCapturedPayment()` into a state that fails to persist — asserted instead by
+  calling that service function directly with a hand-built order carrying `customerPhone: null`,
+  which trips the real constraint. Stock adjustment's "resubmission creates a second movement,
+  arguably correct but never tested either way" line is now an actual test, unchanged behaviour.
+  **Verified:** `node test_http.js` alone (136/136, up from 132) and full `npm test` (all eleven
+  suites), both green, exit code 0. Full detail: `docs/LEDGER.md` 2026-09-16.
+
+- **2026-09-16 (first pass): closed `docs/INVARIANT_MATRIX.md`'s last two named gaps — stock
+  adjustment and day reconciliation now have an owning service layer, and stock adjustment's
+  refusals carry a `DOMAIN_CODE`.** New `backend/services/stockService.js` (`openLot`,
+  `adjustLot`) and `backend/services/reconciliationService.js` (`openShift`, `closeShift`) sit
+  between their four `server.js` routes and
+  `inventoryRepository.js`/`cashShiftRepository.js`, mirroring the existing `oldGoldService.js`
+  shape (pre-check → `DomainRefusal` inside `inTransaction` → caught and returned as
+  `{success:false,status,error,code}`). New codes: `STOCK_ITEM_NOT_FOUND`, `STOCK_LOT_NOT_FOUND`,
+  `STOCK_ADJUSTMENT_ZERO`, `STOCK_ADJUSTMENT_NEGATIVE`, `CASH_SHIFT_ALREADY_OPEN`,
+  `CASH_SHIFT_NOT_FOUND`, `CASH_SHIFT_ALREADY_CLOSED`. Stock adjustment also gained an
+  `audit.record()` call (day reconciliation's was already there from 2026-09-13).
+  **Deliberately not done: no new approver gate on either workflow** — that stays the one real
+  open product decision `INVARIANT_MATRIX.md` names, not something this structural pass should
+  guess at. `TESTING_CHECKLIST.md`'s "every permanent record has an owning service" item is now
+  checked off. **Verified:** `node test_http.js` alone (132/132, three new checks) and full
+  `npm test` (all eleven suites), both green, exit code 0. Full detail: `docs/LEDGER.md`
+  2026-09-16. **Uncommitted on `phase-21-payment-verification-and-production-guard`** as of both
+  passes above: `backend/services/{stockService,reconciliationService}.js` (new),
+  `backend/{server,domainCodes,test_http,test_concurrency}.js`,
+  `docs/{INVARIANT_MATRIX,TESTING_CHECKLIST,LEDGER,ai_handover}.md` — the last four plus
+  `test_concurrency.js` carry over uncommitted from the 2026-09-13 session below, unrelated to
+  either pass.
+
+- **2026-09-13: `docs/INVARIANT_MATRIX.md` brought current, and the one real gap it surfaced closed.** The matrix (last verified 2026-09-09) was found stale — the Phase 2.1/2.2/2.3/2.4 adversarial tests it named as missing had already landed 2026-09-11 (`b943b0d`) but the doc was never updated to say so. Re-verified every "known gap" line against current source and tests; all but one were already closed. The one real gap: `test_repositories.js` only proved webhook replay/claim sequentially in one process, never under genuinely concurrent delivery of the same event id (the actual retry-storm scenario). Added a 20-way real-child-process race to `test_concurrency.js` (§3, "20 concurrent deliveries of the same webhook event id credit the customer exactly once") — same pattern as the existing return/void/exchange races, since an in-process test would only prove the JS logic runs, not that SQLite's unique constraint actually serializes racing processes. `docs/TESTING_CHECKLIST.md` §24c's invariant-matrix and adversarial-tests items are now both checked off, each citing the specific test that closes it. Two real gaps remain and are intentionally NOT closed: stock adjustment and day reconciliation have no owning service layer (a design decision, not a test gap) — see the matrix's cross-cutting findings. **Verified:** `node test_concurrency.js` alone (31/31) and full `npm test` (all eleven suites) both green, exit code 0. Nothing uncommitted beyond this session's own changes: `backend/test_concurrency.js`, `docs/{INVARIANT_MATRIX,TESTING_CHECKLIST,LEDGER,ai_handover}.md`.
+
 - **2026-09-11: fixed an indefinite hang in `test_http.js`'s "Gateway await gap" check before committing/deploying phase-21.** Root cause: the check signed its expected Razorpay HMAC with the stale module-level `initialSettings.razorpayKeySecret`; an earlier check in the same file rotates the store's live secret and never rotates it back, so the server correctly rejected the signature and returned before ever reaching the gateway call the check was waiting to observe — and `await gatewayReached` had no timeout, so it hung forever instead of failing. Confirmed for real, not theoretically: two independent `npm test` runs (one from an unrelated concurrent session, started ~19h earlier) were both found stuck at the exact same line. Fixed by tracking the live secret in a `currentRazorpayKeySecret` variable kept in sync by the rotation check, and by bounding `gatewayReached` with a 5s timeout that fails loudly instead of hanging. Full detail: `docs/LEDGER.md` 2026-09-11. **Verified:** `node test_http.js` alone and full `npm test` (all eleven suites) both green, exit code 0. No production code changed — `backend/server.js` only had temporary diagnostic logging added and removed during the investigation; `git diff` on it is unchanged from before this entry. This was found while preparing to commit and deploy the branch below to `main` — do not skip a real `npm test` run before that merge on the strength of this fix alone; it was one specific hang, not a general clean bill of health beyond what the suite covers.
 
 - **2026-09-07: benchmark now measures a seeded, authenticated workload.** `backend/benchmark.js` keeps its original empty-tenant health/static scenarios (unchanged, still run first), then signs in as the tenant owner, files a seeded merchant dataset via real `POST /api/sales` calls, and measures authenticated checkout (serial + 5-till concurrent)/lookup/paged-ledger against that populated tenant. `API_RATE_MAX` is raised for the spawned child so the harness's own volume doesn't trip the abuse throttle it isn't testing. `docs/TESTING_CHECKLIST.md` §24d's seeded-benchmark item is updated but left unchecked — target-hardware/VPS budgets and a return/void/mixed-concurrency workload are still open, see `docs/PERFORMANCE_BENCHMARK.md`. Full `npm test` green throughout. **Uncommitted on `phase-21-payment-verification-and-production-guard`**: everything listed in the domain-refusal entry immediately below, plus `backend/benchmark.js` and `docs/PERFORMANCE_BENCHMARK.md`.

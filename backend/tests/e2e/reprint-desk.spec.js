@@ -206,4 +206,47 @@ test.describe('Reprint desk', () => {
 
         await page.emulateMedia({ media: 'screen' });
     });
+
+    test('searches by a fragment of the customer name, as well as by phone', async ({ page, posServer }) => {
+        await loginAsAdmin(page, posServer);
+        const filed = await fileASale(page, posServer, { name: 'Priyanka Fragment Search' });
+
+        await openReprintDesk(page);
+        // A fragment, not the full name — mixed case, the way a cashier who
+        // half-remembers a customer would actually type it.
+        await search(page, 'fragment');
+        await expect(page.locator('#reprint-results tbody tr')).toHaveCount(1);
+        await expect(page.locator('#reprint-results')).toContainText(filed.id);
+    });
+
+    test('a date range around the sale finds it, narrowing it out excludes it, and a backwards range is refused', async ({ page, posServer }) => {
+        await loginAsAdmin(page, posServer);
+        const filed = await fileASale(page, posServer, { name: 'Date Range Subject' });
+
+        const day = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const today = day(new Date(filed.timestamp));
+        const yesterday = day(new Date(filed.timestamp - 24 * 60 * 60 * 1000));
+        const tomorrow = day(new Date(filed.timestamp + 24 * 60 * 60 * 1000));
+
+        await openReprintDesk(page);
+
+        // A range that spans the sale's own day finds it, with no text query.
+        await page.fill('#reprint-from', yesterday);
+        await page.fill('#reprint-to', tomorrow);
+        await page.click('#reprint-search-btn');
+        await expect(page.locator('#reprint-results')).toContainText(filed.id);
+
+        // Narrowed to exclude it entirely.
+        await page.fill('#reprint-from', yesterday);
+        await page.fill('#reprint-to', yesterday);
+        await page.click('#reprint-search-btn');
+        await expect(page.locator('#reprint-results tbody tr')).toHaveCount(0);
+
+        // A backwards range (To before From) is refused with a clear message,
+        // not silently treated as empty or as the whole ledger.
+        await page.fill('#reprint-from', tomorrow);
+        await page.fill('#reprint-to', yesterday);
+        await page.click('#reprint-search-btn');
+        await expect(page.locator('#reprint-results')).toContainText('cannot be after');
+    });
 });

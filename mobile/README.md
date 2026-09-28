@@ -40,7 +40,11 @@ machine that has them.
 
 1. Install [Android Studio](https://developer.android.com/studio) (includes
    the Android SDK) and a JDK 17.
-2. `cd mobile && npm install`
+2. `cd mobile && npm ci` — installs the exact versions pinned in
+   `package-lock.json` (added 2026-09-19; before that, `mobile/` had no
+   lockfile at all and `npm audit` refused to run here — see below). Use
+   `npm ci`, not `npm install`, so every machine building this app gets the
+   identical dependency tree.
 3. Edit `capacitor.config.json` — replace
    `REPLACE-WITH-TENANT-DOMAIN.example.com` with the real deployed domain
    for the tenant this build targets (see `deploy/README.md` for how a
@@ -64,6 +68,35 @@ Per `docs/PROJECT_PLAN.md` §5.13, publishing needs, from the platform owner:
 None of those exist yet, so this phase stops at "a developer can build and
 side-load a working APK" — the actual store listing is a separate,
 non-code task once those assets are provided.
+
+## Dependency reproducibility and security (2026-09-19)
+
+- `package-lock.json` is now committed. Previously `mobile/` had none, which
+  also meant `npm audit` could not run here at all (it refuses without a
+  lockfile) — this was the audit gap tracked as part of
+  `docs/WHOLE_APP_QUALITY_AUDIT_2026-09-18.md`.
+- Generating that lockfile surfaced a real finding: the scaffold's original
+  `@capacitor/{core,android,cli}@^6.0.0` pin resolved to a `tar` version with
+  several critical/high archive-extraction advisories (path traversal via
+  hardlinks/symlinks, DoS). No non-breaking fix existed within the 6.x line —
+  the patched `tar` only ships behind a Capacitor major bump. Bumped all three
+  packages to `^7.0.0` (the very next major, not the latest 8.x — a smaller,
+  lower-risk migration was preferred since nothing native has ever been built
+  against this scaffold yet, so there is no existing customization to
+  re-migrate). `npm audit` now reports 0 vulnerabilities.
+- **What was verified in this sandbox** (no Android SDK/Studio/JDK
+  available here — see the warning at the top of this file): `npm ci`
+  installs cleanly, `npx cap --version` reports `7.6.9`, `npx cap sync`
+  runs without error against the existing `capacitor.config.json` (no
+  platform directory exists yet, so this only proves the CLI and config
+  schema are still compatible, not that a native build succeeds).
+- **What remains unverified, and must be done on a real machine before
+  relying on this**: `npx cap add android`, a real Gradle build, and running
+  the app on a device/emulator. If anything in Capacitor 7's own migration
+  notes affects Gradle/AGP/`minSdkVersion` requirements, resolve it there —
+  this scaffold has no native customization to lose either way.
+- `npm run audit:security` / `npm run sbom:dependencies` added, matching the
+  convention already used in `backend/` and `licensing_server/`.
 
 ## Notes / gotchas for whoever builds this next
 

@@ -38,6 +38,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { DATA_DIR } from './db.js';
 import { resolveKey } from './secretVault.js';
 import { decryptFile, ENCRYPTED_EXTENSION } from './backupCrypto.js';
 
@@ -123,7 +124,12 @@ try {
         if (name.endsWith(ENCRYPTED_EXTENSION)) {
             const originalName = name.slice(0, -ENCRYPTED_EXTENSION.length);
             try {
-                if (!vaultKey) ({ key: vaultKey } = resolveKey(restoreData));
+                // Resolve against the REAL data dir, not the throwaway restore
+                // dir: this backup was sealed with the live install's key
+                // (backupEngine.js calls resolveKey(DATA_DIR) the same way), so
+                // pointing at the empty restore dir generated a fresh, wrong
+                // dev keyfile there and every decrypt failed (2026-09-28).
+                if (!vaultKey) ({ key: vaultKey } = resolveKey(DATA_DIR));
                 decryptFile(from, path.join(restoreData, originalName), vaultKey, originalName);
             } catch (err) {
                 decryptError = decryptError || err;

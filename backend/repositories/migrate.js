@@ -59,7 +59,11 @@ export function discoverMigrations() {
                 );
             }
             const filepath = path.join(MIGRATIONS_DIR, filename);
-            const sql = fs.readFileSync(filepath, 'utf8');
+            // Normalize CRLF -> LF before hashing: a git checkout with
+            // core.autocrlf=true rewrites every migration file's line endings
+            // on Windows, which would otherwise look identical to editing an
+            // already-applied migration and refuse to boot (2026-09-28).
+            const sql = fs.readFileSync(filepath, 'utf8').replace(/\r\n/g, '\n');
             return {
                 version: Number(match[1]),
                 name: match[2],

@@ -31,7 +31,7 @@
                 <button type="button" id="admin-recovery-toggle" style="background:none; border:none; color:#94a3b8; font-size:12px; text-decoration:underline; cursor:pointer; margin-top:10px; padding:0;">Lost your phone? Use a recovery code</button>
                 <input type="text" id="admin-recovery-input" style="display:none; width:100%; box-sizing:border-box; padding:12px; border-radius:8px; border:1px solid #475569; background:#0f172a; color:#f8fafc; font-size:15px; text-align:center; letter-spacing:2px; margin-top:10px;" placeholder="XXXXX-XXXXX" maxlength="11">
             </div>
-            <button id="admin-login-btn" style="width:100%; padding:15px; background:#3b82f6; color:#fff; border:none; border-radius:8px; font-size:16px; font-weight:bold; cursor:pointer;">UNLOCK</button>
+            <button type="button" id="admin-login-btn" style="width:100%; padding:15px; background:#3b82f6; color:#fff; border:none; border-radius:8px; font-size:16px; font-weight:bold; cursor:pointer;">UNLOCK</button>
             <p id="admin-login-error" style="color:#f87171; font-size:13px; margin:14px 0 0; min-height:18px;"></p>
         </div>
     </div>
@@ -45,27 +45,27 @@
                 <span class="system-status badge active" id="system-status-indicator">SYSTEM HEALTHY</span>
             </div>
             <nav class="sidebar-nav">
-                <button class="nav-btn active" data-target="dashboard-tab">Dashboard</button>
-                <button class="nav-btn" data-target="sales-tab">Billing Desk</button>
-                <button class="nav-btn" data-target="reprint-tab">Reprint Invoice</button>
-                <button class="nav-btn" data-target="returns-tab">Returns &amp; Refunds</button>
-                <button class="nav-btn" data-target="advances-tab">Customer Advances</button>
-                <button class="nav-btn" data-target="inventory-tab">Inventory</button>
+                <button type="button" class="nav-btn active" data-target="dashboard-tab">Dashboard</button>
+                <button type="button" class="nav-btn" data-target="sales-tab">Billing Desk</button>
+                <button type="button" class="nav-btn" data-target="reprint-tab">Reprint Invoice</button>
+                <button type="button" class="nav-btn" data-target="returns-tab">Returns &amp; Refunds</button>
+                <button type="button" class="nav-btn" data-target="advances-tab">Customer Advances</button>
+                <button type="button" class="nav-btn" data-target="inventory-tab">Inventory</button>
                 <!-- Off by default (settings.managementReportsEnabled) — ReportsDesk.js
                      shows this only once it confirms the module is enabled, same
                      "never existed until turned on" contract as Gold Schemes below. -->
-                <button class="nav-btn" data-target="reports-tab" id="reports-nav-btn" style="display:none;">Management Reports</button>
-                <button class="nav-btn" data-target="cash-shifts-tab">Cash Shifts</button>
-                <button class="nav-btn" data-target="quotes-holds-tab">Quotes &amp; Holds</button>
-                <button class="nav-btn" data-target="customer-accounts-tab">Customers</button>
+                <button type="button" class="nav-btn" data-target="reports-tab" id="reports-nav-btn" style="display:none;">Management Reports</button>
+                <button type="button" class="nav-btn" data-target="cash-shifts-tab">Cash Shifts</button>
+                <button type="button" class="nav-btn" data-target="quotes-holds-tab">Quotes &amp; Holds</button>
+                <button type="button" class="nav-btn" data-target="customer-accounts-tab">Customers</button>
                 <!-- Off by default (settings.goldSchemeEnabled) — SchemeDesk.js
                      shows this only once it confirms the module is enabled,
                      the same "never existed until turned on" contract every
                      other flagged module in this build follows. -->
-                <button class="nav-btn" data-target="gold-schemes-tab" id="gold-schemes-nav-btn" style="display:none;">Gold Schemes</button>
-                <button class="nav-btn" data-target="audit-tab">Audit Trail</button>
-                <button class="nav-btn" data-target="settings-tab">Settings</button>
-                <button class="nav-btn" data-target="diagnostics-tab">Diagnostics</button>
+                <button type="button" class="nav-btn" data-target="gold-schemes-tab" id="gold-schemes-nav-btn" style="display:none;">Gold Schemes</button>
+                <button type="button" class="nav-btn" data-target="audit-tab">Audit Trail</button>
+                <button type="button" class="nav-btn" data-target="settings-tab">Settings</button>
+                <button type="button" class="nav-btn" data-target="diagnostics-tab">Diagnostics</button>
                 <a href="/customer.html" target="_blank" style="text-decoration:none; text-align:left; color:#cbd5e1; display:block; padding:15px 20px; font-weight:bold; font-size:13px; border-top:1px solid #334155; margin-top:10px;">⧉ Open Customer Login</a>
             </nav>
             <div class="sidebar-footer">
@@ -74,7 +74,7 @@
                      from this session carries this name, so it is stated where
                      the cashier can see it rather than left implicit. -->
                 <div id="signed-in-as" style="font-size:11px; color:#cbd5e1; margin-bottom:10px; line-height:1.5;"></div>
-                <button id="admin-logout-btn" style="width:100%; margin-bottom:15px; padding:10px; background:#ef4444; color:#fff; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer;">LOGOUT</button>
+                <button type="button" id="admin-logout-btn" style="width:100%; margin-bottom:15px; padding:10px; background:#ef4444; color:#fff; border:none; border-radius:6px; font-size:14px; font-weight:bold; cursor:pointer;">LOGOUT</button>
                 <p id="license-footer">SaaS Core v1.0.0</p>
                 <p id="license-status">Status: Active</p>
             </div>
@@ -224,9 +224,9 @@
                             <p style="font-size:13px; color:#64748b; margin-bottom:15px;">Developer Telemetry and Log Exports.</p>
                             <div id="debug-drawer" style="background:#f8fafc; border:1px solid #cbd5e1; padding:15px; font-family:monospace; border-radius:4px;">
                                 <div class="debug-actions" style="margin-bottom:15px; display:flex; gap:10px;">
-                                    <button id="pull-technical-logs" style="padding:8px 12px; background:#e2e8f0; border:1px solid #94a3b8; cursor:pointer; border-radius:4px;">Pull Level 1 Logs</button>
-                                    <button id="pull-emergency-logs" style="padding:8px 12px; background:#fecaca; border:1px solid #f87171; color:#991b1b; cursor:pointer; border-radius:4px; font-weight:bold;">Request Level 2 Export</button>
-                                    <button id="pull-blackbox-export" style="padding:8px 12px; background:#1e293b; border:1px solid #334155; color:#38bdf8; cursor:pointer; border-radius:4px; font-weight:bold;">Export Black-Box Log</button>
+                                    <button type="button" id="pull-technical-logs" style="padding:8px 12px; background:#e2e8f0; border:1px solid #94a3b8; cursor:pointer; border-radius:4px;">Pull Level 1 Logs</button>
+                                    <button type="button" id="pull-emergency-logs" style="padding:8px 12px; background:#fecaca; border:1px solid #f87171; color:#991b1b; cursor:pointer; border-radius:4px; font-weight:bold;">Request Level 2 Export</button>
+                                    <button type="button" id="pull-blackbox-export" style="padding:8px 12px; background:#1e293b; border:1px solid #334155; color:#38bdf8; cursor:pointer; border-radius:4px; font-weight:bold;">Export Black-Box Log</button>
                                 </div>
                                 <pre id="log-output" style="background:#0f172a; color:#38bdf8; padding:15px; max-height:150px; overflow-y:auto; font-size:12px; border-radius:4px; margin:0;">System initialized. Awaiting queries...</pre>
                             </div>

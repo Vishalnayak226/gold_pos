@@ -433,6 +433,8 @@ function initDiagnosticsDrawer() {
                 if (res.ok) {
                     const data = await res.json();
                     logTelemetry(`Level 1 OK: uptime ${Math.round(data.metrics.uptime)}s, heap ${Math.round(data.metrics.memory.heapUsed / 1024 / 1024)}MB, ${data.telemetry.length} telemetry entries, ${(data.errors.match(/ERROR:/g) || []).length} recent errors.`);
+                } else if (res.status === 403) {
+                    logTelemetry('Level 1 pull failed: this needs the owner account. Sign in as the owner and try again.');
                 } else {
                     logTelemetry('Level 1 pull failed: ' + res.status);
                 }
@@ -450,6 +452,8 @@ function initDiagnosticsDrawer() {
                 if (res.ok) {
                     const data = await res.json();
                     logTelemetry(`Level 2 export ready (${data.status}, exported ${data.exportedAt}). Envelope is encrypted client-side-unreadable — hand it to the developer for offline decryption.`);
+                } else if (res.status === 403) {
+                    logTelemetry('Level 2 export failed: this needs the owner account. Sign in as the owner and try again.');
                 } else {
                     logTelemetry('Level 2 export failed: ' + res.status);
                 }
@@ -467,6 +471,8 @@ function initDiagnosticsDrawer() {
                 if (res.ok) {
                     const data = await res.json();
                     logTelemetry(`Black-box export ready (exported ${data.exportedAt}). Decryptable only offline by the platform owner via developer_blackbox_keys/analyze_blackbox.js.`);
+                } else if (res.status === 403) {
+                    logTelemetry('Black-box export failed: this needs the owner account. Sign in as the owner and try again.');
                 } else {
                     logTelemetry('Black-box export failed: ' + res.status);
                 }
@@ -561,7 +567,7 @@ function showLicenseLockOverlay(licenseInfo) {
                 <label style="display: block; font-size: 11px; margin-bottom: 5px; color: #94a3b8; text-transform: uppercase;">License Activation Key</label>
                 <input type="text" id="activation-key-input" style="width: 100%; padding: 10px; background: #0f172a; border: 1px solid #475569; color: #fff; font-family: monospace; border-radius: 4px; box-sizing: border-box;" value="${licenseInfo.licenseKey || ''}" placeholder="ENTER KEY">
             </div>
-            <button id="activate-system-btn" style="width: 100%; padding: 12px; background: #0284c7; color: white; border: none; font-weight: bold; cursor: pointer; border-radius: 4px; letter-spacing: 0.05em;">ACTIVATE SYSTEM</button>
+            <button type="button" id="activate-system-btn" style="width: 100%; padding: 12px; background: #0284c7; color: white; border: none; font-weight: bold; cursor: pointer; border-radius: 4px; letter-spacing: 0.05em;">ACTIVATE SYSTEM</button>
             <p style="text-align: center; margin-top: 15px; font-size: 10px; color: #64748b;">
                 Universal Gold POS Licensing Gate
             </p>

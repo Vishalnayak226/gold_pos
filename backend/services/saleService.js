@@ -968,7 +968,7 @@ export function listSales({ q = '', fromAt = null, toAt = null, limit = 50, offs
         tenantId: context.tenantId, q, fromAt, toAt, limit, offset
     });
 
-    const resolvedLimit = Math.max(1, Math.trunc(Number(limit) || 50));
+    const resolvedLimit = invoices.clampLimit(limit);
     const resolvedOffset = Math.max(0, Math.trunc(Number(offset) || 0));
 
     return {

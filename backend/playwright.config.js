@@ -36,7 +36,15 @@ export default defineConfig({
     retries: process.env.CI ? 1 : 0,
     reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : [['list']],
     timeout: 60_000,
-    expect: { timeout: 10_000 },
+    expect: {
+        timeout: 10_000,
+        // Visual-regression baselines (tests/e2e/visual-regression.spec.js):
+        // web-font (Google Fonts 'Outfit') load timing causes a few stray
+        // antialiased pixels around glyph edges run to run even with
+        // identical DOM/CSS. A small tolerance absorbs that noise without
+        // masking an actual layout or color regression.
+        toHaveScreenshot: { maxDiffPixelRatio: 0.02 }
+    },
     use: {
         trace: 'retain-on-failure',
         screenshot: 'only-on-failure',

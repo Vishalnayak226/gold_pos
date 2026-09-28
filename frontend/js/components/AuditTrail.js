@@ -57,8 +57,8 @@ export class AuditTrail {
                     <option value="">All record types</option>
                     <option value="invoice">Invoices</option>
                     <option value="credit_note">Credit notes</option>
-                    <option value="advance">Advances</option>
-                    <option value="payment">Payments</option>
+                    <option value="advance_entry">Advances</option>
+                    <option value="payment_order">Payments</option>
                 </select>
                 <input type="date" id="audit-from" class="form-control" style="max-width:170px;" title="From date">
                 <input type="date" id="audit-to" class="form-control" style="max-width:170px;" title="To date">
@@ -104,10 +104,15 @@ export class AuditTrail {
             const res = await adminFetch(`/api/audit?${params.toString()}`);
 
             /* A refusal is not an empty trail. Rendering the 403 as "no events"
-               would tell a cashier the store had done nothing all day. */
+               would tell a cashier the store had done nothing all day.
+               Deliberately NOT using the server's own message here: 403 comes
+               from requireApprover, a middleware written for deposit approval
+               ("Approving a deposit needs a manager or the owner...") and
+               reused here for its role check only — surfacing that text on
+               this screen tells a cashier trying to view the audit trail that
+               they were trying to approve a deposit, which they were not. */
             if (res.status === 403) {
-                const body = await res.json().catch(() => ({}));
-                this.deniedReason = body.message || 'Viewing the audit trail needs a manager or the owner.';
+                this.deniedReason = 'Viewing the audit trail needs a manager or the owner.';
                 this.events = [];
                 this.renderTable();
                 return;

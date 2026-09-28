@@ -19,78 +19,20 @@
 
 import fs from 'node:fs';
 import os from 'node:os';
-import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
-import { once } from 'node:events';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { computeMetalValue, computeInvoiceTotals } from '../frontend/js/lib/billingMath.js';
+import {
+    BENCHMARK_SETTINGS, BENCHMARK_RATES, wait, startServer, stopServer, percentile, rounded
+} from './benchmarkHarness.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const QUICK = process.argv.includes('--quick');
 const OUTPUT_INDEX = process.argv.indexOf('--output');
 const outputFile = OUTPUT_INDEX === -1 ? null : process.argv[OUTPUT_INDEX + 1];
 
 if (OUTPUT_INDEX !== -1 && (!outputFile || outputFile.startsWith('--'))) {
     throw new Error('--output requires a destination filename.');
-}
-
-/* The one source of truth for this tenant's PIN, tax and rate configuration —
-   seedBenchmarkTenant() writes it to disk and buildSalePayload() prices
-   against it, so the two can never drift the way two copies of the same
-   numbers eventually do. */
-const BENCHMARK_SETTINGS = {
-    companyName: 'Benchmark Tenant',
-    adminPin: '2468',
-    goldTaxSlab: 3,
-    taxMode: 'Exclusive',
-    invoicePrefix: 'PERF',
-    invoiceSeqStart: 1
-};
-const BENCHMARK_RATES = { price24K: 7500, price22K: 6875, price18K: 5600 };
-
-function wait(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function getFreePort() {
-    return new Promise((resolve, reject) => {
-        const probe = net.createServer();
-        probe.unref();
-        probe.once('error', reject);
-        probe.listen(0, '127.0.0.1', () => {
-            const { port } = probe.address();
-            probe.close(error => error ? reject(error) : resolve(port));
-        });
-    });
-}
-
-/** A valid, deliberately uninteresting tenant that opens the license gate. */
-function seedBenchmarkTenant(dataDir) {
-    fs.mkdirSync(dataDir, { recursive: true });
-    fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify(BENCHMARK_SETTINGS, null, 2));
-    fs.writeFileSync(path.join(dataDir, 'rates.json'), JSON.stringify({
-        lastUpdated: new Date().toISOString(),
-        status: 'fixture', ...BENCHMARK_RATES
-    }, null, 2));
-    fs.writeFileSync(path.join(dataDir, 'license.json'), JSON.stringify({
-        licenseKey: 'PERFORMANCE-BENCHMARK',
-        activated: true,
-        status: 'active',
-        expiryDate: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-        lastHandshakeTime: Date.now()
-    }, null, 2));
-}
-
-function percentile(sorted, ratio) {
-    if (sorted.length === 0) return 0;
-    return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))];
-}
-
-function rounded(value) {
-    return Math.round(value * 100) / 100;
 }
 
 /**
@@ -102,7 +44,9 @@ function rounded(value) {
  * authenticated checkout is a POST carrying a session cookie and CSRF header,
  * same as a real cashier's browser sends. `scenario.body` may be a fixed
  * string or a `(index) => string` so every sample can be a genuinely new,
- * valid invoice rather than one replayed body.
+ * valid invoice rather than one replayed body. `scenario.path` may likewise
+ * be a `(index) => string` — a void or a return targets a different,
+ * specific invoice on every sample, not a fixed endpoint.
  */
 async function measure(baseUrl, scenario) {
     const latencies = [];
@@ -118,8 +62,9 @@ async function measure(baseUrl, scenario) {
             const index = next++;
             if (index >= scenario.samples || firstError) return;
             const started = performance.now();
+            const path = typeof scenario.path === 'function' ? scenario.path(index) : scenario.path;
             try {
-                const response = await fetch(baseUrl + scenario.path, {
+                const response = await fetch(baseUrl + path, {
                     method,
                     headers: {
                         'Cache-Control': 'no-cache',
@@ -156,7 +101,7 @@ async function measure(baseUrl, scenario) {
     const sorted = [...latencies].sort((a, b) => a - b);
     return {
         name: scenario.name,
-        path: scenario.path,
+        path: typeof scenario.path === 'function' ? scenario.path(0) : scenario.path,
         samples: scenario.samples,
         concurrency: scenario.concurrency,
         statusCounts,
@@ -268,60 +213,151 @@ async function seedMerchantDataset(baseUrl, authHeaders, { customerCount, invoic
     return { customerCount, invoiceCount: jobs.length, elapsedMs: rounded(performance.now() - startedAt) };
 }
 
-async function startServer(tempRoot) {
-    const port = await getFreePort();
-    const dataDir = path.join(tempRoot, 'data');
-    const logsDir = path.join(tempRoot, 'logs');
-    seedBenchmarkTenant(dataDir);
-    fs.mkdirSync(logsDir, { recursive: true });
-
-    const output = [];
-    const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-        cwd: tempRoot,
-        env: {
-            ...process.env,
-            NODE_ENV: 'test',
-            GOLDPOS_DATA_DIR: dataDir,
-            GOLDPOS_LOGS_DIR: logsDir,
-            PORT: String(port),
-            // The blanket per-minute API_RATE_MAX (600 by default) exists to stop
-            // runaway automation against a real store, not to cap how fast this
-            // harness may measure the server's own throughput. Raised only for
-            // this ephemeral benchmark process; the tuning is a router concern
-            // and already covered by its own rate-limit tests.
-            API_RATE_MAX: String(process.env.API_RATE_MAX || 50_000)
-        },
-        stdio: ['ignore', 'pipe', 'pipe']
+/** One authenticated POST /api/sales, returning the invoiceId the server assigned. */
+async function createInvoice(baseUrl, authHeaders, weightGrams, customerIndex) {
+    const response = await fetch(`${baseUrl}/api/sales`, {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: buildSalePayload(weightGrams, customerIndex)
     });
-    child.stdout.on('data', chunk => output.push(chunk.toString()));
-    child.stderr.on('data', chunk => output.push(chunk.toString()));
-
-    const baseUrl = `http://127.0.0.1:${port}`;
-    const deadline = Date.now() + 30_000;
-    while (Date.now() < deadline) {
-        if (child.exitCode !== null) {
-            throw new Error(`Benchmark server exited early:\n${output.join('')}`);
-        }
-        try {
-            const response = await fetch(`${baseUrl}/api/health`);
-            if (response.ok) return { child, baseUrl };
-        } catch (_) {
-            // The process is still opening its SQLite store or TCP listener.
-        }
-        await wait(100);
+    if (!response.ok) {
+        throw new Error(`Benchmark setup: creating a disposable invoice failed: HTTP ${response.status} — ${await response.text()}`);
     }
-    child.kill();
-    throw new Error(`Benchmark server did not become healthy within 30 seconds:\n${output.join('')}`);
+    return (await response.json()).invoiceId;
 }
 
-async function stopServer(child) {
-    if (!child || child.exitCode !== null) return;
-    const exited = once(child, 'exit');
-    child.kill('SIGTERM');
-    const graceful = await Promise.race([exited.then(() => true), wait(10_000).then(() => false)]);
-    if (graceful) return;
-    child.kill('SIGKILL');
-    await once(child, 'exit');
+/**
+ * A return and a void each consume the one invoice they act on — unlike
+ * checkout/lookup, the same invoice cannot be resampled. Unmeasured setup,
+ * same reasoning as seedMerchantDataset: files `count` fresh, disposable
+ * invoices sequentially (this pool is tiny compared to the merchant seed)
+ * and returns their invoice numbers for the return/void scenarios to consume
+ * one-for-one, by sample index.
+ */
+async function seedDisposableInvoices(baseUrl, authHeaders, count) {
+    const invoiceIds = [];
+    for (let i = 0; i < count; i++) {
+        invoiceIds.push(await createInvoice(baseUrl, authHeaders, 2, 0));
+    }
+    return invoiceIds;
+}
+
+/** One item with one generously-sized lot, so many small +weight adjustments never race a real stock floor. */
+async function seedStockLot(baseUrl, authHeaders) {
+    const itemRes = await fetch(`${baseUrl}/api/inventory/items`, {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Benchmark Stock Item', purity: '22K', skuCode: 'BENCH-SKU-1', netWeightGrams: 5 })
+    });
+    if (!itemRes.ok) throw new Error(`Benchmark setup: creating the stock item failed: HTTP ${itemRes.status} — ${await itemRes.text()}`);
+    const item = (await itemRes.json()).item;
+
+    const lotRes = await fetch(`${baseUrl}/api/inventory/lots`, {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ itemId: item.id, weightGrams: 500, unitCostPerGram: 800 })
+    });
+    if (!lotRes.ok) throw new Error(`Benchmark setup: opening the stock lot failed: HTTP ${lotRes.status} — ${await lotRes.text()}`);
+    return (await lotRes.json()).lot.id;
+}
+
+/** A dedicated phone for benchmark advance deposits, well outside the seeded customer index range. */
+const ADVANCE_BENCHMARK_PHONE = benchmarkPhone(999999);
+
+/**
+ * A mixed-till workload: `tills` concurrent workers, each repeatedly running
+ * the same short cycle a real counter mixes through a shift — a sale, a
+ * second sale, a return against the first, a void of the second, and an
+ * advance deposit — rather than every worker hammering one endpoint. This is
+ * what the checkout-only concurrent scenario above cannot show: several
+ * different write paths (sale/return/void/advance) contending for the same
+ * SQLite writer lock at once.
+ *
+ * Every HTTP call still fails fast (same contract as measure()); latency is
+ * bucketed per operation kind so a regression in, say, void specifically is
+ * visible rather than averaged away.
+ */
+async function measureMixedTill(baseUrl, authHeaders, { tills, iterationsPerTill }) {
+    const latenciesByKind = { sale: [], return: [], void: [], 'advance deposit': [] };
+    let firstError = null;
+    const startedAt = performance.now();
+
+    async function timed(kind, fn) {
+        const started = performance.now();
+        await fn();
+        latenciesByKind[kind].push(performance.now() - started);
+    }
+
+    async function till(tillIndex) {
+        for (let iteration = 0; iteration < iterationsPerTill && !firstError; iteration++) {
+            try {
+                const customerIndex = 900000 + tillIndex * 1000 + iteration;
+                let invoiceA, invoiceB;
+                await timed('sale', async () => { invoiceA = await createInvoice(baseUrl, authHeaders, 2, customerIndex); });
+                await timed('sale', async () => { invoiceB = await createInvoice(baseUrl, authHeaders, 2, customerIndex); });
+                await timed('return', async () => {
+                    const response = await fetch(`${baseUrl}/api/returns`, {
+                        method: 'POST',
+                        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ invoiceId: invoiceA, weightGrams: 2, refundMode: 'cash' })
+                    });
+                    if (!response.ok) throw new Error(`Mixed-till return failed: HTTP ${response.status} — ${await response.text()}`);
+                    await response.arrayBuffer();
+                });
+                await timed('void', async () => {
+                    const response = await fetch(`${baseUrl}/api/sales/${encodeURIComponent(invoiceB)}/void`, {
+                        method: 'POST',
+                        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ reason: 'Benchmark mixed-till void' })
+                    });
+                    if (!response.ok) throw new Error(`Mixed-till void failed: HTTP ${response.status} — ${await response.text()}`);
+                    await response.arrayBuffer();
+                });
+                await timed('advance deposit', async () => {
+                    const response = await fetch(`${baseUrl}/api/advances`, {
+                        method: 'POST',
+                        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            customerPhone: ADVANCE_BENCHMARK_PHONE, customerName: 'Benchmark Mixed-Till Customer',
+                            amount: 50, paymentMethod: 'Cash', referenceId: `BENCH-MIXED-${tillIndex}-${iteration}-${Date.now()}`
+                        })
+                    });
+                    if (!response.ok) throw new Error(`Mixed-till advance deposit failed: HTTP ${response.status} — ${await response.text()}`);
+                    await response.arrayBuffer();
+                });
+            } catch (error) {
+                firstError = error;
+                return;
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: tills }, (_, tillIndex) => till(tillIndex)));
+    if (firstError) throw firstError;
+
+    const elapsedMs = performance.now() - startedAt;
+    const totalOps = Object.values(latenciesByKind).reduce((sum, list) => sum + list.length, 0);
+    const breakdown = {};
+    for (const [kind, list] of Object.entries(latenciesByKind)) {
+        const sorted = [...list].sort((a, b) => a - b);
+        breakdown[kind] = {
+            samples: sorted.length,
+            latencyMs: {
+                min: rounded(sorted[0]),
+                p50: rounded(percentile(sorted, 0.50)),
+                p95: rounded(percentile(sorted, 0.95)),
+                p99: rounded(percentile(sorted, 0.99)),
+                max: rounded(sorted[sorted.length - 1])
+            }
+        };
+    }
+    return {
+        name: 'Mixed-till (sale + sale + return + void + advance deposit per cycle)',
+        tills, iterationsPerTill, totalOps,
+        elapsedMs: rounded(elapsedMs),
+        throughputPerSecond: rounded(totalOps / (elapsedMs / 1000)),
+        breakdown
+    };
 }
 
 async function main() {
@@ -334,12 +370,16 @@ async function main() {
             ? {
                 health: 50, static: 30, concurrent: 100,
                 seedCustomers: 10, seedInvoicesPerCustomer: 2,
-                checkout: 20, checkoutConcurrent: 20, lookup: 20, pagedLedger: 20
+                checkout: 20, checkoutConcurrent: 20, lookup: 20, pagedLedger: 20,
+                returnSamples: 10, voidSamples: 10, stockAdjust: 20, paymentDeposit: 20,
+                mixedTills: 3, mixedIterationsPerTill: 2
             }
             : {
                 health: 250, static: 100, concurrent: 500,
                 seedCustomers: 40, seedInvoicesPerCustomer: 5,
-                checkout: 100, checkoutConcurrent: 100, lookup: 100, pagedLedger: 100
+                checkout: 100, checkoutConcurrent: 100, lookup: 100, pagedLedger: 100,
+                returnSamples: 30, voidSamples: 30, stockAdjust: 100, paymentDeposit: 100,
+                mixedTills: 5, mixedIterationsPerTill: 5
             };
 
         // Warm server, JIT, module cache and local TCP path outside the measured samples.
@@ -392,6 +432,57 @@ async function main() {
             results.push(await measure(started.baseUrl, scenario));
         }
 
+        // RETURN / VOID / STOCK / PAYMENT WORKLOADS. Each return and void
+        // consumes the one disposable invoice it acts on, so those pools are
+        // seeded one-for-one with the sample count rather than reused.
+        const returnInvoiceIds = await seedDisposableInvoices(started.baseUrl, authHeaders, count.returnSamples);
+        const voidInvoiceIds = await seedDisposableInvoices(started.baseUrl, authHeaders, count.voidSamples);
+        const stockLotId = await seedStockLot(started.baseUrl, authHeaders);
+
+        const singlePathScenarios = [
+            {
+                name: 'POST /api/returns authenticated (cash refund)', method: 'POST',
+                path: '/api/returns', headers: authHeaders,
+                body: (index) => JSON.stringify({ invoiceId: returnInvoiceIds[index], weightGrams: 2, refundMode: 'cash' }),
+                samples: count.returnSamples, concurrency: 1
+            },
+            {
+                name: 'POST /api/sales/:id/void authenticated (same-day void)', method: 'POST',
+                path: (index) => `/api/sales/${encodeURIComponent(voidInvoiceIds[index])}/void`, headers: authHeaders,
+                body: JSON.stringify({ reason: 'Benchmark same-day void' }),
+                samples: count.voidSamples, concurrency: 1
+            },
+            {
+                // A small positive delta only — this measures write throughput
+                // under the same BEGIN IMMEDIATE lock every other mutation uses,
+                // not stock-floor business rules, so it can never legitimately fail.
+                name: 'POST /api/inventory/lots/:id/adjust authenticated (physical-count top-up)', method: 'POST',
+                path: `/api/inventory/lots/${stockLotId}/adjust`, headers: authHeaders,
+                body: JSON.stringify({ weightDeltaGrams: 0.1 }),
+                samples: count.stockAdjust, concurrency: 1
+            },
+            {
+                name: 'POST /api/advances authenticated (counter deposit)', method: 'POST',
+                path: '/api/advances', headers: authHeaders,
+                body: (index) => JSON.stringify({
+                    customerPhone: ADVANCE_BENCHMARK_PHONE, customerName: 'Benchmark Advance Customer',
+                    amount: 50, paymentMethod: 'Cash', referenceId: `BENCH-ADV-${index}-${Date.now()}`
+                }),
+                samples: count.paymentDeposit, concurrency: 1
+            }
+        ];
+        for (const scenario of singlePathScenarios) {
+            results.push(await measure(started.baseUrl, scenario));
+        }
+
+        // MIXED-TILL: several concurrent workers each running a different mix
+        // of write paths (sale/return/void/advance) against the same ledger,
+        // rather than every worker hammering one endpoint — the scenario the
+        // single-endpoint measurements above cannot show.
+        const mixedTill = await measureMixedTill(started.baseUrl, authHeaders, {
+            tills: count.mixedTills, iterationsPerTill: count.mixedIterationsPerTill
+        });
+
         const report = {
             formatVersion: 2,
             generatedAt: new Date().toISOString(),
@@ -406,11 +497,15 @@ async function main() {
             },
             seed,
             scope: 'Warm loopback only. The four "empty tenant" results run before seeding; the '
-                + 'checkout/lookup/paged-ledger results run authenticated, against the seeded merchant '
-                + `dataset described in "seed" (${seed.customerCount} customers, ${seed.invoiceCount} invoices). `
-                + 'Still no claim about browser rendering, scanner/scale/printer hardware, a low-end '
-                + 'counter, real network latency, VPS capacity or return/void/mixed-concurrency workloads.',
-            results
+                + 'checkout/lookup/paged-ledger/return/void/stock-adjust/advance-deposit results run '
+                + 'authenticated, against the seeded merchant dataset described in "seed" '
+                + `(${seed.customerCount} customers, ${seed.invoiceCount} invoices); "mixedTill" runs `
+                + 'several concurrent tills each mixing sale/return/void/advance-deposit writes against '
+                + 'the same ledger. Still no claim about browser rendering, scanner/scale/printer '
+                + 'hardware, a low-end counter, real network latency, VPS capacity, disk pressure, or a '
+                + 'representative production-scale tenant (this seed is tens, not thousands, of invoices).',
+            results,
+            mixedTill
         };
 
         const json = JSON.stringify(report, null, 2);

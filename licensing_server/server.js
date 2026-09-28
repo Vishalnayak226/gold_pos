@@ -22,8 +22,11 @@ const __dirname = path.dirname(__filename);
 // license handshake. Keep PORT out of the forbidden list if you override it.
 const PORT = process.env.PORT || 6060;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'MASTER-ADMIN-SECRET-12345';
-const DATA_DIR = path.join(__dirname, 'data');
-const KEYS_DIR = path.join(__dirname, 'keys');
+/* Overridable so an isolated test can point this whole module at a throwaway
+   temp directory instead of the real licence/key data — same convention as
+   backend/db.js's GOLD_POS_DATA_DIR. Unset in production; default unchanged. */
+const DATA_DIR = process.env.GOLD_POS_LICENSING_DATA_DIR || path.join(__dirname, 'data');
+const KEYS_DIR = process.env.GOLD_POS_LICENSING_KEYS_DIR || path.join(__dirname, 'keys');
 
 // Create folders if missing
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -971,10 +974,57 @@ app.get('/', (req, res) => {
     `);
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-    console.log(`[Licensing Server] Control panel running on http://localhost:${PORT}`);
-    // Never the secret itself (it used to be printed here) — stdout ends up
-    // in log files and terminal scrollback far more casually than
-    // settings.json ever does, and this token can publish fleet-wide code.
-    console.log(`[Licensing Server] Admin authentication is ${ADMIN_SECRET_IS_DEFAULT ? 'using the DEFAULT secret — set ADMIN_SECRET before deploying' : 'configured'}.`);
+/**
+ * An unmatched /api/* route falls through to here as JSON rather than
+ * Express's default HTML "Cannot GET ..." page.
+ */
+app.use((req, res, next) => {
+    if (!req.path.startsWith('/api/')) return next();
+    res.status(404).json({ error: 'NOT_FOUND', path: req.path });
 });
+
+/**
+ * The one place an unhandled throw becomes a response (same pattern and same
+ * bug class as backend/server.js's identical handler — reused, not
+ * reinvented, per CLAUDE.md §1).
+ *
+ * Until this existed, a body-parser rejection (malformed JSON, an oversized
+ * body) fell through to Express's default handler, which renders the
+ * **stack trace** into the response body outside NODE_ENV=production —
+ * leaking absolute filesystem paths and node_modules internals to whoever
+ * sent the bad request. Confirmed live: `POST /api/license/verify` with a
+ * truncated JSON body returned the full body-parser call stack, including
+ * this checkout's absolute path, in an HTML response.
+ *
+ * `next` is unused and must still be declared — Express identifies an error
+ * handler by arity, and a three-argument version is silently treated as
+ * ordinary middleware that never runs.
+ */
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+    const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
+    console.error(`[Licensing Server] Unhandled error on ${req.method} ${req.path}: ${err.message}`);
+    if (res.headersSent) return next(err);
+    res.status(status).json(status === 500
+        ? { error: 'INTERNAL_ERROR', message: 'Something went wrong.' }
+        : { error: 'BAD_REQUEST', message: err.message });
+});
+
+/** Starts the HTTP listener. Exported so an isolated test can boot this on an
+ * ephemeral port, exactly like backend/server.js's startServer(). */
+export function startServer(port = PORT, host = '127.0.0.1') {
+    const server = app.listen(port, host, () => {
+        const address = server.address();
+        const listeningPort = typeof address === 'object' && address ? address.port : port;
+        console.log(`[Licensing Server] Control panel running on http://${host}:${listeningPort}`);
+        // Never the secret itself (it used to be printed here) — stdout ends up
+        // in log files and terminal scrollback far more casually than
+        // settings.json ever does, and this token can publish fleet-wide code.
+        console.log(`[Licensing Server] Admin authentication is ${ADMIN_SECRET_IS_DEFAULT ? 'using the DEFAULT secret — set ADMIN_SECRET before deploying' : 'configured'}.`);
+    });
+    return server;
+}
+
+/* Same bootstrap gate as backend/server.js: a test sets this before importing
+   the module so it can seed fixtures and call startServer(0) itself instead
+   of this file binding the real PORT the moment it is imported. */
+if (process.env.GOLD_POS_DISABLE_BOOTSTRAP !== '1') startServer();

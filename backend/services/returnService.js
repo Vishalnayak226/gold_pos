@@ -402,7 +402,7 @@ export function listReturns({ customerPhone = null, limit = 50, offset = 0, from
     return {
         results: projectPage(rows),
         total,
-        limit: Math.max(1, Math.trunc(Number(limit) || 50)),
+        limit: creditNotes.clampLimit(limit),
         offset: Math.max(0, Math.trunc(Number(offset) || 0))
     };
 }

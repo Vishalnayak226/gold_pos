@@ -382,6 +382,50 @@ try {
         assert.equal(allowed.headers.get('access-control-allow-origin'), 'https://admin.example.test');
     });
 
+    await check('boot-time asset version is stamped on script/link tags and cached correctly by tag', async () => {
+        // HTML itself is always revalidated so a browser never runs a page
+        // whose asset URLs point at a release that no longer exists.
+        const page = await request('/');
+        assert.equal(page.headers.get('cache-control'), 'no-cache');
+        const html = await page.text();
+        const [, assetPath] = html.match(/(?:src|href)="(js\/[^"]+\.js|css\/[^"]+\.css)\?v=[^"]+"/) || [];
+        assert.ok(assetPath, 'index.html must stamp at least one same-origin script/link asset with ?v=');
+
+        const tagged = html.match(new RegExp(`${assetPath.replace(/\//g, '\\/')}\\?v=([^"]+)"`));
+        const version = tagged && tagged[1];
+        assert.ok(version, 'could not extract the stamped ?v= value');
+
+        // The exact tagged version is this release's content — cache it hard.
+        const current = await request(`/${assetPath}?v=${version}`);
+        assert.equal(current.status, 200);
+        assert.equal(current.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+
+        // No tag, or a stale one from a previous release, must never be
+        // served as long-lived — always revalidated instead.
+        const untagged = await request(`/${assetPath}`);
+        assert.equal(untagged.headers.get('cache-control'), 'no-cache');
+        const stale = await request(`/${assetPath}?v=some-previous-release`);
+        assert.equal(stale.headers.get('cache-control'), 'no-cache');
+
+        // customer.html gets the same treatment, independent of index.html.
+        const customerPage = await request('/customer.html');
+        assert.equal(customerPage.headers.get('cache-control'), 'no-cache');
+        assert.match(await customerPage.text(), /\?v=[^"]+"/);
+
+        // The <script type="module"> entry point itself must NEVER be
+        // stamped. Every component imports its shared helpers back from that
+        // same file via a bare, unversioned specifier (e.g.
+        // `import { adminFetch } from '../app.js'`) — if the HTML tag that
+        // boots it pointed at a different, versioned URL, ES module identity
+        // (exact-URL) would give the browser two separate instances of the
+        // entry module to fetch and execute, silently double-registering
+        // every top-level component and double-firing every click handler.
+        // Found 2026-09-16 via a Playwright spec that finally clicked
+        // Billing Desk's "Add Item" button — see docs/LEDGER.md.
+        assert.doesNotMatch(html, /<script[^>]*type="module"[^>]*\?v=/);
+        assert.match(html, /<script type="module" src="js\/app\.js">/);
+    });
+
     await check('admin-only settings route rejects an unauthenticated request', async () => {
         const response = await request('/api/settings');
         assert.equal(response.status, 401);
@@ -1161,6 +1205,29 @@ try {
         // credited to this phone over the course of the suite.
         assert.ok(creditRows.some(a => a.amount === 5665),
             'the closing gold refund is credited at its trued-up value');
+    });
+
+    /* ----------------------------------------------------------------------
+       Authentication semantics contract, customer side — TESTING_CHECKLIST.md
+       §24b named this the one surface-contract gap left. CSRF rejection itself
+       is already covered for the customer session in test_security.js; what
+       was never asserted anywhere is the cookie ATTRIBUTE contract
+       (HttpOnly/SameSite). The admin side of this same contract lives in
+       test_routes.js's "Authentication semantics contract" group.
+       ---------------------------------------------------------------------- */
+    await check('customer session cookies are HttpOnly and SameSite=Lax', async () => {
+        const session = await loginCustomerHttp(request, { phone, password: 'PortalPass!2026' });
+        assert.equal(session.response.status, 200);
+
+        const setCookies = session.response.headers.getSetCookie ? session.response.headers.getSetCookie() : [];
+        const sessLine = setCookies.find(line => line.startsWith('gp_cust_sess='));
+        const csrfLine = setCookies.find(line => line.startsWith('gp_cust_csrf='));
+        assert.ok(sessLine, 'expected a gp_cust_sess Set-Cookie line');
+        assert.match(sessLine, /;\s*HttpOnly/i, 'the customer session cookie must be HttpOnly');
+        assert.match(sessLine, /;\s*SameSite=Lax/i, 'the customer session cookie must be SameSite=Lax');
+        assert.ok(csrfLine, 'expected a gp_cust_csrf Set-Cookie line');
+        assert.ok(!/;\s*HttpOnly/i.test(csrfLine), 'the CSRF cookie must stay JS-readable — the double-submit pattern depends on it');
+        assert.match(csrfLine, /;\s*SameSite=Lax/i, 'the CSRF cookie must be SameSite=Lax');
     });
 
     /* ======================================================================
@@ -2745,6 +2812,19 @@ try {
         }
     });
 
+    await check('an oversized limit clamps the echoed `limit`, not just the page (§24b pagination contract)', async () => {
+        // Every ledger repository (invoiceRepository/advanceRepository/creditNoteRepository)
+        // caps a query at 200 rows regardless of what is requested. A client that pages with
+        // `offset += page.limit` needs that field to report the bound actually applied — if it
+        // echoed the raw request instead, a `?limit=300` page would claim `limit: 300` while
+        // `results` held at most 200, and the next page's offset would silently skip rows.
+        for (const route of ['/api/sales', '/api/returns', '/api/advances']) {
+            const page = await (await request(`${route}?limit=300`, { headers: adminHeaders })).json();
+            assert.equal(page.limit, 200, `${route} must clamp the echoed limit to the repository's real cap`);
+            assert.equal(page.results.length <= page.limit, true, route);
+        }
+    });
+
     await check('the advance liability summary ignores the date filter', async () => {
         // A balance is a lifetime running figure; a month's slice of it is not a
         // balance. Only `totals` describes the filtered period.
@@ -2829,6 +2909,107 @@ try {
         const stockAfterReturn = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
         assert.equal(stockAfterReturn.find(row => row.itemId === item.id).weightGrams, 4);
         billingInventory = { item, lot, exchangeCreditNoteId: returned.returnId };
+    });
+
+    await check('opening a lot for a missing item is refused with a domain code, and a real open leaves an audit trail entry', async () => {
+        const bogus = await request('/api/inventory/lots', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId: 'ITEM-NO-SUCH-ID', weightGrams: 1 })
+        });
+        assert.equal(bogus.status, 400);
+        assert.equal((await bogus.json()).code, 'STOCK_ITEM_NOT_FOUND');
+
+        const lotTrail = await request(`/api/audit?action=STOCK_LOT_OPENED&limit=10`, { headers: adminHeaders });
+        const lotEvents = (await lotTrail.json()).results;
+        assert.ok(lotEvents.some(e => e.entityId === billingInventory.lot.id && e.entityType === 'inventory_lot'),
+            'opening a lot must leave a STOCK_LOT_OPENED row naming that lot');
+    });
+
+    await check('adjusting a lot past zero is refused with a domain code, leaves stock untouched, and a real adjustment leaves an audit trail entry', async () => {
+        const before = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        const beforeWeight = before.find(row => row.itemId === billingInventory.item.id).weightGrams;
+
+        const negative = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weightDeltaGrams: -(beforeWeight + 1) })
+        });
+        assert.equal(negative.status, 409);
+        assert.equal((await negative.json()).code, 'STOCK_ADJUSTMENT_NEGATIVE');
+
+        const zero = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weightDeltaGrams: 0.0001 })
+        });
+        assert.equal(zero.status, 400);
+        assert.equal((await zero.json()).code, 'STOCK_ADJUSTMENT_ZERO');
+
+        const missingLot = await request('/api/inventory/lots/NO-SUCH-LOT/adjust', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weightDeltaGrams: 1 })
+        });
+        assert.equal(missingLot.status, 400);
+        assert.equal((await missingLot.json()).code, 'STOCK_LOT_NOT_FOUND');
+
+        const after = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(after.find(row => row.itemId === billingInventory.item.id).weightGrams, beforeWeight,
+            'a refused adjustment must not change on-hand stock');
+
+        const okAdjust = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weightDeltaGrams: 0.5, reason: 'Physical count' })
+        });
+        assert.equal(okAdjust.status, 200);
+
+        const adjustTrail = await request(`/api/audit?action=STOCK_ADJUSTED&limit=10`, { headers: adminHeaders });
+        const adjustEvents = (await adjustTrail.json()).results;
+        assert.ok(adjustEvents.some(e => e.entityId === billingInventory.lot.id && e.entityType === 'inventory_lot'),
+            'a real adjustment must leave a STOCK_ADJUSTED row naming that lot');
+
+        // Reverse the probe adjustment — later checks in this file assume
+        // billingInventory's lot sits at exactly the balance the earlier
+        // sale/return chain left it at.
+        const reversed = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weightDeltaGrams: -0.5, reason: 'Reverse physical-count probe' })
+        });
+        assert.equal(reversed.status, 200);
+        const restored = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(restored.find(row => row.itemId === billingInventory.item.id).weightGrams, beforeWeight);
+    });
+
+    await check('resubmitting an identical stock adjustment is not deduped — each physical count is its own fact', async () => {
+        // INVARIANT_MATRIX.md names this as accepted-but-untested behaviour: an
+        // adjustment carries no idempotency key, unlike every money workflow,
+        // and a resubmission is arguably correct (each physical count is its
+        // own fact) rather than a bug. This locks in that current, accepted
+        // behaviour instead of leaving it merely asserted in prose.
+        const before = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        const beforeWeight = before.find(row => row.itemId === billingInventory.item.id).weightGrams;
+
+        const body = JSON.stringify({ weightDeltaGrams: 0.2, reason: 'Resubmission probe' });
+        const first = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body
+        });
+        assert.equal(first.status, 200);
+        const second = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' }, body
+        });
+        assert.equal(second.status, 200);
+        assert.notEqual((await first.json()).movementId, (await second.json()).movementId);
+
+        const after = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(after.find(row => row.itemId === billingInventory.item.id).weightGrams, beforeWeight + 0.4,
+            'an identical adjustment resubmitted twice must post twice, not dedupe to one movement');
+
+        // Restore — later checks assume billingInventory's lot sits at its
+        // original balance.
+        const reversed = await request(`/api/inventory/lots/${billingInventory.lot.id}/adjust`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weightDeltaGrams: -0.4, reason: 'Reverse resubmission probe' })
+        });
+        assert.equal(reversed.status, 200);
+        const restored = await (await request('/api/inventory/stock', { headers: adminHeaders })).json();
+        assert.equal(restored.find(row => row.itemId === billingInventory.item.id).weightGrams, beforeWeight);
     });
 
     await check('a replacement sale naming a bogus exchange credit is refused', async () => {
@@ -3041,10 +3222,9 @@ try {
     });
 
     /* ==================================================================
-       CASH SHIFTS (day reconciliation). No owning service exists for this
-       workflow (route -> repository directly, see docs/INVARIANT_MATRIX.md),
-       but open/close are still financial facts and belong in the same
-       tamper-evident trail a sale/return/void already lands in.
+       CASH SHIFTS (day reconciliation), owned by reconciliationService.js.
+       Open/close are financial facts and belong in the same tamper-evident
+       trail a sale/return/void already lands in.
        ================================================================== */
 
     await check('opening and closing a cash shift both leave an audit trail entry', async () => {
@@ -3074,6 +3254,42 @@ try {
         const closeEvent = closeEvents.find(e => e.entityId === openedBody.id);
         assert.ok(closeEvent, 'closing a shift must leave a CASH_SHIFT_CLOSED row naming that shift');
         assert.equal(closeEvent.detail.variance, 0);
+    });
+
+    await check('reopening or misclosing a cash shift is refused with a domain code, not a bare 400', async () => {
+        const opened = await request('/api/cash-shifts/open', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ openingFloat: 500 })
+        });
+        const openedBody = await opened.json();
+        assert.equal(opened.status, 200, JSON.stringify(openedBody));
+
+        const reopened = await request('/api/cash-shifts/open', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ openingFloat: 500 })
+        });
+        assert.equal(reopened.status, 409);
+        assert.equal((await reopened.json()).code, 'CASH_SHIFT_ALREADY_OPEN');
+
+        const missing = await request('/api/cash-shifts/NO-SUCH-SHIFT/close', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ countedCash: 500 })
+        });
+        assert.equal(missing.status, 400);
+        assert.equal((await missing.json()).code, 'CASH_SHIFT_NOT_FOUND');
+
+        const closed = await request(`/api/cash-shifts/${openedBody.id}/close`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ countedCash: 500 })
+        });
+        assert.equal(closed.status, 200);
+
+        const reclosed = await request(`/api/cash-shifts/${openedBody.id}/close`, {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ countedCash: 500 })
+        });
+        assert.equal(reclosed.status, 409);
+        assert.equal((await reclosed.json()).code, 'CASH_SHIFT_ALREADY_CLOSED');
     });
 
     /* ------------------------------------------------------------------
@@ -3298,6 +3514,91 @@ try {
             'a webhook retry for the same payment must be recognised as a duplicate even after a concurrent session revocation');
         assert.equal(advanceService.customerLedger(phone).balance, balanceAfter,
             'the duplicate-delivery guard must hold after the gap');
+    });
+
+    /* ------------------------------------------------------------------
+       Domain-code coverage named as an open gap in TESTING_CHECKLIST.md
+       (§24c, closed 2026-09-07 for every other refusal): DUPLICATE_REFERENCE
+       and the gateway PAYMENT_AMOUNT_MISMATCH/PAYMENT_CREDIT_PERSIST_FAILED
+       codes were wired into domainCodes.js but no fixture here ever reached
+       them.
+       ------------------------------------------------------------------ */
+
+    await check('submitting the same transaction reference twice is refused with DUPLICATE_REFERENCE', async () => {
+        const body = {
+            customerPhone: '9000000199', customerName: 'Duplicate Reference Customer',
+            amount: 500, paymentMethod: 'Cash', referenceId: 'DUP-REF-TEST-1'
+        };
+        const first = await request('/api/advances', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        assert.equal(first.status, 200, JSON.stringify(await first.clone().json().catch(() => null)));
+
+        const second = await request('/api/advances', {
+            method: 'POST', headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        assert.equal(second.status, 409);
+        assert.equal((await second.json()).code, 'DUPLICATE_REFERENCE');
+    });
+
+    await check('a checkout verify whose captured amount does not match its order is refused with PAYMENT_AMOUNT_MISMATCH', async () => {
+        // Reuses the customer session the "Gateway await gap" check above
+        // already signed in as (password changed there, still live here).
+        const session = await loginCustomerHttp(request, { phone, password: 'GatewayGap!2026' });
+        assert.equal(session.response.status, 200);
+        const customerHeaders = session.headers;
+
+        const orderId = 'order_verify_mismatch_test';
+        const paymentId = 'pay_verify_mismatch_test';
+        assert.equal(paymentServiceModule.recordOrder({
+            providerOrderId: orderId, customerPhone: phone, amountPaise: 200000, currency: 'INR'
+        }), true);
+
+        const signature = crypto.createHmac('sha256', currentRazorpayKeySecret)
+            .update(`${orderId}|${paymentId}`).digest('hex');
+
+        const gatewayReached = new Promise(resolve => { gatewayRequestReceived = resolve; });
+        const verifyPromise = request('/api/payment/verify', {
+            method: 'POST', headers: { ...customerHeaders, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: signature
+            })
+        });
+
+        const gatewayTimedOut = Symbol('gatewayTimedOut');
+        const gatewayOutcome = await Promise.race([
+            gatewayReached,
+            new Promise(resolve => setTimeout(() => resolve(gatewayTimedOut), 5000))
+        ]);
+        assert.notEqual(gatewayOutcome, gatewayTimedOut, 'the route never reached the gateway call');
+
+        // ₹50 captured against a ₹2000 order.
+        releaseGatewayPayment(200, { status: 'captured', amount: 5000, order_id: orderId });
+
+        const verifyResponse = await verifyPromise;
+        assert.equal(verifyResponse.status, 409);
+        assert.equal((await verifyResponse.json()).code, 'PAYMENT_AMOUNT_MISMATCH');
+    });
+
+    await check('a ledger write that fails after a captured payment is refused with PAYMENT_CREDIT_PERSIST_FAILED, not silently dropped', async () => {
+        // Unreachable through the HTTP path by construction: payment_orders and
+        // advance_accounts both make customer_phone NOT NULL, so no order this
+        // suite (or a real checkout) can ever create reaches
+        // creditCapturedPayment() with a phone that fails to persist. Calling
+        // the service directly with a hand-built order is the only way to
+        // reach the "money captured, the ledger write itself throws" branch
+        // this code exists for.
+        const result = paymentServiceModule.creditCapturedPayment({
+            order: { orderId: 'order_forced_persist_failure', customerPhone: null, amountPaise: 1000, provider: 'razorpay' },
+            paymentId: 'pay_forced_persist_failure',
+            capturedPaise: 1000,
+            source: 'checkout'
+        }, {});
+        assert.equal(result.ok, false);
+        assert.equal(result.status, 500);
+        assert.equal(result.code, 'PAYMENT_CREDIT_PERSIST_FAILED');
     });
 
     /* ------------------------------------------------------------------
